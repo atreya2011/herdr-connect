@@ -213,8 +213,8 @@ pub fn watch_transitions(snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
 }
 /// Reads an activity fixture.
 #[must_use]
-pub fn read_activity_fixture(_path: &str) -> String {
-    todo!()
+pub fn read_activity_fixture(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 /// Returns the socket-client contract response.
 #[must_use]
