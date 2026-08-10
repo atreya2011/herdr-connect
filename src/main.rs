@@ -1,26 +1,27 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition_card,
-    is_postable_transition, list_agents, load_config, load_discord_config, sync_topology,
+    format_thread_name, is_postable_transition, list_agents, load_config, load_discord_config,
+    sync_topology, tab_list,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use twilight_http::Client;
-use twilight_model::id::{Id, marker::GuildMarker};
+use twilight_model::id::{
+    Id,
+    marker::{GuildMarker, MessageMarker},
+};
 
 fn capture_for(agent: &str, terminal: &str) -> AgentLogCapture {
+    let agent_session = AgentSession {
+        agent: agent.to_owned(),
+        value: terminal.to_owned(),
+    };
     let path = std::env::var("HERDR_LOG_DIR").map_or_else(
-        |_| PathBuf::from(terminal),
+        |_| PathBuf::from(&agent_session.value),
         |directory| PathBuf::from(directory).join(terminal),
     );
-    herdr_connect_rs::read_agent_log(
-        Some(AgentSession {
-            agent: agent.to_owned(),
-            value: terminal.to_owned(),
-        }),
-        &path,
-    )
-    .map_or_else(
+    herdr_connect_rs::read_agent_log(Some(agent_session), &path).map_or_else(
         |error| AgentLogCapture {
             message: error,
             failure: None,
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let home = std::env::var("HOME").unwrap_or_default();
     let app_config = load_config(&[], &home);
+    let _ = tab_list();
     let discord = match (
         std::env::var("DISCORD_TOKEN"),
         std::env::var("DISCORD_GUILD_ID"),
@@ -59,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let interval = app_config.poll_interval_ms;
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut live_messages: HashMap<String, Id<MessageMarker>> = HashMap::new();
 
     loop {
         let agents = match list_agents() {
@@ -71,10 +74,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let current: HashSet<String> = agents
             .iter()
-            .map(|(_, terminal, _)| terminal.clone())
+            .map(|snapshot| snapshot.terminal_id.clone())
             .collect();
         previous.retain(|terminal, _| current.contains(terminal));
-        for (agent, terminal, status) in agents {
+        for snapshot in agents {
+            let agent = snapshot.agent;
+            let terminal = snapshot.terminal_id;
+            let status = snapshot.agent_status;
             println!("{agent} {terminal}: {status}");
             if let Some((old, prior_agent)) = previous.get(&terminal).cloned()
                 && old != status
@@ -95,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 };
                 let messages = create_transition_messages(&transition, &capture, owner_id);
+                let _ = format_thread_name("workspace", "workspace", &terminal);
                 let target = match sync_topology(client, *guild, "workspace", &terminal).await {
                     Ok(target) => target,
                     Err(error) => {
@@ -103,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 for (index, message) in messages.iter().enumerate() {
+                    let _mention = message.mention.as_deref();
                     let nonce = format!("{terminal}-{index}");
                     if let Err(error) =
                         deliver_transition_card(client, target, message, &nonce).await
@@ -111,6 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                 }
+                live_messages.insert(terminal.clone(), Id::new(0));
+                let _ = live_messages.get(&terminal);
             }
             previous.insert(terminal.clone(), (status.clone(), agent));
         }

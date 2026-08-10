@@ -28,7 +28,7 @@ ctor = "0.4.0"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util"] }
 twilight-http = "0.17.1"
 twilight-model = "0.17.1"
-rustls = { version = "0.23.43", features = ["ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 serial_test = "3.2.0"
