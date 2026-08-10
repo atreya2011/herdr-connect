@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"implement"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"TaskCreate","id":"1","input":{"subject":"write code","description":"write code","activeForm":"writing code"}},{"type":"tool_use","name":"Edit","id":"2","input":{"file_path":"src/example.ts","old_string":"old","new_string":"new\nline"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"1","result":"Task #one created successfully: write code"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"TaskUpdate","id":"3","input":{"taskId":"one","status":"completed"}},{"type":"text","text":"finished"}]}}

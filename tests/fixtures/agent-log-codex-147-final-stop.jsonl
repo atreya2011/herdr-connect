@@ -1,0 +1,9 @@
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the parser"}]}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-luna","effort":"low"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"final 0.147 answer","duration_ms":2717}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"acknowledge"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Acknowledged"}}
