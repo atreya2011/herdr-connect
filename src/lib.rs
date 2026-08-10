@@ -245,11 +245,11 @@ pub const fn deliver_transition(
     let _ = (client, channel, content, nonce);
 }
 /// Updates a live-status message.
-pub fn update_live_status(
-    _client: &twilight_http::Client,
-    _channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    _terminal: &str,
-    _message: Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>>,
+pub const fn update_live_status(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    terminal: &str,
+    message: Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>>,
 ) {
-    todo!()
+    let _ = (client, channel, terminal, message);
 }
