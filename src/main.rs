@@ -1,5 +1,5 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition,
+    AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition_card,
     is_postable_transition, list_agents, load_config, load_discord_config, sync_topology,
 };
 use std::collections::{HashMap, HashSet};
@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (index, message) in messages.iter().enumerate() {
                     let nonce = format!("{terminal}-{index}");
                     if let Err(error) =
-                        deliver_transition(client, target, &message.description, &nonce).await
+                        deliver_transition_card(client, target, message, &nonce).await
                     {
                         eprintln!("discord delivery error: {error}");
                         break;
