@@ -47,10 +47,39 @@ pub fn read_agent_log(
     todo!()
 }
 pub fn load_config(_environment: &[(&str, &str)], _home: &str) -> AppConfig {
-    todo!()
+    let socket = _environment
+        .iter()
+        .find(|(name, _)| *name == "HERDR_SOCKET_PATH")
+        .map(|(_, value)| (*value).to_owned())
+        .unwrap_or_else(|| format!("{_home}/.config/herdr/herdr.sock"));
+    AppConfig {
+        herdr_socket_path: socket,
+        poll_interval_ms: 1_500,
+    }
 }
 pub fn load_discord_config(_environment: &[(&str, &str)]) -> Result<DiscordConfig, String> {
-    todo!()
+    let value = |name: &str| {
+        _environment
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| *value)
+    };
+    let required = ["DISCORD_TOKEN", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"];
+    let missing: Vec<_> = required
+        .into_iter()
+        .filter(|name| value(name).is_none_or(|v| v.trim().is_empty()))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Missing required environment variables: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(DiscordConfig {
+        guild_id: value("DISCORD_GUILD_ID").unwrap().trim().into(),
+        owner_id: value("DISCORD_OWNER_ID").unwrap().trim().into(),
+        token: value("DISCORD_TOKEN").unwrap().trim().into(),
+    })
 }
 pub fn create_transition_messages(
     _transition: Transition,
