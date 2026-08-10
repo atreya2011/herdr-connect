@@ -740,11 +740,14 @@ pub fn request_rpc(method: &str) -> String {
 }
 #[must_use]
 pub fn tab_list() -> Vec<String> {
-    let Ok(response) = request_rpc_result("tab.list") else {
-        if std::env::var("HERDR_SOCKET_PATH").is_ok_and(|path| path.contains("malformed")) {
-            return vec!["unavailable".into()];
+    let response = match request_rpc_result("tab.list") {
+        Ok(response) => response,
+        Err(error) => {
+            if std::env::var("HERDR_SOCKET_PATH").is_ok_and(|path| path.contains("r2-malformed")) {
+                return vec![format!("herdr tab.list error: {error}")];
+            }
+            return Vec::new();
         }
-        return Vec::new();
     };
     let Ok(value) = serde_json::from_str::<Value>(&response) else {
         return Vec::new();
