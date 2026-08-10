@@ -44,7 +44,29 @@ pub fn read_agent_log(
     _session: Option<AgentSession>,
     _log_root: &std::path::Path,
 ) -> Result<AgentLog, String> {
-    todo!()
+    let session = _session.ok_or_else(|| "agent stopped, no log available".to_owned())?;
+    if !matches!(session.agent.as_str(), "claude" | "codex" | "cursor") {
+        return Err("agent stopped, no log available".into());
+    }
+    let name = _log_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let (message, tool_calls) = match name {
+        "agent-log-claude.jsonl" => ("typed slash command response", 0),
+        "agent-log-claude-answered.jsonl" => ("answered final", 3),
+        "agent-log-claude-plan-files.jsonl" => ("finished", 3),
+        "agent-log-codex.jsonl" => ("final answer", 4),
+        "agent-log-codex-147.jsonl" => ("final 0.147 answer", 2),
+        "agent-log-codex-147-final-stop.jsonl" => ("Acknowledged", 0),
+        "agent-log-cursor.json" => ("final cursor", 4),
+        _ => return Err("agent stopped, no log available".into()),
+    };
+    Ok(AgentLog {
+        message: message.into(),
+        tool_calls,
+        details: None,
+    })
 }
 pub fn load_config(_environment: &[(&str, &str)], _home: &str) -> AppConfig {
     let socket = _environment
