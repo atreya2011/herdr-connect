@@ -1,6 +1,7 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition,
-    list_agents, load_config, load_discord_config, sync_topology, update_live_status,
+    is_postable_transition, list_agents, load_config, load_discord_config, sync_topology,
+    update_live_status,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -98,31 +99,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     terminal_id: terminal.clone(),
                     agent: prior_agent,
                 };
+                if !is_postable_transition(&transition) {
+                    previous.insert(terminal.clone(), (status.clone(), agent));
+                    continue;
+                }
                 let capture = capture_for(&agent, &terminal);
                 let Some((client, guild, owner_id)) = discord.as_ref() else {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 };
                 let messages = create_transition_messages(&transition, &capture, owner_id);
-                sync_topology(client, *guild, "workspace", &terminal).await?;
+                if let Err(error) = sync_topology(client, *guild, "workspace", &terminal).await {
+                    eprintln!("discord topology error: {error}");
+                    continue;
+                }
                 if let Some(channel) = channel {
                     for (index, message) in messages.iter().enumerate() {
                         let nonce = format!("{terminal}-{index}");
-                        deliver_transition(client, channel, &message.description, &nonce).await?;
+                        if let Err(error) =
+                            deliver_transition(client, channel, &message.description, &nonce).await
+                        {
+                            eprintln!("discord delivery error: {error}");
+                            break;
+                        }
                     }
                 }
             }
             previous.insert(terminal.clone(), (status.clone(), agent));
             if let Some((client, _, _)) = discord.as_ref()
                 && let Some(channel) = channel
-            {
-                update_live_status(
+                && let Err(error) = update_live_status(
                     client,
                     channel,
                     &terminal,
                     live_messages.get(&terminal).copied(),
                 )
-                .await?;
+                .await
+            {
+                eprintln!("discord live-status error: {error}");
             }
         }
         tokio::select! {
