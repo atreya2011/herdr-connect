@@ -2,12 +2,23 @@
 name = "herdr-connect-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Rust Discord bridge for Herdr agents"
+license = "MIT"
+repository = "https://github.com/atreya/herdr-connect-rs"
+readme = "README.md"
+keywords = ["herdr", "discord"]
+categories = ["command-line-utilities"]
 
 [lints.rust]
 warnings = "deny"
 
 [lints.clippy]
-all = "deny"
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Twilight and Rustls bring unavoidable duplicate transitive versions.
+multiple-crate-versions = { level = "allow", priority = 1 }
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

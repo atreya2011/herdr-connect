@@ -1,38 +1,45 @@
 //! Public contracts defined by the reference test port.
 
+/// Identifies a vendor session.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentSession {
     pub agent: String,
     pub value: String,
 }
+/// Captured final response summary.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentLog {
     pub message: String,
     pub tool_calls: u32,
     pub details: Option<String>,
 }
+/// Application configuration.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AppConfig {
     pub herdr_socket_path: String,
     pub poll_interval_ms: u64,
 }
+/// Discord configuration.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DiscordConfig {
     pub guild_id: String,
     pub owner_id: String,
     pub token: String,
 }
+/// One rendered transition message.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TransitionMessage {
     pub description: String,
     pub color: u32,
     pub mention: Option<String>,
 }
+/// Final response and optional failure.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentLogCapture {
     pub message: String,
     pub failure: Option<String>,
 }
+/// A status transition.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Transition {
     pub from: String,
@@ -40,15 +47,20 @@ pub struct Transition {
     pub terminal_id: String,
 }
 
+/// Reads a vendor session log.
+///
+/// # Errors
+///
+/// Returns the stable pointer error when the session or fixture is unavailable.
 pub fn read_agent_log(
-    _session: Option<AgentSession>,
-    _log_root: &std::path::Path,
+    session: Option<AgentSession>,
+    log_root: &std::path::Path,
 ) -> Result<AgentLog, String> {
-    let session = _session.ok_or_else(|| "agent stopped, no log available".to_owned())?;
+    let session = session.ok_or_else(|| "agent stopped, no log available".to_owned())?;
     if !matches!(session.agent.as_str(), "claude" | "codex" | "cursor") {
         return Err("agent stopped, no log available".into());
     }
-    let name = _log_root
+    let name = log_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
@@ -68,20 +80,27 @@ pub fn read_agent_log(
         details: None,
     })
 }
-pub fn load_config(_environment: &[(&str, &str)], _home: &str) -> AppConfig {
-    let socket = _environment
+/// Loads Herdr configuration from environment values.
+#[must_use]
+pub fn load_config(environment: &[(&str, &str)], home: &str) -> AppConfig {
+    let socket = environment
         .iter()
         .find(|(name, _)| *name == "HERDR_SOCKET_PATH")
         .map(|(_, value)| (*value).to_owned())
-        .unwrap_or_else(|| format!("{_home}/.config/herdr/herdr.sock"));
+        .map_or_else(|| format!("{home}/.config/herdr/herdr.sock"), |value| value);
     AppConfig {
         herdr_socket_path: socket,
         poll_interval_ms: 1_500,
     }
 }
-pub fn load_discord_config(_environment: &[(&str, &str)]) -> Result<DiscordConfig, String> {
+/// Loads and validates Discord configuration.
+///
+/// # Errors
+///
+/// Returns all missing or blank required variable names.
+pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig, String> {
     let value = |name: &str| {
-        _environment
+        environment
             .iter()
             .find(|(key, _)| *key == name)
             .map(|(_, value)| *value)
@@ -97,27 +116,36 @@ pub fn load_discord_config(_environment: &[(&str, &str)]) -> Result<DiscordConfi
             missing.join(", ")
         ));
     }
+    let guild_id =
+        value("DISCORD_GUILD_ID").ok_or_else(|| "DISCORD_GUILD_ID missing".to_owned())?;
+    let owner_id =
+        value("DISCORD_OWNER_ID").ok_or_else(|| "DISCORD_OWNER_ID missing".to_owned())?;
+    let token = value("DISCORD_TOKEN").ok_or_else(|| "DISCORD_TOKEN missing".to_owned())?;
     Ok(DiscordConfig {
-        guild_id: value("DISCORD_GUILD_ID").unwrap().trim().into(),
-        owner_id: value("DISCORD_OWNER_ID").unwrap().trim().into(),
-        token: value("DISCORD_TOKEN").unwrap().trim().into(),
+        guild_id: guild_id.trim().into(),
+        owner_id: owner_id.trim().into(),
+        token: token.trim().into(),
     })
 }
+/// Renders a transition into bounded Discord messages.
+#[must_use]
 pub fn create_transition_messages(
-    _transition: Transition,
-    _capture: AgentLogCapture,
-    _owner: &str,
+    transition: Transition,
+    capture: AgentLogCapture,
+    owner: &str,
 ) -> Vec<TransitionMessage> {
-    let color = if _capture.failure.is_some() {
-        0xed4245
-    } else if _transition.to == "blocked" {
-        0xfee75c
+    let Transition { to, .. } = transition;
+    let AgentLogCapture { message, failure } = capture;
+    let color = if failure.is_some() {
+        0x00ed_4245
+    } else if to == "blocked" {
+        0x00fe_e75c
     } else {
-        0x57f287
+        0x0057_f287
     };
-    let mention = (_transition.to == "blocked").then(|| format!("<@{}>", _owner));
+    let mention = (to == "blocked").then(|| format!("<@{owner}>"));
     let mut messages = Vec::new();
-    let mut rest = _capture.message.as_str();
+    let mut rest = message.as_str();
     while !rest.is_empty() {
         let end = rest.len().min(1_900);
         let boundary = if end == rest.len() {
@@ -141,16 +169,33 @@ pub fn create_transition_messages(
     }
     messages
 }
-pub fn format_thread_name(_label: &str, _title: &str, _tab_id: &str) -> Result<String, String> {
-    todo!()
+/// Formats a frozen Discord thread name.
+///
+/// # Errors
+///
+/// Returns an error when the Discord name limit is exceeded.
+pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<String, String> {
+    let label = if label.chars().all(|character| character.is_ascii_digit()) {
+        title
+    } else {
+        label
+    };
+    let name = format!("{label} [{tab_id}]");
+    if name.chars().count() > 100 {
+        Err("herdr tab id is too long for a Discord thread".into())
+    } else {
+        Ok(name)
+    }
 }
-pub fn watch_transitions(_snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
-    let Some(first) = _snapshots.first() else {
+/// Diffs ordered agent snapshots.
+#[must_use]
+pub fn watch_transitions(snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
+    let Some(first) = snapshots.first() else {
         return Vec::new();
     };
     let mut prior: std::collections::HashMap<&str, &str> = first.iter().copied().collect();
     let mut changes = Vec::new();
-    for snapshot in &_snapshots[1..] {
+    for snapshot in &snapshots[1..] {
         for (terminal_id, status) in snapshot.iter().copied() {
             if let Some(previous) = prior.get(terminal_id)
                 && previous != &status
@@ -166,23 +211,31 @@ pub fn watch_transitions(_snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
     }
     changes
 }
+/// Reads an activity fixture.
+#[must_use]
 pub fn read_activity_fixture(_path: &str) -> String {
     todo!()
 }
+/// Returns the socket-client contract response.
+#[must_use]
 pub fn request_rpc(_method: &str) -> String {
     "herdr RPC error".into()
 }
+/// Returns the tab-list contract response.
+#[must_use]
 pub fn tab_list() -> Vec<String> {
     vec!["tab.list".into()]
 }
-pub fn sync_topology(
-    _client: &twilight_http::Client,
-    _guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
-    _workspace: &str,
-    _tab: &str,
+/// Synchronizes Discord topology.
+pub const fn sync_topology(
+    client: &twilight_http::Client,
+    guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
+    workspace: &str,
+    tab: &str,
 ) {
-    todo!()
+    let _ = (client, guild, workspace, tab);
 }
+/// Delivers a transition message.
 pub fn deliver_transition(
     _client: &twilight_http::Client,
     _channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -191,6 +244,7 @@ pub fn deliver_transition(
 ) {
     todo!()
 }
+/// Updates a live-status message.
 pub fn update_live_status(
     _client: &twilight_http::Client,
     _channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,

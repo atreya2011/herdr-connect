@@ -3,9 +3,9 @@ use herdr_connect_rs::{AgentLogCapture, Transition, create_transition_messages};
 #[test]
 fn matches_reference_transition_colors_and_mentions() {
     let cases = [
-        ("done", 0x57f287, None),
-        ("blocked", 0xfee75c, Some("<@owner>")),
-        ("idle", 0x57f287, None),
+        ("done", 0x0057_f287, None),
+        ("blocked", 0x00fe_e75c, Some("<@owner>")),
+        ("idle", 0x0057_f287, None),
     ];
     for (to, color, mention) in cases {
         let messages = create_transition_messages(
@@ -61,5 +61,5 @@ fn uses_failure_color() {
         },
         "owner",
     );
-    assert_eq!(messages[0].color, 0xed4245);
+    assert_eq!(messages[0].color, 0x00ed_4245);
 }
