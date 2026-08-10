@@ -1,4 +1,4 @@
-use herdr_connect_rs::{Transition, create_transition_messages};
+use herdr_connect_rs::{AgentLogCapture, Transition, create_transition_messages};
 
 #[test]
 fn matches_reference_transition_colors_and_mentions() {
@@ -14,8 +14,10 @@ fn matches_reference_transition_colors_and_mentions() {
                 to: to.into(),
                 terminal_id: "t".into(),
             },
-            "final",
-            8,
+            AgentLogCapture {
+                message: "final".into(),
+                failure: None,
+            },
             "owner",
         );
         assert_eq!(messages[0].color, color);
@@ -31,8 +33,10 @@ fn preserves_reference_multipart_lengths_and_numbering() {
             to: "idle".into(),
             terminal_id: "t".into(),
         },
-        &"x".repeat(4_000),
-        1,
+        AgentLogCapture {
+            message: "x".repeat(4_000),
+            failure: None,
+        },
         "owner",
     );
     assert_eq!(messages.len(), 3);
@@ -51,8 +55,10 @@ fn uses_failure_color() {
             to: "done".into(),
             terminal_id: "t".into(),
         },
-        "final",
-        0,
+        AgentLogCapture {
+            message: "final".into(),
+            failure: Some("turn aborted".into()),
+        },
         "owner",
     );
     assert_eq!(messages[0].color, 0xed4245);

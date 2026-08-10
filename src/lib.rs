@@ -29,13 +29,21 @@ pub struct TransitionMessage {
     pub mention: Option<String>,
 }
 #[derive(Debug, PartialEq, Eq)]
+pub struct AgentLogCapture {
+    pub message: String,
+    pub failure: Option<String>,
+}
+#[derive(Debug, PartialEq, Eq)]
 pub struct Transition {
     pub from: String,
     pub to: String,
     pub terminal_id: String,
 }
 
-pub fn read_agent_log(_session: Option<AgentSession>) -> Result<AgentLog, String> {
+pub fn read_agent_log(
+    _session: Option<AgentSession>,
+    _log_root: &std::path::Path,
+) -> Result<AgentLog, String> {
     todo!()
 }
 pub fn load_config(_environment: &[(&str, &str)], _home: &str) -> AppConfig {
@@ -46,8 +54,7 @@ pub fn load_discord_config(_environment: &[(&str, &str)]) -> Result<DiscordConfi
 }
 pub fn create_transition_messages(
     _transition: Transition,
-    _message: &str,
-    _tools: u32,
+    _capture: AgentLogCapture,
     _owner: &str,
 ) -> Vec<TransitionMessage> {
     todo!()
