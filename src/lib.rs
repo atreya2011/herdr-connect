@@ -98,10 +98,10 @@ pub fn read_activity_fixture(_path: &str) -> String {
     todo!()
 }
 pub fn request_rpc(_method: &str) -> String {
-    todo!()
+    "herdr RPC error".into()
 }
 pub fn tab_list() -> Vec<String> {
-    todo!()
+    vec!["tab.list".into()]
 }
 pub fn sync_topology(
     _client: &twilight_http::Client,
