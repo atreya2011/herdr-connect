@@ -59,29 +59,35 @@
 37. Format watcher output as `<agent> <terminal_id>: <from> -> <to>`.
 38. Run the console watcher without requiring Discord configuration.
 39. Stop status and activity polling on SIGINT and SIGTERM.
+40. Post a live-status message when an agent starts working.
+41. Coalesce live-status updates into edits of the existing message.
+42. Persist live-status message ownership in a durable store that survives restart.
+43. Clear the live-status message when the final transition card posts or the agent stops.
+44. Bound live-status edit and delete failures with per-message failure budgets.
+45. Sweep startup stray live-status messages identified by the configured URL marker.
 
 ## Live activity/watch
 
-40. Read only complete new JSONL records after a persisted byte position and detect truncation or rotation.
-41. Read Cursor activity rows from SQLite by increasing row ID.
-42. Merge incremental activity with prior tool counts, task subjects, and plan state.
-43. Track the current tool, tool counts, task subjects, and latest plan step for working agents.
-44. Reset activity position and feed when a working agent’s session identity changes.
-45. Remove non-working agents from the live activity set and report only advancing or rotated activity.
+46. Read only complete new JSONL records after a persisted byte position and detect truncation or rotation.
+47. Read Cursor activity rows from SQLite by increasing row ID.
+48. Merge incremental activity with prior tool counts, task subjects, and plan state.
+49. Track the current tool, tool counts, task subjects, and latest plan step for working agents.
+50. Reset activity position and feed when a working agent’s session identity changes.
+51. Remove non-working agents from the live activity set and report only advancing or rotated activity.
 
 ## Vendor log readers
 
-46. Locate Claude, Codex, and Cursor session logs from the vendor-specific session identity.
-47. Read the final Claude turn after the latest prompt and extract response text, tools, failures, model, tokens, plan, branch, and changed files.
-48. Read the final Codex turn from rollout JSONL and extract response text, tools, failures, model, effort, tokens, plan, and changed files.
-49. Read Cursor SQLite blobs, normalize tool calls and results, and extract the final response, failures, plan, and changed files.
-50. Deduplicate split vendor records and API usage while preserving parallel tool counts.
-51. Return the stable no-log failure when a session or log is unavailable or unreadable.
+52. Locate Claude, Codex, and Cursor session logs from the vendor-specific session identity.
+53. Read the final Claude turn after the latest prompt and extract response text, tools, failures, model, tokens, plan, branch, and changed files.
+54. Read the final Codex turn from rollout JSONL and extract response text, tools, failures, model, effort, tokens, plan, and changed files.
+55. Read Cursor SQLite blobs, normalize tool calls and results, and extract the final response, failures, plan, and changed files.
+56. Deduplicate split vendor records and API usage while preserving parallel tool counts.
+57. Return the stable no-log failure when a session or log is unavailable or unreadable.
 
 ## Config/allowlist
 
-52. Require non-empty trimmed Discord token, guild ID, and owner ID before gateway login.
-53. Read the Herdr socket path from configuration and default it to the standard Herdr socket location.
-54. Read and validate the polling interval configuration.
-55. Ignore every Discord user except the configured owner, and deny all users when the allowlist is empty.
-56. Use the configured Discord guild and gateway intents and do not retry REST requests automatically.
+58. Require non-empty trimmed Discord token, guild ID, and owner ID before gateway login.
+59. Read the Herdr socket path from configuration and default it to the standard Herdr socket location.
+60. Read and validate the polling interval configuration.
+61. Ignore every Discord user except the configured owner, and deny all users when the allowlist is empty.
+62. Use the configured Discord guild and gateway intents and do not retry REST requests automatically.
