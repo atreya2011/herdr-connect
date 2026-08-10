@@ -1,6 +1,6 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition,
-    list_agents, load_discord_config, sync_topology, update_live_status,
+    list_agents, load_config, load_discord_config, sync_topology, update_live_status,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -47,30 +47,48 @@ fn configured_channel() -> Option<Id<ChannelMarker>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_discord_config(&[
-        ("DISCORD_TOKEN", &std::env::var("DISCORD_TOKEN")?),
-        ("DISCORD_GUILD_ID", &std::env::var("DISCORD_GUILD_ID")?),
-        ("DISCORD_OWNER_ID", &std::env::var("DISCORD_OWNER_ID")?),
-    ])?;
-    let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
-    let client = Client::builder().token(config.token).build();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let app_config = load_config(&[], &home);
+    let discord = match (
+        std::env::var("DISCORD_TOKEN"),
+        std::env::var("DISCORD_GUILD_ID"),
+        std::env::var("DISCORD_OWNER_ID"),
+    ) {
+        (Ok(token), Ok(guild_id), Ok(owner_id)) => {
+            let config = load_discord_config(&[
+                ("DISCORD_TOKEN", &token),
+                ("DISCORD_GUILD_ID", &guild_id),
+                ("DISCORD_OWNER_ID", &owner_id),
+            ])?;
+            let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
+            let client = Client::builder().token(config.token).build();
+            Some((client, guild, config.owner_id))
+        }
+        _ => None,
+    };
     let channel = configured_channel();
-    let interval = std::env::var("HERDR_POLL_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1_500);
+    let interval = app_config.poll_interval_ms;
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
     let live_messages: HashMap<String, Id<MessageMarker>> = HashMap::new();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
-        let agents = list_agents()?;
+        let agents = match list_agents() {
+            Ok(agents) => agents,
+            Err(error) => {
+                eprintln!("herdr poll error: {error}");
+                tokio::time::sleep(Duration::from_millis(interval)).await;
+                continue;
+            }
+        };
         let current: HashSet<String> = agents
             .iter()
             .map(|(_, terminal, _)| terminal.clone())
             .collect();
         previous.retain(|terminal, _| current.contains(terminal));
         for (agent, terminal, status) in agents {
+            println!("{agent} {terminal}: {status}");
             if let Some((old, prior_agent)) = previous.get(&terminal).cloned()
                 && old != status
             {
@@ -81,19 +99,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     agent: prior_agent,
                 };
                 let capture = capture_for(&agent, &terminal);
-                let messages = create_transition_messages(&transition, &capture, &config.owner_id);
-                sync_topology(&client, guild, "workspace", &terminal).await?;
+                let Some((client, guild, owner_id)) = discord.as_ref() else {
+                    previous.insert(terminal.clone(), (status.clone(), agent));
+                    continue;
+                };
+                let messages = create_transition_messages(&transition, &capture, owner_id);
+                sync_topology(client, *guild, "workspace", &terminal).await?;
                 if let Some(channel) = channel {
                     for (index, message) in messages.iter().enumerate() {
                         let nonce = format!("{terminal}-{index}");
-                        deliver_transition(&client, channel, &message.description, &nonce).await?;
+                        deliver_transition(client, channel, &message.description, &nonce).await?;
                     }
                 }
             }
             previous.insert(terminal.clone(), (status.clone(), agent));
-            if let Some(channel) = channel {
+            if let Some((client, _, _)) = discord.as_ref()
+                && let Some(channel) = channel
+            {
                 update_live_status(
-                    &client,
+                    client,
                     channel,
                     &terminal,
                     live_messages.get(&terminal).copied(),

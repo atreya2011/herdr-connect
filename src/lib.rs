@@ -14,6 +14,11 @@ const MAX_PART_LENGTH: usize = 1_900;
 const MAX_THREAD_NAME_LENGTH: usize = 100;
 static RPC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[ctor::ctor]
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentSession {
     pub agent: String,
