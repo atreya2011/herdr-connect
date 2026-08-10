@@ -65,7 +65,12 @@ pub struct Transition {
 /// Returns the stable pointer error when the session, file, or parsed response is unavailable.
 pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<AgentLog, String> {
     let session = session.ok_or_else(|| POINTER.to_owned())?;
-    if session.agent == "cursor" && path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+    if session.agent == "cursor" {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            let bytes = std::fs::read(path).map_err(|_| POINTER.to_owned())?;
+            let value: Value = serde_json::from_slice(&bytes).map_err(|_| POINTER.to_owned())?;
+            return parse_cursor_json(&value).map_err(|_| POINTER.to_owned());
+        }
         return parse_cursor_path(path).map_err(|_| POINTER.to_owned());
     }
     let bytes = std::fs::read(path).map_err(|_| POINTER.to_owned())?;
@@ -73,7 +78,6 @@ pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<Agen
     match session.agent.as_str() {
         "claude" => parse_claude(&text),
         "codex" => parse_codex(&text),
-        "cursor" => parse_cursor(&text),
         _ => Err(serde_json::Error::custom(POINTER)),
     }
     .map_err(|_| POINTER.to_owned())
@@ -82,12 +86,19 @@ pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<Agen
 fn parse_cursor_path(path: &Path) -> Result<AgentLog, serde_json::Error> {
     let connection =
         Connection::open(path).map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
+    let _: Vec<(String, String)> = connection
+        .prepare("SELECT key, value FROM meta ORDER BY key")
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?
+        .filter_map(Result::ok)
+        .collect();
     let mut statement = connection
-        .prepare("SELECT data FROM blobs ORDER BY rowid")
+        .prepare("SELECT id, data FROM blobs ORDER BY id")
         .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
     let rows: Vec<Value> = statement
         .query_map([], |row| {
-            let bytes: Vec<u8> = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
             Ok(serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
         })
         .map_err(|_| serde_json::Error::custom("invalid cursor log"))?
@@ -254,26 +265,6 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
         failure,
     })
 }
-fn parse_cursor(text: &str) -> Result<AgentLog, serde_json::Error> {
-    if let Ok(value) = serde_json::from_str::<Value>(text) {
-        return parse_cursor_json(&value);
-    }
-    let connection =
-        Connection::open(text).map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
-    let mut statement = connection
-        .prepare("SELECT data FROM blobs ORDER BY rowid")
-        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
-    let rows: Vec<Value> = statement
-        .query_map([], |row| {
-            let bytes: Vec<u8> = row.get(0)?;
-            Ok(serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
-        })
-        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?
-        .filter_map(Result::ok)
-        .collect();
-    parse_cursor_rows(&rows)
-}
-
 fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
     let start = rows
         .iter()
