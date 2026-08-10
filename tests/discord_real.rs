@@ -1,4 +1,5 @@
 use herdr_connect_rs::{deliver_transition, sync_topology, update_live_status};
+use serial_test::serial;
 use twilight_http::Client;
 use twilight_model::{channel::ChannelType, id::Id};
 
@@ -71,6 +72,7 @@ async fn real_guild_setup() -> (
 }
 
 #[tokio::test]
+#[serial]
 async fn real_guild_topology_create_and_reuse_contract() {
     let (client, guild, channel) = real_guild_setup().await;
     sync_topology(&client, guild, "workspace", "tab");
@@ -78,12 +80,14 @@ async fn real_guild_topology_create_and_reuse_contract() {
 }
 
 #[tokio::test]
+#[serial]
 async fn real_guild_nonce_delivery_contract() {
     let (client, _guild, channel) = real_guild_setup().await;
     deliver_transition(&client, channel, "retry-safe", "nonce");
 }
 
 #[tokio::test]
+#[serial]
 async fn real_guild_live_status_lifecycle_contract() {
     let (client, _guild, channel) = real_guild_setup().await;
     update_live_status(&client, channel, "terminal", None);
