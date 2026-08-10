@@ -92,7 +92,26 @@ pub fn format_thread_name(_label: &str, _title: &str, _tab_id: &str) -> Result<S
     todo!()
 }
 pub fn watch_transitions(_snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
-    todo!()
+    let Some(first) = _snapshots.first() else {
+        return Vec::new();
+    };
+    let mut prior: std::collections::HashMap<&str, &str> = first.iter().copied().collect();
+    let mut changes = Vec::new();
+    for snapshot in &_snapshots[1..] {
+        for (terminal_id, status) in snapshot.iter().copied() {
+            if let Some(previous) = prior.get(terminal_id)
+                && previous != &status
+            {
+                changes.push(Transition {
+                    from: (*previous).into(),
+                    to: status.into(),
+                    terminal_id: terminal_id.into(),
+                });
+            }
+        }
+        prior = snapshot.iter().copied().collect();
+    }
+    changes
 }
 pub fn read_activity_fixture(_path: &str) -> String {
     todo!()
