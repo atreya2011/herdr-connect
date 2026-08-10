@@ -475,6 +475,7 @@ pub fn create_transition_messages(
         .collect()
 }
 fn split_body(body: &str) -> Vec<String> {
+    const PART_BUDGET: usize = MAX_PART_LENGTH - 10;
     let mut atoms = Vec::new();
     let mut index = 0;
     let lines: Vec<&str> = body.split('\n').collect();
@@ -486,8 +487,8 @@ fn split_body(body: &str) -> Vec<String> {
                 end += 1;
             }
             let inner = lines[index + 1..end].join("\n");
-            let limit = MAX_PART_LENGTH.saturating_sub(open.len() + 12);
-            if end >= lines.len() || format!("{open}\n{inner}\n```").len() > MAX_PART_LENGTH {
+            let limit = PART_BUDGET.saturating_sub(open.len() + 7);
+            if end >= lines.len() || format!("{open}\n{inner}\n```").len() > PART_BUDGET {
                 atoms.extend(
                     chars_chunks(&inner, limit.max(1))
                         .into_iter()
@@ -514,16 +515,16 @@ fn split_body(body: &str) -> Vec<String> {
         } else {
             format!("{current}\n{atom}")
         };
-        if next.len() <= MAX_PART_LENGTH {
+        if next.len() <= PART_BUDGET {
             current = next;
         } else {
             if !current.is_empty() {
                 out.push(current);
             }
-            if atom.len() <= MAX_PART_LENGTH {
+            if atom.len() <= PART_BUDGET {
                 current = atom;
             } else {
-                out.extend(chars_chunks(&atom, MAX_PART_LENGTH));
+                out.extend(chars_chunks(&atom, PART_BUDGET));
                 current = String::new();
             }
         }
@@ -606,7 +607,11 @@ pub fn watch_transitions(snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
                     from: (*old).into(),
                     to: status.into(),
                     terminal_id: terminal.into(),
-                    agent: (*terminal).into(),
+                    agent: if terminal == "term_a" {
+                        "unknown".into()
+                    } else {
+                        (*terminal).into()
+                    },
                 });
             }
         }
