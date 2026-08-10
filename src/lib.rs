@@ -1,12 +1,13 @@
-#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde::de::Error as _;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const POINTER: &str = "agent stopped, no log available";
 const MAX_PART_LENGTH: usize = 1_900;
@@ -57,8 +58,16 @@ pub struct Transition {
     pub agent: String,
 }
 
+/// Reads and parses one vendor session log.
+///
+/// # Errors
+///
+/// Returns the stable pointer error when the session, file, or parsed response is unavailable.
 pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<AgentLog, String> {
     let session = session.ok_or_else(|| POINTER.to_owned())?;
+    if session.agent == "cursor" && path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return parse_cursor_path(path).map_err(|_| POINTER.to_owned());
+    }
     let bytes = std::fs::read(path).map_err(|_| POINTER.to_owned())?;
     let text = String::from_utf8(bytes).map_err(|_| POINTER.to_owned())?;
     match session.agent.as_str() {
@@ -68,6 +77,23 @@ pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<Agen
         _ => Err(serde_json::Error::custom(POINTER)),
     }
     .map_err(|_| POINTER.to_owned())
+}
+
+fn parse_cursor_path(path: &Path) -> Result<AgentLog, serde_json::Error> {
+    let connection =
+        Connection::open(path).map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
+    let mut statement = connection
+        .prepare("SELECT data FROM blobs ORDER BY rowid")
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
+    let rows: Vec<Value> = statement
+        .query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            Ok(serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        })
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?
+        .filter_map(Result::ok)
+        .collect();
+    parse_cursor_rows(&rows)
 }
 
 fn lines(text: &str) -> Result<Vec<Value>, serde_json::Error> {
@@ -99,7 +125,7 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         .map_or(0, |i| i + 1);
     let tail = &records[start..];
     let mut message = None;
-    let question = None;
+    let mut question = None;
     let mut tools = 0;
     let mut failure = None;
     for record in tail {
@@ -111,30 +137,39 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
             for part in contents {
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => {
-                        message = part.get("text").and_then(Value::as_str).map(str::to_owned)
+                        message = part.get("text").and_then(Value::as_str).map(str::to_owned);
+                    }
+                    Some("tool_use")
+                        if part.get("name").and_then(Value::as_str) == Some("AskUserQuestion") =>
+                    {
+                        question = format_question(part.get("input"));
+                        tools += 1;
                     }
                     Some("tool_use") => tools += 1,
                     Some("tool_result") if part.get("is_error") == Some(&Value::Bool(true)) => {
                         failure = part
                             .get("content")
                             .and_then(Value::as_str)
-                            .map(str::to_owned)
+                            .map(str::to_owned);
                     }
                     _ => {}
                 }
             }
         }
-        if record.get("type").and_then(Value::as_str) == Some("assistant") {
-            if let Some(s) = record.get("message").and_then(Value::as_str) {
-                message = Some(s.to_owned());
-            }
+        if record.get("type").and_then(Value::as_str) == Some("assistant")
+            && let Some(s) = record.get("message").and_then(Value::as_str)
+        {
+            message = Some(s.to_owned());
         }
     }
-    let message = message.ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
+    let message = message
+        .filter(|text| !text.is_empty())
+        .or_else(|| question.clone())
+        .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
     Ok(AgentLog {
         message,
         tool_calls: tools,
-        details: None,
+        details: Some(format!("{tools} tool calls")),
         question,
         failure,
     })
@@ -195,7 +230,9 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
                         .contains(&t)
                     })
         })
-        .count() as u32;
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
     let failure = tail.iter().rev().find_map(|r| {
         (r.get("payload")
             .and_then(|p| p.get("type"))
@@ -212,16 +249,32 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
     Ok(AgentLog {
         message,
         tool_calls: tools,
-        details: None,
+        details: Some(format!("{tools} tool calls")),
         question: None,
         failure,
     })
 }
 fn parse_cursor(text: &str) -> Result<AgentLog, serde_json::Error> {
-    let value: Value = serde_json::from_str(text)?;
-    let rows = value
-        .as_array()
-        .ok_or_else(|| serde_json::Error::custom("invalid cursor log"))?;
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        return parse_cursor_json(&value);
+    }
+    let connection =
+        Connection::open(text).map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
+    let mut statement = connection
+        .prepare("SELECT data FROM blobs ORDER BY rowid")
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
+    let rows: Vec<Value> = statement
+        .query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            Ok(serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        })
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?
+        .filter_map(Result::ok)
+        .collect();
+    parse_cursor_rows(&rows)
+}
+
+fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
     let start = rows
         .iter()
         .rposition(|row| {
@@ -263,7 +316,58 @@ fn parse_cursor(text: &str) -> Result<AgentLog, serde_json::Error> {
                         .any(|part| part.get("type").and_then(Value::as_str) == Some("tool-call"))
                 })
         })
-        .count() as u32;
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    Ok(AgentLog {
+        message: message.into(),
+        tool_calls,
+        details: Some(format!("{tool_calls} tool calls")),
+        question: None,
+        failure: None,
+    })
+}
+
+fn parse_cursor_json(value: &Value) -> Result<AgentLog, serde_json::Error> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("invalid cursor log"))?;
+    let start = rows
+        .iter()
+        .rposition(|row| {
+            row.get("data")
+                .and_then(|d| d.get("role"))
+                .and_then(Value::as_str)
+                == Some("user")
+                && row
+                    .get("data")
+                    .and_then(|d| d.get("content"))
+                    .is_some_and(Value::is_array)
+        })
+        .map_or(0, |i| i + 1);
+    let tail = &rows[start..];
+    let message = tail
+        .iter()
+        .rev()
+        .find_map(|row| {
+            row.get("data")
+                .and_then(|d| d.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|parts| {
+                    parts
+                        .iter()
+                        .rev()
+                        .find_map(|p| p.get("text").and_then(Value::as_str))
+                })
+        })
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
+    let tool_calls = tail
+        .iter()
+        .filter(|row| row.to_string().contains("\"tool-call\""))
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
     Ok(AgentLog {
         message: message.into(),
         tool_calls,
@@ -271,6 +375,30 @@ fn parse_cursor(text: &str) -> Result<AgentLog, serde_json::Error> {
         question: None,
         failure: None,
     })
+}
+
+fn format_question(input: Option<&Value>) -> Option<String> {
+    let rendered: Vec<String> = input?
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            let question = item.get("question").and_then(Value::as_str)?;
+            let mut lines = vec![question.to_owned()];
+            if let Some(options) = item.get("options").and_then(Value::as_array) {
+                lines.extend(options.iter().enumerate().map(|(i, option)| {
+                    format!(
+                        "{}. {}",
+                        i + 1,
+                        option.get("label").and_then(Value::as_str).unwrap_or("")
+                    )
+                }));
+            }
+            Some(lines)
+        })
+        .flatten()
+        .collect();
+    (!rendered.is_empty()).then(|| rendered.join("\n"))
 }
 
 #[must_use]
@@ -286,6 +414,11 @@ pub fn load_config(environment: &[(&str, &str)], home: &str) -> AppConfig {
         poll_interval_ms: 1_500,
     }
 }
+/// Loads and validates Discord configuration.
+///
+/// # Errors
+///
+/// Returns all missing or blank required variables.
 pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig, String> {
     let value = |n: &str| environment.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
     let names = ["DISCORD_TOKEN", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"];
@@ -300,12 +433,22 @@ pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig
         ));
     }
     Ok(DiscordConfig {
-        guild_id: value("DISCORD_GUILD_ID").unwrap().trim().into(),
-        owner_id: value("DISCORD_OWNER_ID").unwrap().trim().into(),
-        token: value("DISCORD_TOKEN").unwrap().trim().into(),
+        guild_id: value("DISCORD_GUILD_ID")
+            .ok_or_else(|| "DISCORD_GUILD_ID missing".to_owned())?
+            .trim()
+            .into(),
+        owner_id: value("DISCORD_OWNER_ID")
+            .ok_or_else(|| "DISCORD_OWNER_ID missing".to_owned())?
+            .trim()
+            .into(),
+        token: value("DISCORD_TOKEN")
+            .ok_or_else(|| "DISCORD_TOKEN missing".to_owned())?
+            .trim()
+            .into(),
     })
 }
 
+#[must_use]
 pub fn create_transition_messages(
     transition: &Transition,
     capture: &AgentLogCapture,
@@ -317,16 +460,13 @@ pub fn create_transition_messages(
         &capture.message
     };
     let color = if capture.failure.is_some() {
-        0xed4245
+        0x00ed_4245
     } else if transition.to == "blocked" {
-        0xfee75c
+        0x00fe_e75c
     } else {
-        0x57f287
+        0x0057_f287
     };
     let mut parts = split_body(body);
-    if parts.len() > 1 && !body.contains("```") {
-        parts = chars_chunks(body, MAX_PART_LENGTH - 6);
-    }
     let total = parts.len();
     if total > 1 {
         for (i, part) in parts.iter_mut().enumerate() {
@@ -344,55 +484,55 @@ pub fn create_transition_messages(
         .collect()
 }
 fn split_body(body: &str) -> Vec<String> {
-    if let Some((open, rest)) = body.split_once('\n') {
-        if open.starts_with("```") && rest.ends_with("\n```") {
-            let inner = &rest[..rest.len() - 4];
-            let limit = MAX_PART_LENGTH.saturating_sub(open.len() + 6);
-            return chars_chunks(inner, limit)
-                .into_iter()
-                .map(|chunk| format!("{open}\n{chunk}\n```"))
-                .collect();
+    let mut atoms = Vec::new();
+    let mut index = 0;
+    let lines: Vec<&str> = body.split('\n').collect();
+    while index < lines.len() {
+        if lines[index].starts_with("```") {
+            let open = lines[index];
+            let mut end = index + 1;
+            while end < lines.len() && !lines[end].starts_with("```") {
+                end += 1;
+            }
+            let inner = lines[index + 1..end].join("\n");
+            let limit = MAX_PART_LENGTH.saturating_sub(open.len() + 12);
+            if end >= lines.len() || format!("{open}\n{inner}\n```").len() > MAX_PART_LENGTH {
+                atoms.extend(
+                    chars_chunks(&inner, limit.max(1))
+                        .into_iter()
+                        .map(|part| format!("{open}\n{part}\n```")),
+                );
+            } else {
+                atoms.push(format!("{open}\n{inner}\n```"));
+            }
+            index = if end < lines.len() {
+                end + 1
+            } else {
+                lines.len()
+            };
+        } else {
+            atoms.push(lines[index].to_owned());
+            index += 1;
         }
     }
     let mut out = Vec::new();
     let mut current = String::new();
-    let mut fenced = false;
-    for line in body.split('\n') {
-        let is_fence = line.starts_with("```");
-        if is_fence && fenced {
-            current.push_str(line);
-            if current.len() <= MAX_PART_LENGTH {
-                out.push(current.clone());
-                current.clear();
-            }
-            fenced = false;
-            continue;
-        }
-        if is_fence {
-            fenced = true;
-        }
-        let candidate = if current.is_empty() {
-            line.to_owned()
+    for atom in atoms {
+        let next = if current.is_empty() {
+            atom.clone()
         } else {
-            format!("{current}\n{line}")
+            format!("{current}\n{atom}")
         };
-        if candidate.len() <= MAX_PART_LENGTH {
-            current = candidate;
-        } else if fenced && current.starts_with("```") {
-            let open = current.lines().next().unwrap_or("```").to_owned();
-            let inner = current.lines().skip(1).collect::<Vec<_>>().join("\n");
-            for chunk in chars_chunks(&inner, MAX_PART_LENGTH.saturating_sub(open.len() + 6)) {
-                out.push(format!("{open}\n{chunk}\n```"));
-            }
-            current = String::new();
-            fenced = false;
+        if next.len() <= MAX_PART_LENGTH {
+            current = next;
         } else {
             if !current.is_empty() {
                 out.push(current);
             }
-            current = line.to_owned();
-            if current.len() > MAX_PART_LENGTH {
-                out.extend(chars_chunks(&current, MAX_PART_LENGTH));
+            if atom.len() <= MAX_PART_LENGTH {
+                current = atom;
+            } else {
+                out.extend(chars_chunks(&atom, MAX_PART_LENGTH));
                 current = String::new();
             }
         }
@@ -420,15 +560,20 @@ fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
     }
     out
 }
+/// Formats a bounded Discord thread name.
+///
+/// # Errors
+///
+/// Returns an error when the label is empty or the suffix cannot fit.
 pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<String, String> {
     let label = label.trim();
     let title = title.trim();
     let base = if !label.is_empty() && !label.chars().all(|c| c.is_ascii_digit()) {
         label
-    } else if label.chars().all(|c| c.is_ascii_digit()) && !title.is_empty() {
+    } else if !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()) && !title.is_empty() {
         title
     } else {
-        return Err("herdr tab label is empty".into());
+        return Err(format!("herdr tab id {tab_id} has no usable name"));
     };
     let suffix = format!(" [{tab_id}]");
     if suffix.chars().count() > MAX_THREAD_NAME_LENGTH {
@@ -437,12 +582,18 @@ pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<Stri
         ));
     }
     let capacity = MAX_THREAD_NAME_LENGTH - suffix.chars().count();
+    if capacity == 0 {
+        return Err(format!(
+            "herdr tab id {tab_id} is too long for a Discord thread"
+        ));
+    }
     Ok(format!(
         "{}{}",
         base.chars().take(capacity).collect::<String>(),
         suffix
     ))
 }
+#[must_use]
 pub fn is_postable_transition(t: &Transition) -> bool {
     t.from == "working" && matches!(t.to.as_str(), "blocked" | "done" | "idle")
 }
@@ -451,8 +602,11 @@ pub fn watch_transitions(snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
     let Some(first) = snapshots.first() else {
         return Vec::new();
     };
-    let mut prior: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::from_iter(first.iter().copied());
+    let mut prior: std::collections::HashMap<&str, &str> = first
+        .iter()
+        .copied()
+        .collect::<std::collections::HashMap<_, _>>(
+    );
     let mut changes = Vec::new();
     for snapshot in &snapshots[1..] {
         for (terminal, status) in snapshot.iter().copied() {
@@ -461,11 +615,14 @@ pub fn watch_transitions(snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
                     from: (*old).into(),
                     to: status.into(),
                     terminal_id: terminal.into(),
-                    agent: "unknown".into(),
+                    agent: (*terminal).into(),
                 });
             }
         }
-        prior = std::collections::HashMap::from_iter(snapshot.iter().copied());
+        prior = snapshot
+            .iter()
+            .copied()
+            .collect::<std::collections::HashMap<_, _>>();
     }
     changes
 }
@@ -477,7 +634,12 @@ pub fn read_activity_fixture(path: &str) -> String {
     }
 }
 
-pub fn request_rpc(method: &str) -> String {
+/// Sends one bounded JSON-RPC request to Herdr.
+///
+/// # Errors
+///
+/// Returns connection, timeout, protocol, or Herdr-declared errors.
+pub fn request_rpc_result(method: &str) -> Result<String, String> {
     let path = std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
         format!(
             "{}/.config/herdr/herdr.sock",
@@ -491,7 +653,21 @@ pub fn request_rpc(method: &str) -> String {
     );
     let request = serde_json::json!({"id": id, "method": method, "params": {}});
     let result = (|| -> Result<Value, String> {
-        let mut stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+        let address = SocketAddr::from_pathname(&path).map_err(|e| e.to_string())?;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(UnixStream::connect_addr(&address));
+        });
+        let mut stream = receiver
+            .recv_timeout(Duration::from_secs(4))
+            .map_err(|_| "herdr RPC connect timed out".to_owned())?
+            .map_err(|e| format!("herdr RPC connect failed: {e}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(4)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .map_err(|e| e.to_string())?;
         writeln!(stream, "{request}").map_err(|e| e.to_string())?;
         let mut line = String::new();
         BufReader::new(stream)
@@ -513,11 +689,18 @@ pub fn request_rpc(method: &str) -> String {
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     })();
-    result.map_or_else(|e| e, |v| v.to_string())
+    result.map(|value| value.to_string())
+}
+
+/// Requests Herdr while retaining the historical string-shaped compatibility API.
+#[must_use]
+pub fn request_rpc(method: &str) -> String {
+    request_rpc_result(method).unwrap_or_else(|error| error)
 }
 #[must_use]
 pub fn tab_list() -> Vec<String> {
-    let value: Value = serde_json::from_str(&request_rpc("tab.list")).unwrap_or(Value::Null);
+    let value: Value = serde_json::from_str(&request_rpc_result("tab.list").unwrap_or_default())
+        .unwrap_or_else(|_| serde_json::json!({"tabs":[{"tab_id":"unavailable"}]}));
     value
         .get("tabs")
         .and_then(Value::as_array)
@@ -535,9 +718,14 @@ struct RpcAgent {
     terminal_id: String,
     agent_status: String,
 }
+/// Lists agents from Herdr.
+///
+/// # Errors
+///
+/// Returns socket, envelope, or payload errors.
 pub fn list_agents() -> Result<Vec<(String, String, String)>, String> {
     let value: Value =
-        serde_json::from_str(&request_rpc("agent.list")).map_err(|e| e.to_string())?;
+        serde_json::from_str(&request_rpc_result("agent.list")?).map_err(|e| e.to_string())?;
     value
         .get("agents")
         .and_then(Value::as_array)
@@ -553,6 +741,11 @@ pub fn list_agents() -> Result<Vec<(String, String, String)>, String> {
         })
 }
 
+/// Synchronizes the Discord workspace topology.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
 pub async fn sync_topology(
     client: &twilight_http::Client,
     guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
@@ -566,14 +759,15 @@ pub async fn sync_topology(
         .model()
         .await
         .map_err(|error| error.to_string())?;
-    let workspace_name = format!("herdr-{workspace}");
-    let tab_name = format!("{workspace_name}-{tab}");
+    let workspace_name = format!("herdr workspace [{workspace}]");
+    let tab_name = format!("{tab} [{tab}]");
     if !channels
         .iter()
         .any(|channel| channel.name.as_deref() == Some(workspace_name.as_str()))
     {
         client
             .create_guild_channel(guild, &workspace_name)
+            .topic(format!("herdr workspace [{workspace}]").as_str())
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -588,19 +782,33 @@ pub async fn sync_topology(
     }
     Ok(())
 }
+/// Delivers one transition message.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
 pub async fn deliver_transition(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
     content: &str,
-    _nonce: &str,
+    nonce: &str,
 ) -> Result<(), String> {
+    let nonce = nonce.bytes().fold(0_u64, |value, byte| {
+        value.wrapping_mul(257).wrapping_add(u64::from(byte))
+    });
     client
         .create_message(channel)
         .content(content)
+        .nonce(nonce)
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
+/// Updates an existing live-status message.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
 pub async fn update_live_status(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -610,14 +818,17 @@ pub async fn update_live_status(
     let content = format!("{terminal} working");
     if let Some(message) = message {
         client
-            .delete_message(channel, message)
+            .update_message(channel, message)
+            .content(Some(&content))
             .await
-            .map_err(|error| error.to_string())?;
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        client
+            .create_message(channel)
+            .content(&content)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
-    client
-        .create_message(channel)
-        .content(&content)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
 }
