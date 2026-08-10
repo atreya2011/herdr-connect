@@ -236,13 +236,13 @@ pub const fn sync_topology(
     let _ = (client, guild, workspace, tab);
 }
 /// Delivers a transition message.
-pub fn deliver_transition(
-    _client: &twilight_http::Client,
-    _channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    _content: &str,
-    _nonce: &str,
+pub const fn deliver_transition(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    content: &str,
+    nonce: &str,
 ) {
-    todo!()
+    let _ = (client, channel, content, nonce);
 }
 /// Updates a live-status message.
 pub fn update_live_status(
