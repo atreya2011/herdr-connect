@@ -19,7 +19,6 @@ fn detects_rotation_and_complete_records() {
 
 #[test]
 fn formats_reference_watch_line() {
-    let expected = "claude term-1: Read [Read 2] — capture activity";
-    assert_eq!(expected, "claude term-1: Read [Read 2] — capture activity");
-    let _ = read_activity_fixture("tests/fixtures/live-activity-claude.jsonl");
+    let actual = read_activity_fixture("tests/fixtures/live-activity-claude.jsonl");
+    assert!(actual.contains("Read"));
 }

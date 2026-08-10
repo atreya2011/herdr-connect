@@ -23,11 +23,9 @@ multiple-crate-versions = { level = "allow", priority = 1 }
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
-twilight-gateway = "0.17.1"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util"] }
 twilight-http = "0.17.1"
 twilight-model = "0.17.1"
-rusqlite = "0.40.2"
 rustls = { version = "0.23.43", features = ["ring"] }
 
 [dev-dependencies]

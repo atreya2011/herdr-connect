@@ -9,14 +9,16 @@ fn matches_reference_transition_colors_and_mentions() {
     ];
     for (to, color, mention) in cases {
         let messages = create_transition_messages(
-            Transition {
+            &Transition {
                 from: "working".into(),
                 to: to.into(),
                 terminal_id: "t".into(),
+                agent: "unknown".into(),
             },
-            AgentLogCapture {
+            &AgentLogCapture {
                 message: "final".into(),
                 failure: None,
+                question: None,
             },
             "owner",
         );
@@ -28,14 +30,16 @@ fn matches_reference_transition_colors_and_mentions() {
 #[test]
 fn preserves_reference_multipart_lengths_and_numbering() {
     let messages = create_transition_messages(
-        Transition {
+        &Transition {
             from: "working".into(),
             to: "idle".into(),
             terminal_id: "t".into(),
+            agent: "unknown".into(),
         },
-        AgentLogCapture {
+        &AgentLogCapture {
             message: "x".repeat(4_000),
             failure: None,
+            question: None,
         },
         "owner",
     );
@@ -45,19 +49,27 @@ fn preserves_reference_multipart_lengths_and_numbering() {
             .iter()
             .all(|message| message.description.len() <= 2_000)
     );
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.description.len() <= 1_900)
+    );
+    assert_eq!(messages[0].description.lines().next(), Some("1/3"));
 }
 
 #[test]
 fn uses_failure_color() {
     let messages = create_transition_messages(
-        Transition {
+        &Transition {
             from: "working".into(),
             to: "done".into(),
             terminal_id: "t".into(),
+            agent: "unknown".into(),
         },
-        AgentLogCapture {
+        &AgentLogCapture {
             message: "final".into(),
             failure: Some("turn aborted".into()),
+            question: None,
         },
         "owner",
     );

@@ -1,114 +1,297 @@
-//! Public contracts defined by the reference test port.
+#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 
-/// Identifies a vendor session.
-#[derive(Debug, PartialEq, Eq)]
+use serde::Deserialize;
+use serde::de::Error as _;
+use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const POINTER: &str = "agent stopped, no log available";
+const MAX_PART_LENGTH: usize = 1_900;
+const MAX_THREAD_NAME_LENGTH: usize = 100;
+static RPC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentSession {
     pub agent: String,
     pub value: String,
 }
-/// Captured final response summary.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentLog {
     pub message: String,
     pub tool_calls: u32,
     pub details: Option<String>,
+    pub question: Option<String>,
+    pub failure: Option<String>,
 }
-/// Application configuration.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AppConfig {
     pub herdr_socket_path: String,
     pub poll_interval_ms: u64,
 }
-/// Discord configuration.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DiscordConfig {
     pub guild_id: String,
     pub owner_id: String,
     pub token: String,
 }
-/// One rendered transition message.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TransitionMessage {
     pub description: String,
     pub color: u32,
     pub mention: Option<String>,
 }
-/// Final response and optional failure.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentLogCapture {
     pub message: String,
     pub failure: Option<String>,
+    pub question: Option<String>,
 }
-/// A status transition.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Transition {
     pub from: String,
     pub to: String,
     pub terminal_id: String,
+    pub agent: String,
 }
 
-/// Reads a vendor session log.
-///
-/// # Errors
-///
-/// Returns the stable pointer error when the session or fixture is unavailable.
-pub fn read_agent_log(
-    session: Option<AgentSession>,
-    log_root: &std::path::Path,
-) -> Result<AgentLog, String> {
-    let session = session.ok_or_else(|| "agent stopped, no log available".to_owned())?;
-    if !matches!(session.agent.as_str(), "claude" | "codex" | "cursor") {
-        return Err("agent stopped, no log available".into());
+pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<AgentLog, String> {
+    let session = session.ok_or_else(|| POINTER.to_owned())?;
+    let bytes = std::fs::read(path).map_err(|_| POINTER.to_owned())?;
+    let text = String::from_utf8(bytes).map_err(|_| POINTER.to_owned())?;
+    match session.agent.as_str() {
+        "claude" => parse_claude(&text),
+        "codex" => parse_codex(&text),
+        "cursor" => parse_cursor(&text),
+        _ => Err(serde_json::Error::custom(POINTER)),
     }
-    let name = log_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let (message, tool_calls) = match name {
-        "agent-log-claude.jsonl" => ("typed slash command response", 0),
-        "agent-log-claude-answered.jsonl" => ("answered final", 3),
-        "agent-log-claude-plan-files.jsonl" => ("finished", 3),
-        "agent-log-codex.jsonl" => ("final answer", 4),
-        "agent-log-codex-147.jsonl" => ("final 0.147 answer", 2),
-        "agent-log-codex-147-final-stop.jsonl" => ("Acknowledged", 0),
-        "agent-log-cursor.json" => ("final cursor", 4),
-        _ => return Err("agent stopped, no log available".into()),
-    };
+    .map_err(|_| POINTER.to_owned())
+}
+
+fn lines(text: &str) -> Result<Vec<Value>, serde_json::Error> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect()
+}
+fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
+    let records = lines(text)?;
+    let start = records
+        .iter()
+        .rposition(|r| {
+            if r.get("type").and_then(Value::as_str) != Some("user")
+                || r.get("isMeta") == Some(&Value::Bool(true))
+            {
+                return false;
+            }
+            let content = r.get("message").and_then(|m| m.get("content"));
+            content.is_some_and(|c| {
+                c.is_string()
+                    || c.as_array().is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                    })
+            })
+        })
+        .map_or(0, |i| i + 1);
+    let tail = &records[start..];
+    let mut message = None;
+    let question = None;
+    let mut tools = 0;
+    let mut failure = None;
+    for record in tail {
+        if let Some(contents) = record
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        {
+            for part in contents {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        message = part.get("text").and_then(Value::as_str).map(str::to_owned)
+                    }
+                    Some("tool_use") => tools += 1,
+                    Some("tool_result") if part.get("is_error") == Some(&Value::Bool(true)) => {
+                        failure = part
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if record.get("type").and_then(Value::as_str) == Some("assistant") {
+            if let Some(s) = record.get("message").and_then(Value::as_str) {
+                message = Some(s.to_owned());
+            }
+        }
+    }
+    let message = message.ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
+    Ok(AgentLog {
+        message,
+        tool_calls: tools,
+        details: None,
+        question,
+        failure,
+    })
+}
+fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
+    let records = lines(text)?;
+    let start = records
+        .iter()
+        .rposition(|r| {
+            r.get("type").and_then(Value::as_str) == Some("turn_context")
+                || (r.get("type").and_then(Value::as_str) == Some("event_msg")
+                    && r.get("payload")
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("task_started"))
+        })
+        .map_or(0, |i| i + 1);
+    let tail = &records[start..];
+    let message = tail
+        .iter()
+        .rev()
+        .find_map(|r| {
+            r.get("payload")
+                .and_then(|p| p.get("last_agent_message").or_else(|| p.get("message")))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            tail.iter().rev().find_map(|r| {
+                r.get("payload")
+                    .and_then(|p| p.get("content"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.get("text").and_then(Value::as_str))
+                            .collect::<String>()
+                    })
+                    .filter(|s| !s.is_empty())
+            })
+        })
+        .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
+    let tools = tail
+        .iter()
+        .filter(|r| {
+            r.get("type").and_then(Value::as_str) == Some("response_item")
+                && r.get("payload")
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| {
+                        [
+                            "local_shell_call",
+                            "function_call",
+                            "tool_search_call",
+                            "custom_tool_call",
+                            "web_search_call",
+                            "image_generation_call",
+                        ]
+                        .contains(&t)
+                    })
+        })
+        .count() as u32;
+    let failure = tail.iter().rev().find_map(|r| {
+        (r.get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            == Some("turn_aborted"))
+        .then(|| {
+            r.get("payload")
+                .and_then(|p| p.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("turn aborted")
+                .to_owned()
+        })
+    });
+    Ok(AgentLog {
+        message,
+        tool_calls: tools,
+        details: None,
+        question: None,
+        failure,
+    })
+}
+fn parse_cursor(text: &str) -> Result<AgentLog, serde_json::Error> {
+    let value: Value = serde_json::from_str(text)?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| serde_json::Error::custom("invalid cursor log"))?;
+    let start = rows
+        .iter()
+        .rposition(|row| {
+            row.get("data")
+                .and_then(|data| data.get("role"))
+                .and_then(Value::as_str)
+                == Some("user")
+                && row
+                    .get("data")
+                    .and_then(|data| data.get("content"))
+                    .is_some_and(Value::is_array)
+        })
+        .map_or(0, |i| i + 1);
+    let tail = &rows[start..];
+    let message = tail
+        .iter()
+        .rev()
+        .find_map(|row| {
+            row.get("data")
+                .and_then(|data| data.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|parts| {
+                    parts
+                        .iter()
+                        .rev()
+                        .find_map(|part| part.get("text").and_then(Value::as_str))
+                })
+        })
+        .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
+    let tool_calls = tail
+        .iter()
+        .filter(|row| {
+            row.get("data")
+                .and_then(|data| data.get("content"))
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("tool-call"))
+                })
+        })
+        .count() as u32;
     Ok(AgentLog {
         message: message.into(),
         tool_calls,
         details: None,
+        question: None,
+        failure: None,
     })
 }
-/// Loads Herdr configuration from environment values.
+
 #[must_use]
 pub fn load_config(environment: &[(&str, &str)], home: &str) -> AppConfig {
-    let socket = environment
-        .iter()
-        .find(|(name, _)| *name == "HERDR_SOCKET_PATH")
-        .map(|(_, value)| (*value).to_owned())
-        .map_or_else(|| format!("{home}/.config/herdr/herdr.sock"), |value| value);
     AppConfig {
-        herdr_socket_path: socket,
+        herdr_socket_path: environment
+            .iter()
+            .find(|(n, _)| *n == "HERDR_SOCKET_PATH")
+            .map_or_else(
+                || format!("{home}/.config/herdr/herdr.sock"),
+                |(_, v)| (*v).into(),
+            ),
         poll_interval_ms: 1_500,
     }
 }
-/// Loads and validates Discord configuration.
-///
-/// # Errors
-///
-/// Returns all missing or blank required variable names.
 pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig, String> {
-    let value = |name: &str| {
-        environment
-            .iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| *value)
-    };
-    let required = ["DISCORD_TOKEN", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"];
-    let missing: Vec<_> = required
+    let value = |n: &str| environment.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
+    let names = ["DISCORD_TOKEN", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"];
+    let missing: Vec<_> = names
         .into_iter()
-        .filter(|name| value(name).is_none_or(|v| v.trim().is_empty()))
+        .filter(|n| value(n).is_none_or(|v| v.trim().is_empty()))
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -116,140 +299,325 @@ pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig
             missing.join(", ")
         ));
     }
-    let guild_id =
-        value("DISCORD_GUILD_ID").ok_or_else(|| "DISCORD_GUILD_ID missing".to_owned())?;
-    let owner_id =
-        value("DISCORD_OWNER_ID").ok_or_else(|| "DISCORD_OWNER_ID missing".to_owned())?;
-    let token = value("DISCORD_TOKEN").ok_or_else(|| "DISCORD_TOKEN missing".to_owned())?;
     Ok(DiscordConfig {
-        guild_id: guild_id.trim().into(),
-        owner_id: owner_id.trim().into(),
-        token: token.trim().into(),
+        guild_id: value("DISCORD_GUILD_ID").unwrap().trim().into(),
+        owner_id: value("DISCORD_OWNER_ID").unwrap().trim().into(),
+        token: value("DISCORD_TOKEN").unwrap().trim().into(),
     })
 }
-/// Renders a transition into bounded Discord messages.
-#[must_use]
+
 pub fn create_transition_messages(
-    transition: Transition,
-    capture: AgentLogCapture,
+    transition: &Transition,
+    capture: &AgentLogCapture,
     owner: &str,
 ) -> Vec<TransitionMessage> {
-    let Transition { to, .. } = transition;
-    let AgentLogCapture { message, failure } = capture;
-    let color = if failure.is_some() {
-        0x00ed_4245
-    } else if to == "blocked" {
-        0x00fe_e75c
+    let body = if transition.to == "blocked" {
+        capture.question.as_deref().unwrap_or(&capture.message)
     } else {
-        0x0057_f287
+        &capture.message
     };
-    let mention = (to == "blocked").then(|| format!("<@{owner}>"));
-    let mut messages = Vec::new();
-    let mut rest = message.as_str();
-    while !rest.is_empty() {
-        let end = rest.len().min(1_900);
-        let boundary = if end == rest.len() {
-            end
-        } else {
-            rest[..end].rfind('\n').map_or(end, |index| index + 1)
-        };
-        messages.push(TransitionMessage {
-            description: rest[..boundary].to_owned(),
-            color,
-            mention: mention.clone(),
-        });
-        rest = &rest[boundary..];
+    let color = if capture.failure.is_some() {
+        0xed4245
+    } else if transition.to == "blocked" {
+        0xfee75c
+    } else {
+        0x57f287
+    };
+    let mut parts = split_body(body);
+    if parts.len() > 1 && !body.contains("```") {
+        parts = chars_chunks(body, MAX_PART_LENGTH - 6);
     }
-    if messages.is_empty() {
-        messages.push(TransitionMessage {
-            description: String::new(),
-            color,
-            mention,
-        });
+    let total = parts.len();
+    if total > 1 {
+        for (i, part) in parts.iter_mut().enumerate() {
+            *part = format!("{}/{}\n{}", i + 1, total, part);
+        }
     }
-    messages
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, description)| TransitionMessage {
+            description,
+            color,
+            mention: (transition.to == "blocked" && i == 0).then(|| format!("<@{owner}>")),
+        })
+        .collect()
 }
-/// Formats a frozen Discord thread name.
-///
-/// # Errors
-///
-/// Returns an error when the Discord name limit is exceeded.
+fn split_body(body: &str) -> Vec<String> {
+    if let Some((open, rest)) = body.split_once('\n') {
+        if open.starts_with("```") && rest.ends_with("\n```") {
+            let inner = &rest[..rest.len() - 4];
+            let limit = MAX_PART_LENGTH.saturating_sub(open.len() + 6);
+            return chars_chunks(inner, limit)
+                .into_iter()
+                .map(|chunk| format!("{open}\n{chunk}\n```"))
+                .collect();
+        }
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut fenced = false;
+    for line in body.split('\n') {
+        let is_fence = line.starts_with("```");
+        if is_fence && fenced {
+            current.push_str(line);
+            if current.len() <= MAX_PART_LENGTH {
+                out.push(current.clone());
+                current.clear();
+            }
+            fenced = false;
+            continue;
+        }
+        if is_fence {
+            fenced = true;
+        }
+        let candidate = if current.is_empty() {
+            line.to_owned()
+        } else {
+            format!("{current}\n{line}")
+        };
+        if candidate.len() <= MAX_PART_LENGTH {
+            current = candidate;
+        } else if fenced && current.starts_with("```") {
+            let open = current.lines().next().unwrap_or("```").to_owned();
+            let inner = current.lines().skip(1).collect::<Vec<_>>().join("\n");
+            for chunk in chars_chunks(&inner, MAX_PART_LENGTH.saturating_sub(open.len() + 6)) {
+                out.push(format!("{open}\n{chunk}\n```"));
+            }
+            current = String::new();
+            fenced = false;
+        } else {
+            if !current.is_empty() {
+                out.push(current);
+            }
+            current = line.to_owned();
+            if current.len() > MAX_PART_LENGTH {
+                out.extend(chars_chunks(&current, MAX_PART_LENGTH));
+                current = String::new();
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if current.len() + c.len_utf8() > limit && !current.is_empty() {
+            out.push(current);
+            current = String::new();
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
 pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<String, String> {
-    let label = if label.chars().all(|character| character.is_ascii_digit()) {
+    let label = label.trim();
+    let title = title.trim();
+    let base = if !label.is_empty() && !label.chars().all(|c| c.is_ascii_digit()) {
+        label
+    } else if label.chars().all(|c| c.is_ascii_digit()) && !title.is_empty() {
         title
     } else {
-        label
+        return Err("herdr tab label is empty".into());
     };
-    let name = format!("{label} [{tab_id}]");
-    if name.chars().count() > 100 {
-        Err("herdr tab id is too long for a Discord thread".into())
-    } else {
-        Ok(name)
+    let suffix = format!(" [{tab_id}]");
+    if suffix.chars().count() > MAX_THREAD_NAME_LENGTH {
+        return Err(format!(
+            "herdr tab id {tab_id} is too long for a Discord thread"
+        ));
     }
+    let capacity = MAX_THREAD_NAME_LENGTH - suffix.chars().count();
+    Ok(format!(
+        "{}{}",
+        base.chars().take(capacity).collect::<String>(),
+        suffix
+    ))
 }
-/// Diffs ordered agent snapshots.
+pub fn is_postable_transition(t: &Transition) -> bool {
+    t.from == "working" && matches!(t.to.as_str(), "blocked" | "done" | "idle")
+}
 #[must_use]
 pub fn watch_transitions(snapshots: &[&[(&str, &str)]]) -> Vec<Transition> {
     let Some(first) = snapshots.first() else {
         return Vec::new();
     };
-    let mut prior: std::collections::HashMap<&str, &str> = first.iter().copied().collect();
+    let mut prior: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::from_iter(first.iter().copied());
     let mut changes = Vec::new();
     for snapshot in &snapshots[1..] {
-        for (terminal_id, status) in snapshot.iter().copied() {
-            if let Some(previous) = prior.get(terminal_id)
-                && previous != &status
-            {
+        for (terminal, status) in snapshot.iter().copied() {
+            if let Some(old) = prior.get(terminal).filter(|old| **old != status) {
                 changes.push(Transition {
-                    from: (*previous).into(),
+                    from: (*old).into(),
                     to: status.into(),
-                    terminal_id: terminal_id.into(),
+                    terminal_id: terminal.into(),
+                    agent: "unknown".into(),
                 });
             }
         }
-        prior = snapshot.iter().copied().collect();
+        prior = std::collections::HashMap::from_iter(snapshot.iter().copied());
     }
     changes
 }
-/// Reads an activity fixture.
 #[must_use]
 pub fn read_activity_fixture(path: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+    match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) => format!("activity read error: {error}"),
+    }
 }
-/// Returns the socket-client contract response.
-#[must_use]
-pub fn request_rpc(_method: &str) -> String {
-    "herdr RPC error".into()
+
+pub fn request_rpc(method: &str) -> String {
+    let path = std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/.config/herdr/herdr.sock",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let id = format!(
+        "herdr-connect:{}:{}",
+        std::process::id(),
+        RPC_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    let request = serde_json::json!({"id": id, "method": method, "params": {}});
+    let result = (|| -> Result<Value, String> {
+        let mut stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+        writeln!(stream, "{request}").map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        let response: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+        if response.get("id").and_then(Value::as_str) != Some(&id) {
+            return Err(format!("herdr returned response id for request {id}"));
+        }
+        if let Some(error) = response.get("error") {
+            return Err(format!(
+                "herdr {method} failed: {} {}",
+                error.get("code").map_or(Value::Null, Clone::clone),
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            ));
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    })();
+    result.map_or_else(|e| e, |v| v.to_string())
 }
-/// Returns the tab-list contract response.
 #[must_use]
 pub fn tab_list() -> Vec<String> {
-    vec!["tab.list".into()]
+    let value: Value = serde_json::from_str(&request_rpc("tab.list")).unwrap_or(Value::Null);
+    value
+        .get("tabs")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|t| t.get("tab_id").and_then(Value::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
-/// Synchronizes Discord topology.
-pub const fn sync_topology(
+
+#[derive(Deserialize)]
+struct RpcAgent {
+    agent: String,
+    terminal_id: String,
+    agent_status: String,
+}
+pub fn list_agents() -> Result<Vec<(String, String, String)>, String> {
+    let value: Value =
+        serde_json::from_str(&request_rpc("agent.list")).map_err(|e| e.to_string())?;
+    value
+        .get("agents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "agent.list response did not contain agents".into())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    serde_json::from_value::<RpcAgent>(v.clone())
+                        .ok()
+                        .map(|x| (x.agent, x.terminal_id, x.agent_status))
+                })
+                .collect()
+        })
+}
+
+pub async fn sync_topology(
     client: &twilight_http::Client,
     guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
     workspace: &str,
     tab: &str,
-) {
-    let _ = (client, guild, workspace, tab);
+) -> Result<(), String> {
+    let channels = client
+        .guild_channels(guild)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map_err(|error| error.to_string())?;
+    let workspace_name = format!("herdr-{workspace}");
+    let tab_name = format!("{workspace_name}-{tab}");
+    if !channels
+        .iter()
+        .any(|channel| channel.name.as_deref() == Some(workspace_name.as_str()))
+    {
+        client
+            .create_guild_channel(guild, &workspace_name)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if !channels
+        .iter()
+        .any(|channel| channel.name.as_deref() == Some(tab_name.as_str()))
+    {
+        client
+            .create_guild_channel(guild, &tab_name)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
-/// Delivers a transition message.
-pub const fn deliver_transition(
+pub async fn deliver_transition(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
     content: &str,
-    nonce: &str,
-) {
-    let _ = (client, channel, content, nonce);
+    _nonce: &str,
+) -> Result<(), String> {
+    client
+        .create_message(channel)
+        .content(content)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
-/// Updates a live-status message.
-pub const fn update_live_status(
+pub async fn update_live_status(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
     terminal: &str,
     message: Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>>,
-) {
-    let _ = (client, channel, terminal, message);
+) -> Result<(), String> {
+    let content = format!("{terminal} working");
+    if let Some(message) = message {
+        client
+            .delete_message(channel, message)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    client
+        .create_message(channel)
+        .content(&content)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }

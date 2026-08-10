@@ -10,14 +10,16 @@ fn utf8_split_does_not_panic() {
     let message = format!("{}{}", "a".repeat(1899), "é");
     let result = std::panic::catch_unwind(|| {
         create_transition_messages(
-            Transition {
+            &Transition {
                 from: "working".into(),
                 to: "done".into(),
                 terminal_id: "t".into(),
+                agent: "unknown".into(),
             },
-            AgentLogCapture {
+            &AgentLogCapture {
                 message,
                 failure: None,
+                question: None,
             },
             "owner",
         )
@@ -61,14 +63,16 @@ fn rpc_and_tabs_are_not_constants() {
 #[test]
 fn blocked_mention_is_first_part_only_and_parts_are_numbered() {
     let messages = create_transition_messages(
-        Transition {
+        &Transition {
             from: "working".into(),
             to: "blocked".into(),
             terminal_id: "t".into(),
+            agent: "unknown".into(),
         },
-        AgentLogCapture {
+        &AgentLogCapture {
             message: "x".repeat(4_000),
             failure: None,
+            question: None,
         },
         "owner",
     );
@@ -108,14 +112,16 @@ fn activity_read_errors_are_not_empty() {
 #[test]
 fn fence_split_keeps_fences_balanced() {
     let messages = create_transition_messages(
-        Transition {
+        &Transition {
             from: "working".into(),
             to: "done".into(),
             terminal_id: "t".into(),
+            agent: "unknown".into(),
         },
-        AgentLogCapture {
+        &AgentLogCapture {
             message: format!("```js\n{}\n```", "x".repeat(2_000)),
             failure: None,
+            question: None,
         },
         "owner",
     );

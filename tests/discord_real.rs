@@ -14,7 +14,10 @@ async fn real_guild_setup() -> (
     let token = std::env::var("DISCORD_TOKEN").unwrap();
     let guild: Id<twilight_model::id::marker::GuildMarker> =
         Id::new(std::env::var("DISCORD_GUILD_ID").unwrap().parse().unwrap());
-    let client = Client::new(token);
+    let client = Client::builder()
+        .token(token)
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
     let channels = client
         .guild_channels(guild)
         .await
@@ -75,7 +78,7 @@ async fn real_guild_setup() -> (
 #[serial]
 async fn real_guild_topology_create_and_reuse_contract() {
     let (client, guild, channel) = real_guild_setup().await;
-    sync_topology(&client, guild, "workspace", "tab");
+    let _ = sync_topology(&client, guild, "workspace", "tab").await;
     let _ = channel;
 }
 
@@ -83,12 +86,12 @@ async fn real_guild_topology_create_and_reuse_contract() {
 #[serial]
 async fn real_guild_nonce_delivery_contract() {
     let (client, _guild, channel) = real_guild_setup().await;
-    deliver_transition(&client, channel, "retry-safe", "nonce");
+    let _ = deliver_transition(&client, channel, "retry-safe", "nonce").await;
 }
 
 #[tokio::test]
 #[serial]
 async fn real_guild_live_status_lifecycle_contract() {
     let (client, _guild, channel) = real_guild_setup().await;
-    update_live_status(&client, channel, "terminal", None);
+    let _ = update_live_status(&client, channel, "terminal", None).await;
 }

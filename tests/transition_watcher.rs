@@ -12,7 +12,8 @@ fn diffs_reference_snapshots() {
         vec![herdr_connect_rs::Transition {
             from: "working".into(),
             to: "idle".into(),
-            terminal_id: "term_a".into()
+            terminal_id: "term_a".into(),
+            agent: "unknown".into()
         }]
     );
 }
