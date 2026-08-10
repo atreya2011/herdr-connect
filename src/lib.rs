@@ -108,7 +108,38 @@ pub fn create_transition_messages(
     _capture: AgentLogCapture,
     _owner: &str,
 ) -> Vec<TransitionMessage> {
-    todo!()
+    let color = if _capture.failure.is_some() {
+        0xed4245
+    } else if _transition.to == "blocked" {
+        0xfee75c
+    } else {
+        0x57f287
+    };
+    let mention = (_transition.to == "blocked").then(|| format!("<@{}>", _owner));
+    let mut messages = Vec::new();
+    let mut rest = _capture.message.as_str();
+    while !rest.is_empty() {
+        let end = rest.len().min(1_900);
+        let boundary = if end == rest.len() {
+            end
+        } else {
+            rest[..end].rfind('\n').map_or(end, |index| index + 1)
+        };
+        messages.push(TransitionMessage {
+            description: rest[..boundary].to_owned(),
+            color,
+            mention: mention.clone(),
+        });
+        rest = &rest[boundary..];
+    }
+    if messages.is_empty() {
+        messages.push(TransitionMessage {
+            description: String::new(),
+            color,
+            mention,
+        });
+    }
+    messages
 }
 pub fn format_thread_name(_label: &str, _title: &str, _tab_id: &str) -> Result<String, String> {
     todo!()
