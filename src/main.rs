@@ -1,7 +1,7 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition_card,
-    format_thread_name, is_postable_transition, list_agents, load_config, load_discord_config,
-    sync_topology, tab_list,
+    drive_gateway, format_thread_name, is_postable_transition, list_agents, load_config,
+    load_discord_config, sync_topology, tab_list,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -53,7 +53,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ("DISCORD_OWNER_ID", &owner_id),
             ])?;
             let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
-            let client = Client::builder().token(config.token).build();
+            let client = Client::builder().token(config.token.clone()).build();
+            let (notices_tx, notices_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                while let Ok(notice) = notices_rx.recv() {
+                    eprintln!("{notice}");
+                }
+            });
+            tokio::spawn(drive_gateway(config.token, None, notices_tx));
             Some((client, guild, config.owner_id))
         }
         _ => None,
