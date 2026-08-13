@@ -7,6 +7,7 @@ mod activity;
 mod cards;
 mod config;
 mod delivery;
+mod gateway;
 mod herdr;
 mod live_status;
 mod readers;
@@ -19,6 +20,7 @@ pub use cards::{
 };
 pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
 pub use delivery::{deliver_transition, deliver_transition_card};
+pub use gateway::drive_gateway;
 pub use herdr::{
     AgentSession, AgentSnapshot, list_agents, request_rpc, request_rpc_result, tab_list,
 };
