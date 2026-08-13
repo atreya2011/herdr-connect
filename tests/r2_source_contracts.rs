@@ -2,16 +2,24 @@ use std::fs;
 
 #[test]
 fn discord_contracts_are_real_and_main_wires_library() {
-    let lib = fs::read_to_string("src/lib.rs").unwrap();
+    let delivery_src = fs::read_to_string("src/delivery.rs").unwrap();
+    let status_src = fs::read_to_string("src/live_status.rs").unwrap();
+    let topology_src = fs::read_to_string("src/topology.rs").unwrap();
     let main = fs::read_to_string("src/main.rs").unwrap();
-    assert!(!lib.contains("#![allow(clippy::"));
-    assert!(!lib.contains("block_on("));
-    let delivery = &lib[lib.find("pub async fn deliver_transition").unwrap()..];
-    assert!(
-        delivery[..delivery.find("pub async fn update_live_status").unwrap()].contains("nonce")
-    );
-    let status = &lib[lib.find("pub async fn update_live_status").unwrap()..];
+    for entry in fs::read_dir("src").unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "rs") {
+            let src = fs::read_to_string(&path).unwrap();
+            assert!(!src.contains("#![allow(clippy::"), "{}", path.display());
+            assert!(!src.contains("block_on("), "{}", path.display());
+        }
+    }
+    let delivery = &delivery_src[delivery_src
+        .find("pub async fn deliver_transition")
+        .unwrap()..];
+    assert!(delivery.contains("nonce"));
+    let status = &status_src[status_src.find("pub async fn update_live_status").unwrap()..];
     assert!(status.contains("update_message"));
-    assert!(lib.contains("topic("));
+    assert!(topology_src.contains("topic("));
     assert!(main.contains("create_transition_messages") || main.contains("sync_topology"));
 }

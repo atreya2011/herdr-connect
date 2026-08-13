@@ -68,17 +68,15 @@ fn main_delivers_mention_content_for_blocked() {
 
 #[test]
 fn sync_topology_creates_threads_not_guild_text_for_tabs() {
-    let lib = std::fs::read_to_string("src/lib.rs").unwrap();
-    let body = &lib[lib.find("pub async fn sync_topology").unwrap()
-        ..lib.find("pub async fn deliver_transition").unwrap()];
+    let topology = std::fs::read_to_string("src/topology.rs").unwrap();
+    let body = &topology[topology.find("pub async fn sync_topology").unwrap()..];
     assert!(body.contains("create_thread") || body.contains("CreateThread"));
 }
 
 #[test]
 fn sync_topology_matches_workspace_by_topic_not_channel_name() {
-    let lib = std::fs::read_to_string("src/lib.rs").unwrap();
-    let body = &lib[lib.find("pub async fn sync_topology").unwrap()
-        ..lib.find("pub async fn deliver_transition").unwrap()];
+    let topology = std::fs::read_to_string("src/topology.rs").unwrap();
+    let body = &topology[topology.find("pub async fn sync_topology").unwrap()..];
     assert!(!body.contains("channel.name.as_deref() == Some(workspace_name.as_str())"));
 }
 
@@ -106,7 +104,7 @@ fn answered_ask_user_question_is_not_kept_as_question() {
 #[test]
 fn watch_transitions_must_not_hardcode_term_a_agent() {
     assert!(
-        !std::fs::read_to_string("src/lib.rs")
+        !std::fs::read_to_string("src/watcher.rs")
             .unwrap()
             .contains("terminal == \"term_a\"")
     );
