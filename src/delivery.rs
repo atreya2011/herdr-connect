@@ -247,7 +247,10 @@ fn new_process_start_component() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DISCORD_NONCE_LENGTH, allowed_mentions, transition_card_nonce_for_start};
+    use super::{
+        MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
+        permission_card_description, transition_card_nonce_for_start,
+    };
     use crate::cards::TransitionMessage;
     use serde_json::json;
 
@@ -292,6 +295,33 @@ mod tests {
             assert_eq!(
                 first,
                 transition_card_nonce_for_start(first_start, terminal, sequence, card_index)
+            );
+        }
+    }
+
+    #[test]
+    fn permission_card_description_is_safe_and_bounded() {
+        let long_command = "x".repeat(4_097);
+        let cases = [
+            ("backtick run", "printf 'before ``` after'", false),
+            ("long command", long_command.as_str(), true),
+        ];
+
+        for (name, command, truncated) in cases {
+            let description = permission_card_description("Bash", command);
+            assert!(
+                description.chars().count() <= MAX_PERMISSION_DESCRIPTION_LENGTH,
+                "{name} description exceeded the safe limit"
+            );
+            assert_eq!(
+                description.matches("```").count(),
+                2,
+                "{name} description contains an unescaped code-fence run"
+            );
+            assert_eq!(
+                description.contains('…'),
+                truncated,
+                "{name} truncation marker did not match the input size"
             );
         }
     }
