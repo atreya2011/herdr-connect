@@ -104,12 +104,6 @@ pub fn request_rpc(method: &str) -> String {
     request_rpc_result(method).unwrap_or_else(|error| error)
 }
 
-/// Requests Herdr with method parameters while retaining the historical string API.
-#[must_use]
-pub fn request_rpc_with_params(method: &str, params: &Value) -> String {
-    request_rpc_result_with_params(method, params).unwrap_or_else(|error| error)
-}
-
 /// Submits one vendor-neutral prompt to a Herdr agent and waits for it to become working.
 ///
 /// A successful result means Herdr observed the working state and accepted the prompt. It does
