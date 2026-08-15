@@ -1,4 +1,8 @@
-use crate::permission::{Decision, Interaction};
+use crate::permission::{Decision, DecisionBehavior, Interaction};
+use crate::{
+    ApprovalRequest, InteractionRegistry, ResolveError, deliver_permission_card,
+    expire_permission_card, list_agents, route_topology, sync_topology, tab_list_result,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io;
@@ -9,8 +13,191 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, oneshot};
+use twilight_http::Client;
+use twilight_model::application::interaction::{
+    Interaction as DiscordInteraction, InteractionData,
+};
+use twilight_model::channel::message::MessageFlags;
+use twilight_model::http::interaction::{
+    InteractionResponse, InteractionResponseData, InteractionResponseType,
+};
+use twilight_model::id::{Id, marker::GuildMarker};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
+
+pub struct PermissionResponder {
+    pub client: Arc<Client>,
+    pub guild: Id<GuildMarker>,
+    pub owner_id: String,
+    pub registry: Arc<InteractionRegistry>,
+}
+
+impl PermissionResponder {
+    #[must_use]
+    pub fn new(client: Arc<Client>, guild: Id<GuildMarker>, owner_id: String) -> Self {
+        Self {
+            client,
+            guild,
+            owner_id,
+            registry: Arc::new(InteractionRegistry::default()),
+        }
+    }
+
+    async fn request(&self, interaction: &Interaction) -> Option<Decision> {
+        let interaction_for_route = interaction.clone();
+        let route = tokio::task::spawn_blocking(move || {
+            let agents = list_agents()?;
+            let tabs = tab_list_result()?;
+            let matches: Vec<_> = agents
+                .iter()
+                .filter(|agent| {
+                    agent
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.value == interaction_for_route.session_id)
+                })
+                .collect();
+            let agent = match matches.as_slice() {
+                [agent] => *agent,
+                [] => return Err("permission request has no mapped pane".to_owned()),
+                [_first, _second, ..] => {
+                    return Err("permission request has ambiguous pane mapping".to_owned());
+                }
+            };
+            route_topology(&agents, &tabs, &agent.terminal_id)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)?;
+        let channel = sync_topology(
+            self.client.as_ref(),
+            self.guild,
+            &route.workspace_id,
+            &route.channel_name,
+            &route.thread_name,
+            &route.tab_id,
+        )
+        .await
+        .ok()?;
+        let created_at = std::time::Instant::now();
+        let issued = self
+            .registry
+            .issue(
+                ApprovalRequest {
+                    owner_id: self.owner_id.clone(),
+                    session_id: interaction.session_id.clone(),
+                    prompt_id: interaction.prompt_id.clone(),
+                    tool: interaction.tool_name.clone(),
+                    channel_id: channel.get(),
+                },
+                created_at,
+                created_at + PERMISSION_TIMEOUT,
+            )
+            .ok()?;
+        let Ok(message) = deliver_permission_card(
+            self.client.as_ref(),
+            channel,
+            &interaction.tool_name,
+            &interaction.tool_input.command,
+            &issued.token,
+        )
+        .await
+        else {
+            self.registry.remove(&issued.token);
+            return None;
+        };
+        let decision = tokio::time::timeout(PERMISSION_TIMEOUT, issued.receiver)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let card_text = match decision.as_ref().map(|decision| &decision.behavior) {
+            Some(DecisionBehavior::Allow) => "resolved: allowed",
+            Some(DecisionBehavior::Deny) => "resolved: denied",
+            None => {
+                self.registry
+                    .expire(&issued.token, std::time::Instant::now());
+                "expired: no owner decision"
+            }
+        };
+        let _ = expire_permission_card(
+            self.client.as_ref(),
+            channel,
+            message,
+            &issued.token,
+            card_text,
+        )
+        .await;
+        decision
+    }
+}
+
+pub async fn handle_component(
+    responder: Arc<PermissionResponder>,
+    interaction: DiscordInteraction,
+) {
+    let Some(InteractionData::MessageComponent(data)) = interaction.data.as_ref() else {
+        return;
+    };
+    let Some((action, token)) = data
+        .custom_id
+        .split_once(':')
+        .and_then(|(prefix, rest)| prefix.strip_prefix("herdr").map(|_| rest))
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return;
+    };
+    let Some(channel) = interaction.channel.as_ref() else {
+        return;
+    };
+    let response = if interaction.guild_id != Some(responder.guild)
+        || interaction
+            .author_id()
+            .is_none_or(|id| id.to_string() != responder.owner_id)
+    {
+        ephemeral_response("not authorized")
+    } else if let Some(session_id) = responder.registry.session_id(token) {
+        let decision = match action {
+            "allow" => Decision::allow(),
+            "deny" => Decision::deny(Some("operator denied this request".to_owned())),
+            _ => return,
+        };
+        match responder.registry.resolve(
+            token,
+            &responder.owner_id,
+            &session_id,
+            channel.id.get(),
+            decision,
+            std::time::Instant::now(),
+        ) {
+            Ok(()) => ephemeral_response("decision recorded"),
+            Err(ResolveError::Unauthorized) => ephemeral_response("not authorized"),
+            Err(
+                ResolveError::UnknownOrExpired
+                | ResolveError::WrongSession
+                | ResolveError::WrongChannel,
+            ) => ephemeral_response("expired"),
+        }
+    } else {
+        ephemeral_response("expired")
+    };
+    let _ = responder
+        .client
+        .interaction(interaction.application_id)
+        .create_response(interaction.id, &interaction.token, &response)
+        .await;
+}
+
+fn ephemeral_response(content: &str) -> InteractionResponse {
+    InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(content.to_owned()),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..InteractionResponseData::default()
+        }),
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct RequestKey {
@@ -32,16 +219,6 @@ pub struct BrokerResponse {
     pub session_id: String,
     pub prompt_id: String,
     pub decision: Decision,
-}
-
-impl BrokerResponse {
-    fn allow_for(interaction: &Interaction) -> Self {
-        Self {
-            session_id: interaction.session_id.clone(),
-            prompt_id: interaction.prompt_id.clone(),
-            decision: Decision::allow(),
-        }
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -153,9 +330,10 @@ impl From<&Interaction> for RequestFingerprint {
 /// # Errors
 ///
 /// Returns an I/O error when accepting a client connection fails.
-pub async fn serve_tracer_broker(
+pub async fn serve_broker(
     listener: UnixListener,
     mut shutdown: oneshot::Receiver<()>,
+    responder: Arc<PermissionResponder>,
 ) -> io::Result<()> {
     let pending = Arc::new(PendingRequests::default());
     let next_connection_id = AtomicU64::new(0);
@@ -164,9 +342,10 @@ pub async fn serve_tracer_broker(
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let pending = Arc::clone(&pending);
+                let responder = Arc::clone(&responder);
                 let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    handle_connection(stream, pending, connection_id).await;
+                    handle_connection(stream, pending, responder, connection_id).await;
                 });
             }
             _ = &mut shutdown => break,
@@ -175,12 +354,12 @@ pub async fn serve_tracer_broker(
     Ok(())
 }
 
-/// Binds and runs the fixed-allow tracer broker until Ctrl-C or SIGTERM.
+/// Binds and runs the Discord-backed permission broker until Ctrl-C or SIGTERM.
 ///
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be bound or the listener fails.
-pub async fn run_tracer_broker(socket_path: &Path) -> io::Result<()> {
+pub async fn run_broker(socket_path: &Path, responder: Arc<PermissionResponder>) -> io::Result<()> {
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -192,7 +371,7 @@ pub async fn run_tracer_broker(socket_path: &Path) -> io::Result<()> {
         }
         let _ = shutdown_tx.send(());
     });
-    let result = serve_tracer_broker(listener, shutdown_rx).await;
+    let result = serve_broker(listener, shutdown_rx, responder).await;
     shutdown_task.abort();
     let _ = std::fs::remove_file(socket_path);
     result
@@ -225,6 +404,7 @@ fn remove_stale_socket(socket_path: &Path) -> io::Result<()> {
 async fn handle_connection(
     mut stream: UnixStream,
     pending: Arc<PendingRequests>,
+    responder: Arc<PermissionResponder>,
     connection_id: u64,
 ) {
     let interaction = match read_json_line(&mut stream).await {
@@ -236,8 +416,15 @@ async fn handle_connection(
         return;
     }
 
-    let response = BrokerResponse::allow_for(&interaction);
-    let _ = write_json_line(&mut stream, &response).await;
+    let decision = responder.request(&interaction).await;
+    if let Some(decision) = decision {
+        let response = BrokerResponse {
+            session_id: interaction.session_id.clone(),
+            prompt_id: interaction.prompt_id.clone(),
+            decision,
+        };
+        let _ = write_json_line(&mut stream, &response).await;
+    }
     pending.remove(&key).await;
 }
 

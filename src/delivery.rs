@@ -38,6 +38,75 @@ pub async fn deliver_transition_card(
     deliver_payload(client, channel, &message.description, Some(message), nonce).await
 }
 
+/// Delivers an owner decision card with opaque allow and deny component IDs.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn deliver_permission_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    tool: &str,
+    command: &str,
+    token: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let payload = serde_json::json!({
+        "embeds": [{
+            "title": "Claude permission request",
+            "description": format!("Tool: `{tool}`\nCommand:\n```\n{command}\n```"),
+            "color": 0x00f1_c40f,
+        }],
+        "components": permission_components(token, false),
+        "allowed_mentions": {"parse": []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .create_message(channel)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+/// Disables the controls on an expired or resolved permission card.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
+pub async fn expire_permission_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+    token: &str,
+    content: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "content": content,
+        "components": permission_components(token, true),
+        "allowed_mentions": {"parse": []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .update_message(channel, message)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn permission_components(token: &str, disabled: bool) -> serde_json::Value {
+    serde_json::json!([{
+        "type": 1,
+        "components": [
+            {"type": 2, "style": 3, "label": "Allow", "custom_id": format!("herdr:allow:{token}"), "disabled": disabled},
+            {"type": 2, "style": 4, "label": "Deny", "custom_id": format!("herdr:deny:{token}"), "disabled": disabled}
+        ]
+    }])
+}
+
 async fn deliver_payload(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,

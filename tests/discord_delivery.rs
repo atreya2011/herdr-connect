@@ -6,8 +6,8 @@ mod support;
 mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
-        AgentLogCapture, Transition, create_transition_messages, deliver_transition_card,
-        transition_card_nonce,
+        AgentLogCapture, Transition, create_transition_messages, deliver_permission_card,
+        deliver_transition_card, transition_card_nonce,
     };
     use serial_test::serial;
     use twilight_model::id::{Id, marker::UserMarker};
@@ -28,6 +28,75 @@ mod real_guild {
         let left = cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(left, 0, "named zero-leftover check");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn permission_card_has_allow_and_deny_components() {
+        let Some(guild) = guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let result = permission_card_exercise(&guild).await;
+        let left = cleanup(&guild).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(left, 0, "named zero-leftover check");
+    }
+
+    async fn permission_card_exercise(guild: &Guild) -> Result<(), String> {
+        let parent = channel(guild, "testrun-permission").await?;
+        let thread = guild
+            .client
+            .create_thread(
+                parent,
+                "testrun-permission-thread",
+                twilight_model::channel::ChannelType::PublicThread,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())?
+            .id;
+        let message = deliver_permission_card(
+            guild.client.as_ref(),
+            thread,
+            "Bash",
+            "touch proof",
+            "opaque-token-for-test",
+        )
+        .await?;
+        let delivered = fetch_message(guild, thread, message).await?;
+        if delivered.components.len() != 1 {
+            return Err("permission card did not have one action row".to_owned());
+        }
+        let twilight_model::channel::message::component::Component::ActionRow(row) =
+            &delivered.components[0]
+        else {
+            return Err("permission card component was not an action row".to_owned());
+        };
+        if row.components.len() != 2 {
+            return Err("permission card did not have two buttons".to_owned());
+        }
+        let labels = row
+            .components
+            .iter()
+            .filter_map(|component| match component {
+                twilight_model::channel::message::component::Component::Button(button) => {
+                    button.label.as_deref()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if labels != ["Allow", "Deny"] {
+            return Err(format!("unexpected permission labels: {labels:?}"));
+        }
+        Ok(())
     }
 
     async fn exercise(guild: &Guild) -> Result<(), String> {

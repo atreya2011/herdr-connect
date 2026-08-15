@@ -185,7 +185,7 @@ fn permission_fixtures_decode_and_encode_allow_and_deny() {
 }
 
 #[tokio::test]
-async fn real_unix_broker_round_trip_and_concurrent_requests_do_not_cross() {
+async fn real_unix_broker_falls_through_when_pane_is_unmapped() {
     let broker = BrokerProcess::start("round-trip");
     broker.wait_until_ready().await;
     let requests = [
@@ -196,13 +196,13 @@ async fn real_unix_broker_round_trip_and_concurrent_requests_do_not_cross() {
         request_decision(&requests[0], &broker.path, Duration::from_secs(1)),
         request_decision(&requests[1], &broker.path, Duration::from_secs(1)),
     );
-    assert_eq!(first, Some(Decision::allow()));
-    assert_eq!(second, Some(Decision::allow()));
+    assert_eq!(first, None);
+    assert_eq!(second, None);
     broker.terminate();
 }
 
 #[tokio::test]
-async fn concurrent_same_session_and_prompt_requests_both_resolve() {
+async fn concurrent_same_session_and_prompt_requests_fall_through_without_a_mapped_pane() {
     let broker = BrokerProcess::start("same-prompt");
     broker.wait_until_ready().await;
     let first_request = interaction_with_command("same-session", "same-prompt", "touch first");
@@ -213,8 +213,8 @@ async fn concurrent_same_session_and_prompt_requests_both_resolve() {
         request_decision(&second_request, &broker.path, Duration::from_secs(1)),
     );
 
-    assert_eq!(first, Some(Decision::allow()));
-    assert_eq!(second, Some(Decision::allow()));
+    assert_eq!(first, None);
+    assert_eq!(second, None);
     broker.terminate();
 }
 
@@ -313,7 +313,7 @@ async fn broker_restarts_after_sigterm() {
 }
 
 #[tokio::test]
-async fn hook_subcommand_uses_real_broker_round_trip() {
+async fn hook_subcommand_falls_through_when_broker_cannot_map_the_session() {
     let broker = BrokerProcess::start("hook-process");
     broker.wait_until_ready().await;
     let output = tokio::task::spawn_blocking({
@@ -323,7 +323,6 @@ async fn hook_subcommand_uses_real_broker_round_trip() {
     .await
     .expect("hook process task completes");
     assert!(output.status.success());
-    let value: Value = serde_json::from_slice(&output.stdout).expect("hook output is JSON");
-    assert_eq!(value["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    assert!(output.stdout.is_empty());
     broker.terminate();
 }

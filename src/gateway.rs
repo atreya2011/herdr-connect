@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use std::{future::Future, sync::Arc};
 use tokio::sync::Mutex;
@@ -6,6 +7,14 @@ use twilight_gateway::{
 };
 use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
+
+pub type ComponentHandler = Arc<
+    dyn Fn(
+            twilight_model::application::interaction::Interaction,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 async fn with_owner_prompt_gate<F, Fut>(gate: &Mutex<()>, action: F) -> Result<(), String>
 where
@@ -29,6 +38,44 @@ pub async fn drive_gateway_with_owner_prompt(
     owner_id: String,
     notices: Sender<String>,
 ) -> Result<(), String> {
+    drive_gateway(token, gateway_url, client, guild, owner_id, notices, None).await
+}
+
+/// Connects the Discord gateway and dispatches owner prompts and component taps.
+///
+/// # Errors
+///
+/// Returns an error when the Discord gateway terminates.
+pub async fn drive_gateway_with_components(
+    token: String,
+    gateway_url: Option<String>,
+    client: Arc<Client>,
+    guild: Id<GuildMarker>,
+    owner_id: String,
+    notices: Sender<String>,
+    components: ComponentHandler,
+) -> Result<(), String> {
+    drive_gateway(
+        token,
+        gateway_url,
+        client,
+        guild,
+        owner_id,
+        notices,
+        Some(components),
+    )
+    .await
+}
+
+async fn drive_gateway(
+    token: String,
+    gateway_url: Option<String>,
+    client: Arc<Client>,
+    guild: Id<GuildMarker>,
+    owner_id: String,
+    notices: Sender<String>,
+    components: Option<ComponentHandler>,
+) -> Result<(), String> {
     let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
     let builder = ConfigBuilder::new(token, intents);
     let config = match gateway_url {
@@ -37,7 +84,10 @@ pub async fn drive_gateway_with_owner_prompt(
     };
     let mut shard = Shard::with_config(ShardId::ONE, config);
     let owner_prompt_gate = Arc::new(Mutex::new(()));
-    while let Some(item) = shard.next_event(EventTypeFlags::MESSAGE_CREATE).await {
+    while let Some(item) = shard
+        .next_event(EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE)
+        .await
+    {
         let notice = match item {
             Ok(Event::MessageCreate(message)) => {
                 let client = Arc::clone(&client);
@@ -55,6 +105,13 @@ pub async fn drive_gateway_with_owner_prompt(
                     }
                 });
                 "discord gateway message: MESSAGE_CREATE".to_owned()
+            }
+            Ok(Event::InteractionCreate(interaction)) => {
+                if let Some(handler) = components.as_ref() {
+                    let handler = Arc::clone(handler);
+                    tokio::spawn(async move { handler(interaction.0).await });
+                }
+                "discord gateway interaction: INTERACTION_CREATE".to_owned()
             }
             Ok(_) => continue,
             Err(error) => format!("discord gateway error: {error}"),

@@ -1,11 +1,12 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, TopologyRoute, Transition,
+    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, TopologyRoute, Transition,
     create_transition_messages, deliver_transition_card, drive_gateway_with_owner_prompt,
     is_postable_transition, list_agents, load_config, load_discord_config, route_topology,
     sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
-    decode_claude_permission_request, encode_claude_decision, request_decision, run_tracer_broker,
+    PermissionResponder, decode_claude_permission_request, encode_claude_decision,
+    handle_component, request_decision, run_broker as run_permission_broker,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -321,7 +322,36 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path(&args)
         .ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
-    run_tracer_broker(&socket_path).await?;
+    let token = std::env::var("DISCORD_TOKEN")?;
+    let guild_id = std::env::var("DISCORD_GUILD_ID")?;
+    let owner_id = std::env::var("DISCORD_OWNER_ID").unwrap_or_default();
+    if token.trim().is_empty() || guild_id.trim().is_empty() {
+        return Err("broker requires non-blank DISCORD_TOKEN and DISCORD_GUILD_ID".into());
+    }
+    let guild = Id::<GuildMarker>::new(guild_id.trim().parse()?);
+    let client = Arc::new(Client::builder().token(token.clone()).build());
+    let responder = Arc::new(PermissionResponder::new(
+        Arc::clone(&client),
+        guild,
+        owner_id.trim().to_owned(),
+    ));
+    let (notices_tx, notices_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(notice) = notices_rx.recv() {
+            eprintln!("{notice}");
+        }
+    });
+    let component_responder = Arc::clone(&responder);
+    let components: ComponentHandler = Arc::new(move |interaction| {
+        let responder = Arc::clone(&component_responder);
+        Box::pin(async move { handle_component(responder, interaction).await })
+    });
+    let gateway = tokio::spawn(herdr_connect_rs::drive_gateway_with_components(
+        token, None, client, guild, owner_id, notices_tx, components,
+    ));
+    let result = run_permission_broker(&socket_path, responder).await;
+    gateway.abort();
+    result?;
     Ok(())
 }
 
