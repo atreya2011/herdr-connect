@@ -15,6 +15,16 @@ use twilight_model::id::{
 };
 
 type DiscordConnection = (Arc<Client>, Id<GuildMarker>, String);
+type GatewayTask = tokio::task::JoinHandle<Result<(), String>>;
+
+async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), String> {
+    match gateway {
+        Some(gateway) => gateway
+            .await
+            .map_err(|error| format!("discord gateway task failed: {error}"))?,
+        None => std::future::pending().await,
+    }
+}
 
 fn capture_for(agent: &str, terminal: &str) -> AgentLogCapture {
     let agent_session = AgentSession {
@@ -76,7 +86,8 @@ async fn deliver_to_route(
     last_message_id.ok_or_else(|| "discord delivery produced no messages".to_owned())
 }
 
-fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error::Error>> {
+fn discord_connection()
+-> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
     match (
         std::env::var("DISCORD_TOKEN"),
         std::env::var("DISCORD_GUILD_ID"),
@@ -96,7 +107,7 @@ fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error:
                     eprintln!("{notice}");
                 }
             });
-            tokio::spawn(drive_gateway_with_owner_prompt(
+            let gateway = tokio::spawn(drive_gateway_with_owner_prompt(
                 config.token,
                 None,
                 Arc::clone(&client),
@@ -104,7 +115,7 @@ fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error:
                 config.owner_id.clone(),
                 notices_tx,
             ));
-            Ok(Some((client, guild, config.owner_id)))
+            Ok(Some(((client, guild, config.owner_id), gateway)))
         }
         _ => Ok(None),
     }
@@ -115,7 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let home = std::env::var("HOME").unwrap_or_default();
     let app_config = load_config(&[], &home);
-    let discord = discord_connection()?;
+    let (discord, mut gateway) = match discord_connection()? {
+        Some((connection, gateway)) => (Some(connection), Some(gateway)),
+        None => (None, None),
+    };
     let interval = app_config.poll_interval_ms;
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
     let mut state_change_sequences: HashMap<String, u64> = HashMap::new();
@@ -197,6 +211,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             () = tokio::time::sleep(Duration::from_millis(interval)) => {},
             _ = tokio::signal::ctrl_c() => break,
             _ = stop.recv() => break,
+            result = wait_for_gateway(gateway.as_mut()) => {
+                return result.map_err(Into::into);
+            }
         }
     }
     Ok(())

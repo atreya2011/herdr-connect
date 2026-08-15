@@ -6,6 +6,19 @@ use twilight_gateway::{
 use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
 
+#[cfg(test)]
+mod tests {
+    use super::gateway_closed_result;
+
+    #[test]
+    fn closed_gateway_returns_terminal_error() {
+        assert_eq!(
+            gateway_closed_result(),
+            Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
+        );
+    }
+}
+
 /// Connects the Discord gateway and dispatches owner prompts without blocking gateway progress.
 pub async fn drive_gateway_with_owner_prompt(
     token: String,
@@ -14,7 +27,7 @@ pub async fn drive_gateway_with_owner_prompt(
     guild: Id<GuildMarker>,
     owner_id: String,
     notices: Sender<String>,
-) {
+) -> Result<(), String> {
     let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
     let builder = ConfigBuilder::new(token, intents);
     let config = match gateway_url {
@@ -45,4 +58,9 @@ pub async fn drive_gateway_with_owner_prompt(
             break;
         }
     }
+    gateway_closed_result()
+}
+
+fn gateway_closed_result() -> Result<(), String> {
+    Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
 }
