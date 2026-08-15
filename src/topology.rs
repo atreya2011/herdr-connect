@@ -48,14 +48,6 @@ pub fn route_topology(
             "herdr topology error: tab {tab_id} workspace mismatch"
         ));
     }
-    if agents
-        .iter()
-        .filter(|candidate| candidate.tab_id.as_deref() == Some(tab_id))
-        .count()
-        != 1
-    {
-        return Err(format!("herdr tab {tab_id} maps to multiple panes"));
-    }
     let workspace_tabs: HashSet<&str> = tabs
         .iter()
         .filter(|candidate| candidate.workspace_id == workspace_id)

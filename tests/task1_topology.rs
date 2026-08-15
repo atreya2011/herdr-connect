@@ -24,16 +24,17 @@ fn routes_the_captured_herdr_snapshot_to_its_workspace_tab_and_pane() {
 }
 
 #[test]
-fn refuses_an_ambiguous_tab_to_pane_mapping() {
+fn routes_two_agents_in_one_tab_to_the_same_thread() {
     let mut agents = fixture_agents();
     let mut duplicate = fixture_agents().pop().unwrap();
     duplicate.pane_id = Some("wC:pR".to_owned());
     duplicate.terminal_id = "term_657e35d8c8ea12".to_owned();
     agents.push(duplicate);
-    assert_eq!(
-        route_topology(&agents, &fixture_tabs(), "term_657e35d8c8ea11").unwrap_err(),
-        "herdr tab wC:tG maps to multiple panes"
-    );
+    let first = route_topology(&agents, &fixture_tabs(), "term_657e35d8c8ea11").unwrap();
+    let second = route_topology(&agents, &fixture_tabs(), "term_657e35d8c8ea12").unwrap();
+    assert_eq!(first.thread_name, second.thread_name);
+    assert_eq!(first.pane_id, "wC:pQ");
+    assert_eq!(second.pane_id, "wC:pR");
 }
 
 #[test]
