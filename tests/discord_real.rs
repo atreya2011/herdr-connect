@@ -77,45 +77,70 @@ async fn real_guild_setup() -> (
 #[tokio::test]
 #[serial]
 async fn real_guild_topology_create_and_reuse_contract() {
-    let (client, guild, channel) = real_guild_setup().await;
+    let (client, guild, _channel) = real_guild_setup().await;
     let workspace_id = "testrun-workspace";
-    let _ = sync_topology(
-        &client,
-        guild,
-        workspace_id,
-        "testrun-workspace-testrun-workspace",
-        "tab [testrun-tab]",
-        "testrun-tab",
-    )
-    .await
-    .unwrap();
-    let workspace = client
-        .guild_channels(guild)
-        .await
-        .unwrap()
-        .model()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|item| item.topic.as_deref() == Some("herdr workspace [testrun-workspace]"))
-        .unwrap();
-    client.delete_channel(workspace.id).await.unwrap();
-    let remaining = client
-        .guild_channels(guild)
-        .await
-        .unwrap()
-        .model()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|item| {
-            item.name
-                .as_deref()
-                .is_some_and(|name| name.starts_with(PREFIX))
-        })
-        .count();
+    let sync_result = async {
+        let first = sync_topology(
+            &client,
+            guild,
+            workspace_id,
+            "testrun-workspace-testrun-workspace",
+            "tab [testrun-tab]",
+            "testrun-tab",
+        )
+        .await?;
+        let second = sync_topology(
+            &client,
+            guild,
+            workspace_id,
+            "testrun-workspace-testrun-workspace",
+            "changed label [testrun-tab]",
+            "testrun-tab",
+        )
+        .await?;
+        Ok::<_, String>((first, second))
+    }
+    .await;
+    let cleanup_result = async {
+        let channels = client
+            .guild_channels(guild)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        for channel in channels
+            .into_iter()
+            .filter(|item| item.topic.as_deref() == Some("herdr workspace [testrun-workspace]"))
+        {
+            client
+                .delete_channel(channel.id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        client
+            .guild_channels(guild)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())
+            .map(|channels| {
+                channels
+                    .into_iter()
+                    .filter(|item| {
+                        item.name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with(PREFIX))
+                    })
+                    .count()
+            })
+    }
+    .await;
+    let (first, second) = sync_result.unwrap();
+    let remaining = cleanup_result.unwrap();
     assert_eq!(remaining, 0, "named zero-leftover check");
-    let _ = channel;
+    assert_eq!(first, second);
 }
 
 #[tokio::test]
