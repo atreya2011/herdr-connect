@@ -272,8 +272,7 @@ fn discord_connection()
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let app_config = load_config(&[], &home);
+    let app_config = load_config();
     let (discord, mut gateway) = match discord_connection()? {
         Some((connection, gateway)) => (Some(connection), Some(gateway)),
         None => (None, None),

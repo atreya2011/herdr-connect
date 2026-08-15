@@ -1,6 +1,5 @@
 #[derive(Debug, PartialEq, Eq)]
 pub struct AppConfig {
-    pub herdr_socket_path: String,
     pub poll_interval_ms: u64,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -11,15 +10,8 @@ pub struct DiscordConfig {
 }
 
 #[must_use]
-pub fn load_config(environment: &[(&str, &str)], home: &str) -> AppConfig {
+pub const fn load_config() -> AppConfig {
     AppConfig {
-        herdr_socket_path: environment
-            .iter()
-            .find(|(n, _)| *n == "HERDR_SOCKET_PATH")
-            .map_or_else(
-                || format!("{home}/.config/herdr/herdr.sock"),
-                |(_, v)| (*v).into(),
-            ),
         poll_interval_ms: 1_500,
     }
 }
