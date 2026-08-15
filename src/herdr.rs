@@ -77,16 +77,17 @@ pub fn request_rpc_result(method: &str) -> Result<String, String> {
 pub fn request_rpc(method: &str) -> String {
     request_rpc_result(method).unwrap_or_else(|error| error)
 }
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
+pub struct HerdrTab {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub label: String,
+}
+
 #[must_use]
-pub fn tab_list() -> Vec<String> {
-    let response = match request_rpc_result("tab.list") {
-        Ok(response) => response,
-        Err(error) => {
-            if std::env::var("HERDR_SOCKET_PATH").is_ok_and(|path| path.contains("r2-malformed")) {
-                return vec![format!("herdr tab.list error: {error}")];
-            }
-            return Vec::new();
-        }
+pub fn tab_list() -> Vec<HerdrTab> {
+    let Ok(response) = request_rpc_result("tab.list") else {
+        return Vec::new();
     };
     let Ok(value) = serde_json::from_str::<Value>(&response) else {
         return Vec::new();
@@ -96,20 +97,23 @@ pub fn tab_list() -> Vec<String> {
         .and_then(Value::as_array)
         .map(|tabs| {
             tabs.iter()
-                .filter_map(|t| t.get("tab_id").and_then(Value::as_str).map(str::to_owned))
+                .filter_map(|t| serde_json::from_value(t.clone()).ok())
                 .collect()
         })
         .unwrap_or_default()
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct AgentSnapshot {
     pub agent: String,
     pub terminal_id: String,
     pub agent_status: String,
     pub tab_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub pane_id: Option<String>,
     pub cwd: Option<String>,
     pub terminal_title_stripped: Option<String>,
+    #[serde(alias = "agent_session")]
     pub session: Option<AgentSession>,
 }
 /// Lists agents from Herdr.

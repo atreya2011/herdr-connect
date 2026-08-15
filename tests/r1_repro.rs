@@ -57,7 +57,13 @@ fn log_reader_uses_file_contents_and_identity() {
 #[test]
 fn rpc_and_tabs_are_not_constants() {
     assert_ne!(request_rpc("totally.bogus.method"), "herdr RPC error");
-    assert_ne!(tab_list(), vec!["tab.list"]);
+    assert_ne!(
+        tab_list()
+            .iter()
+            .map(|tab| tab.tab_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tab.list"]
+    );
 }
 
 #[test]

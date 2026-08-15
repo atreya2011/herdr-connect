@@ -4,10 +4,11 @@ use std::os::unix::net::UnixListener;
 use herdr_connect_rs::{list_agents, tab_list};
 
 /// Answers exactly one newline-delimited JSON-RPC request, echoing the request id.
-fn serve_once(name: &str, result: &'static str) -> std::path::PathBuf {
+fn serve_once(name: &str, result: impl Into<String>) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("r3-rpc-{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
+    let result = result.into();
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -24,6 +25,35 @@ fn serve_once(name: &str, result: &'static str) -> std::path::PathBuf {
         stream.flush().unwrap();
     });
     path
+}
+
+fn captured_result(path: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(path).unwrap()["result"].to_string()
+}
+
+#[test]
+fn t1_captured_herdr_responses_preserve_topology_identity() {
+    let agent_socket = serve_once(
+        "task1-agent",
+        captured_result(include_str!("fixtures/herdr-agent-list-task1.json")),
+    );
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &agent_socket) };
+    let agents = list_agents().unwrap();
+    let _ = std::fs::remove_file(&agent_socket);
+    assert_eq!(agents[0].workspace_id.as_deref(), Some("wC"));
+    assert_eq!(agents[0].tab_id.as_deref(), Some("wC:tG"));
+    assert_eq!(agents[0].pane_id.as_deref(), Some("wC:pQ"));
+
+    let tab_socket = serve_once(
+        "task1-tab",
+        captured_result(include_str!("fixtures/herdr-tab-list-task1.json")),
+    );
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &tab_socket) };
+    let tabs = tab_list();
+    let _ = std::fs::remove_file(&tab_socket);
+    assert_eq!(tabs[0].workspace_id, "wC");
+    assert_eq!(tabs[0].tab_id, "wC:tG");
+    assert_eq!(tabs[0].label, "captured-tab");
 }
 
 // P1: src/lib.rs:722 — PARITY 5: tab ID, working directory and vendor session identity are dropped.

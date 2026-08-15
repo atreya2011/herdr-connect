@@ -22,9 +22,9 @@ pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
 pub use delivery::{deliver_transition, deliver_transition_card};
 pub use gateway::drive_gateway;
 pub use herdr::{
-    AgentSession, AgentSnapshot, list_agents, request_rpc, request_rpc_result, tab_list,
+    AgentSession, AgentSnapshot, HerdrTab, list_agents, request_rpc, request_rpc_result, tab_list,
 };
 pub use live_status::update_live_status;
 pub use readers::{AgentLog, read_agent_log};
-pub use topology::sync_topology;
+pub use topology::{TopologyRoute, route_topology, sync_topology, workspace_channel_name};
 pub use watcher::{Transition, is_postable_transition, watch_transitions};

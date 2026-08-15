@@ -8,6 +8,9 @@ use twilight_model::id::Id;
 
 const CHANNEL: &str = r#"{"id":"100","type":0,"guild_id":"1","name":"herdr-workspace-ws","topic":"herdr workspace [ws]"}"#;
 const MESSAGE: &str = r#"{"id":"200","type":0,"channel_id":"100","content":"x","timestamp":"2024-01-01T00:00:00.000000+00:00","author":{"id":"9","username":"bot","discriminator":"0001","avatar":null},"attachments":[],"embeds":[],"mentions":[],"mention_roles":[],"mention_everyone":false,"pinned":false,"tts":false,"edited_timestamp":null}"#;
+const EMPTY_THREADS: &str = r#"{"threads":[],"members":[]}"#;
+const ARCHIVED_TAB: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
+const DUPLICATE_TAB_THREADS: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}},{"id":"102","type":11,"guild_id":"1","parent_id":"100","name":"another-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
 
 /// Records every call the code under test makes and answers it with a canned Discord payload.
 struct Stand {
@@ -17,6 +20,14 @@ struct Stand {
 }
 
 async fn stand(existing_channels: &'static str) -> Stand {
+    stand_with_threads(existing_channels, EMPTY_THREADS, EMPTY_THREADS).await
+}
+
+async fn stand_with_threads(
+    existing_channels: &'static str,
+    active_threads: &'static str,
+    archived_threads: &'static str,
+) -> Stand {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -64,6 +75,10 @@ async fn stand(existing_channels: &'static str) -> Stand {
                         MESSAGE.to_owned()
                     } else if method == "GET" && path.ends_with("/channels") {
                         format!("[{existing_channels}]")
+                    } else if path.contains("/threads/active") {
+                        active_threads.to_owned()
+                    } else if path.contains("/threads/archived/") {
+                        archived_threads.to_owned()
                     } else {
                         CHANNEL.to_owned()
                     };
@@ -85,6 +100,53 @@ async fn stand(existing_channels: &'static str) -> Stand {
     }
 }
 
+// W5: A renamed tab must reuse its archived thread through the stable tab-id suffix.
+#[tokio::test]
+async fn w5_reuses_and_unarchives_a_thread_by_tab_id_suffix() {
+    let stand = stand_with_threads(CHANNEL, EMPTY_THREADS, ARCHIVED_TAB).await;
+    let _ = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "workspace-ws",
+        "current-label [tab-7]",
+        "tab-7",
+    )
+    .await;
+    let calls = stand.calls.lock().unwrap().clone();
+    let bodies = stand.bodies.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == "POST /api/v10/channels/100/threads"),
+        "created a duplicate tab thread; calls: {calls:?}"
+    );
+    assert!(
+        calls.iter().zip(&bodies).any(|(call, body)| {
+            call == "PATCH /api/v10/channels/101" && body.contains("\"archived\":false")
+        }),
+        "did not unarchive the matched tab thread; calls: {calls:?} bodies: {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn w6_refuses_duplicate_discord_threads_for_one_tab_id() {
+    let stand = stand_with_threads(CHANNEL, DUPLICATE_TAB_THREADS, EMPTY_THREADS).await;
+    let result = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "workspace-ws",
+        "current-label [tab-7]",
+        "tab-7",
+    )
+    .await;
+    assert_eq!(
+        result.unwrap_err(),
+        "Discord topology has duplicate threads for tab tab-7"
+    );
+}
+
 fn client(address: &str) -> Client {
     // The shipped binary omits this line; see finding 1. Installed here so the wire defects are visible.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -98,7 +160,15 @@ fn client(address: &str) -> Client {
 #[tokio::test]
 async fn w1_reuses_the_channel_carrying_the_workspace_topic_marker() {
     let stand = stand(CHANNEL).await;
-    let _ = sync_topology(&client(&stand.address), Id::new(1), "ws", "tab-7").await;
+    let _ = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "workspace-ws",
+        "tab [tab-7]",
+        "tab-7",
+    )
+    .await;
     let calls = stand.calls.lock().unwrap().clone();
     let bodies = stand.bodies.lock().unwrap().clone();
     assert!(
@@ -115,7 +185,15 @@ async fn w1_reuses_the_channel_carrying_the_workspace_topic_marker() {
 #[tokio::test]
 async fn w2_creates_the_tab_as_a_thread() {
     let stand = stand(CHANNEL).await;
-    let _ = sync_topology(&client(&stand.address), Id::new(1), "ws", "tab-7").await;
+    let _ = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "workspace-ws",
+        "tab [tab-7]",
+        "tab-7",
+    )
+    .await;
     let calls = stand.calls.lock().unwrap().clone();
     assert!(
         calls.iter().any(|call| call.contains("/threads")),

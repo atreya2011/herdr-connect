@@ -151,7 +151,7 @@ fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns an error when the label is empty or the suffix cannot fit.
+/// Returns an error when the label has no usable base or the suffix cannot fit.
 pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<String, String> {
     let label = label.trim();
     let title = title.trim();
@@ -160,7 +160,9 @@ pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<Stri
     } else if !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()) && !title.is_empty() {
         title
     } else {
-        return Err(format!("herdr tab id {tab_id} has no usable name"));
+        return Err(format!(
+            "herdr tab {tab_id} has numeric label {label} without a terminal title"
+        ));
     };
     let suffix = format!(" [{tab_id}]");
     if suffix.chars().count() > MAX_THREAD_NAME_LENGTH {

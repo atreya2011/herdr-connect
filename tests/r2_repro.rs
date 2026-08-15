@@ -1,3 +1,5 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use herdr_connect_rs::{
@@ -148,10 +150,35 @@ fn details_are_populated_and_malformed_agents_are_errors() {
     .unwrap();
     assert!(log.details.is_some());
     let path = std::env::temp_dir().join(format!("r2-malformed-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let tab_result = serde_json::from_str::<serde_json::Value>(include_str!(
+        "fixtures/herdr-tab-list-task1.json"
+    ))
+    .unwrap()["result"]
+        .to_string();
+    std::thread::spawn(move || {
+        for result in [
+            r#"{"agents":[{"agent":"claude","terminal_id":"t1"}]}"#.to_owned(),
+            tab_result,
+        ] {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let id = request["id"].as_str().unwrap();
+            let mut stream = stream;
+            stream
+                .write_all(format!("{{\"id\":\"{id}\",\"result\":{result}}}\n").as_bytes())
+                .unwrap();
+            stream.flush().unwrap();
+        }
+    });
     unsafe {
         std::env::set_var("HERDR_SOCKET_PATH", &path);
     }
-    let _ = std::fs::remove_file(&path);
     assert!(list_agents().is_err());
     assert!(!tab_list().is_empty());
+    let _ = std::fs::remove_file(&path);
 }

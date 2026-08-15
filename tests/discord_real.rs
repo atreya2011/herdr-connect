@@ -78,7 +78,27 @@ async fn real_guild_setup() -> (
 #[serial]
 async fn real_guild_topology_create_and_reuse_contract() {
     let (client, guild, channel) = real_guild_setup().await;
-    let _ = sync_topology(&client, guild, "workspace", "tab").await;
+    let workspace_id = "testrun-workspace";
+    let _ = sync_topology(
+        &client,
+        guild,
+        workspace_id,
+        "testrun-workspace-testrun-workspace",
+        "tab [testrun-tab]",
+        "testrun-tab",
+    )
+    .await;
+    let workspace = client
+        .guild_channels(guild)
+        .await
+        .unwrap()
+        .model()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.topic.as_deref() == Some("herdr workspace [testrun-workspace]"))
+        .unwrap();
+    client.delete_channel(workspace.id).await.unwrap();
     let _ = channel;
 }
 

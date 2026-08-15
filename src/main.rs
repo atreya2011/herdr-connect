@@ -1,7 +1,7 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, Transition, create_transition_messages, deliver_transition_card,
-    drive_gateway, format_thread_name, is_postable_transition, list_agents, load_config,
-    load_discord_config, sync_topology, tab_list,
+    AgentLogCapture, AgentSession, TopologyRoute, Transition, create_transition_messages,
+    deliver_transition_card, drive_gateway, is_postable_transition, list_agents, load_config,
+    load_discord_config, route_topology, sync_topology, tab_list,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -35,12 +35,45 @@ fn capture_for(agent: &str, terminal: &str) -> AgentLogCapture {
     )
 }
 
+/// Delivers a transition's cards to the route resolved from one Herdr snapshot, including its `format_thread_name` result.
+///
+/// # Errors
+///
+/// Returns Discord topology or card-delivery errors.
+async fn deliver_to_route(
+    client: &Client,
+    guild: Id<GuildMarker>,
+    owner_id: &str,
+    route: &TopologyRoute,
+    transition: &Transition,
+    capture: &AgentLogCapture,
+) -> Result<(), String> {
+    let messages = create_transition_messages(transition, capture, owner_id);
+    let target = sync_topology(
+        client,
+        guild,
+        &route.workspace_id,
+        &route.channel_name,
+        &route.thread_name,
+        &route.tab_id,
+    )
+    .await
+    .map_err(|error| format!("discord topology error: {error}"))?;
+    for (index, message) in messages.iter().enumerate() {
+        let _mention = message.mention.as_deref();
+        let nonce = format!("{}-{index}", transition.terminal_id);
+        deliver_transition_card(client, target, message, &nonce)
+            .await
+            .map_err(|error| format!("discord delivery error: {error}"))?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let home = std::env::var("HOME").unwrap_or_default();
     let app_config = load_config(&[], &home);
-    let _ = tab_list();
     let discord = match (
         std::env::var("DISCORD_TOKEN"),
         std::env::var("DISCORD_GUILD_ID"),
@@ -79,15 +112,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        let tabs = tab_list();
         let current: HashSet<String> = agents
             .iter()
             .map(|snapshot| snapshot.terminal_id.clone())
             .collect();
         previous.retain(|terminal, _| current.contains(terminal));
-        for snapshot in agents {
-            let agent = snapshot.agent;
-            let terminal = snapshot.terminal_id;
-            let status = snapshot.agent_status;
+        for snapshot in &agents {
+            let agent = snapshot.agent.clone();
+            let terminal = snapshot.terminal_id.clone();
+            let status = snapshot.agent_status.clone();
             println!("{agent} {terminal}: {status}");
             if let Some((old, prior_agent)) = previous.get(&terminal).cloned()
                 && old != status
@@ -103,28 +137,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let capture = capture_for(&agent, &terminal);
+                let route = match route_topology(&agents, &tabs, &terminal) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                };
                 let Some((client, guild, owner_id)) = discord.as_ref() else {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 };
-                let messages = create_transition_messages(&transition, &capture, owner_id);
-                let _ = format_thread_name("workspace", "workspace", &terminal);
-                let target = match sync_topology(client, *guild, "workspace", &terminal).await {
-                    Ok(target) => target,
-                    Err(error) => {
-                        eprintln!("discord topology error: {error}");
-                        continue;
-                    }
-                };
-                for (index, message) in messages.iter().enumerate() {
-                    let _mention = message.mention.as_deref();
-                    let nonce = format!("{terminal}-{index}");
-                    if let Err(error) =
-                        deliver_transition_card(client, target, message, &nonce).await
-                    {
-                        eprintln!("discord delivery error: {error}");
-                        break;
-                    }
+                if let Err(error) =
+                    deliver_to_route(client, *guild, owner_id, &route, &transition, &capture).await
+                {
+                    eprintln!("{error}");
+                    continue;
                 }
                 live_messages.insert(terminal.clone(), Id::new(0));
                 let _ = live_messages.get(&terminal);
