@@ -1,0 +1,25 @@
+{
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "transcript_path": "<home>/.claude/projects/-tmp-herdr-connect-rs-gauntlet-20260815-102236-t3-trigger/11111111-1111-4111-8111-111111111111.jsonl",
+  "cwd": "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t3-trigger",
+  "prompt_id": "22222222-2222-4222-8222-222222222222",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "touch <tmp>/herdr-connect-rs-gauntlet-20260815-102236/t3-proof.txt",
+    "description": "Create proof file as requested"
+  },
+  "permission_suggestions": [
+    {
+      "type": "addDirectories",
+      "directories": ["<tmp>/herdr-connect-rs-gauntlet-20260815-102236"],
+      "destination": "session"
+    },
+    {
+      "type": "setMode",
+      "mode": "acceptEdits",
+      "destination": "session"
+    }
+  ]
+}

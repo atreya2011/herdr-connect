@@ -8,6 +8,7 @@ mod config;
 mod delivery;
 mod gateway;
 mod herdr;
+mod permission;
 mod prompting;
 mod readers;
 mod topology;
@@ -23,6 +24,7 @@ pub use herdr::{
     AgentSession, AgentSnapshot, HerdrTab, agent_prompt, list_agents, request_rpc_result,
     tab_list_result,
 };
+pub use permission::{ClaudePermissionRequest, ClaudePermissionToolInput};
 pub use prompting::should_handle_owner_message;
 pub use readers::{AgentLog, read_agent_log};
 pub use topology::{TopologyRoute, route_topology, sync_topology, workspace_channel_name};
