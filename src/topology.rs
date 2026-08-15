@@ -264,7 +264,10 @@ async fn archived_threads(
         .map_err(|error| error.to_string())?;
         let listing = response.model().await.map_err(|error| error.to_string())?;
         let has_more = listing.has_more.unwrap_or(false);
-        before = listing
+        if has_more && listing.threads.is_empty() {
+            return Err("Discord returned an empty archived-thread page with has_more".to_owned());
+        }
+        let next_before = listing
             .threads
             .last()
             .and_then(|thread| thread.thread_metadata.as_ref())
@@ -273,8 +276,15 @@ async fn archived_threads(
         if !has_more {
             return Ok(threads);
         }
-        if before.is_none() {
+        if next_before.is_none() {
             return Err("Discord returned archived threads without a pagination cursor".to_owned());
         }
+        if next_before == before {
+            return Err(
+                "Discord returned archived threads without an advancing pagination cursor"
+                    .to_owned(),
+            );
+        }
+        before = next_before;
     }
 }

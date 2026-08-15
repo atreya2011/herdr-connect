@@ -15,6 +15,9 @@ const MESSAGE: &str = r#"{"id":"200","type":0,"channel_id":"100","content":"x","
 const EMPTY_THREADS: &str = r#"{"threads":[],"members":[]}"#;
 const ARCHIVED_TAB: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
 const DUPLICATE_TAB_THREADS: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}},{"id":"102","type":11,"guild_id":"1","parent_id":"100","name":"another-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
+const STALLED_ARCHIVED_TAB: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"other [tab-8]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":true}"#;
+const EMPTY_ARCHIVED_PAGE_WITH_MORE: &str =
+    r#"{"threads":[],"members":[],"has_more":true}"#;
 
 /// Records every call the code under test makes and answers it with a canned Discord payload.
 struct Stand {
@@ -149,6 +152,37 @@ async fn w6_refuses_duplicate_discord_threads_for_one_tab_id() {
         result.unwrap_err(),
         "Discord topology has duplicate threads for tab tab-7"
     );
+}
+
+#[tokio::test]
+async fn archived_thread_pagination_must_advance() {
+    let cases = [
+        (
+            STALLED_ARCHIVED_TAB,
+            "Discord returned archived threads without an advancing pagination cursor",
+        ),
+        (
+            EMPTY_ARCHIVED_PAGE_WITH_MORE,
+            "Discord returned an empty archived-thread page with has_more",
+        ),
+    ];
+    for (page, expected) in cases {
+        let stand = stand_with_threads(CHANNEL, EMPTY_THREADS, page).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            sync_topology(
+                &client(&stand.address),
+                Id::new(1),
+                "ws",
+                "workspace-ws",
+                "tab [tab-7]",
+                "tab-7",
+            ),
+        )
+        .await
+        .expect("archived-thread pagination did not fail fast");
+        assert_eq!(result.unwrap_err(), expected);
+    }
 }
 
 fn client(address: &str) -> Client {
