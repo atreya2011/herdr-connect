@@ -1,0 +1,5 @@
+{"type":"event_msg","payload":{"type":"user_message","message":"previous"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"previous answer"}}
+{"type":"turn_context","payload":{}}
+{"type":"event_msg","payload":{"type":"user_message","message":"current"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"final answer"}}

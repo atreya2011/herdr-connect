@@ -1,11 +1,12 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSnapshot, TopologyRoute, Transition, create_transition_messages,
-    deliver_transition_card, drive_gateway_with_owner_prompt, is_postable_transition, list_agents,
-    load_config, load_discord_config, route_topology, sync_topology, tab_list_result,
-    transition_card_nonce,
+    AgentLogCapture, AgentSession, AgentSnapshot, TopologyRoute, Transition,
+    create_transition_messages, deliver_transition_card, drive_gateway_with_owner_prompt,
+    is_postable_transition, list_agents, load_config, load_discord_config, route_topology,
+    sync_topology, tab_list_result, transition_card_nonce,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use twilight_http::Client;
@@ -27,13 +28,13 @@ async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), Strin
 }
 
 fn capture_for(snapshot: &AgentSnapshot) -> Result<AgentLogCapture, String> {
-    let log_dir = std::env::var_os("HERDR_LOG_DIR");
-    capture_for_with_log_dir(snapshot, log_dir.as_deref().map(std::path::Path::new))
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not configured".to_owned())?;
+    capture_for_with_search_root(snapshot, Path::new(&home))
 }
 
-fn capture_for_with_log_dir(
+fn capture_for_with_search_root(
     snapshot: &AgentSnapshot,
-    log_dir: Option<&std::path::Path>,
+    search_root: &Path,
 ) -> Result<AgentLogCapture, String> {
     let Some(session) = snapshot.session.clone() else {
         return Ok(AgentLogCapture {
@@ -42,16 +43,142 @@ fn capture_for_with_log_dir(
             question: None,
         });
     };
-    let path = log_dir.map_or_else(
-        || PathBuf::from(&session.value),
-        |directory| directory.join(&session.value),
-    );
+    let path = resolve_session_path(search_root, snapshot, &session)?;
     let log = herdr_connect_rs::read_agent_log(Some(session), &path)?;
     Ok(AgentLogCapture {
         message: log.message,
         failure: log.failure,
         question: log.question,
     })
+}
+
+fn resolve_session_path(
+    search_root: &Path,
+    snapshot: &AgentSnapshot,
+    session: &AgentSession,
+) -> Result<PathBuf, String> {
+    match session.agent.as_str() {
+        "claude" => {
+            let cwd = snapshot
+                .cwd
+                .as_deref()
+                .filter(|cwd| !cwd.trim().is_empty())
+                .ok_or_else(|| "claude session has no cwd for log resolution".to_owned())?;
+            let cwd_slug = cwd
+                .chars()
+                .map(|character| if character == '/' { '-' } else { character })
+                .collect::<String>();
+            let candidates = [
+                search_root
+                    .join(".claude/projects")
+                    .join(&cwd_slug)
+                    .join(format!("{}.jsonl", session.value)),
+                search_root
+                    .join(".claude-one/projects")
+                    .join(&cwd_slug)
+                    .join(format!("{}.jsonl", session.value)),
+            ];
+            let existing = candidates
+                .into_iter()
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>();
+            unique_existing_path(&existing, "claude session log")
+        }
+        "codex" => find_unique_session_path(
+            &search_root.join(".codex/sessions"),
+            &session.value,
+            |path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("rollout-")
+                            && Path::new(name)
+                                .extension()
+                                .and_then(|extension| extension.to_str())
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+                    })
+            },
+            "codex session log",
+        ),
+        "cursor" => {
+            let chats = search_root.join(".cursor/chats");
+            let mut candidates = Vec::new();
+            for workspace in read_directories(&chats, "Cursor chat directory")? {
+                let store = workspace.join(&session.value).join("store.db");
+                if store.is_file() {
+                    candidates.push(store);
+                }
+            }
+            unique_existing_path(&candidates, "Cursor session store")
+        }
+        agent => Err(format!("unsupported vendor session agent: {agent}")),
+    }
+}
+
+fn unique_existing_path(candidates: &[PathBuf], description: &str) -> Result<PathBuf, String> {
+    match candidates {
+        [path] => Ok(path.clone()),
+        [] => Err(format!("{description} was not found")),
+        _ => Err(format!("multiple {description}s were found")),
+    }
+}
+
+fn find_unique_session_path(
+    root: &Path,
+    session_id: &str,
+    matches: fn(&Path) -> bool,
+    description: &str,
+) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    collect_matching_paths(root, session_id, matches, &mut candidates)?;
+    unique_existing_path(&candidates, description)
+}
+
+fn collect_matching_paths(
+    directory: &Path,
+    session_id: &str,
+    matches: fn(&Path) -> bool,
+    candidates: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in read_entries(directory, "session search directory")? {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_matching_paths(&path, session_id, matches, candidates)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(session_id))
+            && matches(&path)
+        {
+            candidates.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_directories(root: &Path, description: &str) -> Result<Vec<PathBuf>, String> {
+    Ok(read_entries(root, description)?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect())
+}
+
+fn read_entries(directory: &Path, description: &str) -> Result<Vec<fs::DirEntry>, String> {
+    fs::read_dir(directory)
+        .map_err(|error| {
+            format!(
+                "failed to read {description} {}: {error}",
+                directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "failed to read {description} {}: {error}",
+                directory.display()
+            )
+        })
 }
 
 fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
@@ -239,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_for_with_log_dir, create_transition_messages};
+    use super::{capture_for_with_search_root, create_transition_messages};
     use herdr_connect_rs::{AgentSnapshot, Transition};
     use serde_json::Value;
     use std::path::Path;
@@ -254,6 +381,7 @@ mod tests {
                 .expect("captured agent.list fixture has typed agents");
         let cases = [
             ("term-real-1", "final answer"),
+            ("term-real-2", "final answer"),
             ("term-no-session", "agent stopped, no log available"),
         ];
         for (terminal, expected_body) in cases {
@@ -261,7 +389,7 @@ mod tests {
                 .iter()
                 .find(|snapshot| snapshot.terminal_id == terminal)
                 .expect("fixture contains the requested agent");
-            let capture = capture_for_with_log_dir(snapshot, Some(Path::new("tests/fixtures")))
+            let capture = capture_for_with_search_root(snapshot, Path::new("tests/fixtures"))
                 .expect("capture succeeds for a real session or explicit no-session pointer");
             let transition = Transition {
                 from: "working".to_owned(),
@@ -283,7 +411,7 @@ mod tests {
             .expect("session fixture is present")
             .value = "missing-session.jsonl".to_owned();
         assert!(
-            capture_for_with_log_dir(&missing_log, Some(Path::new("tests/fixtures"))).is_err(),
+            capture_for_with_search_root(&missing_log, Path::new("tests/fixtures")).is_err(),
             "reader errors for a reported session must surface instead of posting the pointer"
         );
     }

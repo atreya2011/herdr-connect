@@ -1,5 +1,5 @@
 use crate::herdr::AgentSession;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde::de::Error as _;
 use serde_json::Value;
 use std::path::Path;
@@ -41,8 +41,8 @@ pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<Agen
 }
 
 fn parse_cursor_path(path: &Path) -> Result<AgentLog, serde_json::Error> {
-    let connection =
-        Connection::open(path).map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
     let mut statement = connection
         .prepare("SELECT data FROM blobs ORDER BY rowid")
         .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;

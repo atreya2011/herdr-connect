@@ -43,7 +43,6 @@ pub async fn handle_owner_message(
         return Ok(());
     }
     let Some(parent_id) = thread.parent_id else {
-        reply(&client, &message, "refused: unmapped Discord thread").await?;
         return Ok(());
     };
     let parent = client
@@ -54,7 +53,6 @@ pub async fn handle_owner_message(
         .await
         .map_err(|error| error.to_string())?;
     let Some(thread_name) = thread.name.as_deref() else {
-        reply(&client, &message, "refused: unmapped Discord thread").await?;
         return Ok(());
     };
     let Some(topic) = parent.topic.as_deref() else {
