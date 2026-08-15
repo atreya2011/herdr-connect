@@ -253,12 +253,12 @@ async fn archived_threads(
     client: &twilight_http::Client,
     workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
 ) -> Result<Vec<twilight_model::channel::Channel>, String> {
-    let mut before = None;
+    let mut before: Option<String> = None;
     let mut threads = Vec::new();
     loop {
         let request = client.public_archived_threads(workspace_channel).limit(100);
         let response = if let Some(before) = before.as_deref() {
-            request.before(before).await
+            request.before(&before.replace('+', "%2B")).await
         } else {
             request.await
         }

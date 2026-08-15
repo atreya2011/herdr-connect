@@ -188,6 +188,43 @@ async fn archived_thread_pagination_must_advance() {
     }
 }
 
+#[tokio::test]
+async fn archived_thread_pagination_percent_encodes_cursor() {
+    let stand = stand_with_threads(CHANNEL, EMPTY_THREADS, STALLED_ARCHIVED_TAB).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        sync_topology(
+            &client(&stand.address),
+            Id::new(1),
+            "ws",
+            "workspace-ws",
+            "tab [tab-7]",
+            "tab-7",
+        ),
+    )
+    .await
+    .expect("archived-thread pagination did not reach the second request");
+    let archived_calls = stand
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.starts_with("GET /api/v10/channels/100/threads/archived/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let second_call = archived_calls
+        .get(1)
+        .expect("archived-thread pagination made fewer than two requests");
+    assert!(
+        second_call.contains("%2B"),
+        "second archived-thread request did not encode the cursor: {second_call}"
+    );
+    assert!(
+        !second_call.contains('+'),
+        "second archived-thread request contains a bare plus: {second_call}"
+    );
+}
+
 fn client(address: &str) -> Client {
     // The shipped binary omits this line; see finding 1. Installed here so the wire defects are visible.
     let _ = rustls::crypto::ring::default_provider().install_default();
