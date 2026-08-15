@@ -234,6 +234,16 @@ async fn deliver_to_route(
     last_message_id.ok_or_else(|| "discord delivery produced no messages".to_owned())
 }
 
+fn next_state_change_sequence(
+    state_change_sequences: &mut HashMap<String, u64>,
+    terminal: &str,
+) -> u64 {
+    *state_change_sequences
+        .entry(terminal.to_owned())
+        .and_modify(|sequence| *sequence += 1)
+        .or_insert(1)
+}
+
 fn discord_connection()
 -> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
     match (
@@ -300,7 +310,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let current: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
         previous.retain(|terminal, _| current.contains(terminal));
-        state_change_sequences.retain(|terminal, _| current.contains(terminal));
         for snapshot in &agents {
             let agent = snapshot.agent.clone();
             let terminal = snapshot.terminal_id.clone();
@@ -309,10 +318,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((old, prior_agent)) = previous.get(&terminal).cloned()
                 && old != status
             {
-                let state_change_seq = state_change_sequences
-                    .entry(terminal.clone())
-                    .and_modify(|sequence| *sequence += 1)
-                    .or_insert(1);
+                let state_change_seq =
+                    next_state_change_sequence(&mut state_change_sequences, &terminal);
                 let transition = Transition {
                     from: old,
                     to: status.clone(),
@@ -346,7 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &route,
                     &transition,
                     &capture,
-                    *state_change_seq,
+                    state_change_seq,
                 )
                 .await
                 {
@@ -371,12 +378,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_for_with_search_root, create_transition_messages, resolve_session_path};
-    use herdr_connect_rs::{AgentSession, AgentSnapshot, Transition};
+    use super::{
+        capture_for_with_search_root, create_transition_messages, next_state_change_sequence,
+        resolve_session_path,
+    };
+    use herdr_connect_rs::{AgentSession, AgentSnapshot, Transition, transition_card_nonce};
     use serde_json::Value;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn state_change_nonce_survives_terminal_departure_and_return() {
+        let terminal = "terminal";
+        let mut state_change_sequences = HashMap::new();
+        let mut current_terminals = HashSet::from([terminal.to_owned()]);
+
+        let pre_departure_nonce = transition_card_nonce(
+            terminal,
+            next_state_change_sequence(&mut state_change_sequences, terminal),
+            0,
+        );
+
+        assert!(current_terminals.remove(terminal));
+        assert!(current_terminals.insert(terminal.to_owned()));
+        let returned_nonce = transition_card_nonce(
+            terminal,
+            next_state_change_sequence(&mut state_change_sequences, terminal),
+            0,
+        );
+
+        assert_ne!(pre_departure_nonce, returned_nonce);
+    }
 
     #[test]
     fn claude_project_slugs_match_dot_and_underscore_directory_names_in_both_roots() {
