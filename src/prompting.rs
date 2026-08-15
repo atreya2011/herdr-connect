@@ -58,7 +58,11 @@ pub async fn handle_owner_message(
     let Some(topic) = parent.topic.as_deref() else {
         return Ok(());
     };
-    if !is_qualifying_prompt_surface(thread_name, topic) {
+    let Some((tab_id, workspace_id)) = prompt_surface_markers(thread_name, topic) else {
+        return Ok(());
+    };
+    if !has_prompt_content(&message.content) {
+        reply(&client, &message, "refused: prompt content is empty").await?;
         return Ok(());
     }
     let agents = match tokio::task::spawn_blocking(list_agents).await {
@@ -75,7 +79,7 @@ pub async fn handle_owner_message(
             return Err(error);
         }
     };
-    let pane_id = match resolve_prompt_pane(thread_name, topic, &agents) {
+    let pane_id = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
         Ok(pane_id) => pane_id,
         Err(reason) => {
             reply(&client, &message, &reason).await?;
@@ -103,6 +107,11 @@ pub async fn handle_owner_message(
 }
 
 #[must_use]
+fn has_prompt_content(content: &str) -> bool {
+    !content.trim().is_empty()
+}
+
+#[must_use]
 pub fn should_handle_owner_message(author_id: &str, is_bot: bool, owner_id: &str) -> bool {
     !is_bot && !owner_id.trim().is_empty() && author_id == owner_id.trim()
 }
@@ -113,33 +122,26 @@ const fn is_thread_channel(kind: ChannelType) -> bool {
 }
 
 #[must_use]
-fn is_qualifying_prompt_surface(thread_name: &str, topic: &str) -> bool {
-    let has_tab_suffix = thread_name
-        .rsplit_once(" [")
-        .and_then(|(_, suffix)| suffix.strip_suffix(']'))
-        .is_some_and(|value| !value.trim().is_empty());
-    let has_workspace_marker = topic
-        .strip_prefix("herdr workspace [")
-        .and_then(|value| value.strip_suffix(']'))
-        .is_some_and(|value| !value.trim().is_empty());
-    has_tab_suffix && has_workspace_marker
-}
-
-fn resolve_prompt_pane(
-    thread_name: &str,
-    topic: &str,
-    agents: &[AgentSnapshot],
-) -> Result<String, String> {
+fn prompt_surface_markers<'a, 'b>(
+    thread_name: &'a str,
+    topic: &'b str,
+) -> Option<(&'a str, &'b str)> {
     let tab_id = thread_name
         .rsplit_once(" [")
         .and_then(|(_, suffix)| suffix.strip_suffix(']'))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "refused: unmapped Discord thread".to_owned())?;
+        .filter(|value| !value.trim().is_empty())?;
     let workspace_id = topic
         .strip_prefix("herdr workspace [")
         .and_then(|value| value.strip_suffix(']'))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "refused: unmapped Discord channel".to_owned())?;
+        .filter(|value| !value.trim().is_empty())?;
+    Some((tab_id, workspace_id))
+}
+
+fn resolve_prompt_pane(
+    tab_id: &str,
+    workspace_id: &str,
+    agents: &[AgentSnapshot],
+) -> Result<String, String> {
     let matches: Vec<&AgentSnapshot> = agents
         .iter()
         .filter(|agent| agent.tab_id.as_deref() == Some(tab_id))
@@ -181,12 +183,20 @@ async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_list_failure_reply, is_qualifying_prompt_surface, is_thread_channel,
+        agent_list_failure_reply, has_prompt_content, is_thread_channel, prompt_surface_markers,
         resolve_prompt_pane,
     };
     use crate::AgentSnapshot;
     use serde_json::Value;
     use twilight_model::channel::ChannelType;
+
+    #[test]
+    fn empty_prompt_content_is_refused_before_herdr() {
+        let cases = [("", false), ("   \n\t", false), ("prompt", true)];
+        for (content, expected) in cases {
+            assert_eq!(has_prompt_content(content), expected, "content={content:?}");
+        }
+    }
 
     #[test]
     fn only_thread_channel_kinds_are_prompt_surfaces() {
@@ -217,9 +227,8 @@ mod tests {
         ];
         for (thread_name, topic, expected) in cases {
             assert_eq!(
-                is_qualifying_prompt_surface(thread_name, topic),
-                expected,
-                "thread_name={thread_name:?}, topic={topic:?}"
+                prompt_surface_markers(thread_name, topic).is_some(),
+                expected
             );
         }
     }
@@ -257,8 +266,6 @@ mod tests {
             .tab_id
             .as_deref()
             .expect("captured agent has a tab id");
-        let topic = format!("herdr workspace [{workspace_id}]");
-        let qualifying_thread = format!("bridge [{tab_id}]");
         let mut missing_pane = captured[0].clone();
         missing_pane.pane_id = None;
         let mut working = captured[0].clone();
@@ -273,72 +280,58 @@ mod tests {
         ambiguous.push(captured[0].clone());
         let cases = [
             (
-                "missing thread suffix",
-                "bridge",
-                topic.as_str(),
-                captured.clone(),
-                "refused: unmapped Discord thread",
-            ),
-            (
-                "invalid workspace topic",
-                qualifying_thread.as_str(),
-                "workspace",
-                captured.clone(),
-                "refused: unmapped Discord channel",
-            ),
-            (
                 "no matching pane",
-                "bridge [missing-tab]",
-                topic.as_str(),
+                "missing-tab",
+                workspace_id,
                 vec![captured[0].clone()],
                 "refused: unmapped pane",
             ),
             (
                 "ambiguous pane",
-                qualifying_thread.as_str(),
-                topic.as_str(),
+                tab_id,
+                workspace_id,
                 ambiguous,
                 "refused: ambiguous pane mapping",
             ),
             (
                 "matching pane has no pane id",
-                qualifying_thread.as_str(),
-                topic.as_str(),
+                tab_id,
+                workspace_id,
                 vec![missing_pane],
                 "refused: unmapped pane",
             ),
             (
                 "working pane",
-                qualifying_thread.as_str(),
-                topic.as_str(),
+                tab_id,
+                workspace_id,
                 vec![working],
                 "refused: agent state is working",
             ),
             (
                 "blocked pane",
-                qualifying_thread.as_str(),
-                topic.as_str(),
+                tab_id,
+                workspace_id,
                 vec![blocked],
                 "refused: agent state is blocked",
             ),
             (
                 "missing agent status",
-                qualifying_thread.as_str(),
-                topic.as_str(),
+                tab_id,
+                workspace_id,
                 vec![no_status],
                 "refused: agent state is unknown",
             ),
             (
                 "unrecognized agent status",
-                qualifying_thread.as_str(),
-                topic.as_str(),
+                tab_id,
+                workspace_id,
                 vec![unknown],
                 "refused: agent state is paused",
             ),
         ];
-        for (branch, thread_name, topic, agents, expected) in cases {
+        for (branch, tab_id, workspace_id, agents, expected) in cases {
             assert_eq!(
-                resolve_prompt_pane(thread_name, topic, &agents),
+                resolve_prompt_pane(tab_id, workspace_id, &agents),
                 Err(expected.to_owned()),
                 "branch={branch}"
             );
