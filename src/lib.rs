@@ -28,7 +28,7 @@ pub use herdr::{
     tab_list_result,
 };
 pub use live_status::update_live_status;
-pub use prompting::handle_owner_message;
+pub use prompting::{handle_owner_message, should_handle_owner_message};
 pub use readers::{AgentLog, read_agent_log};
 pub use topology::{TopologyRoute, route_topology, sync_topology, workspace_channel_name};
 pub use watcher::{Transition, is_postable_transition, watch_transitions};

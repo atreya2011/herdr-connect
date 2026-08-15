@@ -1,8 +1,13 @@
+//! Owner-message routing is restricted to mapped Discord threads.
+//!
+//! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
+//! message creation responses do not carry the guild identifier required by the gateway handler.
+
 use crate::{AgentSnapshot, agent_prompt, list_agents};
 use std::sync::Arc;
 use twilight_http::Client;
 use twilight_model::{
-    channel::Message,
+    channel::{ChannelType, Message},
     id::{Id, marker::GuildMarker},
 };
 
@@ -17,10 +22,12 @@ pub async fn handle_owner_message(
     owner_id: &str,
     message: Message,
 ) -> Result<(), String> {
-    if owner_id.trim().is_empty()
-        || message.guild_id != Some(guild)
-        || message.author.bot
-        || message.author.id.to_string() != owner_id.trim()
+    if message.guild_id != Some(guild)
+        || !should_handle_owner_message(
+            &message.author.id.to_string(),
+            message.author.bot,
+            owner_id,
+        )
     {
         return Ok(());
     }
@@ -32,6 +39,9 @@ pub async fn handle_owner_message(
         .model()
         .await
         .map_err(|error| error.to_string())?;
+    if !is_thread_channel(thread.kind) {
+        return Ok(());
+    }
     let Some(parent_id) = thread.parent_id else {
         reply(&client, &message, "refused: unmapped Discord thread").await?;
         return Ok(());
@@ -81,6 +91,16 @@ pub async fn handle_owner_message(
     }
 }
 
+#[must_use]
+pub fn should_handle_owner_message(author_id: &str, is_bot: bool, owner_id: &str) -> bool {
+    !is_bot && !owner_id.trim().is_empty() && author_id == owner_id.trim()
+}
+
+#[must_use]
+fn is_thread_channel(kind: ChannelType) -> bool {
+    kind.is_thread()
+}
+
 fn resolve_prompt_pane(
     thread_name: &str,
     topic: &str,
@@ -128,4 +148,25 @@ async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), 
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_thread_channel;
+    use twilight_model::channel::ChannelType;
+
+    #[test]
+    fn only_thread_channel_kinds_are_prompt_surfaces() {
+        let cases = [
+            (ChannelType::GuildText, false),
+            (ChannelType::GuildCategory, false),
+            (ChannelType::GuildForum, false),
+            (ChannelType::AnnouncementThread, true),
+            (ChannelType::PublicThread, true),
+            (ChannelType::PrivateThread, true),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(is_thread_channel(kind), expected);
+        }
+    }
 }
