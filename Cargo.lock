@@ -239,7 +239,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
  "futures-core",
- "futures-sink",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -310,14 +309,12 @@ name = "herdr-connect-rs"
 version = "0.1.0"
 dependencies = [
  "ctor",
- "futures-util",
  "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "serial_test",
  "tokio",
- "tokio-websockets",
  "twilight-gateway",
  "twilight-http",
  "twilight-model",

@@ -1,0 +1,7 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"previous"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/srv/bridge/README.md"}},{"type":"text","text":"previous answer"}]}}
+{"type":"user","message":{"role":"user","content":"current"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/srv/bridge/src/lib.rs"}},{"type":"tool_use","name":"Edit","input":{"path":"/srv/bridge/src/lib.rs"}},{"type":"tool_use","name":"AskUserQuestion","id":"question-1","input":{"questions":[{"question":"First?","options":[{"label":"a"},{"label":"b"}]}]}},{"type":"tool_use","name":"AskUserQuestion","id":"question-2","input":{"questions":[{"question":"Second?","options":[{"label":"a"},{"label":"b"}]}]}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"question-1","content":"done"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"narration"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"final answer"}]}}
