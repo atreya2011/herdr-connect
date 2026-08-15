@@ -1,6 +1,8 @@
 use crate::cards::TransitionMessage;
 use twilight_model::channel::message::{AllowedMentions, Embed};
 
+const DISCORD_NONCE_LENGTH: usize = 16;
+
 /// Delivers one transition message.
 ///
 /// # Errors
@@ -61,12 +63,19 @@ async fn deliver_payload(
             || content.to_owned(),
             |mention| format!("{mention} {content}"),
         );
+    let nonce = format!("{nonce:016x}");
+    debug_assert_eq!(nonce.len(), DISCORD_NONCE_LENGTH);
+    let payload = serde_json::json!({
+        "content": message_content,
+        "embeds": [embed],
+        "allowed_mentions": allowed,
+        "nonce": nonce,
+        "enforce_nonce": true,
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
     client
         .create_message(channel)
-        .content(&message_content)
-        .embeds(std::slice::from_ref(&embed))
-        .allowed_mentions(Some(&allowed))
-        .nonce(nonce)
+        .payload_json(&payload)
         .await
         .map_err(|error| error.to_string())?
         .model()
