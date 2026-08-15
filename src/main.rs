@@ -14,7 +14,7 @@ use twilight_model::id::{
     marker::{GuildMarker, MessageMarker},
 };
 
-type DiscordConnection = (Client, Id<GuildMarker>, String);
+type DiscordConnection = (Arc<Client>, Id<GuildMarker>, String);
 
 fn capture_for(agent: &str, terminal: &str) -> AgentLogCapture {
     let agent_session = AgentSession {
@@ -89,8 +89,7 @@ fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error:
                 ("DISCORD_OWNER_ID", &owner_id),
             ])?;
             let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
-            let client = Client::builder().token(config.token.clone()).build();
-            let gateway_client = Arc::new(Client::builder().token(config.token.clone()).build());
+            let client = Arc::new(Client::builder().token(config.token.clone()).build());
             let (notices_tx, notices_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 while let Ok(notice) = notices_rx.recv() {
@@ -100,7 +99,7 @@ fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error:
             tokio::spawn(drive_gateway_with_owner_prompt(
                 config.token,
                 None,
-                gateway_client,
+                Arc::clone(&client),
                 guild,
                 config.owner_id.clone(),
                 notices_tx,
@@ -180,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let message_id =
                     match deliver_to_route(
-                        client,
+                        client.as_ref(),
                         *guild,
                         owner_id,
                         &route,
