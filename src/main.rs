@@ -120,8 +120,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
     let mut state_change_sequences: HashMap<String, u64> = HashMap::new();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut live_messages: HashMap<String, Id<MessageMarker>> = HashMap::new();
-
     loop {
         let agents = match list_agents() {
             Ok(agents) => agents,
@@ -177,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 };
-                let message_id = match deliver_to_route(
+                if let Err(error) = deliver_to_route(
                     client.as_ref(),
                     *guild,
                     owner_id,
@@ -188,15 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
                 {
-                    Ok(message_id) => message_id,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        previous.insert(terminal.clone(), (status.clone(), agent));
-                        continue;
-                    }
-                };
-                live_messages.insert(terminal.clone(), message_id);
-                let _ = live_messages.get(&terminal);
+                    eprintln!("{error}");
+                    previous.insert(terminal.clone(), (status.clone(), agent));
+                    continue;
+                }
             }
             previous.insert(terminal.clone(), (status.clone(), agent));
         }

@@ -98,12 +98,6 @@ fn request_rpc_result_with_params_and_timeout(
     result.map(|value| value.to_string())
 }
 
-/// Requests Herdr while retaining the historical string-shaped compatibility API.
-#[must_use]
-pub fn request_rpc(method: &str) -> String {
-    request_rpc_result(method).unwrap_or_else(|error| error)
-}
-
 /// Submits one vendor-neutral prompt to a Herdr agent and waits for it to become working.
 ///
 /// A successful result means Herdr observed the working state and accepted the prompt. It does
@@ -128,25 +122,6 @@ pub struct HerdrTab {
     pub tab_id: String,
     pub workspace_id: String,
     pub label: String,
-}
-
-#[must_use]
-pub fn tab_list() -> Vec<HerdrTab> {
-    let Ok(response) = request_rpc_result("tab.list") else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&response) else {
-        return Vec::new();
-    };
-    value
-        .get("tabs")
-        .and_then(Value::as_array)
-        .map(|tabs| {
-            tabs.iter()
-                .filter_map(|t| serde_json::from_value(t.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Lists tabs while preserving Herdr and payload errors.
