@@ -29,6 +29,14 @@ pub fn request_rpc_result(method: &str) -> Result<String, String> {
 ///
 /// Returns connection, timeout, protocol, or Herdr-declared errors.
 pub fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<String, String> {
+    request_rpc_result_with_params_and_timeout(method, params, Duration::from_secs(4))
+}
+
+fn request_rpc_result_with_params_and_timeout(
+    method: &str,
+    params: &Value,
+    read_timeout: Duration,
+) -> Result<String, String> {
     if !params.is_object() {
         return Err("herdr RPC params must be a JSON object".to_owned());
     }
@@ -58,7 +66,7 @@ pub fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<St
             .set_write_timeout(Some(Duration::from_secs(4)))
             .map_err(|e| e.to_string())?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(4)))
+            .set_read_timeout(Some(read_timeout))
             .map_err(|e| e.to_string())?;
         writeln!(stream, "{request}").map_err(|e| e.to_string())?;
         let mut line = String::new();
@@ -102,10 +110,10 @@ pub fn request_rpc_with_params(method: &str, params: &Value) -> String {
     request_rpc_result_with_params(method, params).unwrap_or_else(|error| error)
 }
 
-/// Submits one vendor-neutral prompt to a Herdr agent and waits for its lifecycle settlement.
+/// Submits one vendor-neutral prompt to a Herdr agent and waits for it to become working.
 ///
-/// The returned result is the Herdr RPC result. It is not interpreted as acknowledgement of the
-/// prompt content because Herdr's wait observes lifecycle state rather than turns.
+/// A successful result means Herdr observed the working state and accepted the prompt. It does
+/// not wait for the agent turn to complete.
 ///
 /// # Errors
 ///
@@ -114,9 +122,12 @@ pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
     let params = json!({
         "target": target,
         "text": text,
-        "wait": {},
+        "wait": {
+            "until": ["working"],
+            "timeout_ms": 6000,
+        },
     });
-    request_rpc_result_with_params("agent.prompt", &params)
+    request_rpc_result_with_params_and_timeout("agent.prompt", &params, Duration::from_secs(10))
 }
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 pub struct HerdrTab {
