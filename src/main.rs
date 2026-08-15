@@ -12,6 +12,8 @@ use twilight_model::id::{
     marker::{GuildMarker, MessageMarker},
 };
 
+type DiscordConnection = (Client, Id<GuildMarker>, String);
+
 fn capture_for(agent: &str, terminal: &str) -> AgentLogCapture {
     let agent_session = AgentSession {
         agent: agent.to_owned(),
@@ -47,7 +49,7 @@ async fn deliver_to_route(
     route: &TopologyRoute,
     transition: &Transition,
     capture: &AgentLogCapture,
-) -> Result<(), String> {
+) -> Result<Id<MessageMarker>, String> {
     let messages = create_transition_messages(transition, capture, owner_id);
     let target = sync_topology(
         client,
@@ -59,22 +61,21 @@ async fn deliver_to_route(
     )
     .await
     .map_err(|error| format!("discord topology error: {error}"))?;
+    let mut last_message_id = None;
     for (index, message) in messages.iter().enumerate() {
         let _mention = message.mention.as_deref();
         let nonce = format!("{}-{index}", transition.terminal_id);
-        deliver_transition_card(client, target, message, &nonce)
-            .await
-            .map_err(|error| format!("discord delivery error: {error}"))?;
+        last_message_id = Some(
+            deliver_transition_card(client, target, message, &nonce)
+                .await
+                .map_err(|error| format!("discord delivery error: {error}"))?,
+        );
     }
-    Ok(())
+    last_message_id.ok_or_else(|| "discord delivery produced no messages".to_owned())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let app_config = load_config(&[], &home);
-    let discord = match (
+fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error::Error>> {
+    match (
         std::env::var("DISCORD_TOKEN"),
         std::env::var("DISCORD_GUILD_ID"),
         std::env::var("DISCORD_OWNER_ID"),
@@ -94,10 +95,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
             tokio::spawn(drive_gateway(config.token, None, notices_tx));
-            Some((client, guild, config.owner_id))
+            Ok(Some((client, guild, config.owner_id)))
         }
-        _ => None,
-    };
+        _ => Ok(None),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let app_config = load_config(&[], &home);
+    let discord = discord_connection()?;
     let interval = app_config.poll_interval_ms;
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -153,14 +162,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 };
-                if let Err(error) =
-                    deliver_to_route(client, *guild, owner_id, &route, &transition, &capture).await
-                {
-                    eprintln!("{error}");
-                    previous.insert(terminal.clone(), (status.clone(), agent));
-                    continue;
-                }
-                live_messages.insert(terminal.clone(), Id::new(0));
+                let message_id =
+                    match deliver_to_route(client, *guild, owner_id, &route, &transition, &capture)
+                        .await
+                    {
+                        Ok(message_id) => message_id,
+                        Err(error) => {
+                            eprintln!("{error}");
+                            previous.insert(terminal.clone(), (status.clone(), agent));
+                            continue;
+                        }
+                    };
+                live_messages.insert(terminal.clone(), message_id);
                 let _ = live_messages.get(&terminal);
             }
             previous.insert(terminal.clone(), (status.clone(), agent));

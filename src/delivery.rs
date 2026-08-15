@@ -11,7 +11,7 @@ pub async fn deliver_transition(
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
     content: &str,
     nonce: &str,
-) -> Result<(), String> {
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
     deliver_payload(client, channel, content, None, nonce).await
 }
 
@@ -25,7 +25,7 @@ pub async fn deliver_transition_card(
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
     message: &TransitionMessage,
     nonce: &str,
-) -> Result<(), String> {
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
     deliver_payload(client, channel, &message.description, Some(message), nonce).await
 }
 
@@ -35,7 +35,7 @@ async fn deliver_payload(
     content: &str,
     card: Option<&TransitionMessage>,
     nonce: &str,
-) -> Result<(), String> {
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
     let nonce = nonce.bytes().fold(0_u64, |value, byte| {
         value.wrapping_mul(257).wrapping_add(u64::from(byte))
     });
@@ -68,6 +68,9 @@ async fn deliver_payload(
         .allowed_mentions(Some(&allowed))
         .nonce(nonce)
         .await
-        .map(|_| ())
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map(|message| message.id)
         .map_err(|error| error.to_string())
 }

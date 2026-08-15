@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use herdr_connect_rs::{deliver_transition, sync_topology, update_live_status};
+use herdr_connect_rs::{
+    TransitionMessage, deliver_transition, deliver_transition_card, sync_topology,
+    update_live_status,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use twilight_http::Client;
@@ -239,24 +243,32 @@ async fn refuses_duplicate_channels_carrying_one_workspace_topic_marker() {
 }
 
 #[tokio::test]
-async fn keeps_the_name_of_the_channel_identified_by_topic() {
-    let stand = stand(CHANNEL).await;
-    let _ = sync_topology(
-        &client(&stand.address),
-        Id::new(1),
-        "ws",
-        "changed-workspace-ws",
-        "tab [tab-7]",
-        "tab-7",
-    )
-    .await;
-    let calls = stand.calls.lock().unwrap().clone();
-    assert!(
-        !calls
-            .iter()
-            .any(|call| call == "PATCH /api/v10/channels/100"),
-        "renamed a workspace channel identified by its topic; calls: {calls:?}"
-    );
+async fn reconciles_topic_matched_channel_name_only_when_needed() {
+    for (channel_name, should_rename) in [
+        ("changed-workspace-ws", true),
+        ("herdr-workspace-ws", false),
+    ] {
+        let stand = stand(CHANNEL).await;
+        let _ = sync_topology(
+            &client(&stand.address),
+            Id::new(1),
+            "ws",
+            channel_name,
+            "tab [tab-7]",
+            "tab-7",
+        )
+        .await;
+        let calls = stand.calls.lock().unwrap().clone();
+        let bodies = stand.bodies.lock().unwrap().clone();
+        let renamed = calls.iter().zip(&bodies).any(|(call, body)| {
+            call == "PATCH /api/v10/channels/100"
+                && body.contains(&format!("\"name\":\"{channel_name}\""))
+        });
+        assert_eq!(
+            renamed, should_rename,
+            "calls: {calls:?} bodies: {bodies:?}"
+        );
+    }
 }
 
 // W2: src/lib.rs:770 — PARITY 20/21/22: the tab is created as a guild channel, never as a thread.
@@ -314,4 +326,25 @@ async fn w4_delivery_carries_the_embed_and_owner_mention() {
         body.contains("embeds") && body.contains("allowed_mentions"),
         "delivered body was: {body}"
     );
+}
+
+#[tokio::test]
+async fn successful_delivery_returns_the_real_id_for_live_storage() {
+    let stand = stand(CHANNEL).await;
+    let posted = deliver_transition_card(
+        &client(&stand.address),
+        Id::new(100),
+        &TransitionMessage {
+            description: "delivered".to_owned(),
+            color: 0x0057_f287,
+            mention: None,
+        },
+        "t1-0",
+    )
+    .await
+    .expect("successful delivery must return its posted message id");
+    let mut live_messages = HashMap::new();
+    live_messages.insert("t1".to_owned(), posted);
+    assert_eq!(live_messages.get("t1"), Some(&Id::new(200)));
+    assert_ne!(posted.get(), 0);
 }
