@@ -100,7 +100,9 @@ pub fn workspace_channel_name(workspace_id: &str, cwds: &[String]) -> Result<Str
         if !cwd.is_empty() {
             let count = counts.entry(cwd).or_insert(0usize);
             *count += 1;
-            if *count > common_count {
+            if *count > common_count
+                || (*count == common_count && common.is_none_or(|current| cwd < current))
+            {
                 common = Some(cwd);
                 common_count = *count;
             }
@@ -172,17 +174,16 @@ pub async fn sync_topology(
         ));
     }
     let topic = format!("herdr workspace [{workspace_id}]");
-    let workspace_channel = if let Some(channel) = channels
+    let matching_channels: Vec<_> = channels
         .iter()
-        .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
-    {
-        if channel.name.as_deref() != Some(channel_name) {
-            client
-                .update_channel(channel.id)
-                .name(channel_name)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        .filter(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+        .collect();
+    if matching_channels.len() > 1 {
+        return Err(format!(
+            "Discord topology has duplicate channels for workspace {workspace_id}"
+        ));
+    }
+    let workspace_channel = if let Some(channel) = matching_channels.first() {
         channel.id
     } else {
         client

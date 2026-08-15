@@ -7,6 +7,10 @@ use twilight_http::Client;
 use twilight_model::id::Id;
 
 const CHANNEL: &str = r#"{"id":"100","type":0,"guild_id":"1","name":"herdr-workspace-ws","topic":"herdr workspace [ws]"}"#;
+const DUPLICATE_CHANNELS: &str = concat!(
+    r#"{"id":"100","type":0,"guild_id":"1","name":"first","topic":"herdr workspace [ws]"},"#,
+    r#"{"id":"101","type":0,"guild_id":"1","name":"second","topic":"herdr workspace [ws]"}"#,
+);
 const MESSAGE: &str = r#"{"id":"200","type":0,"channel_id":"100","content":"x","timestamp":"2024-01-01T00:00:00.000000+00:00","author":{"id":"9","username":"bot","discriminator":"0001","avatar":null},"attachments":[],"embeds":[],"mentions":[],"mention_roles":[],"mention_everyone":false,"pinned":false,"tts":false,"edited_timestamp":null}"#;
 const EMPTY_THREADS: &str = r#"{"threads":[],"members":[]}"#;
 const ARCHIVED_TAB: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
@@ -178,6 +182,45 @@ async fn w1_reuses_the_channel_carrying_the_workspace_topic_marker() {
             .any(|(call, body)| call == "POST /api/v10/guilds/1/channels"
                 && body.contains("herdr workspace [ws]")),
         "recreated a workspace channel that already exists; calls: {calls:?} bodies: {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn refuses_duplicate_channels_carrying_one_workspace_topic_marker() {
+    let stand = stand(DUPLICATE_CHANNELS).await;
+    let result = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "workspace-ws",
+        "tab [tab-7]",
+        "tab-7",
+    )
+    .await;
+    assert_eq!(
+        result.unwrap_err(),
+        "Discord topology has duplicate channels for workspace ws"
+    );
+    let calls = stand.calls.lock().unwrap().clone();
+    assert_eq!(calls, ["GET /api/v10/guilds/1/channels"]);
+}
+
+#[tokio::test]
+async fn keeps_the_name_of_the_channel_identified_by_topic() {
+    let stand = stand(CHANNEL).await;
+    let _ = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "changed-workspace-ws",
+        "tab [tab-7]",
+        "tab-7",
+    )
+    .await;
+    let calls = stand.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|call| call == "PATCH /api/v10/channels/100"),
+        "renamed a workspace channel identified by its topic; calls: {calls:?}"
     );
 }
 

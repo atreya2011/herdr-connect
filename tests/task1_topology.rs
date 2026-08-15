@@ -1,4 +1,6 @@
-use herdr_connect_rs::{AgentSnapshot, HerdrTab, format_thread_name, route_topology};
+use herdr_connect_rs::{
+    AgentSnapshot, HerdrTab, format_thread_name, route_topology, workspace_channel_name,
+};
 use serde_json::Value;
 
 fn fixture_agents() -> Vec<AgentSnapshot> {
@@ -43,4 +45,10 @@ fn preserves_the_reference_numeric_label_error() {
         format_thread_name("7", "", "w1:t7").unwrap_err(),
         "herdr tab w1:t7 has numeric label 7 without a terminal title"
     );
+}
+
+#[test]
+fn breaks_workspace_cwd_plurality_ties_lexicographically() {
+    let cwds = vec!["/repo/zeta".to_owned(), "/repo/alpha".to_owned()];
+    assert_eq!(workspace_channel_name("ws", &cwds).unwrap(), "alpha-ws");
 }
