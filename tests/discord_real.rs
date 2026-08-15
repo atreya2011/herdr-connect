@@ -87,7 +87,8 @@ async fn real_guild_topology_create_and_reuse_contract() {
         "tab [testrun-tab]",
         "testrun-tab",
     )
-    .await;
+    .await
+    .unwrap();
     let workspace = client
         .guild_channels(guild)
         .await
@@ -99,6 +100,21 @@ async fn real_guild_topology_create_and_reuse_contract() {
         .find(|item| item.topic.as_deref() == Some("herdr workspace [testrun-workspace]"))
         .unwrap();
     client.delete_channel(workspace.id).await.unwrap();
+    let remaining = client
+        .guild_channels(guild)
+        .await
+        .unwrap()
+        .model()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.name
+                .as_deref()
+                .is_some_and(|name| name.starts_with(PREFIX))
+        })
+        .count();
+    assert_eq!(remaining, 0, "named zero-leftover check");
     let _ = channel;
 }
 
