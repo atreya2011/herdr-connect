@@ -1,9 +1,0 @@
-{"type":"user","message":{"role":"user","content":"new"}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"AskUserQuestion","id":"question-1","input":{"questions":[{"question":"Continue?","options":[{"label":"yes"}]}]}}],"usage":{"input_tokens":10,"output_tokens":5}}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"question-1","content":"yes"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"denied-1","input":{}}]}}
-{"type":"user","toolDenialKind":"permission-rule","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"denied-1","is_error":true,"content":"permission denied"}]}}
-{"type":"assistant","message":{"role":"assistant","id":"msg-read-1","content":[{"type":"thinking","text":"considering the file read"}],"usage":{"input_tokens":20,"output_tokens":4,"cache_read_input_tokens":3}}}
-{"type":"assistant","message":{"role":"assistant","id":"msg-read-1","content":[{"type":"tool_use","name":"Read","id":"failed-1","input":{}}],"usage":{"input_tokens":20,"output_tokens":9,"cache_read_input_tokens":3}}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"failed-1","is_error":true,"content":"file not found"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answered final"}],"usage":{"input_tokens":30,"output_tokens":12,"cache_creation_input_tokens":7}}}

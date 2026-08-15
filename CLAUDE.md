@@ -15,7 +15,7 @@ Never print or commit the env file's contents. Real-guild tests create only `tes
 ## Laws (locked by the owner)
 
 - **Red-green**: a failing test is written before any behavior. Tests are the contract — assertions, inputs, expected values, and fixtures are frozen; adapting a test to force green is forbidden. A genuinely wrong test stops work and gets reported, not edited.
-- **Real services only**: no mocked, stubbed, faked, or emulated service clients or responses. Discord tests run against the real guild; socket tests run a real in-process Unix socket server; vendor-log tests use committed fixtures mirroring real on-disk records.
+- **Real services only**: no mocked, stubbed, faked, or emulated service clients or responses, and no test-run servers posing as a service. Socket tests connect to the real running herdr socket. Discord tests run against the real guild. Vendor-log tests use committed fixtures mirroring real on-disk records.
 - **Barebones**: overengineering is evil. No abstractions beyond what tests force, no speculative configurability.
 - **No fallbacks**: mandatory behavior that fails must fail fast through the error surface. Placeholder values, invented defaults, and silent recovery are forbidden.
 - **No reinvented wheels**: use battle-tested crates where they replace real hand-rolled complexity — and only then. A crate earns its place; speculative dependencies are overengineering.

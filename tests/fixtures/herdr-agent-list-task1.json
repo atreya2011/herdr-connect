@@ -1,1 +1,0 @@
-{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"done","cwd":"/home/user/project-4","focused":false,"foreground_cwd":"/home/user/project-4","pane_id":"wC:pQ","revision":6,"state_change_seq":5247,"tab_id":"wC:tG","terminal_id":"term_657e35d8c8ea11","terminal_title":"agent-0","terminal_title_stripped":"agent-0","workspace_id":"wC"}],"type":"agent_list"}}

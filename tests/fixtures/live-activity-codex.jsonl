@@ -1,3 +1,0 @@
-{"type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"ship the console feed","status":"active"}}}
-{"type":"response_item","payload":{"type":"function_call","name":"exec_command"}}
-{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec_command"}}
