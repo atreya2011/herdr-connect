@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::oneshot;
-
 const TOKEN_BYTES: usize = 24;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,29 +18,20 @@ pub struct ApprovalRequest {
     pub tool: String,
     pub channel_id: u64,
 }
-
 #[derive(Debug)]
 pub struct IssuedApproval {
     pub token: String,
     pub receiver: oneshot::Receiver<Decision>,
     pub expiry: Instant,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EntryState {
-    Pending,
-}
-
 #[derive(Debug)]
 struct Entry {
     request: ApprovalRequest,
     created_at: Instant,
     expiry: Instant,
-    state: EntryState,
     hook_alive: Arc<AtomicBool>,
     sender: oneshot::Sender<Decision>,
 }
-
 #[derive(Debug, Eq, PartialEq)]
 pub enum ResolveError {
     UnknownOrExpired,
@@ -49,12 +39,10 @@ pub enum ResolveError {
     WrongSession,
     WrongChannel,
 }
-
 #[derive(Default, Debug)]
 pub struct InteractionRegistry {
     entries: Mutex<HashMap<String, Entry>>,
 }
-
 impl InteractionRegistry {
     /// Issues an opaque token backed by the operating system random source.
     ///
@@ -69,7 +57,6 @@ impl InteractionRegistry {
     ) -> Result<IssuedApproval, String> {
         self.issue_with_liveness(request, created_at, expiry, Arc::new(AtomicBool::new(true)))
     }
-
     pub(crate) fn issue_with_liveness(
         &self,
         request: ApprovalRequest,
@@ -87,7 +74,6 @@ impl InteractionRegistry {
         }
         self.issue_with_token_and_liveness(token, request, created_at, expiry, hook_alive)
     }
-
     /// Inserts a supplied token for deterministic state-machine tests.
     ///
     /// # Errors
@@ -108,7 +94,6 @@ impl InteractionRegistry {
             Arc::new(AtomicBool::new(true)),
         )
     }
-
     pub(crate) fn issue_with_token_and_liveness(
         &self,
         token: String,
@@ -134,7 +119,6 @@ impl InteractionRegistry {
                 request,
                 created_at,
                 expiry,
-                state: EntryState::Pending,
                 hook_alive,
                 sender,
             },
@@ -146,7 +130,6 @@ impl InteractionRegistry {
             expiry,
         })
     }
-
     /// Resolves one pending token exactly once.
     ///
     /// # Errors
@@ -171,7 +154,6 @@ impl InteractionRegistry {
         };
         if now < entry.created_at
             || now >= entry.expiry
-            || entry.state != EntryState::Pending
             || !entry.hook_alive.load(Ordering::Acquire)
         {
             return Err(ResolveError::UnknownOrExpired);
@@ -196,18 +178,14 @@ impl InteractionRegistry {
         let _ = sender.send(decision);
         Ok(())
     }
-
     pub fn session_id(&self, token: &str) -> Option<String> {
         self.entries
             .lock()
             .ok()?
             .get(token)
-            .filter(|entry| {
-                entry.state == EntryState::Pending && entry.hook_alive.load(Ordering::Acquire)
-            })
+            .filter(|entry| entry.hook_alive.load(Ordering::Acquire))
             .map(|entry| entry.request.session_id.clone())
     }
-
     pub fn expire(&self, token: &str, now: Instant) -> bool {
         let Ok(mut entries) = self.entries.lock() else {
             return false;
@@ -218,7 +196,6 @@ impl InteractionRegistry {
         }
         expired
     }
-
     pub fn remove(&self, token: &str) -> bool {
         self.entries
             .lock()
@@ -226,7 +203,6 @@ impl InteractionRegistry {
             .and_then(|mut entries| entries.remove(token))
             .is_some()
     }
-
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.lock().map_or(0, |entries| entries.len())
@@ -237,7 +213,6 @@ impl InteractionRegistry {
         self.len() == 0
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::{ApprovalRequest, InteractionRegistry, ResolveError};
@@ -245,7 +220,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-
     fn request(channel_id: u64) -> ApprovalRequest {
         ApprovalRequest {
             owner_id: "owner".to_owned(),
@@ -255,7 +229,6 @@ mod tests {
             channel_id,
         }
     }
-
     #[test]
     fn registry_state_machine_rejects_invalid_taps() {
         let now = Instant::now();
@@ -305,7 +278,6 @@ mod tests {
             );
         }
     }
-
     #[tokio::test]
     async fn registry_issues_and_resolves_exactly_once() {
         let now = Instant::now();
@@ -346,7 +318,6 @@ mod tests {
         );
         assert!(registry.is_empty());
     }
-
     #[test]
     fn expired_token_is_removed_and_rejected() {
         let now = Instant::now();
@@ -373,7 +344,6 @@ mod tests {
             Err(ResolveError::UnknownOrExpired)
         );
     }
-
     #[test]
     fn disconnected_hook_cannot_resolve_a_pending_token() {
         let now = Instant::now();
@@ -390,7 +360,6 @@ mod tests {
             .expect("issue token");
 
         hook_alive.store(false, Ordering::Release);
-
         assert_eq!(
             registry.resolve(&issued.token, "owner", "session", 7, Decision::allow(), now,),
             Err(ResolveError::UnknownOrExpired)

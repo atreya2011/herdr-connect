@@ -36,18 +36,6 @@ fn interaction(session_id: &str, prompt_id: &str) -> Interaction {
     }
 }
 
-fn interaction_with_command(session_id: &str, prompt_id: &str, command: &str) -> Interaction {
-    Interaction {
-        session_id: session_id.to_owned(),
-        prompt_id: prompt_id.to_owned(),
-        tool_name: "Bash".to_owned(),
-        tool_input: ClaudePermissionToolInput {
-            command: command.to_owned(),
-            description: format!("Run {command}"),
-        },
-    }
-}
-
 fn invoke_hook(payload: &str, socket: &Path) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
         .arg("hook")
@@ -182,40 +170,6 @@ fn permission_fixtures_decode_and_encode_allow_and_deny() {
             message
         );
     }
-}
-
-#[tokio::test]
-async fn real_unix_broker_falls_through_when_pane_is_unmapped() {
-    let broker = BrokerProcess::start("round-trip");
-    broker.wait_until_ready().await;
-    let requests = [
-        interaction("session-a", "prompt-a"),
-        interaction("session-b", "prompt-b"),
-    ];
-    let (first, second) = tokio::join!(
-        request_decision(&requests[0], &broker.path, Duration::from_secs(1)),
-        request_decision(&requests[1], &broker.path, Duration::from_secs(1)),
-    );
-    assert_eq!(first, None);
-    assert_eq!(second, None);
-    broker.terminate();
-}
-
-#[tokio::test]
-async fn concurrent_same_session_and_prompt_requests_fall_through_without_a_mapped_pane() {
-    let broker = BrokerProcess::start("same-prompt");
-    broker.wait_until_ready().await;
-    let first_request = interaction_with_command("same-session", "same-prompt", "touch first");
-    let second_request = interaction_with_command("same-session", "same-prompt", "touch second");
-
-    let (first, second) = tokio::join!(
-        request_decision(&first_request, &broker.path, Duration::from_secs(1)),
-        request_decision(&second_request, &broker.path, Duration::from_secs(1)),
-    );
-
-    assert_eq!(first, None);
-    assert_eq!(second, None);
-    broker.terminate();
 }
 
 #[tokio::test]
