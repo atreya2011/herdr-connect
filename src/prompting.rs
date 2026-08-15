@@ -7,6 +7,10 @@ use twilight_model::{
 };
 
 /// Handles one Discord owner message after gateway-level filtering.
+///
+/// # Errors
+///
+/// Returns Discord, Herdr, or task-dispatch errors.
 pub async fn handle_owner_message(
     client: Arc<Client>,
     guild: Id<GuildMarker>,
