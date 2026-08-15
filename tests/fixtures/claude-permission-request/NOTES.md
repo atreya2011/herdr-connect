@@ -6,10 +6,12 @@ These fixtures are sanitized copies of live Claude 2.1.x Haiku PermissionRequest
 
 - CORRELATION: The payload carries `session_id` and `prompt_id`. It does not carry `tool_use_id`. The broker must correlate on `(session_id, prompt_id)` and must not assume that `tool_use_id` exists for `PermissionRequest`.
 - `hook_event_name` is `PermissionRequest`.
-- DECISION SUPPRESSION: The allow-variant hook emitted the exact documented decision JSON `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":"allow"}}`. The interactive TUI dialog still rendered, and the tool did not run.
-- The default capture also fell through to the interactive dialog. The captures provide no evidence of a hook timeout; they do provide evidence that the interactive flow was not suppressed.
-- The observed allow result differs from the documented interactive outcome. Two explanations remain undistinguished without Anthropic's exact accepted schema: `allow` may not be honored in the interactive TUI, or the accepted field/shape may differ subtly from the documented shape and the output fell through under the documented malformed-output rule.
+- `permission_mode` is `default`.
 
-## Repro-gate
+## Decision and suppression
 
-This is a repro-gate for tasks 4/5. The hook-broker approval design depends on interactive suppression working, and that behavior is currently UNPROVEN on this Claude version.
+- ACCEPTED SCHEMA (Claude 2.1.233): The allow decision is `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`. The deny decision is `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"..."}}}`. `decision` is an object with a `behavior` field, not a bare string.
+- SUPPRESSION PROVEN: A well-formed allow decision returned synchronously from the `PermissionRequest` hook suppresses the interactive TUI dialog and the tool executes with no prompt. This was live-verified on Claude 2.1.233 Haiku under Herdr: the `touch` command ran, no dialog rendered, and the agent settled in the done state.
+- GOTCHA: A malformed decision such as `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":"allow"}}` is discarded and the flow falls through to the interactive dialog under the documented malformed-output rule. The broker MUST emit the object form.
+
+- Remaining task-4 unknowns are hook-timeout behavior, which is undetermined, and whether a running session adopts a newly added hook.
