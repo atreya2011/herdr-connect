@@ -16,8 +16,7 @@ const EMPTY_THREADS: &str = r#"{"threads":[],"members":[]}"#;
 const ARCHIVED_TAB: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
 const DUPLICATE_TAB_THREADS: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"previous-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}},{"id":"102","type":11,"guild_id":"1","parent_id":"100","name":"another-label [tab-7]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":false}"#;
 const STALLED_ARCHIVED_TAB: &str = r#"{"threads":[{"id":"101","type":11,"guild_id":"1","parent_id":"100","name":"other [tab-8]","thread_metadata":{"archived":true,"auto_archive_duration":1440,"archive_timestamp":"2024-01-01T00:00:00.000000+00:00","locked":false}}],"members":[],"has_more":true}"#;
-const EMPTY_ARCHIVED_PAGE_WITH_MORE: &str =
-    r#"{"threads":[],"members":[],"has_more":true}"#;
+const EMPTY_ARCHIVED_PAGE_WITH_MORE: &str = r#"{"threads":[],"members":[],"has_more":true}"#;
 
 /// Records every call the code under test makes and answers it with a canned Discord payload.
 struct Stand {
@@ -253,7 +252,9 @@ async fn keeps_the_name_of_the_channel_identified_by_topic() {
     .await;
     let calls = stand.calls.lock().unwrap().clone();
     assert!(
-        !calls.iter().any(|call| call == "PATCH /api/v10/channels/100"),
+        !calls
+            .iter()
+            .any(|call| call == "PATCH /api/v10/channels/100"),
         "renamed a workspace channel identified by its topic; calls: {calls:?}"
     );
 }

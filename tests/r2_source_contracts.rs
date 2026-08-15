@@ -29,7 +29,5 @@ fn delivery_errors_advance_the_recorded_transition_state() {
     let main = fs::read_to_string("src/main.rs").unwrap();
     let delivery = &main[main.find("deliver_to_route(client").unwrap()..];
     let error_branch = &delivery[..delivery.find("continue;").unwrap()];
-    assert!(error_branch.contains(
-        "previous.insert(terminal.clone(), (status.clone(), agent));"
-    ));
+    assert!(error_branch.contains("previous.insert(terminal.clone(), (status.clone(), agent));"));
 }

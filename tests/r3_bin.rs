@@ -14,10 +14,13 @@ fn serve(name: &str, result: &'static str) -> std::path::PathBuf {
             if reader.read_line(&mut request).is_err() || request.is_empty() {
                 continue;
             }
-            let id = serde_json::from_str::<serde_json::Value>(&request)
-                .ok()
-                .and_then(|value| value["id"].as_str().map(str::to_owned))
-                .unwrap_or_default();
+            let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+            let id = request["id"].as_str().unwrap_or_default();
+            let result = if request["method"] == "tab.list" {
+                r#"{"tabs":[]}"#
+            } else {
+                result
+            };
             let mut stream = stream;
             let _ =
                 stream.write_all(format!("{{\"id\":\"{id}\",\"result\":{result}}}\n").as_bytes());
@@ -139,7 +142,9 @@ fn failed_transition_is_not_retried_on_every_poll() {
     let (_stdout, stderr, _status) = run(&socket, false, 3_400);
     let _ = std::fs::remove_file(&socket);
     assert_eq!(
-        stderr.matches("herdr topology error: agent t1 has no tab id").count(),
+        stderr
+            .matches("herdr topology error: agent t1 has no tab id")
+            .count(),
         1,
         "failed transition was retried: {stderr}"
     );

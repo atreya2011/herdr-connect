@@ -120,10 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
-        let current: HashSet<String> = agents
-            .iter()
-            .map(|snapshot| snapshot.terminal_id.clone())
-            .collect();
+        let current: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
         previous.retain(|terminal, _| current.contains(terminal));
         for snapshot in &agents {
             let agent = snapshot.agent.clone();
