@@ -60,6 +60,68 @@ fn serve_capturing_request(
     (path, receiver)
 }
 
+/// Captures one request and returns a response without changing its envelope id.
+fn serve_fixed_response(name: &str, response: Value) -> (std::path::PathBuf, Receiver<Value>) {
+    let path = std::env::temp_dir().join(format!("r3-rpc-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        sender.send(request).unwrap();
+        let mut stream = stream;
+        writeln!(stream, "{response}").unwrap();
+        stream.flush().unwrap();
+    });
+    (path, receiver)
+}
+
+/// Validates the installed Herdr agent.prompt wait shape before returning its result.
+fn serve_prompt_wait_contract(name: &str) -> (std::path::PathBuf, Receiver<Value>) {
+    let path = std::env::temp_dir().join(format!("r3-rpc-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let request: Value = serde_json::from_str(&request_line).unwrap();
+        sender.send(request.clone()).unwrap();
+        let response = if request["params"]["wait"] == true {
+            json!({
+                "id": request["id"],
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: invalid type: boolean `true`, expected struct AgentPromptWaitOptions at line 1 column 137",
+                },
+            })
+        } else if request["params"]["wait"].is_object() {
+            json!({
+                "id": request["id"],
+                "result": {"status": "agent_prompted"},
+            })
+        } else {
+            json!({
+                "id": request["id"],
+                "error": {
+                    "code": "invalid_request",
+                    "message": "agent.prompt wait must be an object",
+                },
+            })
+        };
+        let mut stream = stream;
+        writeln!(stream, "{response}").unwrap();
+        stream.flush().unwrap();
+    });
+    (path, receiver)
+}
+
 #[test]
 #[serial]
 fn t1_captured_herdr_responses_preserve_topology_identity() {
@@ -207,7 +269,63 @@ fn agent_prompt_sends_wait_and_surfaces_stalled_error() {
     assert_eq!(request["method"], "agent.prompt");
     assert_eq!(
         request["params"],
-        json!({"target": "pane-7", "text": "inspect the failing test", "wait": true})
+        json!({"target": "pane-7", "text": "inspect the failing test", "wait": {}})
     );
     assert!(error.contains("agent_prompt_stalled"), "{error}");
+}
+
+#[test]
+#[serial]
+fn agent_prompt_uses_wait_options_object() {
+    let (socket, requests) = serve_prompt_wait_contract("prompt-wait-shape");
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &socket) };
+
+    let result = agent_prompt("pane-7", "inspect the failing test");
+    let request = requests.recv().unwrap();
+    let _ = std::fs::remove_file(&socket);
+
+    assert_eq!(request["method"], "agent.prompt");
+    assert_eq!(request["params"]["wait"], json!({}));
+    assert_eq!(result.unwrap(), r#"{"status":"agent_prompted"}"#);
+}
+
+#[test]
+#[serial]
+fn agent_prompt_surfaces_error_with_mismatched_empty_id() {
+    let (socket, requests) = serve_fixed_response(
+        "prompt-error-empty-id",
+        json!({
+            "id": "",
+            "error": {
+                "code": "invalid_request",
+                "message": "prompt envelope sentinel",
+            },
+        }),
+    );
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &socket) };
+
+    let error = agent_prompt("pane-7", "inspect the failing test").unwrap_err();
+    let _ = requests.recv().unwrap();
+    let _ = std::fs::remove_file(&socket);
+
+    assert!(error.contains("invalid_request"), "{error}");
+    assert!(error.contains("prompt envelope sentinel"), "{error}");
+}
+
+#[test]
+#[serial]
+fn request_rpc_result_with_params_reports_both_mismatched_ids() {
+    let (socket, requests) = serve_fixed_response(
+        "response-id-mismatch",
+        json!({"id": "returned-id", "result": {"accepted": true}}),
+    );
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &socket) };
+
+    let error = request_rpc_result_with_params("custom.method", &json!({})).unwrap_err();
+    let request = requests.recv().unwrap();
+    let _ = std::fs::remove_file(&socket);
+    let expected_id = request["id"].as_str().unwrap();
+
+    assert!(error.contains(expected_id), "{error}");
+    assert!(error.contains("returned-id"), "{error}");
 }

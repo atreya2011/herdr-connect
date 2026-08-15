@@ -66,9 +66,6 @@ pub fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<St
             .read_line(&mut line)
             .map_err(|e| e.to_string())?;
         let response: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-        if response.get("id").and_then(Value::as_str) != Some(&id) {
-            return Err(format!("herdr returned response id for request {id}"));
-        }
         if let Some(error) = response.get("error") {
             return Err(format!(
                 "herdr {method} failed: {} {}",
@@ -77,6 +74,15 @@ pub fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<St
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
+            ));
+        }
+        let returned_id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if returned_id != id {
+            return Err(format!(
+                "herdr returned response id {returned_id} for request {id}"
             ));
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
@@ -108,7 +114,7 @@ pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
     let params = json!({
         "target": target,
         "text": text,
-        "wait": true,
+        "wait": {},
     });
     request_rpc_result_with_params("agent.prompt", &params)
 }
