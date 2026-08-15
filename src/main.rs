@@ -1,8 +1,8 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, TopologyRoute, Transition,
-    create_transition_messages, deliver_transition_card, drive_gateway_with_owner_prompt,
-    is_postable_transition, list_agents, load_config, load_discord_config, route_topology,
-    sync_topology, tab_list_result, transition_card_nonce,
+    create_transition_messages, deliver_transition_card, drive_gateway_with_components,
+    hook_timeout, is_postable_transition, list_agents, load_config, load_discord_config,
+    route_topology, sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
     PermissionResponder, decode_claude_permission_request, encode_claude_decision,
@@ -20,8 +20,14 @@ use twilight_model::id::{
     marker::{GuildMarker, MessageMarker},
 };
 
-type DiscordConnection = (Arc<Client>, Id<GuildMarker>, String);
+type DiscordConnection = (
+    Arc<Client>,
+    Id<GuildMarker>,
+    String,
+    Arc<PermissionResponder>,
+);
 type GatewayTask = tokio::task::JoinHandle<Result<(), String>>;
+type BrokerTask = tokio::task::JoinHandle<Result<(), String>>;
 
 async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), String> {
     match gateway {
@@ -30,6 +36,22 @@ async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), Strin
             .map_err(|error| format!("discord gateway task failed: {error}"))?,
         None => std::future::pending().await,
     }
+}
+
+async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> {
+    match broker {
+        Some(broker) => broker
+            .await
+            .map_err(|error| format!("permission broker task failed: {error}"))?,
+        None => std::future::pending().await,
+    }
+}
+
+fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
+    Arc::new(move |interaction| {
+        let responder = Arc::clone(&responder);
+        Box::pin(async move { handle_component(responder, interaction).await })
+    })
 }
 
 fn capture_for(snapshot: &AgentSnapshot) -> Result<AgentLogCapture, String> {
@@ -270,15 +292,21 @@ fn discord_connection()
                     eprintln!("{notice}");
                 }
             });
-            let gateway = tokio::spawn(drive_gateway_with_owner_prompt(
+            let responder = Arc::new(PermissionResponder::new(
+                Arc::clone(&client),
+                guild,
+                config.owner_id.clone(),
+            ));
+            let gateway = tokio::spawn(drive_gateway_with_components(
                 config.token,
                 None,
                 Arc::clone(&client),
                 guild,
                 config.owner_id.clone(),
                 notices_tx,
+                component_handler(Arc::clone(&responder)),
             ));
-            Ok(Some(((client, guild, config.owner_id), gateway)))
+            Ok(Some(((client, guild, config.owner_id, responder), gateway)))
         }
         _ => Ok(None),
     }
@@ -309,9 +337,7 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "hook requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>",
         )
     })?;
-    let Some(decision) =
-        request_decision(&interaction, &socket_path, Duration::from_secs(30)).await
-    else {
+    let Some(decision) = request_decision(&interaction, &socket_path, hook_timeout()).await else {
         return Ok(());
     };
     let output = encode_claude_decision(&decision)?;
@@ -324,16 +350,18 @@ async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         .ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
     let token = std::env::var("DISCORD_TOKEN")?;
     let guild_id = std::env::var("DISCORD_GUILD_ID")?;
-    let owner_id = std::env::var("DISCORD_OWNER_ID").unwrap_or_default();
-    if token.trim().is_empty() || guild_id.trim().is_empty() {
-        return Err("broker requires non-blank DISCORD_TOKEN and DISCORD_GUILD_ID".into());
-    }
-    let guild = Id::<GuildMarker>::new(guild_id.trim().parse()?);
-    let client = Arc::new(Client::builder().token(token.clone()).build());
+    let owner_id = std::env::var("DISCORD_OWNER_ID")?;
+    let config = load_discord_config(&[
+        ("DISCORD_TOKEN", &token),
+        ("DISCORD_GUILD_ID", &guild_id),
+        ("DISCORD_OWNER_ID", &owner_id),
+    ])?;
+    let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
+    let client = Arc::new(Client::builder().token(config.token.clone()).build());
     let responder = Arc::new(PermissionResponder::new(
         Arc::clone(&client),
         guild,
-        owner_id.trim().to_owned(),
+        config.owner_id.clone(),
     ));
     let (notices_tx, notices_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -341,13 +369,14 @@ async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
             eprintln!("{notice}");
         }
     });
-    let component_responder = Arc::clone(&responder);
-    let components: ComponentHandler = Arc::new(move |interaction| {
-        let responder = Arc::clone(&component_responder);
-        Box::pin(async move { handle_component(responder, interaction).await })
-    });
-    let gateway = tokio::spawn(herdr_connect_rs::drive_gateway_with_components(
-        token, None, client, guild, owner_id, notices_tx, components,
+    let gateway = tokio::spawn(drive_gateway_with_components(
+        config.token,
+        None,
+        client,
+        guild,
+        config.owner_id,
+        notices_tx,
+        component_handler(Arc::clone(&responder)),
     ));
     let result = run_permission_broker(&socket_path, responder).await;
     gateway.abort();
@@ -365,13 +394,32 @@ fn socket_path(args: &[String]) -> Option<std::path::PathBuf> {
     }
 }
 
+fn start_broker(connection: &DiscordConnection) -> Option<BrokerTask> {
+    socket_path(&[]).map(|socket| {
+        let responder = Arc::clone(&connection.3);
+        tokio::spawn(async move {
+            run_permission_broker(&socket, responder)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+}
+
+fn abort_broker(broker: &mut Option<BrokerTask>) {
+    if let Some(broker) = broker.as_mut() {
+        broker.abort();
+    }
+}
+
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    let app_config = load_config();
-    let (discord, mut gateway) = match discord_connection()? {
-        Some((connection, gateway)) => (Some(connection), Some(gateway)),
-        None => (None, None),
+    let (discord, mut gateway, mut broker) = match discord_connection()? {
+        Some((connection, gateway)) => {
+            let broker = start_broker(&connection);
+            (Some(connection), Some(gateway), broker)
+        }
+        None => (None, None, None),
     };
-    let interval = app_config.poll_interval_ms;
+    let interval = load_config().poll_interval_ms;
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
     let mut state_change_sequences: HashMap<String, u64> = HashMap::new();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -426,7 +474,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-                let Some((client, guild, owner_id)) = discord.as_ref() else {
+                let Some((client, guild, owner_id, _responder)) = discord.as_ref() else {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 };
@@ -455,8 +503,12 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
             result = wait_for_gateway(gateway.as_mut()) => {
                 return result.map_err(Into::into);
             }
+            result = wait_for_broker(broker.as_mut()) => {
+                return result.map_err(Into::into);
+            }
         }
     }
+    abort_broker(&mut broker);
     Ok(())
 }
 

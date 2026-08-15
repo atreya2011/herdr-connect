@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use twilight_model::channel::message::Embed;
 
 const MAX_DISCORD_NONCE_LENGTH: usize = 25;
+const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
 const STARTUP_COMPONENT_MASK: u64 = (1_u64 << 44) - 1;
 const PAYLOAD_COMPONENT_MASK: u64 = (1_u64 << 52) - 1;
 static PROCESS_START_COMPONENT: OnceLock<u64> = OnceLock::new();
@@ -53,7 +54,7 @@ pub async fn deliver_permission_card(
     let payload = serde_json::json!({
         "embeds": [{
             "title": "Claude permission request",
-            "description": format!("Tool: `{tool}`\nCommand:\n```\n{command}\n```"),
+            "description": permission_card_description(tool, command),
             "color": 0x00f1_c40f,
         }],
         "components": permission_components(token, false),
@@ -69,6 +70,29 @@ pub async fn deliver_permission_card(
         .await
         .map(|message| message.id)
         .map_err(|error| error.to_string())
+}
+
+fn permission_card_description(tool: &str, command: &str) -> String {
+    let prefix = format!("Tool: `{tool}`\nCommand:\n```\n");
+    let suffix = "\n```";
+    let command_limit = MAX_PERMISSION_DESCRIPTION_LENGTH
+        .saturating_sub(prefix.chars().count() + suffix.chars().count());
+    let sanitized_command = command
+        .chars()
+        .map(|character| if character == '`' { 'ˋ' } else { character })
+        .collect::<String>();
+    let command_length = sanitized_command.chars().count();
+    let bounded_command = if command_length > command_limit {
+        let mut bounded = sanitized_command
+            .chars()
+            .take(command_limit.saturating_sub(1))
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    } else {
+        sanitized_command
+    };
+    format!("{prefix}{bounded_command}{suffix}")
 }
 
 /// Disables the controls on an expired or resolved permission card.
@@ -223,7 +247,10 @@ fn new_process_start_component() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DISCORD_NONCE_LENGTH, allowed_mentions, transition_card_nonce_for_start};
+    use super::{
+        MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
+        permission_card_description, transition_card_nonce_for_start,
+    };
     use crate::cards::TransitionMessage;
     use serde_json::json;
 
@@ -268,6 +295,33 @@ mod tests {
             assert_eq!(
                 first,
                 transition_card_nonce_for_start(first_start, terminal, sequence, card_index)
+            );
+        }
+    }
+
+    #[test]
+    fn permission_card_description_is_safe_and_bounded() {
+        let long_command = "x".repeat(4_097);
+        let cases = [
+            ("backtick run", "printf 'before ``` after'", false),
+            ("long command", long_command.as_str(), true),
+        ];
+
+        for (name, command, truncated) in cases {
+            let description = permission_card_description("Bash", command);
+            assert!(
+                description.chars().count() <= MAX_PERMISSION_DESCRIPTION_LENGTH,
+                "{name} description exceeded the safe limit"
+            );
+            assert_eq!(
+                description.matches("```").count(),
+                2,
+                "{name} description contains an unescaped code-fence run"
+            );
+            assert_eq!(
+                description.contains('…'),
+                truncated,
+                "{name} truncation marker did not match the input size"
             );
         }
     }

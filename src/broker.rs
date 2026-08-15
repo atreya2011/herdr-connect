@@ -24,7 +24,12 @@ use twilight_model::http::interaction::{
 use twilight_model::id::{Id, marker::GuildMarker};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
-const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
+pub const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[must_use]
+pub const fn hook_timeout() -> Duration {
+    Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
+}
 
 pub struct PermissionResponder {
     pub client: Arc<Client>,
@@ -107,16 +112,22 @@ impl PermissionResponder {
             self.registry.remove(&issued.token);
             return None;
         };
-        let decision = tokio::time::timeout(PERMISSION_TIMEOUT, issued.receiver)
-            .await
-            .ok()
-            .and_then(Result::ok);
+        let decision = tokio::time::timeout(
+            issued
+                .expiry
+                .saturating_duration_since(std::time::Instant::now()),
+            issued.receiver,
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
         let card_text = match decision.as_ref().map(|decision| &decision.behavior) {
             Some(DecisionBehavior::Allow) => "resolved: allowed",
             Some(DecisionBehavior::Deny) => "resolved: denied",
             None => {
                 self.registry
                     .expire(&issued.token, std::time::Instant::now());
+                self.registry.remove(&issued.token);
                 "expired: no owner decision"
             }
         };
@@ -466,7 +477,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BrokerResponse, PendingKey, PendingRequests, correlate_decision, read_json_line};
+    use super::{
+        BrokerResponse, PERMISSION_TIMEOUT, PendingKey, PendingRequests, correlate_decision,
+        hook_timeout, read_json_line,
+    };
     use crate::permission::{ClaudePermissionToolInput, Interaction};
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
@@ -501,6 +515,11 @@ mod tests {
                 decision: crate::permission::Decision::allow(),
             };
         }
+    }
+
+    #[test]
+    fn hook_deadline_leaves_grace_after_broker_deadline() {
+        assert!(hook_timeout() > PERMISSION_TIMEOUT);
     }
 
     #[tokio::test]

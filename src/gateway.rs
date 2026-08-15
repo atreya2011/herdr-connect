@@ -25,22 +25,6 @@ where
     action().await
 }
 
-/// Connects the Discord gateway and dispatches owner prompts without blocking gateway progress.
-///
-/// # Errors
-///
-/// Returns an error when the Discord gateway terminates.
-pub async fn drive_gateway_with_owner_prompt(
-    token: String,
-    gateway_url: Option<String>,
-    client: Arc<Client>,
-    guild: Id<GuildMarker>,
-    owner_id: String,
-    notices: Sender<String>,
-) -> Result<(), String> {
-    drive_gateway(token, gateway_url, client, guild, owner_id, notices, None).await
-}
-
 /// Connects the Discord gateway and dispatches owner prompts and component taps.
 ///
 /// # Errors
@@ -62,7 +46,7 @@ pub async fn drive_gateway_with_components(
         guild,
         owner_id,
         notices,
-        Some(components),
+        components,
     )
     .await
 }
@@ -74,7 +58,7 @@ async fn drive_gateway(
     guild: Id<GuildMarker>,
     owner_id: String,
     notices: Sender<String>,
-    components: Option<ComponentHandler>,
+    components: ComponentHandler,
 ) -> Result<(), String> {
     let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
     let builder = ConfigBuilder::new(token, intents);
@@ -107,10 +91,8 @@ async fn drive_gateway(
                 "discord gateway message: MESSAGE_CREATE".to_owned()
             }
             Ok(Event::InteractionCreate(interaction)) => {
-                if let Some(handler) = components.as_ref() {
-                    let handler = Arc::clone(handler);
-                    tokio::spawn(async move { handler(interaction.0).await });
-                }
+                let handler = Arc::clone(&components);
+                tokio::spawn(async move { handler(interaction.0).await });
                 "discord gateway interaction: INTERACTION_CREATE".to_owned()
             }
             Ok(_) => continue,

@@ -17,8 +17,8 @@ mod topology;
 mod watcher;
 
 pub use broker::{
-    BrokerResponse, CorrelationError, PermissionResponder, correlate_decision, handle_component,
-    request_decision, run_broker, serve_broker,
+    BrokerResponse, CorrelationError, PERMISSION_TIMEOUT, PermissionResponder, correlate_decision,
+    handle_component, hook_timeout, request_decision, run_broker, serve_broker,
 };
 pub use cards::{
     AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,
@@ -27,9 +27,7 @@ pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
 pub use delivery::{
     deliver_permission_card, deliver_transition_card, expire_permission_card, transition_card_nonce,
 };
-pub use gateway::{
-    ComponentHandler, drive_gateway_with_components, drive_gateway_with_owner_prompt,
-};
+pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
     AgentSession, AgentSnapshot, HerdrTab, agent_prompt, list_agents, request_rpc_result,
     tab_list_result,

@@ -136,7 +136,7 @@ impl InteractionRegistry {
             .entries
             .lock()
             .map_err(|_| ResolveError::UnknownOrExpired)?;
-        let Some(entry) = entries.get_mut(token) else {
+        let Some(entry) = entries.get(token) else {
             return Err(ResolveError::UnknownOrExpired);
         };
         if now < entry.created_at || now >= entry.expiry || entry.state != EntryState::Pending {
@@ -151,8 +151,11 @@ impl InteractionRegistry {
         if channel_id != entry.request.channel_id {
             return Err(ResolveError::WrongChannel);
         }
+        let mut entry = entries
+            .remove(token)
+            .ok_or(ResolveError::UnknownOrExpired)?;
         entry.state = EntryState::Resolved;
-        let sender = std::mem::replace(&mut entry.sender, oneshot::channel().0);
+        let sender = entry.sender;
         drop(entries);
         let _ = sender.send(decision);
         Ok(())
@@ -301,6 +304,7 @@ mod tests {
             ),
             Err(ResolveError::UnknownOrExpired)
         );
+        assert!(registry.is_empty());
     }
 
     #[test]

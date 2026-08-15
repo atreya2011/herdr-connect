@@ -63,38 +63,63 @@ mod real_guild {
             .await
             .map_err(|e| e.to_string())?
             .id;
-        let message = deliver_permission_card(
-            guild.client.as_ref(),
-            thread,
-            "Bash",
-            "touch proof",
-            "opaque-token-for-test",
-        )
-        .await?;
-        let delivered = fetch_message(guild, thread, message).await?;
-        if delivered.components.len() != 1 {
-            return Err("permission card did not have one action row".to_owned());
-        }
-        let twilight_model::channel::message::component::Component::ActionRow(row) =
-            &delivered.components[0]
-        else {
-            return Err("permission card component was not an action row".to_owned());
-        };
-        if row.components.len() != 2 {
-            return Err("permission card did not have two buttons".to_owned());
-        }
-        let labels = row
-            .components
-            .iter()
-            .filter_map(|component| match component {
-                twilight_model::channel::message::component::Component::Button(button) => {
-                    button.label.as_deref()
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if labels != ["Allow", "Deny"] {
-            return Err(format!("unexpected permission labels: {labels:?}"));
+        let long_command = "x".repeat(4_097);
+        let cases = [
+            ("backtick run", "printf 'before ``` after'", false),
+            ("long command", long_command.as_str(), true),
+        ];
+        for (name, command, truncated) in cases {
+            let message = deliver_permission_card(
+                guild.client.as_ref(),
+                thread,
+                "Bash",
+                command,
+                "opaque-token-for-test",
+            )
+            .await?;
+            let delivered = fetch_message(guild, thread, message).await?;
+            let description = delivered
+                .embeds
+                .first()
+                .and_then(|embed| embed.description.as_deref())
+                .ok_or_else(|| format!("{name} permission card had no description"))?;
+            if description.chars().count() > 3_800 {
+                return Err(format!("{name} permission description was not bounded"));
+            }
+            if description.matches("```").count() != 2 {
+                return Err(format!(
+                    "{name} permission description broke its code fence"
+                ));
+            }
+            if description.contains('…') != truncated {
+                return Err(format!(
+                    "{name} permission description truncation was wrong"
+                ));
+            }
+            if delivered.components.len() != 1 {
+                return Err("permission card did not have one action row".to_owned());
+            }
+            let twilight_model::channel::message::component::Component::ActionRow(row) =
+                &delivered.components[0]
+            else {
+                return Err("permission card component was not an action row".to_owned());
+            };
+            if row.components.len() != 2 {
+                return Err("permission card did not have two buttons".to_owned());
+            }
+            let labels = row
+                .components
+                .iter()
+                .filter_map(|component| match component {
+                    twilight_model::channel::message::component::Component::Button(button) => {
+                        button.label.as_deref()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if labels != ["Allow", "Deny"] {
+                return Err(format!("unexpected permission labels: {labels:?}"));
+            }
         }
         Ok(())
     }
