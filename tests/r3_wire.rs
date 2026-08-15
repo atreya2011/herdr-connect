@@ -243,32 +243,24 @@ async fn refuses_duplicate_channels_carrying_one_workspace_topic_marker() {
 }
 
 #[tokio::test]
-async fn reconciles_topic_matched_channel_name_only_when_needed() {
-    for (channel_name, should_rename) in [
-        ("changed-workspace-ws", true),
-        ("herdr-workspace-ws", false),
-    ] {
-        let stand = stand(CHANNEL).await;
-        let _ = sync_topology(
-            &client(&stand.address),
-            Id::new(1),
-            "ws",
-            channel_name,
-            "tab [tab-7]",
-            "tab-7",
-        )
-        .await;
-        let calls = stand.calls.lock().unwrap().clone();
-        let bodies = stand.bodies.lock().unwrap().clone();
-        let renamed = calls.iter().zip(&bodies).any(|(call, body)| {
-            call == "PATCH /api/v10/channels/100"
-                && body.contains(&format!("\"name\":\"{channel_name}\""))
-        });
-        assert_eq!(
-            renamed, should_rename,
-            "calls: {calls:?} bodies: {bodies:?}"
-        );
-    }
+async fn keeps_the_name_of_the_channel_identified_by_topic() {
+    let stand = stand(CHANNEL).await;
+    let _ = sync_topology(
+        &client(&stand.address),
+        Id::new(1),
+        "ws",
+        "changed-workspace-ws",
+        "tab [tab-7]",
+        "tab-7",
+    )
+    .await;
+    let calls = stand.calls.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == "PATCH /api/v10/channels/100"),
+        "renamed a workspace channel identified by its topic; calls: {calls:?}"
+    );
 }
 
 // W2: src/lib.rs:770 — PARITY 20/21/22: the tab is created as a guild channel, never as a thread.

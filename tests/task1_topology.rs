@@ -52,3 +52,18 @@ fn breaks_workspace_cwd_plurality_ties_lexicographically() {
     let cwds = vec!["/repo/zeta".to_owned(), "/repo/alpha".to_owned()];
     assert_eq!(workspace_channel_name("ws", &cwds).unwrap(), "alpha-ws");
 }
+
+#[test]
+fn foreign_workspace_agents_cannot_name_the_routed_workspace_channel() {
+    let mut agents = fixture_agents();
+    for (terminal_id, pane_id) in [("foreign-1", "foreign:p1"), ("foreign-2", "foreign:p2")] {
+        let mut foreign = fixture_agents().pop().unwrap();
+        foreign.terminal_id = terminal_id.to_owned();
+        foreign.workspace_id = Some("foreign".to_owned());
+        foreign.pane_id = Some(pane_id.to_owned());
+        foreign.cwd = Some("/repo/foreign".to_owned());
+        agents.push(foreign);
+    }
+    let route = route_topology(&agents, &fixture_tabs(), "term_657e35d8c8ea11").unwrap();
+    assert_eq!(route.channel_name, "project-4-wc");
+}

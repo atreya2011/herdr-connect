@@ -89,6 +89,11 @@ async fn real_guild_topology_create_and_reuse_contract() {
             "testrun-tab",
         )
         .await?;
+        client
+            .update_thread(first)
+            .archived(true)
+            .await
+            .map_err(|error| error.to_string())?;
         let second = sync_topology(
             &client,
             guild,
@@ -98,6 +103,20 @@ async fn real_guild_topology_create_and_reuse_contract() {
             "testrun-tab",
         )
         .await?;
+        let restored = client
+            .channel(second)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        if restored
+            .thread_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.archived)
+        {
+            return Err("sync_topology did not unarchive the reused thread".to_owned());
+        }
         Ok::<_, String>((first, second))
     }
     .await;

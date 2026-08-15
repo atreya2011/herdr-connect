@@ -55,6 +55,7 @@ pub fn route_topology(
         .collect();
     let cwds: Vec<String> = agents
         .iter()
+        .filter(|candidate| candidate.workspace_id.as_deref() == Some(workspace_id))
         .filter(|candidate| {
             candidate
                 .tab_id
@@ -184,9 +185,6 @@ pub async fn sync_topology(
         ));
     }
     let workspace_channel = if let Some(channel) = matching_channels.first() {
-        if channel.name.as_deref() != Some(channel_name) {
-            rename_workspace_channel(client, channel.id, channel_name).await?;
-        }
         channel.id
     } else {
         client
@@ -249,19 +247,6 @@ pub async fn sync_topology(
         .await
         .map_err(|error| error.to_string())?
         .id)
-}
-
-async fn rename_workspace_channel(
-    client: &twilight_http::Client,
-    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    name: &str,
-) -> Result<(), String> {
-    client
-        .update_channel(channel)
-        .name(name)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
 }
 
 async fn archived_threads(
