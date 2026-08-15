@@ -1,5 +1,5 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, TopologyRoute, Transition, create_transition_messages,
+    AgentLogCapture, AgentSnapshot, TopologyRoute, Transition, create_transition_messages,
     deliver_transition_card, drive_gateway_with_owner_prompt, is_postable_transition, list_agents,
     load_config, load_discord_config, route_topology, sync_topology, tab_list_result,
     transition_card_nonce,
@@ -26,27 +26,42 @@ async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), Strin
     }
 }
 
-fn capture_for(agent: &str, terminal: &str) -> AgentLogCapture {
-    let agent_session = AgentSession {
-        agent: agent.to_owned(),
-        value: terminal.to_owned(),
-    };
-    let path = std::env::var("HERDR_LOG_DIR").map_or_else(
-        |_| PathBuf::from(&agent_session.value),
-        |directory| PathBuf::from(directory).join(terminal),
-    );
-    herdr_connect_rs::read_agent_log(Some(agent_session), &path).map_or_else(
-        |error| AgentLogCapture {
-            message: error,
+fn capture_for(snapshot: &AgentSnapshot) -> Result<AgentLogCapture, String> {
+    let log_dir = std::env::var_os("HERDR_LOG_DIR");
+    capture_for_with_log_dir(snapshot, log_dir.as_deref().map(std::path::Path::new))
+}
+
+fn capture_for_with_log_dir(
+    snapshot: &AgentSnapshot,
+    log_dir: Option<&std::path::Path>,
+) -> Result<AgentLogCapture, String> {
+    let Some(session) = snapshot.session.clone() else {
+        return Ok(AgentLogCapture {
+            message: "agent stopped, no log available".to_owned(),
             failure: None,
             question: None,
-        },
-        |log| AgentLogCapture {
-            message: log.message,
-            failure: log.failure,
-            question: log.question,
-        },
-    )
+        });
+    };
+    let path = log_dir.map_or_else(
+        || PathBuf::from(&session.value),
+        |directory| directory.join(&session.value),
+    );
+    let log = herdr_connect_rs::read_agent_log(Some(session), &path)?;
+    Ok(AgentLogCapture {
+        message: log.message,
+        failure: log.failure,
+        question: log.question,
+    })
+}
+
+fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
+    match capture_for(snapshot) {
+        Ok(capture) => Some(capture),
+        Err(error) => {
+            eprintln!("agent log capture error: {error}");
+            None
+        }
+    }
 }
 
 /// Delivers a transition's cards to the route resolved from one Herdr snapshot, including its `format_thread_name` result.
@@ -176,7 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 }
-                let capture = capture_for(&agent, &terminal);
+                let Some(capture) = capture_for_or_report(snapshot) else {
+                    previous.insert(terminal.clone(), (status.clone(), agent));
+                    continue;
+                };
                 let route = match route_topology(&agents, &tabs, &terminal) {
                     Ok(route) => route,
                     Err(error) => {
@@ -217,4 +235,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_for_with_log_dir, create_transition_messages};
+    use herdr_connect_rs::{AgentSnapshot, Transition};
+    use serde_json::Value;
+    use std::path::Path;
+
+    #[test]
+    fn captured_sessions_drive_transition_cards_and_pointer_posts() {
+        let response: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
+                .expect("captured agent.list fixture is JSON");
+        let agents: Vec<AgentSnapshot> =
+            serde_json::from_value(response["result"]["agents"].clone())
+                .expect("captured agent.list fixture has typed agents");
+        let cases = [
+            ("term-real-1", "final answer"),
+            ("term-no-session", "agent stopped, no log available"),
+        ];
+        for (terminal, expected_body) in cases {
+            let snapshot = agents
+                .iter()
+                .find(|snapshot| snapshot.terminal_id == terminal)
+                .expect("fixture contains the requested agent");
+            let capture = capture_for_with_log_dir(snapshot, Some(Path::new("tests/fixtures")))
+                .expect("capture succeeds for a real session or explicit no-session pointer");
+            let transition = Transition {
+                from: "working".to_owned(),
+                to: "done".to_owned(),
+                terminal_id: terminal.to_owned(),
+                agent: snapshot.agent.clone(),
+            };
+            let card = create_transition_messages(&transition, &capture, "owner")
+                .into_iter()
+                .next()
+                .expect("transition produces a card");
+            assert_eq!(card.description, expected_body);
+        }
+
+        let mut missing_log = agents[0].clone();
+        missing_log
+            .session
+            .as_mut()
+            .expect("session fixture is present")
+            .value = "missing-session.jsonl".to_owned();
+        assert!(
+            capture_for_with_log_dir(&missing_log, Some(Path::new("tests/fixtures"))).is_err(),
+            "reader errors for a reported session must surface instead of posting the pointer"
+        );
+    }
 }
