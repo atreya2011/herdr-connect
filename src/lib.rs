@@ -10,6 +10,7 @@ mod delivery;
 mod gateway;
 mod herdr;
 mod live_status;
+mod prompting;
 mod readers;
 mod topology;
 mod watcher;
@@ -20,9 +21,10 @@ pub use cards::{
 };
 pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
 pub use delivery::{deliver_transition, deliver_transition_card};
-pub use gateway::drive_gateway;
+pub use gateway::{drive_gateway, drive_gateway_with_owner_prompt};
 pub use herdr::{
-    AgentSession, AgentSnapshot, HerdrTab, list_agents, request_rpc, request_rpc_result, tab_list,
+    AgentSession, AgentSnapshot, HerdrTab, agent_prompt, list_agents, request_rpc,
+    request_rpc_result, request_rpc_result_with_params, request_rpc_with_params, tab_list,
     tab_list_result,
 };
 pub use live_status::update_live_status;

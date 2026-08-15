@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{SocketAddr, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,18 @@ pub struct AgentSession {
 ///
 /// Returns connection, timeout, protocol, or Herdr-declared errors.
 pub fn request_rpc_result(method: &str) -> Result<String, String> {
+    request_rpc_result_with_params(method, &json!({}))
+}
+
+/// Sends one bounded JSON-RPC request with an object of method parameters.
+///
+/// # Errors
+///
+/// Returns connection, timeout, protocol, or Herdr-declared errors.
+pub fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<String, String> {
+    if !params.is_object() {
+        return Err("herdr RPC params must be a JSON object".to_owned());
+    }
     let path = std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
         format!(
             "{}/.config/herdr/herdr.sock",
@@ -31,7 +43,7 @@ pub fn request_rpc_result(method: &str) -> Result<String, String> {
         std::process::id(),
         RPC_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
     );
-    let request = serde_json::json!({"id": id, "method": method, "params": {}});
+    let request = serde_json::json!({"id": id, "method": method, "params": params});
     let result = (|| -> Result<Value, String> {
         let address = SocketAddr::from_pathname(&path).map_err(|e| e.to_string())?;
         let (sender, receiver) = mpsc::channel();
@@ -76,6 +88,29 @@ pub fn request_rpc_result(method: &str) -> Result<String, String> {
 #[must_use]
 pub fn request_rpc(method: &str) -> String {
     request_rpc_result(method).unwrap_or_else(|error| error)
+}
+
+/// Requests Herdr with method parameters while retaining the historical string API.
+#[must_use]
+pub fn request_rpc_with_params(method: &str, params: &Value) -> String {
+    request_rpc_result_with_params(method, params).unwrap_or_else(|error| error)
+}
+
+/// Submits one vendor-neutral prompt to a Herdr agent and waits for its lifecycle settlement.
+///
+/// The returned result is the Herdr RPC result. It is not interpreted as acknowledgement of the
+/// prompt content because Herdr's wait observes lifecycle state rather than turns.
+///
+/// # Errors
+///
+/// Returns socket, protocol, or Herdr-declared errors, including `agent_prompt_stalled`.
+pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
+    let params = json!({
+        "target": target,
+        "text": text,
+        "wait": true,
+    });
+    request_rpc_result_with_params("agent.prompt", &params)
 }
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 pub struct HerdrTab {

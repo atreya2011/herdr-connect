@@ -1,10 +1,11 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, TopologyRoute, Transition, create_transition_messages,
-    deliver_transition_card, drive_gateway, is_postable_transition, list_agents, load_config,
-    load_discord_config, route_topology, sync_topology, tab_list_result,
+    deliver_transition_card, drive_gateway_with_owner_prompt, is_postable_transition, list_agents,
+    load_config, load_discord_config, route_topology, sync_topology, tab_list_result,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use twilight_http::Client;
 use twilight_model::id::{
@@ -88,13 +89,21 @@ fn discord_connection() -> Result<Option<DiscordConnection>, Box<dyn std::error:
             ])?;
             let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
             let client = Client::builder().token(config.token.clone()).build();
+            let gateway_client = Arc::new(Client::builder().token(config.token.clone()).build());
             let (notices_tx, notices_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 while let Ok(notice) = notices_rx.recv() {
                     eprintln!("{notice}");
                 }
             });
-            tokio::spawn(drive_gateway(config.token, None, notices_tx));
+            tokio::spawn(drive_gateway_with_owner_prompt(
+                config.token,
+                None,
+                gateway_client,
+                guild,
+                config.owner_id.clone(),
+                notices_tx,
+            ));
             Ok(Some((client, guild, config.owner_id)))
         }
         _ => Ok(None),

@@ -1,7 +1,11 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
+use std::sync::mpsc::Receiver;
 
-use herdr_connect_rs::{list_agents, tab_list, tab_list_result};
+use herdr_connect_rs::{
+    agent_prompt, list_agents, request_rpc_result_with_params, tab_list, tab_list_result,
+};
+use serde_json::{Value, json};
 use serial_test::serial;
 
 /// Answers exactly one newline-delimited JSON-RPC request, echoing the request id.
@@ -30,6 +34,30 @@ fn serve_once(name: &str, result: impl Into<String>) -> std::path::PathBuf {
 
 fn captured_result(path: &str) -> String {
     serde_json::from_str::<serde_json::Value>(path).unwrap()["result"].to_string()
+}
+
+/// Captures one newline-delimited JSON-RPC request and returns a supplied envelope.
+fn serve_capturing_request(
+    name: &str,
+    mut response: Value,
+) -> (std::path::PathBuf, Receiver<Value>) {
+    let path = std::env::temp_dir().join(format!("r3-rpc-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        sender.send(request.clone()).unwrap();
+        response["id"] = request["id"].clone();
+        let mut stream = stream;
+        writeln!(stream, "{response}").unwrap();
+        stream.flush().unwrap();
+    });
+    (path, receiver)
 }
 
 #[test]
@@ -135,4 +163,51 @@ fn tab_list_result_rejects_any_malformed_tab() {
     let error = tab_list_result().unwrap_err();
     let _ = std::fs::remove_file(&socket);
     assert!(error.contains("missing field `label`"), "{error}");
+}
+
+#[test]
+#[serial]
+fn request_rpc_result_with_params_sends_json_object_unchanged() {
+    let params = json!({
+        "target": "pane-7",
+        "nested": {"keep": ["ordering", 3]},
+        "enabled": true,
+    });
+    let (socket, requests) =
+        serve_capturing_request("params", json!({"result": {"accepted": true}}));
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &socket) };
+
+    let result = request_rpc_result_with_params("custom.method", &params).unwrap();
+    let request = requests.recv().unwrap();
+    let _ = std::fs::remove_file(&socket);
+
+    assert_eq!(request["method"], "custom.method");
+    assert_eq!(request["params"], params);
+    assert_eq!(result, r#"{"accepted":true}"#);
+}
+
+#[test]
+#[serial]
+fn agent_prompt_sends_wait_and_surfaces_stalled_error() {
+    let (socket, requests) = serve_capturing_request(
+        "prompt-stalled",
+        json!({
+            "error": {
+                "code": "agent_prompt_stalled",
+                "message": "no observed state change within 5000ms",
+            },
+        }),
+    );
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &socket) };
+
+    let error = agent_prompt("pane-7", "inspect the failing test").unwrap_err();
+    let request = requests.recv().unwrap();
+    let _ = std::fs::remove_file(&socket);
+
+    assert_eq!(request["method"], "agent.prompt");
+    assert_eq!(
+        request["params"],
+        json!({"target": "pane-7", "text": "inspect the failing test", "wait": true})
+    );
+    assert!(error.contains("agent_prompt_stalled"), "{error}");
 }

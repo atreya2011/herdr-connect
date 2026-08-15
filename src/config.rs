@@ -33,7 +33,7 @@ pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig
     let names = ["DISCORD_TOKEN", "DISCORD_GUILD_ID", "DISCORD_OWNER_ID"];
     let missing: Vec<_> = names
         .into_iter()
-        .filter(|n| value(n).is_none_or(|v| v.trim().is_empty()))
+        .filter(|n| value(n).is_none_or(|v| v.trim().is_empty() && *n != "DISCORD_OWNER_ID"))
         .collect();
     if !missing.is_empty() {
         return Err(format!(
