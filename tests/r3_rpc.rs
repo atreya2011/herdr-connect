@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 
 use herdr_connect_rs::{list_agents, tab_list, tab_list_result};
+use serial_test::serial;
 
 /// Answers exactly one newline-delimited JSON-RPC request, echoing the request id.
 fn serve_once(name: &str, result: impl Into<String>) -> std::path::PathBuf {
@@ -32,6 +33,7 @@ fn captured_result(path: &str) -> String {
 }
 
 #[test]
+#[serial]
 fn t1_captured_herdr_responses_preserve_topology_identity() {
     let agent_socket = serve_once(
         "task1-agent",
@@ -58,6 +60,7 @@ fn t1_captured_herdr_responses_preserve_topology_identity() {
 
 // P1: src/lib.rs:722 — PARITY 5: tab ID, working directory and vendor session identity are dropped.
 #[test]
+#[serial]
 fn p1_agent_snapshot_preserves_tab_cwd_and_session() {
     let socket = serve_once(
         "fields",
@@ -80,6 +83,7 @@ fn p1_agent_snapshot_preserves_tab_cwd_and_session() {
 
 // P2: src/lib.rs:731 — PARITY 4: an agent entry missing `agent_status` is silently discarded.
 #[test]
+#[serial]
 fn p2_malformed_agent_entry_is_an_error() {
     let socket = serve_once(
         "malformed",
@@ -96,6 +100,7 @@ fn p2_malformed_agent_entry_is_an_error() {
 
 // P3: src/lib.rs:698 — PARITY 3: an unreachable Herdr yields a fabricated tab instead of an error.
 #[test]
+#[serial]
 fn p3_unreachable_herdr_does_not_fabricate_a_tab() {
     unsafe {
         std::env::set_var(
@@ -111,6 +116,7 @@ fn p3_unreachable_herdr_does_not_fabricate_a_tab() {
 }
 
 #[test]
+#[serial]
 fn tab_list_result_propagates_rpc_errors() {
     let socket = std::env::temp_dir().join(format!("r3-rpc-{}-absent", std::process::id()));
     let _ = std::fs::remove_file(&socket);
@@ -119,6 +125,7 @@ fn tab_list_result_propagates_rpc_errors() {
 }
 
 #[test]
+#[serial]
 fn tab_list_result_rejects_any_malformed_tab() {
     let socket = serve_once(
         "malformed-tab",
