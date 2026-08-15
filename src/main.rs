@@ -141,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(route) => route,
                     Err(error) => {
                         eprintln!("{error}");
+                        previous.insert(terminal.clone(), (status.clone(), agent));
                         continue;
                     }
                 };
@@ -152,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     deliver_to_route(client, *guild, owner_id, &route, &transition, &capture).await
                 {
                     eprintln!("{error}");
+                    previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 }
                 live_messages.insert(terminal.clone(), Id::new(0));

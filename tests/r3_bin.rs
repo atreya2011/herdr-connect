@@ -27,6 +27,39 @@ fn serve(name: &str, result: &'static str) -> std::path::PathBuf {
     path
 }
 
+fn serve_one_transition(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("r3-bin-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        let mut agent_polls = 0;
+        while let Ok((stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() || request.is_empty() {
+                continue;
+            }
+            let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+            let method = request["method"].as_str().unwrap();
+            let result = if method == "agent.list" {
+                agent_polls += 1;
+                let status = if agent_polls == 1 { "working" } else { "done" };
+                format!(
+                    r#"{{"agents":[{{"agent":"claude","terminal_id":"t1","agent_status":"{status}"}}]}}"#
+                )
+            } else {
+                r#"{"tabs":[]}"#.to_owned()
+            };
+            let mut stream = stream;
+            let _ = stream.write_all(
+                format!("{{\"id\":{},\"result\":{result}}}\n", request["id"]).as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+    });
+    path
+}
+
 fn run(
     socket: &std::path::Path,
     discord: bool,
@@ -97,5 +130,17 @@ fn b3_prints_watch_lines() {
     assert!(
         !stdout.is_empty(),
         "the watcher printed nothing; stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn failed_transition_is_not_retried_on_every_poll() {
+    let socket = serve_one_transition("failed-transition");
+    let (_stdout, stderr, _status) = run(&socket, false, 3_400);
+    let _ = std::fs::remove_file(&socket);
+    assert_eq!(
+        stderr.matches("herdr topology error: agent t1 has no tab id").count(),
+        1,
+        "failed transition was retried: {stderr}"
     );
 }

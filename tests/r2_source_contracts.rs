@@ -23,3 +23,13 @@ fn discord_contracts_are_real_and_main_wires_library() {
     assert!(topology_src.contains("topic("));
     assert!(main.contains("create_transition_messages") || main.contains("sync_topology"));
 }
+
+#[test]
+fn delivery_errors_advance_the_recorded_transition_state() {
+    let main = fs::read_to_string("src/main.rs").unwrap();
+    let delivery = &main[main.find("deliver_to_route(client").unwrap()..];
+    let error_branch = &delivery[..delivery.find("continue;").unwrap()];
+    assert!(error_branch.contains(
+        "previous.insert(terminal.clone(), (status.clone(), agent));"
+    ));
+}
