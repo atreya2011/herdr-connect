@@ -58,9 +58,11 @@ pub async fn handle_owner_message(
         return Ok(());
     };
     let Some(topic) = parent.topic.as_deref() else {
-        reply(&client, &message, "refused: unmapped Discord channel").await?;
         return Ok(());
     };
+    if !is_qualifying_prompt_surface(thread_name, topic) {
+        return Ok(());
+    }
     let agents = tokio::task::spawn_blocking(list_agents)
         .await
         .map_err(|error| format!("herdr agent.list task failed: {error}"))??;
@@ -99,6 +101,19 @@ pub fn should_handle_owner_message(author_id: &str, is_bot: bool, owner_id: &str
 #[must_use]
 const fn is_thread_channel(kind: ChannelType) -> bool {
     kind.is_thread()
+}
+
+#[must_use]
+fn is_qualifying_prompt_surface(thread_name: &str, topic: &str) -> bool {
+    let has_tab_suffix = thread_name
+        .rsplit_once(" [")
+        .and_then(|(_, suffix)| suffix.strip_suffix(']'))
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_workspace_marker = topic
+        .strip_prefix("herdr workspace [")
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(|value| !value.trim().is_empty());
+    has_tab_suffix && has_workspace_marker
 }
 
 fn resolve_prompt_pane(
@@ -152,7 +167,9 @@ async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::is_thread_channel;
+    use super::{is_qualifying_prompt_surface, is_thread_channel, resolve_prompt_pane};
+    use crate::AgentSnapshot;
+    use serde_json::Value;
     use twilight_model::channel::ChannelType;
 
     #[test]
@@ -167,6 +184,120 @@ mod tests {
         ];
         for (kind, expected) in cases {
             assert_eq!(is_thread_channel(kind), expected);
+        }
+    }
+
+    #[test]
+    fn qualifying_prompt_surface_requires_both_discord_markers() {
+        let cases = [
+            (
+                "bridge [real-workspace:tab-1]",
+                "herdr workspace [real-workspace]",
+                true,
+            ),
+            ("bridge", "herdr workspace [real-workspace]", false),
+            ("bridge [real-workspace:tab-1]", "workspace", false),
+            ("bridge", "workspace", false),
+        ];
+        for (thread_name, topic, expected) in cases {
+            assert_eq!(
+                is_qualifying_prompt_surface(thread_name, topic),
+                expected,
+                "thread_name={thread_name:?}, topic={topic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_prompt_pane_captured_snapshot_refusal_branches() {
+        let value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
+                .expect("captured agent snapshot is JSON");
+        let captured: Vec<AgentSnapshot> =
+            serde_json::from_value(value["result"]["agents"].clone())
+                .expect("captured agent snapshot has the expected shape");
+        let topic = "herdr workspace [real-workspace]";
+        let mut missing_pane = captured[0].clone();
+        missing_pane.pane_id = None;
+        let mut working = captured[0].clone();
+        working.agent_status = "working".to_owned();
+        let mut blocked = captured[0].clone();
+        blocked.agent_status = "blocked".to_owned();
+        let mut unknown = captured[0].clone();
+        unknown.agent_status = "paused".to_owned();
+        let mut no_status = captured[0].clone();
+        no_status.agent_status.clear();
+        let cases = [
+            (
+                "missing thread suffix",
+                "bridge",
+                topic,
+                captured.clone(),
+                "refused: unmapped Discord thread",
+            ),
+            (
+                "invalid workspace topic",
+                "bridge [real-workspace:tab-1]",
+                "workspace",
+                captured.clone(),
+                "refused: unmapped Discord channel",
+            ),
+            (
+                "no matching pane",
+                "bridge [missing-tab]",
+                topic,
+                vec![captured[0].clone()],
+                "refused: unmapped pane",
+            ),
+            (
+                "ambiguous pane",
+                "bridge [real-workspace:tab-1]",
+                topic,
+                captured.clone(),
+                "refused: ambiguous pane mapping",
+            ),
+            (
+                "matching pane has no pane id",
+                "bridge [real-workspace:tab-1]",
+                topic,
+                vec![missing_pane],
+                "refused: unmapped pane",
+            ),
+            (
+                "working pane",
+                "bridge [real-workspace:tab-1]",
+                topic,
+                vec![working],
+                "refused: agent state is working",
+            ),
+            (
+                "blocked pane",
+                "bridge [real-workspace:tab-1]",
+                topic,
+                vec![blocked],
+                "refused: agent state is blocked",
+            ),
+            (
+                "missing agent status",
+                "bridge [real-workspace:tab-1]",
+                topic,
+                vec![no_status],
+                "refused: agent state is unknown",
+            ),
+            (
+                "unrecognized agent status",
+                "bridge [real-workspace:tab-1]",
+                topic,
+                vec![unknown],
+                "refused: agent state is paused",
+            ),
+        ];
+        for (branch, thread_name, topic, agents, expected) in cases {
+            assert_eq!(
+                resolve_prompt_pane(thread_name, topic, &agents),
+                Err(expected.to_owned()),
+                "branch={branch}"
+            );
         }
     }
 }

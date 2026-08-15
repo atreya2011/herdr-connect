@@ -29,4 +29,4 @@ Never print or commit the env file's contents. Real-guild tests create only `tes
 - Commits go straight to `main` in small atomic chunks. No PRs, no remote.
 - Source is organized as modules under `src/` with crate-root re-exports (post folder-split).
 - Cursor prompts may stall at the Herdr level; the bridge surfaces the stall and never injects keys.
-- Refusal replies exist only inside mapped threads; all other surfaces stay silent.
+- Refusal replies exist only inside threads with a `[tab_id]` suffix whose parent topic is `herdr workspace [workspace_id]`; all other surfaces stay silent.
