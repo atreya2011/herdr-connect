@@ -30,7 +30,6 @@ pub struct IssuedApproval {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryState {
     Pending,
-    Resolved,
 }
 
 #[derive(Debug)]
@@ -186,13 +185,12 @@ impl InteractionRegistry {
         if channel_id != entry.request.channel_id {
             return Err(ResolveError::WrongChannel);
         }
-        let mut entry = entries
+        let entry = entries
             .remove(token)
             .ok_or(ResolveError::UnknownOrExpired)?;
         if !entry.hook_alive.load(Ordering::Acquire) {
             return Err(ResolveError::UnknownOrExpired);
         }
-        entry.state = EntryState::Resolved;
         let sender = entry.sender;
         drop(entries);
         let _ = sender.send(decision);
