@@ -60,6 +60,8 @@ mod real_guild {
         let first =
             deliver_transition_card(guild.client.as_ref(), channel, &first_card, &retry_nonce)
                 .await?;
+        let delivered_blocked = fetch_message(guild, channel, first).await?;
+        assert_owner_mention(&delivered_blocked, owner)?;
         let second =
             deliver_transition_card(guild.client.as_ref(), channel, &first_card, &retry_nonce)
                 .await?;
@@ -112,9 +114,45 @@ mod real_guild {
             &second_card_nonce,
         )
         .await?;
+        let delivered_idle = fetch_message(guild, channel, second_card_id).await?;
+        assert_no_user_mentions(&delivered_idle)?;
         if first_card_id == second_card_id {
             return Err("distinct cards reused one message".to_owned());
         }
         Ok(())
+    }
+
+    async fn fetch_message(
+        guild: &Guild,
+        channel: Id<twilight_model::id::marker::ChannelMarker>,
+        message: Id<twilight_model::id::marker::MessageMarker>,
+    ) -> Result<twilight_model::channel::Message, String> {
+        guild
+            .client
+            .message(channel, message)
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn assert_owner_mention(
+        message: &twilight_model::channel::Message,
+        owner: Id<UserMarker>,
+    ) -> Result<(), String> {
+        if message.mentions.iter().any(|mention| mention.id == owner) {
+            Ok(())
+        } else {
+            Err("blocked card did not mention the owner".to_owned())
+        }
+    }
+
+    fn assert_no_user_mentions(message: &twilight_model::channel::Message) -> Result<(), String> {
+        if message.mentions.is_empty() {
+            Ok(())
+        } else {
+            Err("non-blocked card mentioned a user".to_owned())
+        }
     }
 }

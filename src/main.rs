@@ -66,7 +66,13 @@ fn resolve_session_path(
                 .ok_or_else(|| "claude session has no cwd for log resolution".to_owned())?;
             let cwd_slug = cwd
                 .chars()
-                .map(|character| if character == '/' { '-' } else { character })
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
                 .collect::<String>();
             let candidates = [
                 search_root
@@ -366,10 +372,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_for_with_search_root, create_transition_messages};
-    use herdr_connect_rs::{AgentSnapshot, Transition};
+    use super::{capture_for_with_search_root, create_transition_messages, resolve_session_path};
+    use herdr_connect_rs::{AgentSession, AgentSnapshot, Transition};
     use serde_json::Value;
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn claude_project_slugs_match_dot_and_underscore_directory_names_in_both_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-claude-slug-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        let cases = [
+            (
+                ".claude",
+                "/home/user/src/herdr-connect-rs",
+                "-home-user-src-herdr-connect-rs",
+            ),
+            (
+                ".claude-one",
+                "/tmp/agent_workspace_v2",
+                "-tmp-agent-workspace-v2",
+            ),
+        ];
+        for (vendor_root, cwd, expected_directory) in cases {
+            let directory = root
+                .join(vendor_root)
+                .join("projects")
+                .join(expected_directory);
+            fs::create_dir_all(&directory).expect("create Claude project directory");
+            let expected_path = directory.join("slug-session.jsonl");
+            fs::write(&expected_path, "").expect("create Claude session file");
+            let snapshot = AgentSnapshot {
+                agent: "claude".to_owned(),
+                terminal_id: "slug-terminal".to_owned(),
+                agent_status: "done".to_owned(),
+                tab_id: None,
+                workspace_id: None,
+                pane_id: None,
+                cwd: Some(cwd.to_owned()),
+                terminal_title_stripped: None,
+                session: Some(AgentSession {
+                    agent: "claude".to_owned(),
+                    value: "slug-session".to_owned(),
+                }),
+            };
+            assert_eq!(
+                resolve_session_path(
+                    &root,
+                    &snapshot,
+                    snapshot.session.as_ref().expect("session is present"),
+                ),
+                Ok(expected_path)
+            );
+        }
+        fs::remove_dir_all(&root).expect("remove Claude slug test directory");
+    }
 
     #[test]
     fn captured_sessions_drive_transition_cards_and_pointer_posts() {
@@ -379,22 +443,18 @@ mod tests {
         let agents: Vec<AgentSnapshot> =
             serde_json::from_value(response["result"]["agents"].clone())
                 .expect("captured agent.list fixture has typed agents");
-        let cases = [
-            ("term-real-1", "final answer"),
-            ("term-real-2", "final answer"),
-            ("term-no-session", "agent stopped, no log available"),
-        ];
-        for (terminal, expected_body) in cases {
+        let cases = [(true, "agent stopped, no log available")];
+        for (without_session, expected_body) in cases {
             let snapshot = agents
                 .iter()
-                .find(|snapshot| snapshot.terminal_id == terminal)
+                .find(|snapshot| snapshot.session.is_none() == without_session)
                 .expect("fixture contains the requested agent");
             let capture = capture_for_with_search_root(snapshot, Path::new("tests/fixtures"))
                 .expect("capture succeeds for a real session or explicit no-session pointer");
             let transition = Transition {
                 from: "working".to_owned(),
                 to: "done".to_owned(),
-                terminal_id: terminal.to_owned(),
+                terminal_id: snapshot.terminal_id.clone(),
                 agent: snapshot.agent.clone(),
             };
             let card = create_transition_messages(&transition, &capture, "owner")
@@ -404,7 +464,11 @@ mod tests {
             assert_eq!(card.description, expected_body);
         }
 
-        let mut missing_log = agents[0].clone();
+        let mut missing_log = agents
+            .iter()
+            .find(|snapshot| snapshot.session.is_some())
+            .expect("fixture contains a session")
+            .clone();
         missing_log
             .session
             .as_mut()

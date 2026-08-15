@@ -61,9 +61,20 @@ pub async fn handle_owner_message(
     if !is_qualifying_prompt_surface(thread_name, topic) {
         return Ok(());
     }
-    let agents = tokio::task::spawn_blocking(list_agents)
-        .await
-        .map_err(|error| format!("herdr agent.list task failed: {error}"))??;
+    let agents = match tokio::task::spawn_blocking(list_agents).await {
+        Ok(Ok(agents)) => agents,
+        Ok(Err(error)) => {
+            let response = agent_list_failure_reply(&error);
+            reply(&client, &message, &response).await?;
+            return Err(format!("agent.list failed: {error}"));
+        }
+        Err(error) => {
+            let error = format!("herdr agent.list task failed: {error}");
+            let response = agent_list_failure_reply(&error);
+            reply(&client, &message, &response).await?;
+            return Err(error);
+        }
+    };
     let pane_id = match resolve_prompt_pane(thread_name, topic, &agents) {
         Ok(pane_id) => pane_id,
         Err(reason) => {
@@ -153,6 +164,10 @@ fn resolve_prompt_pane(
     }
 }
 
+fn agent_list_failure_reply(error: &str) -> String {
+    format!("refused: agent.list failed: {error}")
+}
+
 async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), String> {
     client
         .create_message(message.channel_id)
@@ -165,7 +180,10 @@ async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_qualifying_prompt_surface, is_thread_channel, resolve_prompt_pane};
+    use super::{
+        agent_list_failure_reply, is_qualifying_prompt_surface, is_thread_channel,
+        resolve_prompt_pane,
+    };
     use crate::AgentSnapshot;
     use serde_json::Value;
     use twilight_model::channel::ChannelType;
@@ -207,6 +225,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_list_failure_is_refused_in_a_qualifying_thread() {
+        let cases = [
+            (
+                "herdr RPC connect failed: no socket",
+                "refused: agent.list failed: herdr RPC connect failed: no socket",
+            ),
+            (
+                "agent.list response did not contain agents",
+                "refused: agent.list failed: agent.list response did not contain agents",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(agent_list_failure_reply(error), expected);
+        }
+    }
+
+    #[test]
     fn resolve_prompt_pane_captured_snapshot_refusal_branches() {
         let value: Value =
             serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
@@ -214,7 +249,16 @@ mod tests {
         let captured: Vec<AgentSnapshot> =
             serde_json::from_value(value["result"]["agents"].clone())
                 .expect("captured agent snapshot has the expected shape");
-        let topic = "herdr workspace [real-workspace]";
+        let workspace_id = captured[0]
+            .workspace_id
+            .as_deref()
+            .expect("captured agent has a workspace id");
+        let tab_id = captured[0]
+            .tab_id
+            .as_deref()
+            .expect("captured agent has a tab id");
+        let topic = format!("herdr workspace [{workspace_id}]");
+        let qualifying_thread = format!("bridge [{tab_id}]");
         let mut missing_pane = captured[0].clone();
         missing_pane.pane_id = None;
         let mut working = captured[0].clone();
@@ -225,17 +269,19 @@ mod tests {
         unknown.agent_status = "paused".to_owned();
         let mut no_status = captured[0].clone();
         no_status.agent_status.clear();
+        let mut ambiguous = vec![captured[0].clone()];
+        ambiguous.push(captured[0].clone());
         let cases = [
             (
                 "missing thread suffix",
                 "bridge",
-                topic,
+                topic.as_str(),
                 captured.clone(),
                 "refused: unmapped Discord thread",
             ),
             (
                 "invalid workspace topic",
-                "bridge [real-workspace:tab-1]",
+                qualifying_thread.as_str(),
                 "workspace",
                 captured.clone(),
                 "refused: unmapped Discord channel",
@@ -243,49 +289,49 @@ mod tests {
             (
                 "no matching pane",
                 "bridge [missing-tab]",
-                topic,
+                topic.as_str(),
                 vec![captured[0].clone()],
                 "refused: unmapped pane",
             ),
             (
                 "ambiguous pane",
-                "bridge [real-workspace:tab-1]",
-                topic,
-                captured.clone(),
+                qualifying_thread.as_str(),
+                topic.as_str(),
+                ambiguous,
                 "refused: ambiguous pane mapping",
             ),
             (
                 "matching pane has no pane id",
-                "bridge [real-workspace:tab-1]",
-                topic,
+                qualifying_thread.as_str(),
+                topic.as_str(),
                 vec![missing_pane],
                 "refused: unmapped pane",
             ),
             (
                 "working pane",
-                "bridge [real-workspace:tab-1]",
-                topic,
+                qualifying_thread.as_str(),
+                topic.as_str(),
                 vec![working],
                 "refused: agent state is working",
             ),
             (
                 "blocked pane",
-                "bridge [real-workspace:tab-1]",
-                topic,
+                qualifying_thread.as_str(),
+                topic.as_str(),
                 vec![blocked],
                 "refused: agent state is blocked",
             ),
             (
                 "missing agent status",
-                "bridge [real-workspace:tab-1]",
-                topic,
+                qualifying_thread.as_str(),
+                topic.as_str(),
                 vec![no_status],
                 "refused: agent state is unknown",
             ),
             (
                 "unrecognized agent status",
-                "bridge [real-workspace:tab-1]",
-                topic,
+                qualifying_thread.as_str(),
+                topic.as_str(),
                 vec![unknown],
                 "refused: agent state is paused",
             ),

@@ -1,7 +1,8 @@
 use crate::cards::TransitionMessage;
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-use twilight_model::channel::message::{AllowedMentions, Embed};
+use twilight_model::channel::message::Embed;
 
 const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const STARTUP_COMPONENT_MASK: u64 = (1_u64 << 44) - 1;
@@ -60,7 +61,7 @@ async fn deliver_payload(
         url: None,
         video: None,
     };
-    let allowed = AllowedMentions::default();
+    let allowed = allowed_mentions(card);
     let message_content = card
         .and_then(|message| message.mention.as_deref())
         .map_or_else(
@@ -84,6 +85,20 @@ async fn deliver_payload(
         .await
         .map(|message| message.id)
         .map_err(|error| error.to_string())
+}
+
+fn allowed_mentions(card: Option<&TransitionMessage>) -> Value {
+    let Some(owner_mention) = card.and_then(|message| message.mention.as_deref()) else {
+        return json!({"parse": []});
+    };
+    let Some(owner_id) = owner_mention
+        .strip_prefix("<@")
+        .and_then(|mention| mention.strip_suffix('>'))
+        .filter(|owner_id| !owner_id.is_empty())
+    else {
+        return json!({"parse": []});
+    };
+    json!({"parse": [], "users": [owner_id]})
 }
 
 fn bounded_nonce(nonce: &str) -> String {
@@ -139,7 +154,25 @@ fn new_process_start_component() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DISCORD_NONCE_LENGTH, transition_card_nonce_for_start};
+    use super::{MAX_DISCORD_NONCE_LENGTH, allowed_mentions, transition_card_nonce_for_start};
+    use crate::cards::TransitionMessage;
+    use serde_json::json;
+
+    #[test]
+    fn allowed_mentions_only_allows_the_blocked_card_owner() {
+        let blocked = TransitionMessage {
+            description: "blocked".to_owned(),
+            color: 0,
+            mention: Some("<@42>".to_owned()),
+        };
+        let cases = [
+            (None, json!({"parse": []})),
+            (Some(&blocked), json!({"parse": [], "users": ["42"]})),
+        ];
+        for (card, expected) in cases {
+            assert_eq!(allowed_mentions(card), expected);
+        }
+    }
 
     #[test]
     fn simulated_process_starts_produce_bounded_distinct_retry_safe_nonces() {
