@@ -302,9 +302,12 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Ok(interaction) = decode_claude_permission_request(&input) else {
         return Ok(());
     };
-    let Some(socket_path) = socket_path(&args) else {
-        return Ok(());
-    };
+    let socket_path = socket_path(&args).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hook requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>",
+        )
+    })?;
     let Some(decision) =
         request_decision(&interaction, &socket_path, Duration::from_secs(30)).await
     else {

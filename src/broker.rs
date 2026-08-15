@@ -4,8 +4,9 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, oneshot};
 
@@ -88,16 +89,62 @@ pub async fn request_decision(
 
 #[derive(Default)]
 struct PendingRequests {
-    keys: Mutex<HashSet<RequestKey>>,
+    state: Mutex<PendingState>,
 }
 
 impl PendingRequests {
-    async fn register(&self, key: RequestKey) -> bool {
-        self.keys.lock().await.insert(key)
+    async fn register(&self, key: PendingKey) -> bool {
+        let mut state = self.state.lock().await;
+        if !state.fingerprints.insert(key.fingerprint.clone()) {
+            return false;
+        }
+        state.keys.insert(key)
     }
 
-    async fn remove(&self, key: &RequestKey) {
-        self.keys.lock().await.remove(key);
+    async fn remove(&self, key: &PendingKey) {
+        let mut state = self.state.lock().await;
+        state.keys.remove(key);
+        state.fingerprints.remove(&key.fingerprint);
+    }
+}
+
+#[derive(Default)]
+struct PendingState {
+    keys: HashSet<PendingKey>,
+    fingerprints: HashSet<RequestFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PendingKey {
+    fingerprint: RequestFingerprint,
+    connection_id: u64,
+}
+
+impl PendingKey {
+    fn new(interaction: &Interaction, connection_id: u64) -> Self {
+        Self {
+            fingerprint: RequestFingerprint::from(interaction),
+            connection_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RequestFingerprint {
+    request: RequestKey,
+    tool_name: String,
+    command: String,
+    description: String,
+}
+
+impl From<&Interaction> for RequestFingerprint {
+    fn from(interaction: &Interaction) -> Self {
+        Self {
+            request: RequestKey::from(interaction),
+            tool_name: interaction.tool_name.clone(),
+            command: interaction.tool_input.command.clone(),
+            description: interaction.tool_input.description.clone(),
+        }
     }
 }
 
@@ -111,13 +158,15 @@ pub async fn serve_tracer_broker(
     mut shutdown: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let pending = Arc::new(PendingRequests::default());
+    let next_connection_id = AtomicU64::new(0);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let pending = Arc::clone(&pending);
+                let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    handle_connection(stream, pending).await;
+                    handle_connection(stream, pending, connection_id).await;
                 });
             }
             _ = &mut shutdown => break,
@@ -126,16 +175,21 @@ pub async fn serve_tracer_broker(
     Ok(())
 }
 
-/// Binds and runs the fixed-allow tracer broker until Ctrl-C.
+/// Binds and runs the fixed-allow tracer broker until Ctrl-C or SIGTERM.
 ///
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be bound or the listener fails.
 pub async fn run_tracer_broker(socket_path: &Path) -> io::Result<()> {
+    remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let shutdown_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
         let _ = shutdown_tx.send(());
     });
     let result = serve_tracer_broker(listener, shutdown_rx).await;
@@ -144,12 +198,40 @@ pub async fn run_tracer_broker(socket_path: &Path) -> io::Result<()> {
     result
 }
 
-async fn handle_connection(mut stream: UnixStream, pending: Arc<PendingRequests>) {
+fn remove_stale_socket(socket_path: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "broker socket path is not a socket: {}",
+                socket_path.display()
+            ),
+        ));
+    }
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("broker socket is already in use: {}", socket_path.display()),
+        )),
+        Err(_) => std::fs::remove_file(socket_path),
+    }
+}
+
+async fn handle_connection(
+    mut stream: UnixStream,
+    pending: Arc<PendingRequests>,
+    connection_id: u64,
+) {
     let interaction = match read_json_line(&mut stream).await {
         Ok(interaction) if is_valid_interaction(&interaction) => interaction,
         _ => return,
     };
-    let key = RequestKey::from(&interaction);
+    let key = PendingKey::new(&interaction, connection_id);
     if !pending.register(key.clone()).await {
         return;
     }
@@ -171,7 +253,7 @@ async fn read_json_line<T>(stream: &mut UnixStream) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take((MAX_FRAME_BYTES + 1) as u64);
     let mut bytes = Vec::new();
     let length = reader
         .read_until(b'\n', &mut bytes)
@@ -197,8 +279,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BrokerResponse, correlate_decision};
+    use super::{BrokerResponse, PendingKey, PendingRequests, correlate_decision, read_json_line};
     use crate::permission::{ClaudePermissionToolInput, Interaction};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
 
     fn interaction() -> Interaction {
         Interaction {
@@ -230,5 +314,32 @@ mod tests {
                 decision: crate::permission::Decision::allow(),
             };
         }
+    }
+
+    #[tokio::test]
+    async fn pending_requests_allow_distinct_tool_calls_and_reject_replays() {
+        let pending = PendingRequests::default();
+        let first = interaction();
+        let mut second = interaction();
+        second.tool_input.command = "touch other-proof".to_owned();
+        second.tool_input.description = "Create other proof".to_owned();
+        let first_key = PendingKey::new(&first, 1);
+        let replay_key = PendingKey::new(&first, 2);
+        let second_key = PendingKey::new(&second, 3);
+
+        assert!(pending.register(first_key.clone()).await);
+        assert!(!pending.register(replay_key).await);
+        assert!(pending.register(second_key).await);
+        pending.remove(&first_key).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_response_is_rejected() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("create Unix stream pair");
+        writer
+            .write_all(b"not json\n")
+            .await
+            .expect("write malformed response");
+        assert!(read_json_line::<BrokerResponse>(&mut reader).await.is_err());
     }
 }
