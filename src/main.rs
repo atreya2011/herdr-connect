@@ -2,6 +2,7 @@ use herdr_connect_rs::{
     AgentLogCapture, AgentSession, TopologyRoute, Transition, create_transition_messages,
     deliver_transition_card, drive_gateway_with_owner_prompt, is_postable_transition, list_agents,
     load_config, load_discord_config, route_topology, sync_topology, tab_list_result,
+    transition_card_nonce,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ async fn deliver_to_route(
     route: &TopologyRoute,
     transition: &Transition,
     capture: &AgentLogCapture,
+    state_change_seq: u64,
 ) -> Result<Id<MessageMarker>, String> {
     let messages = create_transition_messages(transition, capture, owner_id);
     let target = sync_topology(
@@ -64,8 +66,7 @@ async fn deliver_to_route(
     .map_err(|error| format!("discord topology error: {error}"))?;
     let mut last_message_id = None;
     for (index, message) in messages.iter().enumerate() {
-        let _mention = message.mention.as_deref();
-        let nonce = format!("{}-{index}", transition.terminal_id);
+        let nonce = transition_card_nonce(&transition.terminal_id, state_change_seq, index);
         last_message_id = Some(
             deliver_transition_card(client, target, message, &nonce)
                 .await
@@ -118,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let discord = discord_connection()?;
     let interval = app_config.poll_interval_ms;
     let mut previous: HashMap<String, (String, String)> = HashMap::new();
+    let mut state_change_sequences: HashMap<String, u64> = HashMap::new();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut live_messages: HashMap<String, Id<MessageMarker>> = HashMap::new();
 
@@ -140,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let current: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
         previous.retain(|terminal, _| current.contains(terminal));
+        state_change_sequences.retain(|terminal, _| current.contains(terminal));
         for snapshot in &agents {
             let agent = snapshot.agent.clone();
             let terminal = snapshot.terminal_id.clone();
@@ -148,6 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((old, prior_agent)) = previous.get(&terminal).cloned()
                 && old != status
             {
+                let state_change_seq = state_change_sequences
+                    .entry(terminal.clone())
+                    .and_modify(|sequence| *sequence += 1)
+                    .or_insert(1);
                 let transition = Transition {
                     from: old,
                     to: status.clone(),
@@ -172,8 +179,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 };
                 let message_id =
-                    match deliver_to_route(client, *guild, owner_id, &route, &transition, &capture)
-                        .await
+                    match deliver_to_route(
+                        client,
+                        *guild,
+                        owner_id,
+                        &route,
+                        &transition,
+                        &capture,
+                        *state_change_seq,
+                    )
+                    .await
                     {
                         Ok(message_id) => message_id,
                         Err(error) => {

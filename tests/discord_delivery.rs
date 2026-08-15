@@ -7,7 +7,7 @@ mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
         AgentLogCapture, Transition, create_transition_messages, deliver_transition,
-        deliver_transition_card,
+        deliver_transition_card, transition_card_nonce,
     };
     use serial_test::serial;
     use twilight_model::id::{Id, marker::UserMarker};
@@ -55,7 +55,7 @@ mod real_guild {
         if first != second {
             return Err("duplicate nonce created two messages".to_owned());
         }
-        let card = create_transition_messages(
+        let first_card = create_transition_messages(
             &Transition {
                 from: "working".into(),
                 to: "blocked".into(),
@@ -72,8 +72,55 @@ mod real_guild {
         .into_iter()
         .next()
         .ok_or_else(|| "transition card was empty".to_owned())?;
-        deliver_transition_card(guild.client.as_ref(), channel, &card, "testrun-card")
-            .await
-            .map(|_| ())
+        let second_card = create_transition_messages(
+            &Transition {
+                from: "blocked".into(),
+                to: "idle".into(),
+                terminal_id: "testrun-terminal".into(),
+                agent: "claude".into(),
+            },
+            &AgentLogCapture {
+                message: "idle".into(),
+                failure: None,
+                question: None,
+            },
+            &owner.to_string(),
+        )
+        .into_iter()
+        .next()
+        .ok_or_else(|| "second transition card was empty".to_owned())?;
+        let first_card_nonce = transition_card_nonce("testrun-terminal", 1, 0);
+        let second_card_nonce = transition_card_nonce("testrun-terminal", 2, 0);
+        if first_card_nonce.len() > 25 || second_card_nonce.len() > 25 {
+            return Err("delivery nonce exceeded Discord's limit".to_owned());
+        }
+        let first_card_id = deliver_transition_card(
+            guild.client.as_ref(),
+            channel,
+            &first_card,
+            &first_card_nonce,
+        )
+        .await?;
+        let retry_card_id = deliver_transition_card(
+            guild.client.as_ref(),
+            channel,
+            &first_card,
+            &first_card_nonce,
+        )
+        .await?;
+        if first_card_id != retry_card_id {
+            return Err("retry of one card created two messages".to_owned());
+        }
+        let second_card_id = deliver_transition_card(
+            guild.client.as_ref(),
+            channel,
+            &second_card,
+            &second_card_nonce,
+        )
+        .await?;
+        if first_card_id == second_card_id {
+            return Err("distinct cards reused one message".to_owned());
+        }
+        Ok(())
     }
 }

@@ -20,7 +20,7 @@ pub use cards::{
     AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,
 };
 pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
-pub use delivery::{deliver_transition, deliver_transition_card};
+pub use delivery::{deliver_transition, deliver_transition_card, transition_card_nonce};
 pub use gateway::{drive_gateway, drive_gateway_with_owner_prompt};
 pub use herdr::{
     AgentSession, AgentSnapshot, HerdrTab, agent_prompt, list_agents, request_rpc,

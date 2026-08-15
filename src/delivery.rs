@@ -1,7 +1,13 @@
 use crate::cards::TransitionMessage;
 use twilight_model::channel::message::{AllowedMentions, Embed};
 
-const DISCORD_NONCE_LENGTH: usize = 16;
+const MAX_DISCORD_NONCE_LENGTH: usize = 25;
+
+/// Derives one stable nonce for a transition card delivery.
+#[must_use]
+pub fn transition_card_nonce(terminal_id: &str, state_change_seq: u64, card_index: usize) -> String {
+    bounded_nonce(&format!("{terminal_id}-{state_change_seq}-{card_index}"))
+}
 
 /// Delivers one transition message.
 ///
@@ -38,9 +44,7 @@ async fn deliver_payload(
     card: Option<&TransitionMessage>,
     nonce: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    let nonce = nonce.bytes().fold(0_u64, |value, byte| {
-        value.wrapping_mul(257).wrapping_add(u64::from(byte))
-    });
+    let nonce = bounded_nonce(nonce);
     let embed = Embed {
         author: None,
         color: card.map(|message| message.color),
@@ -63,8 +67,6 @@ async fn deliver_payload(
             || content.to_owned(),
             |mention| format!("{mention} {content}"),
         );
-    let nonce = format!("{nonce:016x}");
-    debug_assert_eq!(nonce.len(), DISCORD_NONCE_LENGTH);
     let payload = serde_json::json!({
         "content": message_content,
         "embeds": [embed],
@@ -82,4 +84,14 @@ async fn deliver_payload(
         .await
         .map(|message| message.id)
         .map_err(|error| error.to_string())
+}
+
+fn bounded_nonce(nonce: &str) -> String {
+    if nonce.len() <= MAX_DISCORD_NONCE_LENGTH {
+        return nonce.to_owned();
+    }
+    let digest = nonce.bytes().fold(0_u64, |value, byte| {
+        value.wrapping_mul(257).wrapping_add(u64::from(byte))
+    });
+    format!("{digest:016x}")
 }
