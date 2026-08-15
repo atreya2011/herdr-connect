@@ -38,20 +38,12 @@ mod real_guild {
                 .map_err(|e| e.to_string())?,
         );
         let channel = channel(guild, "testrun-delivery").await?;
-        let first = deliver_transition(
-            guild.client.as_ref(),
-            channel,
-            "retry-safe",
-            "testrun-nonce",
-        )
-        .await?;
-        let second = deliver_transition(
-            guild.client.as_ref(),
-            channel,
-            "retry-safe",
-            "testrun-nonce",
-        )
-        .await?;
+        let test_terminal = format!("testrun-terminal-{}", channel.get());
+        let retry_nonce = transition_card_nonce(&test_terminal, 1, 99);
+        let first =
+            deliver_transition(guild.client.as_ref(), channel, "retry-safe", &retry_nonce).await?;
+        let second =
+            deliver_transition(guild.client.as_ref(), channel, "retry-safe", &retry_nonce).await?;
         if first != second {
             return Err("duplicate nonce created two messages".to_owned());
         }
@@ -59,7 +51,7 @@ mod real_guild {
             &Transition {
                 from: "working".into(),
                 to: "blocked".into(),
-                terminal_id: "testrun-terminal".into(),
+                terminal_id: test_terminal.clone(),
                 agent: "claude".into(),
             },
             &AgentLogCapture {
@@ -76,7 +68,7 @@ mod real_guild {
             &Transition {
                 from: "blocked".into(),
                 to: "idle".into(),
-                terminal_id: "testrun-terminal".into(),
+                terminal_id: test_terminal.clone(),
                 agent: "claude".into(),
             },
             &AgentLogCapture {
@@ -89,8 +81,8 @@ mod real_guild {
         .into_iter()
         .next()
         .ok_or_else(|| "second transition card was empty".to_owned())?;
-        let first_card_nonce = transition_card_nonce("testrun-terminal", 1, 0);
-        let second_card_nonce = transition_card_nonce("testrun-terminal", 2, 0);
+        let first_card_nonce = transition_card_nonce(&test_terminal, 1, 0);
+        let second_card_nonce = transition_card_nonce(&test_terminal, 2, 0);
         if first_card_nonce.len() > 25 || second_card_nonce.len() > 25 {
             return Err("delivery nonce exceeded Discord's limit".to_owned());
         }
