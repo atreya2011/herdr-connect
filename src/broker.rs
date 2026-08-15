@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use twilight_http::Client;
 use twilight_model::application::interaction::{
     Interaction as DiscordInteraction, InteractionData,
@@ -38,6 +38,44 @@ pub struct PermissionResponder {
     pub registry: Arc<InteractionRegistry>,
 }
 
+#[derive(Clone)]
+struct HookLiveness {
+    alive: Arc<AtomicBool>,
+    closed: Arc<Notify>,
+}
+
+impl HookLiveness {
+    fn new() -> Self {
+        Self {
+            alive: Arc::new(AtomicBool::new(true)),
+            closed: Arc::new(Notify::new()),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    async fn wait_closed(&self) {
+        let notified = self.closed.notified();
+        if self.is_alive() {
+            notified.await;
+        }
+    }
+}
+
+fn spawn_hook_monitor<R>(mut reader: R, liveness: HookLiveness) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = [0_u8; 1024];
+        while reader.read(&mut buffer).await.is_ok_and(|read| read > 0) {}
+        liveness.alive.store(false, Ordering::Release);
+        liveness.closed.notify_one();
+    })
+}
+
 impl PermissionResponder {
     #[must_use]
     pub fn new(client: Arc<Client>, guild: Id<GuildMarker>, owner_id: String) -> Self {
@@ -49,9 +87,61 @@ impl PermissionResponder {
         }
     }
 
-    async fn request(&self, interaction: &Interaction) -> Option<Decision> {
+    async fn request(&self, interaction: &Interaction, liveness: HookLiveness) -> Option<Decision> {
+        let route = self.route(interaction, &liveness).await?;
+        let channel = self.sync_channel(&route, &liveness).await?;
+        let created_at = std::time::Instant::now();
+        let issued = self
+            .registry
+            .issue_with_liveness(
+                ApprovalRequest {
+                    owner_id: self.owner_id.clone(),
+                    session_id: interaction.session_id.clone(),
+                    prompt_id: interaction.prompt_id.clone(),
+                    tool: interaction.tool_name.clone(),
+                    channel_id: channel.get(),
+                },
+                created_at,
+                created_at + PERMISSION_TIMEOUT,
+                Arc::clone(&liveness.alive),
+            )
+            .ok()?;
+        let message = self
+            .deliver_card(
+                channel,
+                &interaction.tool_name,
+                &interaction.tool_input.command,
+                &issued.token,
+                &liveness,
+            )
+            .await?;
+        let token = issued.token.clone();
+        let decision = self.wait_decision(issued, &liveness).await;
+        let decision = decision.filter(|_| liveness.is_alive());
+        let card_text = match decision.as_ref().map(|decision| &decision.behavior) {
+            Some(DecisionBehavior::Allow) => "resolved: allowed",
+            Some(DecisionBehavior::Deny) => "resolved: denied",
+            None => {
+                self.registry.remove(&token);
+                if liveness.is_alive() {
+                    "expired: no owner decision"
+                } else {
+                    "expired: hook disconnected"
+                }
+            }
+        };
+        let _ =
+            expire_permission_card(self.client.as_ref(), channel, message, &token, card_text).await;
+        decision
+    }
+
+    async fn route(
+        &self,
+        interaction: &Interaction,
+        liveness: &HookLiveness,
+    ) -> Option<crate::TopologyRoute> {
         let interaction_for_route = interaction.clone();
-        let route = tokio::task::spawn_blocking(move || {
+        let route_task = tokio::task::spawn_blocking(move || {
             let agents = list_agents()?;
             let tabs = tab_list_result()?;
             let matches: Vec<_> = agents
@@ -71,75 +161,91 @@ impl PermissionResponder {
                 }
             };
             route_topology(&agents, &tabs, &agent.terminal_id)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)?;
-        let channel = sync_topology(
+        });
+        let route = tokio::select! {
+            result = route_task => result.ok().and_then(Result::ok),
+            () = liveness.wait_closed() => None,
+        }?;
+        liveness.is_alive().then_some(route)
+    }
+
+    async fn sync_channel(
+        &self,
+        route: &crate::TopologyRoute,
+        liveness: &HookLiveness,
+    ) -> Option<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>> {
+        let channel_task = sync_topology(
             self.client.as_ref(),
             self.guild,
             &route.workspace_id,
             &route.channel_name,
             &route.thread_name,
             &route.tab_id,
-        )
-        .await
-        .ok()?;
-        let created_at = std::time::Instant::now();
-        let issued = self
-            .registry
-            .issue(
-                ApprovalRequest {
-                    owner_id: self.owner_id.clone(),
-                    session_id: interaction.session_id.clone(),
-                    prompt_id: interaction.prompt_id.clone(),
-                    tool: interaction.tool_name.clone(),
-                    channel_id: channel.get(),
-                },
-                created_at,
-                created_at + PERMISSION_TIMEOUT,
-            )
-            .ok()?;
-        let Ok(message) = deliver_permission_card(
-            self.client.as_ref(),
-            channel,
-            &interaction.tool_name,
-            &interaction.tool_input.command,
-            &issued.token,
-        )
-        .await
-        else {
-            self.registry.remove(&issued.token);
-            return None;
-        };
-        let decision = tokio::time::timeout(
-            issued
-                .expiry
-                .saturating_duration_since(std::time::Instant::now()),
-            issued.receiver,
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
-        let card_text = match decision.as_ref().map(|decision| &decision.behavior) {
-            Some(DecisionBehavior::Allow) => "resolved: allowed",
-            Some(DecisionBehavior::Deny) => "resolved: denied",
-            None => {
-                self.registry
-                    .expire(&issued.token, std::time::Instant::now());
-                self.registry.remove(&issued.token);
-                "expired: no owner decision"
+        );
+        let channel = tokio::select! {
+            result = channel_task => result.ok(),
+            () = liveness.wait_closed() => None,
+        }?;
+        liveness.is_alive().then_some(channel)
+    }
+
+    async fn deliver_card(
+        &self,
+        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+        tool: &str,
+        command: &str,
+        token: &str,
+        liveness: &HookLiveness,
+    ) -> Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>> {
+        let delivery = deliver_permission_card(self.client.as_ref(), channel, tool, command, token);
+        tokio::pin!(delivery);
+        tokio::select! {
+            result = &mut delivery => {
+                let Some(message) = result.ok() else {
+                    self.registry.remove(token);
+                    return None;
+                };
+                if liveness.is_alive() {
+                    Some(message)
+                } else {
+                    self.expire_card(channel, message, token, "expired: hook disconnected").await;
+                    None
+                }
             }
-        };
-        let _ = expire_permission_card(
-            self.client.as_ref(),
-            channel,
-            message,
-            &issued.token,
-            card_text,
-        )
-        .await;
-        decision
+            () = liveness.wait_closed() => {
+                let message = delivery.await.ok();
+                if let Some(message) = message {
+                    self.expire_card(channel, message, token, "expired: hook disconnected").await;
+                } else {
+                    self.registry.remove(token);
+                }
+                None
+            }
+        }
+    }
+
+    async fn wait_decision(
+        &self,
+        issued: crate::IssuedApproval,
+        liveness: &HookLiveness,
+    ) -> Option<Decision> {
+        tokio::select! {
+            result = issued.receiver => result.ok(),
+            () = liveness.wait_closed() => None,
+            () = tokio::time::sleep(issued.expiry.saturating_duration_since(std::time::Instant::now())) => None,
+        }
+    }
+
+    async fn expire_card(
+        &self,
+        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+        message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+        token: &str,
+        content: &str,
+    ) {
+        self.registry.remove(token);
+        let _ =
+            expire_permission_card(self.client.as_ref(), channel, message, token, content).await;
     }
 }
 
@@ -422,20 +528,25 @@ async fn handle_connection(
         Ok(interaction) if is_valid_interaction(&interaction) => interaction,
         _ => return,
     };
+    let (read_half, mut write_half) = stream.into_split();
+    let liveness = HookLiveness::new();
+    let monitor = spawn_hook_monitor(read_half, liveness.clone());
     let key = PendingKey::new(&interaction, connection_id);
     if !pending.register(key.clone()).await {
+        monitor.abort();
         return;
     }
 
-    let decision = responder.request(&interaction).await;
+    let decision = responder.request(&interaction, liveness).await;
     if let Some(decision) = decision {
         let response = BrokerResponse {
             session_id: interaction.session_id.clone(),
             prompt_id: interaction.prompt_id.clone(),
             decision,
         };
-        let _ = write_json_line(&mut stream, &response).await;
+        let _ = write_json_line(&mut write_half, &response).await;
     }
+    monitor.abort();
     pending.remove(&key).await;
 }
 
@@ -463,9 +574,10 @@ where
     serde_json::from_slice(&bytes[..bytes.len() - 1]).map_err(|error| error.to_string())
 }
 
-async fn write_json_line<T>(stream: &mut UnixStream, value: &T) -> Result<(), String>
+async fn write_json_line<T, W>(stream: &mut W, value: &T) -> Result<(), String>
 where
     T: Serialize + Sync,
+    W: AsyncWrite + Unpin,
 {
     let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -478,10 +590,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokerResponse, PERMISSION_TIMEOUT, PendingKey, PendingRequests, correlate_decision,
-        hook_timeout, read_json_line,
+        BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingKey, PendingRequests,
+        correlate_decision, read_json_line, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Interaction};
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
@@ -517,9 +630,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hook_deadline_leaves_grace_after_broker_deadline() {
-        assert!(hook_timeout() > PERMISSION_TIMEOUT);
+    #[tokio::test]
+    async fn disconnected_hook_ends_wait_before_broker_timeout_window() {
+        let (client, server) = UnixStream::pair().expect("create hook socket pair");
+        let (read_half, _write_half) = server.into_split();
+        let liveness = HookLiveness::new();
+        let monitor = spawn_hook_monitor(read_half, liveness.clone());
+        drop(client);
+
+        tokio::time::timeout(
+            PERMISSION_TIMEOUT.min(Duration::from_millis(100)),
+            liveness.wait_closed(),
+        )
+        .await
+        .expect("hook EOF must preempt the broker timeout window");
+        monitor.abort();
     }
 
     #[tokio::test]
