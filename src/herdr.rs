@@ -28,7 +28,7 @@ pub fn request_rpc_result(method: &str) -> Result<String, String> {
 /// # Errors
 ///
 /// Returns connection, timeout, protocol, or Herdr-declared errors.
-pub fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<String, String> {
+fn request_rpc_result_with_params(method: &str, params: &Value) -> Result<String, String> {
     request_rpc_result_with_params_and_timeout(method, params, Duration::from_secs(4))
 }
 
