@@ -4,11 +4,15 @@ use herdr_connect_rs::{
     is_postable_transition, list_agents, load_config, load_discord_config, route_topology,
     sync_topology, tab_list_result, transition_card_nonce,
 };
+use herdr_connect_rs::{
+    decode_claude_permission_request, encode_claude_decision, request_decision, run_tracer_broker,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twilight_http::Client;
 use twilight_model::id::{
     Id,
@@ -282,6 +286,53 @@ fn discord_connection()
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut args = std::env::args();
+    let _program = args.next();
+    match args.next().as_deref() {
+        Some("hook") => return run_hook(args.collect()).await,
+        Some("broker") => return run_broker(args.collect()).await,
+        _ => {}
+    }
+    run_bridge().await
+}
+
+async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = Vec::new();
+    tokio::io::stdin().read_to_end(&mut input).await?;
+    let Ok(interaction) = decode_claude_permission_request(&input) else {
+        return Ok(());
+    };
+    let Some(socket_path) = socket_path(&args) else {
+        return Ok(());
+    };
+    let Some(decision) =
+        request_decision(&interaction, &socket_path, Duration::from_secs(30)).await
+    else {
+        return Ok(());
+    };
+    let output = encode_claude_decision(&decision)?;
+    tokio::io::stdout().write_all(&output).await?;
+    Ok(())
+}
+
+async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = socket_path(&args)
+        .ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
+    run_tracer_broker(&socket_path).await?;
+    Ok(())
+}
+
+fn socket_path(args: &[String]) -> Option<std::path::PathBuf> {
+    match args {
+        [flag, path] if flag == "--socket" && !path.is_empty() => {
+            Some(std::path::PathBuf::from(path))
+        }
+        [] => std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET").map(std::path::PathBuf::from),
+        _ => None,
+    }
+}
+
+async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let app_config = load_config();
     let (discord, mut gateway) = match discord_connection()? {
         Some((connection, gateway)) => (Some(connection), Some(gateway)),
