@@ -103,6 +103,23 @@ pub fn tab_list() -> Vec<HerdrTab> {
         .unwrap_or_default()
 }
 
+/// Lists tabs while preserving Herdr and payload errors.
+///
+/// # Errors
+///
+/// Returns socket, envelope, or per-tab deserialization errors.
+pub fn tab_list_result() -> Result<Vec<HerdrTab>, String> {
+    let value: Value =
+        serde_json::from_str(&request_rpc_result("tab.list")?).map_err(|e| e.to_string())?;
+    value
+        .get("tabs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "tab.list response did not contain tabs".to_owned())?
+        .iter()
+        .map(|tab| serde_json::from_value(tab.clone()).map_err(|error| error.to_string()))
+        .collect()
+}
+
 #[derive(Clone, Deserialize, Debug)]
 pub struct AgentSnapshot {
     pub agent: String,

@@ -23,6 +23,7 @@ pub use delivery::{deliver_transition, deliver_transition_card};
 pub use gateway::drive_gateway;
 pub use herdr::{
     AgentSession, AgentSnapshot, HerdrTab, list_agents, request_rpc, request_rpc_result, tab_list,
+    tab_list_result,
 };
 pub use live_status::update_live_status;
 pub use readers::{AgentLog, read_agent_log};

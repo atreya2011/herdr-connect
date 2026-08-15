@@ -1,7 +1,7 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, TopologyRoute, Transition, create_transition_messages,
     deliver_transition_card, drive_gateway, is_postable_transition, list_agents, load_config,
-    load_discord_config, route_topology, sync_topology, tab_list,
+    load_discord_config, route_topology, sync_topology, tab_list_result,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -112,7 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
-        let tabs = tab_list();
+        let tabs = match tab_list_result() {
+            Ok(tabs) => tabs,
+            Err(error) => {
+                eprintln!("herdr tab poll error: {error}");
+                tokio::time::sleep(Duration::from_millis(interval)).await;
+                continue;
+            }
+        };
         let current: HashSet<String> = agents
             .iter()
             .map(|snapshot| snapshot.terminal_id.clone())

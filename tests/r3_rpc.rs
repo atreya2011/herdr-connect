@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 
-use herdr_connect_rs::{list_agents, tab_list};
+use herdr_connect_rs::{list_agents, tab_list, tab_list_result};
 
 /// Answers exactly one newline-delimited JSON-RPC request, echoing the request id.
 fn serve_once(name: &str, result: impl Into<String>) -> std::path::PathBuf {
@@ -108,4 +108,24 @@ fn p3_unreachable_herdr_does_not_fabricate_a_tab() {
         tabs.is_empty(),
         "invented tabs while Herdr was unreachable: {tabs:?}"
     );
+}
+
+#[test]
+fn tab_list_result_propagates_rpc_errors() {
+    let socket = std::env::temp_dir().join(format!("r3-rpc-{}-absent", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", socket) };
+    assert!(tab_list_result().unwrap_err().contains("connect failed"));
+}
+
+#[test]
+fn tab_list_result_rejects_any_malformed_tab() {
+    let socket = serve_once(
+        "malformed-tab",
+        r#"{"tabs":[{"tab_id":"tab-7","workspace_id":"ws"}]}"#,
+    );
+    unsafe { std::env::set_var("HERDR_SOCKET_PATH", &socket) };
+    let error = tab_list_result().unwrap_err();
+    let _ = std::fs::remove_file(&socket);
+    assert!(error.contains("missing field `label`"), "{error}");
 }
