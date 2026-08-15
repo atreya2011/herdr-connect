@@ -97,7 +97,7 @@ pub fn should_handle_owner_message(author_id: &str, is_bot: bool, owner_id: &str
 }
 
 #[must_use]
-fn is_thread_channel(kind: ChannelType) -> bool {
+const fn is_thread_channel(kind: ChannelType) -> bool {
     kind.is_thread()
 }
 

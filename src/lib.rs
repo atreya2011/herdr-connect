@@ -24,8 +24,7 @@ pub use delivery::{deliver_transition, deliver_transition_card, transition_card_
 pub use gateway::drive_gateway_with_owner_prompt;
 pub use herdr::{
     AgentSession, AgentSnapshot, HerdrTab, agent_prompt, list_agents, request_rpc,
-    request_rpc_result, request_rpc_result_with_params, tab_list,
-    tab_list_result,
+    request_rpc_result, request_rpc_result_with_params, tab_list, tab_list_result,
 };
 pub use live_status::update_live_status;
 pub use prompting::{handle_owner_message, should_handle_owner_message};

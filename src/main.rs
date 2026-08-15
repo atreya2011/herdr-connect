@@ -177,25 +177,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     previous.insert(terminal.clone(), (status.clone(), agent));
                     continue;
                 };
-                let message_id =
-                    match deliver_to_route(
-                        client.as_ref(),
-                        *guild,
-                        owner_id,
-                        &route,
-                        &transition,
-                        &capture,
-                        *state_change_seq,
-                    )
-                    .await
-                    {
-                        Ok(message_id) => message_id,
-                        Err(error) => {
-                            eprintln!("{error}");
-                            previous.insert(terminal.clone(), (status.clone(), agent));
-                            continue;
-                        }
-                    };
+                let message_id = match deliver_to_route(
+                    client.as_ref(),
+                    *guild,
+                    owner_id,
+                    &route,
+                    &transition,
+                    &capture,
+                    *state_change_seq,
+                )
+                .await
+                {
+                    Ok(message_id) => message_id,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        previous.insert(terminal.clone(), (status.clone(), agent));
+                        continue;
+                    }
+                };
                 live_messages.insert(terminal.clone(), message_id);
                 let _ = live_messages.get(&terminal);
             }

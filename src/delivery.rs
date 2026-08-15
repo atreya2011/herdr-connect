@@ -5,7 +5,11 @@ const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 
 /// Derives one stable nonce for a transition card delivery.
 #[must_use]
-pub fn transition_card_nonce(terminal_id: &str, state_change_seq: u64, card_index: usize) -> String {
+pub fn transition_card_nonce(
+    terminal_id: &str,
+    state_change_seq: u64,
+    card_index: usize,
+) -> String {
     bounded_nonce(&format!("{terminal_id}-{state_change_seq}-{card_index}"))
 }
 
