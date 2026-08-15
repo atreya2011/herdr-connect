@@ -6,8 +6,8 @@ mod support;
 mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
-        AgentLogCapture, Transition, create_transition_messages, deliver_transition,
-        deliver_transition_card, transition_card_nonce,
+        AgentLogCapture, Transition, create_transition_messages, deliver_transition_card,
+        transition_card_nonce,
     };
     use serial_test::serial;
     use twilight_model::id::{Id, marker::UserMarker};
@@ -40,13 +40,6 @@ mod real_guild {
         let channel = channel(guild, "testrun-delivery").await?;
         let test_terminal = format!("testrun-terminal-{}", channel.get());
         let retry_nonce = transition_card_nonce(&test_terminal, 1, 99);
-        let first =
-            deliver_transition(guild.client.as_ref(), channel, "retry-safe", &retry_nonce).await?;
-        let second =
-            deliver_transition(guild.client.as_ref(), channel, "retry-safe", &retry_nonce).await?;
-        if first != second {
-            return Err("duplicate nonce created two messages".to_owned());
-        }
         let first_card = create_transition_messages(
             &Transition {
                 from: "working".into(),
@@ -64,6 +57,15 @@ mod real_guild {
         .into_iter()
         .next()
         .ok_or_else(|| "transition card was empty".to_owned())?;
+        let first =
+            deliver_transition_card(guild.client.as_ref(), channel, &first_card, &retry_nonce)
+                .await?;
+        let second =
+            deliver_transition_card(guild.client.as_ref(), channel, &first_card, &retry_nonce)
+                .await?;
+        if first != second {
+            return Err("duplicate nonce created two messages".to_owned());
+        }
         let second_card = create_transition_messages(
             &Transition {
                 from: "blocked".into(),

@@ -23,20 +23,6 @@ pub fn transition_card_nonce(
     )
 }
 
-/// Delivers one transition message.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
-pub async fn deliver_transition(
-    client: &twilight_http::Client,
-    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    content: &str,
-    nonce: &str,
-) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    deliver_payload(client, channel, content, None, nonce).await
-}
-
 /// Delivers a complete transition card with its embed color and optional mention.
 ///
 /// # Errors
