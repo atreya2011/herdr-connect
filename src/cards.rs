@@ -4,6 +4,7 @@ use std::time::Duration;
 const MAX_PART_LENGTH: usize = 1_900;
 const MAX_THREAD_NAME_LENGTH: usize = 100;
 const MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH: usize = 3_800;
+const MAX_DISCORD_CONTENT_LENGTH: usize = 2_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct TransitionMessage {
@@ -26,10 +27,17 @@ pub fn create_unsupported_blocked_card(
     owner: &str,
     blocked_age: Duration,
 ) -> TransitionMessage {
+    let mention = format!("<@{owner}>");
     TransitionMessage {
-        description: unsupported_blocked_description(agent_kind, pane_id, context, blocked_age),
+        description: unsupported_blocked_description(
+            agent_kind,
+            pane_id,
+            context,
+            blocked_age,
+            mention.chars().count(),
+        ),
         color: 0x00fe_e75c,
-        mention: Some(format!("<@{owner}>")),
+        mention: Some(mention),
     }
 }
 
@@ -38,23 +46,27 @@ fn unsupported_blocked_description(
     pane_id: &str,
     context: &str,
     blocked_age: Duration,
+    mention_length: usize,
 ) -> String {
-    let agent_kind = bounded_inline(agent_kind, 128);
-    let pane_id = bounded_inline(pane_id, 128);
+    let agent_kind = bounded_inline(agent_kind, 128, true);
+    let pane_id = bounded_inline(pane_id, 128, true);
     let prefix = format!(
         "Unsupported blocked pane\nVendor/agent: `{agent_kind}`\nPane: `{pane_id}`\nBlocked for: {}\nContext:\n```\n",
         format_blocked_age(blocked_age)
     );
     let suffix = "\n```\nAction: OPEN/FOCUS the pane in Herdr.";
-    let context_limit = MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH
-        .saturating_sub(prefix.chars().count() + suffix.chars().count());
-    let context = bounded_inline(context, context_limit);
+    let description_limit = MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH
+        .min(MAX_DISCORD_CONTENT_LENGTH.saturating_sub(mention_length.saturating_add(1)));
+    let context_limit =
+        description_limit.saturating_sub(prefix.chars().count() + suffix.chars().count());
+    let context = bounded_inline(context, context_limit, false);
     format!("{prefix}{context}{suffix}")
 }
 
-fn bounded_inline(value: &str, limit: usize) -> String {
+fn bounded_inline(value: &str, limit: usize, strip_control_characters: bool) -> String {
     let sanitized = value
         .chars()
+        .filter(|character| !strip_control_characters || !character.is_control())
         .map(|character| if character == '`' { 'ˋ' } else { character })
         .collect::<String>();
     if sanitized.chars().count() <= limit {
@@ -291,5 +303,34 @@ mod tests {
             assert_eq!(card.description.matches("```").count(), 2);
             assert_eq!(card.mention.as_deref(), Some("<@42>"));
         }
+    }
+
+    #[test]
+    fn unsupported_blocked_card_content_fits_discord_limit() {
+        let card = create_unsupported_blocked_card(
+            "cursor",
+            "pane-1",
+            &"x".repeat(4_000),
+            "42",
+            Duration::from_secs(3),
+        );
+        let content = format!("{} {}", card.mention.as_deref().unwrap(), card.description);
+
+        assert!(content.chars().count() <= 2_000);
+    }
+
+    #[test]
+    fn unsupported_blocked_card_inline_identity_stays_single_line() {
+        let card = create_unsupported_blocked_card(
+            "cursor\n**Allow**",
+            "pane\n**Allow**",
+            "first\nsecond",
+            "42",
+            Duration::from_secs(3),
+        );
+
+        assert!(!card.description.contains("\n**Allow**"));
+        assert!(card.description.contains("first\nsecond"));
+        assert_eq!(card.description.matches("```").count(), 2);
     }
 }
