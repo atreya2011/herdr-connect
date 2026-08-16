@@ -39,6 +39,32 @@ pub async fn deliver_transition_card(
     deliver_payload(client, channel, &message.description, Some(message), nonce).await
 }
 
+/// Expires an informational blocked-pane card after the pane leaves `blocked`.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
+pub async fn expire_informational_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+    content: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "content": content,
+        "embeds": [],
+        "components": [],
+        "allowed_mentions": {"parse": []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .update_message(channel, message)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Delivers an owner decision card with opaque allow and deny component IDs.
 ///
 /// # Errors
@@ -73,8 +99,28 @@ pub async fn deliver_permission_card(
 }
 
 fn permission_card_description(tool: &str, command: &str) -> String {
-    let prefix = format!("Tool: `{tool}`\nCommand:\n```\n");
+    let tool_prefix = "Tool: `";
+    let tool_suffix = "`\nCommand:\n```\n";
     let suffix = "\n```";
+    let tool_limit = MAX_PERMISSION_DESCRIPTION_LENGTH.saturating_sub(
+        tool_prefix.chars().count() + tool_suffix.chars().count() + suffix.chars().count(),
+    );
+    let sanitized_tool = tool
+        .chars()
+        .map(|character| if character == '`' { 'ˋ' } else { character })
+        .collect::<String>();
+    let tool_length = sanitized_tool.chars().count();
+    let bounded_tool = if tool_length > tool_limit {
+        let mut bounded = sanitized_tool
+            .chars()
+            .take(tool_limit.saturating_sub(1))
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    } else {
+        sanitized_tool
+    };
+    let prefix = format!("{tool_prefix}{bounded_tool}{tool_suffix}");
     let command_limit = MAX_PERMISSION_DESCRIPTION_LENGTH
         .saturating_sub(prefix.chars().count() + suffix.chars().count());
     let sanitized_command = command
@@ -302,15 +348,37 @@ mod tests {
     fn permission_card_description_is_safe_and_bounded() {
         let long_command = "x".repeat(4_097);
         let cases = [
-            ("backtick run", "printf 'before ``` after'", false),
-            ("long command", long_command.as_str(), true),
+            (
+                "backtick run",
+                "Bash",
+                "printf 'before ``` after'",
+                false,
+                "Bash",
+            ),
+            (
+                "backtick tool",
+                "tool ``` injection",
+                "echo ok",
+                false,
+                "tool ˋˋˋ injection",
+            ),
+            ("long command", "Bash", long_command.as_str(), true, "Bash"),
         ];
 
-        for (name, command, truncated) in cases {
-            let description = permission_card_description("Bash", command);
+        for (name, tool, command, truncated, expected_tool) in cases {
+            let description = permission_card_description(tool, command);
             assert!(
                 description.chars().count() <= MAX_PERMISSION_DESCRIPTION_LENGTH,
                 "{name} description exceeded the safe limit"
+            );
+            assert!(
+                description.contains(expected_tool),
+                "{name} tool was not sanitized"
+            );
+            assert_eq!(
+                description.matches('`').count(),
+                8,
+                "{name} description contains an unescaped inline-code delimiter"
             );
             assert_eq!(
                 description.matches("```").count(),
