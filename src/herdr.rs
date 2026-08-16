@@ -98,24 +98,44 @@ fn request_rpc_result_with_params_and_timeout(
     result.map(|value| value.to_string())
 }
 
-/// Submits one vendor-neutral prompt to a Herdr agent and waits for it to become working.
+fn acknowledge_prompt_result(result: Result<String, String>) -> Result<String, String> {
+    match result {
+        Err(error) if is_agent_prompt_stalled(&error) => {
+            Ok("prompt submitted; Herdr state unconfirmed".to_owned())
+        }
+        result => result,
+    }
+}
+
+fn is_agent_prompt_stalled(error: &str) -> bool {
+    error
+        .strip_prefix("herdr agent.prompt failed: ")
+        .and_then(|error| error.split_whitespace().next())
+        .is_some_and(|code| code.trim_matches('"') == "agent_prompt_stalled")
+}
+
+/// Submits one vendor-neutral prompt to a Herdr agent and waits for a lifecycle state.
 ///
-/// A successful result means Herdr observed the working state and accepted the prompt. It does
-/// not wait for the agent turn to complete.
+/// A successful result means Herdr accepted the prompt. The observed state may be working, idle,
+/// done, or blocked; a Herdr observation stall is also accepted with an unconfirmed state.
 ///
 /// # Errors
 ///
-/// Returns socket, protocol, or Herdr-declared errors, including `agent_prompt_stalled`.
+/// Returns socket, protocol, or Herdr-declared submission errors.
 pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
     let params = json!({
         "target": target,
         "text": text,
         "wait": {
-            "until": ["working"],
+            "until": ["idle", "done", "blocked", "working"],
             "timeout_ms": 6000,
         },
     });
-    request_rpc_result_with_params_and_timeout("agent.prompt", &params, Duration::from_secs(10))
+    acknowledge_prompt_result(request_rpc_result_with_params_and_timeout(
+        "agent.prompt",
+        &params,
+        Duration::from_secs(10),
+    ))
 }
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 pub struct HerdrTab {
@@ -174,4 +194,34 @@ pub fn list_agents() -> Result<Vec<AgentSnapshot>, String> {
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::acknowledge_prompt_result;
+
+    #[test]
+    fn prompt_stalls_are_acknowledged_but_real_errors_are_preserved() {
+        let cases = [
+            (
+                Err("herdr agent.prompt failed: agent_prompt_stalled state was not observed"),
+                Ok("prompt submitted; Herdr state unconfirmed"),
+            ),
+            (
+                Err("herdr RPC connect failed: no socket"),
+                Err("herdr RPC connect failed: no socket"),
+            ),
+            (
+                Err("herdr agent.prompt failed: agent_not_found agent_prompt_stalled"),
+                Err("herdr agent.prompt failed: agent_not_found agent_prompt_stalled"),
+            ),
+            (Ok("{\"state\":\"working\"}"), Ok("{\"state\":\"working\"}")),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(
+                acknowledge_prompt_result(result.map(str::to_owned).map_err(str::to_owned)),
+                expected.map(str::to_owned).map_err(str::to_owned)
+            );
+        }
+    }
 }

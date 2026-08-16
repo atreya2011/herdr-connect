@@ -12,6 +12,8 @@ use twilight_model::{
     id::{Id, marker::GuildMarker},
 };
 
+const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
+
 /// Handles one Discord owner message after gateway-level filtering.
 ///
 /// # Errors
@@ -93,12 +95,7 @@ pub async fn handle_owner_message(
         .await
         .map_err(|error| format!("agent.prompt task failed: {error}"))?;
     match result {
-        Ok(_) => reply(
-            &client,
-            &message,
-            "accepted: prompt submitted; Herdr wait observes lifecycle state, not content delivery",
-        )
-        .await,
+        Ok(_) => reply(&client, &message, PROMPT_ACCEPTED_REPLY).await,
         Err(error) => {
             let response = format!("refused: prompt submission failed: {error}");
             reply(&client, &message, &response).await?;
