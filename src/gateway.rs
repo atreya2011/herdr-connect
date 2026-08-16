@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use std::{future::Future, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use twilight_gateway::{
     ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
 };
@@ -16,13 +16,44 @@ pub type ComponentHandler = Arc<
         + Sync,
 >;
 
-async fn with_owner_prompt_gate<F, Fut>(gate: &Mutex<()>, action: F) -> Result<(), String>
+struct OwnerPromptRequest {
+    client: Arc<Client>,
+    guild: Id<GuildMarker>,
+    owner_id: String,
+    message: twilight_model::channel::Message,
+    notices: Sender<String>,
+}
+
+async fn consume_in_order<T, F, Fut>(mut receiver: UnboundedReceiver<T>, mut process: F)
 where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<(), String>>,
+    T: Send + 'static,
+    F: FnMut(T) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
-    let _guard = gate.lock().await;
-    action().await
+    while let Some(item) = receiver.recv().await {
+        process(item).await;
+    }
+}
+
+fn spawn_owner_prompt_consumer() -> UnboundedSender<OwnerPromptRequest> {
+    let (sender, receiver) = unbounded_channel();
+    tokio::spawn(consume_in_order(receiver, process_owner_prompt));
+    sender
+}
+
+async fn process_owner_prompt(request: OwnerPromptRequest) {
+    let result = crate::prompting::handle_owner_message(
+        request.client,
+        request.guild,
+        &request.owner_id,
+        request.message,
+    )
+    .await;
+    if let Err(error) = result {
+        let _ = request
+            .notices
+            .send(format!("discord owner prompt error: {error}"));
+    }
 }
 
 /// Connects the Discord gateway and dispatches owner prompts and component taps.
@@ -67,28 +98,25 @@ async fn drive_gateway(
         None => builder.build(),
     };
     let mut shard = Shard::with_config(ShardId::ONE, config);
-    let owner_prompt_gate = Arc::new(Mutex::new(()));
+    let owner_prompt_sender = spawn_owner_prompt_consumer();
     while let Some(item) = shard
         .next_event(EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE)
         .await
     {
         let notice = match item {
             Ok(Event::MessageCreate(message)) => {
-                let client = Arc::clone(&client);
-                let owner_prompt_gate = Arc::clone(&owner_prompt_gate);
-                let notices = notices.clone();
-                let owner_id = owner_id.clone();
-                tokio::spawn(async move {
-                    let result = with_owner_prompt_gate(&owner_prompt_gate, || async {
-                        crate::prompting::handle_owner_message(client, guild, &owner_id, message.0)
-                            .await
-                    })
-                    .await;
-                    if let Err(error) = result {
-                        let _ = notices.send(format!("discord owner prompt error: {error}"));
-                    }
-                });
-                "discord gateway message: MESSAGE_CREATE".to_owned()
+                let request = OwnerPromptRequest {
+                    client: Arc::clone(&client),
+                    guild,
+                    owner_id: owner_id.clone(),
+                    message: message.0,
+                    notices: notices.clone(),
+                };
+                if owner_prompt_sender.send(request).is_err() {
+                    "discord owner prompt error: owner prompt queue closed".to_owned()
+                } else {
+                    "discord gateway message: MESSAGE_CREATE".to_owned()
+                }
             }
             Ok(Event::InteractionCreate(interaction)) => {
                 let handler = Arc::clone(&components);
@@ -111,40 +139,38 @@ fn gateway_closed_result() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_closed_result, with_owner_prompt_gate};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use super::{consume_in_order, gateway_closed_result};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn owner_prompt_dispatch_serializes_gate_and_send() {
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let gate = Arc::clone(&gate);
-            let active = Arc::clone(&active);
-            let maximum = Arc::clone(&maximum);
-            tasks.push(tokio::spawn(async move {
-                with_owner_prompt_gate(&gate, || async {
-                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    maximum.fetch_max(current, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(())
-                })
-                .await
+    async fn owner_prompt_queue_consumes_messages_in_receive_order() {
+        let cases = [vec![1_u8, 2, 3], vec![3_u8, 1, 2]];
+        for received in cases {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let consumer = tokio::spawn(consume_in_order(receiver, {
+                let observed = Arc::clone(&observed);
+                move |message| {
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        if message == 1 {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        observed.lock().await.push(message);
+                    }
+                }
             }));
+            for message in received.iter().copied() {
+                sender
+                    .send(message)
+                    .expect("owner prompt queue accepts message");
+            }
+            drop(sender);
+            consumer.await.expect("owner prompt consumer joins");
+
+            assert_eq!(*observed.lock().await, received);
         }
-        for task in tasks {
-            task.await
-                .expect("owner prompt task joins")
-                .expect("prompt succeeds");
-        }
-        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 
     #[test]
