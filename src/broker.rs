@@ -1,8 +1,7 @@
+use crate::delivery::expire_permission_card;
 use crate::permission::{Decision, DecisionBehavior, Interaction};
-use crate::{
-    ApprovalRequest, InteractionRegistry, ResolveError, deliver_permission_card,
-    expire_permission_card, list_agents, route_topology, sync_topology, tab_list_result,
-};
+use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
+use crate::{deliver_permission_card, list_agents, route_topology, sync_topology, tab_list_result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
@@ -25,7 +24,7 @@ use twilight_model::http::interaction::{
 use twilight_model::id::{Id, marker::GuildMarker};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
-pub const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[must_use]
 pub const fn hook_timeout() -> Duration {
@@ -33,10 +32,10 @@ pub const fn hook_timeout() -> Duration {
 }
 
 pub struct PermissionResponder {
-    pub client: Arc<Client>,
-    pub guild: Id<GuildMarker>,
-    pub owner_id: String,
-    pub registry: Arc<InteractionRegistry>,
+    client: Arc<Client>,
+    guild: Id<GuildMarker>,
+    owner_id: String,
+    registry: Arc<InteractionRegistry>,
 }
 
 #[derive(Clone)]
@@ -108,10 +107,6 @@ impl PermissionResponder {
             .registry
             .issue_with_liveness(
                 ApprovalRequest {
-                    owner_id: self.owner_id.clone(),
-                    session_id: interaction.session_id.clone(),
-                    prompt_id: interaction.prompt_id.clone(),
-                    tool: interaction.tool_name.clone(),
                     channel_id: channel.get(),
                 },
                 created_at,
@@ -298,7 +293,7 @@ pub async fn handle_component(
             .is_none_or(|id| id.to_string() != responder.owner_id)
     {
         ephemeral_response("not authorized")
-    } else if let Some(session_id) = responder.registry.session_id(token) {
+    } else if responder.registry.has_pending(token) {
         let decision = match action {
             "allow" => Decision::allow(),
             "deny" => Decision::deny(Some("operator denied this request".to_owned())),
@@ -306,19 +301,14 @@ pub async fn handle_component(
         };
         match responder.registry.resolve(
             token,
-            &responder.owner_id,
-            &session_id,
             channel.id.get(),
             decision,
             std::time::Instant::now(),
         ) {
             Ok(()) => ephemeral_response("decision recorded"),
-            Err(ResolveError::Unauthorized) => ephemeral_response("not authorized"),
-            Err(
-                ResolveError::UnknownOrExpired
-                | ResolveError::WrongSession
-                | ResolveError::WrongChannel,
-            ) => ephemeral_response("expired"),
+            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
+                ephemeral_response("expired")
+            }
         }
     } else {
         ephemeral_response("expired")
@@ -357,14 +347,14 @@ impl From<&Interaction> for RequestKey {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct BrokerResponse {
+struct BrokerResponse {
     pub session_id: String,
     pub prompt_id: String,
     pub decision: Decision,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum CorrelationError {
+enum CorrelationError {
     MismatchedRequest,
 }
 
@@ -373,7 +363,7 @@ pub enum CorrelationError {
 /// # Errors
 ///
 /// Returns `MismatchedRequest` for a response belonging to another or stale request.
-pub fn correlate_decision(
+fn correlate_decision(
     interaction: &Interaction,
     response: BrokerResponse,
 ) -> Result<Decision, CorrelationError> {
@@ -472,7 +462,7 @@ impl From<&Interaction> for RequestFingerprint {
 /// # Errors
 ///
 /// Returns an I/O error when accepting a client connection fails.
-pub async fn serve_broker(
+async fn serve_broker(
     listener: UnixListener,
     mut shutdown: oneshot::Receiver<()>,
     responder: Arc<PermissionResponder>,

@@ -12,10 +12,6 @@ const TOKEN_BYTES: usize = 24;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
-    pub owner_id: String,
-    pub session_id: String,
-    pub prompt_id: String,
-    pub tool: String,
     pub channel_id: u64,
 }
 #[derive(Debug)]
@@ -35,8 +31,6 @@ struct Entry {
 #[derive(Debug, Eq, PartialEq)]
 pub enum ResolveError {
     UnknownOrExpired,
-    Unauthorized,
-    WrongSession,
     WrongChannel,
 }
 #[derive(Default, Debug)]
@@ -44,20 +38,7 @@ pub struct InteractionRegistry {
     entries: Mutex<HashMap<String, Entry>>,
 }
 impl InteractionRegistry {
-    /// Issues an opaque token backed by the operating system random source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the random source or registry is unavailable.
-    pub fn issue(
-        &self,
-        request: ApprovalRequest,
-        created_at: Instant,
-        expiry: Instant,
-    ) -> Result<IssuedApproval, String> {
-        self.issue_with_liveness(request, created_at, expiry, Arc::new(AtomicBool::new(true)))
-    }
-    pub(crate) fn issue_with_liveness(
+    pub fn issue_with_liveness(
         &self,
         request: ApprovalRequest,
         created_at: Instant,
@@ -79,7 +60,8 @@ impl InteractionRegistry {
     /// # Errors
     ///
     /// Returns an error for invalid lifetimes, empty tokens, or collisions.
-    pub fn issue_with_token(
+    #[cfg(test)]
+    fn issue_with_token(
         &self,
         token: String,
         request: ApprovalRequest,
@@ -94,7 +76,7 @@ impl InteractionRegistry {
             Arc::new(AtomicBool::new(true)),
         )
     }
-    pub(crate) fn issue_with_token_and_liveness(
+    fn issue_with_token_and_liveness(
         &self,
         token: String,
         request: ApprovalRequest,
@@ -134,13 +116,10 @@ impl InteractionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the rejection reason for an unknown, expired, unauthorized, mismatched, or
-    /// wrong-channel interaction.
+    /// Returns the rejection reason for an unknown, expired, or wrong-channel interaction.
     pub fn resolve(
         &self,
         token: &str,
-        owner_id: &str,
-        session_id: &str,
         channel_id: u64,
         decision: Decision,
         now: Instant,
@@ -158,12 +137,6 @@ impl InteractionRegistry {
         {
             return Err(ResolveError::UnknownOrExpired);
         }
-        if owner_id != entry.request.owner_id {
-            return Err(ResolveError::Unauthorized);
-        }
-        if session_id != entry.request.session_id {
-            return Err(ResolveError::WrongSession);
-        }
         if channel_id != entry.request.channel_id {
             return Err(ResolveError::WrongChannel);
         }
@@ -178,23 +151,12 @@ impl InteractionRegistry {
         let _ = sender.send(decision);
         Ok(())
     }
-    pub fn session_id(&self, token: &str) -> Option<String> {
-        self.entries
-            .lock()
-            .ok()?
-            .get(token)
-            .filter(|entry| entry.hook_alive.load(Ordering::Acquire))
-            .map(|entry| entry.request.session_id.clone())
-    }
-    pub fn expire(&self, token: &str, now: Instant) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
-            return false;
-        };
-        let expired = entries.get(token).is_some_and(|entry| now >= entry.expiry);
-        if expired {
-            entries.remove(token);
-        }
-        expired
+    pub fn has_pending(&self, token: &str) -> bool {
+        self.entries.lock().ok().is_some_and(|entries| {
+            entries
+                .get(token)
+                .is_some_and(|entry| entry.hook_alive.load(Ordering::Acquire))
+        })
     }
     pub fn remove(&self, token: &str) -> bool {
         self.entries
@@ -202,15 +164,6 @@ impl InteractionRegistry {
             .ok()
             .and_then(|mut entries| entries.remove(token))
             .is_some()
-    }
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.lock().map_or(0, |entries| entries.len())
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 #[cfg(test)]
@@ -221,41 +174,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     fn request(channel_id: u64) -> ApprovalRequest {
-        ApprovalRequest {
-            owner_id: "owner".to_owned(),
-            session_id: "session".to_owned(),
-            prompt_id: "prompt".to_owned(),
-            tool: "Bash".to_owned(),
-            channel_id,
-        }
+        ApprovalRequest { channel_id }
     }
     #[test]
     fn registry_state_machine_rejects_invalid_taps() {
         let now = Instant::now();
-        let cases = [
-            (
-                "wrong owner",
-                "other",
-                "session",
-                7,
-                ResolveError::Unauthorized,
-            ),
-            (
-                "wrong session",
-                "owner",
-                "other",
-                7,
-                ResolveError::WrongSession,
-            ),
-            (
-                "wrong channel",
-                "owner",
-                "session",
-                8,
-                ResolveError::WrongChannel,
-            ),
-        ];
-        for (_, owner, session, channel, expected) in cases {
+        let cases = [("wrong channel", 8, ResolveError::WrongChannel)];
+        for (_, channel, expected) in cases {
             let registry = InteractionRegistry::default();
             let issued = registry
                 .issue_with_token(
@@ -266,14 +191,7 @@ mod tests {
                 )
                 .expect("issue token");
             assert_eq!(
-                registry.resolve(
-                    &issued.token,
-                    owner,
-                    session,
-                    channel,
-                    Decision::allow(),
-                    now,
-                ),
+                registry.resolve(&issued.token, channel, Decision::allow(), now,),
                 Err(expected)
             );
         }
@@ -291,53 +209,14 @@ mod tests {
             )
             .expect("issue token");
         registry
-            .resolve(
-                &issued.token,
-                "owner",
-                "session",
-                7,
-                Decision::deny(Some("no".to_owned())),
-                now,
-            )
+            .resolve(&issued.token, 7, Decision::deny(Some("no".to_owned())), now)
             .expect("first tap resolves");
         assert_eq!(
             issued.receiver.await,
             Ok(Decision::deny(Some("no".to_owned())))
         );
         assert_eq!(
-            registry.resolve(
-                "opaque-token",
-                "owner",
-                "session",
-                7,
-                Decision::allow(),
-                now,
-            ),
-            Err(ResolveError::UnknownOrExpired)
-        );
-    }
-    #[test]
-    fn expired_token_is_removed_and_rejected() {
-        let now = Instant::now();
-        let registry = InteractionRegistry::default();
-        registry
-            .issue_with_token(
-                "expired-token".to_owned(),
-                request(7),
-                now,
-                now + Duration::from_secs(1),
-            )
-            .expect("issue token");
-        assert!(registry.expire("expired-token", now + Duration::from_secs(1)));
-        assert_eq!(
-            registry.resolve(
-                "expired-token",
-                "owner",
-                "session",
-                7,
-                Decision::allow(),
-                now + Duration::from_secs(1),
-            ),
+            registry.resolve("opaque-token", 7, Decision::allow(), now,),
             Err(ResolveError::UnknownOrExpired)
         );
     }
@@ -358,7 +237,7 @@ mod tests {
 
         hook_alive.store(false, Ordering::Release);
         assert_eq!(
-            registry.resolve(&issued.token, "owner", "session", 7, Decision::allow(), now,),
+            registry.resolve(&issued.token, 7, Decision::allow(), now,),
             Err(ResolveError::UnknownOrExpired)
         );
     }

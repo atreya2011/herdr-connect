@@ -3,7 +3,8 @@
 //! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
 //! message creation responses do not carry the guild identifier required by the gateway handler.
 
-use crate::{AgentSnapshot, agent_prompt, list_agents};
+use crate::herdr::agent_prompt;
+use crate::{AgentSnapshot, list_agents};
 use std::sync::Arc;
 use twilight_http::Client;
 use twilight_model::{
