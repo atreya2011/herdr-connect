@@ -124,6 +124,7 @@ impl PermissionResponder {
         let message = self
             .deliver_card(
                 channel,
+                interaction.vendor,
                 &interaction.tool_name,
                 &interaction.tool_input.command,
                 &issued.token,
@@ -226,12 +227,14 @@ impl PermissionResponder {
     async fn deliver_card(
         &self,
         channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+        vendor: crate::permission::PermissionVendor,
         tool: &str,
         command: &str,
         token: &str,
         liveness: &HookLiveness,
     ) -> Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>> {
-        let delivery = deliver_permission_card(self.client.as_ref(), channel, tool, command, token);
+        let delivery =
+            deliver_permission_card(self.client.as_ref(), channel, vendor, tool, command, token);
         tokio::pin!(delivery);
         tokio::select! {
             result = &mut delivery => {
@@ -643,7 +646,7 @@ mod tests {
         PermissionResponder, correlate_decision, read_json_line, return_decision_before_card_edit,
         spawn_hook_monitor,
     };
-    use crate::permission::{ClaudePermissionToolInput, Decision, Interaction};
+    use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -660,6 +663,7 @@ mod tests {
                 command: "touch proof".to_owned(),
                 description: "Create proof".to_owned(),
             },
+            vendor: PermissionVendor::Claude,
         }
     }
 

@@ -43,6 +43,17 @@ pub struct Interaction {
     pub prompt_id: String,
     pub tool_name: String,
     pub tool_input: ClaudePermissionToolInput,
+    #[serde(default)]
+    pub vendor: PermissionVendor,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionVendor {
+    #[default]
+    Claude,
+    Codex,
+    Cursor,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +105,7 @@ pub fn decode_claude_permission_request(input: &[u8]) -> Result<Interaction, Str
         prompt_id: request.prompt_id,
         tool_name: request.tool_name,
         tool_input: request.tool_input,
+        vendor: PermissionVendor::Claude,
     })
 }
 
@@ -120,6 +132,7 @@ pub fn decode_codex_permission_request(input: &[u8]) -> Result<Interaction, Stri
             command: request.tool_input.command,
             description: String::new(),
         },
+        vendor: PermissionVendor::Codex,
     })
 }
 
@@ -146,6 +159,7 @@ pub fn decode_cursor_permission_request(input: &[u8]) -> Result<Interaction, Str
             command: request.command,
             description: String::new(),
         },
+        vendor: PermissionVendor::Cursor,
     })
 }
 

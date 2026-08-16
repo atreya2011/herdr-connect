@@ -6,8 +6,9 @@ mod support;
 mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
-        AgentLogCapture, Transition, create_transition_messages, create_unsupported_blocked_card,
-        deliver_permission_card, deliver_transition_card, sync_topology, transition_card_nonce,
+        AgentLogCapture, PermissionVendor, Transition, create_transition_messages,
+        create_unsupported_blocked_card, deliver_permission_card, deliver_transition_card,
+        sync_topology, transition_card_nonce,
     };
     use serial_test::serial;
     use twilight_model::channel::message::component::Component::{ActionRow, Button};
@@ -36,6 +37,7 @@ mod real_guild {
         let message = deliver_permission_card(
             guild.client.as_ref(),
             channel,
+            PermissionVendor::Claude,
             "Bash",
             "printf 'permission'",
             "opaque-token-for-test",

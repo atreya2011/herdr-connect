@@ -1,4 +1,5 @@
 use crate::cards::TransitionMessage;
+use crate::permission::PermissionVendor;
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,13 +74,14 @@ pub async fn expire_informational_card(
 pub async fn deliver_permission_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    vendor: PermissionVendor,
     tool: &str,
     command: &str,
     token: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
     let payload = serde_json::json!({
         "embeds": [{
-            "title": "Claude permission request",
+            "title": permission_card_title(vendor),
             "description": permission_card_description(tool, command),
             "color": 0x00f1_c40f,
         }],
@@ -96,6 +98,14 @@ pub async fn deliver_permission_card(
         .await
         .map(|message| message.id)
         .map_err(|error| error.to_string())
+}
+
+const fn permission_card_title(vendor: PermissionVendor) -> &'static str {
+    match vendor {
+        PermissionVendor::Claude => "Claude permission request",
+        PermissionVendor::Codex => "Codex permission request",
+        PermissionVendor::Cursor => "Cursor shell request",
+    }
 }
 
 fn permission_card_description(tool: &str, command: &str) -> String {
@@ -297,9 +307,10 @@ fn new_process_start_component() -> u64 {
 mod tests {
     use super::{
         MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
-        permission_card_description, transition_card_nonce_for_start,
+        permission_card_description, permission_card_title, transition_card_nonce_for_start,
     };
     use crate::cards::TransitionMessage;
+    use crate::permission::PermissionVendor;
     use serde_json::json;
 
     #[test]
@@ -416,5 +427,18 @@ mod tests {
 
         assert!(description.contains("rm -rf /tmp/x"));
         assert!(description.chars().count() <= MAX_PERMISSION_DESCRIPTION_LENGTH);
+    }
+
+    #[test]
+    fn permission_card_title_identifies_vendor() {
+        let cases = [
+            (PermissionVendor::Claude, "Claude permission request"),
+            (PermissionVendor::Codex, "Codex permission request"),
+            (PermissionVendor::Cursor, "Cursor shell request"),
+        ];
+
+        for (vendor, expected) in cases {
+            assert_eq!(permission_card_title(vendor), expected);
+        }
     }
 }

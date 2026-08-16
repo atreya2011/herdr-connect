@@ -1,5 +1,5 @@
 use herdr_connect_rs::{
-    ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
+    ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction, PermissionVendor,
     decode_claude_permission_request, encode_claude_decision, request_decision,
 };
 use serde_json::Value;
@@ -33,6 +33,7 @@ fn interaction(session_id: &str, prompt_id: &str) -> Interaction {
             command: format!("touch {prompt_id}"),
             description: format!("Create {prompt_id}"),
         },
+        vendor: PermissionVendor::Claude,
     }
 }
 
@@ -210,6 +211,7 @@ async fn real_broker_failure_cases_fall_through() {
                 command: "command".to_owned(),
                 description: "description".to_owned(),
             },
+            vendor: PermissionVendor::Claude,
         },
         &broker.path,
         Duration::from_millis(20),
