@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use twilight_http::Client;
+use twilight_http::{Client, api_error::ApiError, error::ErrorType, response::StatusCode};
 use twilight_model::{
     channel::{Channel, ChannelType},
     id::{
@@ -73,7 +73,7 @@ pub async fn cleanup(guild: &Guild) -> Result<usize, String> {
 }
 
 pub async fn channel(guild: &Guild, name: &str) -> Result<Id<ChannelMarker>, String> {
-    Ok(guild
+    let id = guild
         .client
         .create_guild_channel(guild.id, name)
         .kind(ChannelType::GuildText)
@@ -82,5 +82,26 @@ pub async fn channel(guild: &Guild, name: &str) -> Result<Id<ChannelMarker>, Str
         .model()
         .await
         .map_err(|e| e.to_string())?
-        .id)
+        .id;
+
+    for attempt in 0..6 {
+        match guild.client.channel(id).await {
+            Ok(_) => return Ok(id),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorType::Response {
+                        status,
+                        error: ApiError::General(api_error),
+                        ..
+                    } if *status == StatusCode::NOT_FOUND && api_error.code == 10003
+                ) && attempt < 5 =>
+            {
+                tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    unreachable!()
 }
