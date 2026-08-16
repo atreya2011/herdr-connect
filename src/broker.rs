@@ -5,6 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -76,6 +77,18 @@ where
     })
 }
 
+fn return_decision_before_card_edit<F>(decision: Option<Decision>, card_edit: F) -> Option<Decision>
+where
+    F: Future<Output = Result<(), String>> + Send + 'static,
+{
+    std::mem::drop(tokio::spawn(async move {
+        if let Err(error) = card_edit.await {
+            eprintln!("permission card edit failed: {error}");
+        }
+    }));
+    decision
+}
+
 impl PermissionResponder {
     #[must_use]
     pub fn new(client: Arc<Client>, guild: Id<GuildMarker>, owner_id: String) -> Self {
@@ -116,7 +129,16 @@ impl PermissionResponder {
             )
             .await?;
         let token = issued.token.clone();
-        let decision = self.wait_decision(issued, &liveness).await;
+        let decision = Self::wait_decision(
+            issued.receiver,
+            &liveness,
+            tokio::time::sleep(
+                issued
+                    .expiry
+                    .saturating_duration_since(std::time::Instant::now()),
+            ),
+        )
+        .await;
         let decision = decision.filter(|_| liveness.is_alive());
         let card_text = match decision.as_ref().map(|decision| &decision.behavior) {
             Some(DecisionBehavior::Allow) => "resolved: allowed",
@@ -130,9 +152,10 @@ impl PermissionResponder {
                 }
             }
         };
-        let _ =
-            expire_permission_card(self.client.as_ref(), channel, message, &token, card_text).await;
-        decision
+        let client = Arc::clone(&self.client);
+        return_decision_before_card_edit(decision, async move {
+            expire_permission_card(client.as_ref(), channel, message, &token, card_text).await
+        })
     }
 
     async fn route(
@@ -225,14 +248,16 @@ impl PermissionResponder {
     }
 
     async fn wait_decision(
-        &self,
-        issued: crate::IssuedApproval,
+        receiver: oneshot::Receiver<Decision>,
         liveness: &HookLiveness,
+        expiry: tokio::time::Sleep,
     ) -> Option<Decision> {
+        tokio::pin!(expiry);
         tokio::select! {
-            result = issued.receiver => result.ok(),
+            biased;
+            result = receiver => result.ok(),
             () = liveness.wait_closed() => None,
-            () = tokio::time::sleep(issued.expiry.saturating_duration_since(std::time::Instant::now())) => None,
+            () = &mut expiry => None,
         }
     }
 
@@ -591,12 +616,16 @@ where
 mod tests {
     use super::{
         BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingKey, PendingRequests,
-        correlate_decision, read_json_line, spawn_hook_monitor,
+        PermissionResponder, correlate_decision, read_json_line, return_decision_before_card_edit,
+        spawn_hook_monitor,
     };
-    use crate::permission::{ClaudePermissionToolInput, Interaction};
+    use crate::permission::{ClaudePermissionToolInput, Decision, Interaction};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+    use tokio::sync::oneshot;
 
     fn interaction() -> Interaction {
         Interaction {
@@ -672,5 +701,35 @@ mod tests {
             .await
             .expect("write malformed response");
         assert!(read_json_line::<BrokerResponse>(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolved_decision_wins_expiry_race() {
+        for _ in 0..128 {
+            let (sender, receiver) = oneshot::channel();
+            sender
+                .send(Decision::allow())
+                .expect("send resolved decision");
+            let expiry = tokio::time::sleep(Duration::from_millis(1));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            assert_eq!(
+                PermissionResponder::wait_decision(receiver, &HookLiveness::new(), expiry).await,
+                Some(Decision::allow())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_decision_does_not_wait_for_card_edit() {
+        let edit_started = Arc::new(AtomicBool::new(false));
+        let edit_started_by_task = Arc::clone(&edit_started);
+        let decision = return_decision_before_card_edit(Some(Decision::allow()), async move {
+            edit_started_by_task.store(true, Ordering::Release);
+            std::future::pending::<Result<(), String>>().await
+        });
+        assert_eq!(decision, Some(Decision::allow()));
+        assert!(!edit_started.load(Ordering::Acquire));
+        tokio::task::yield_now().await;
+        assert!(edit_started.load(Ordering::Acquire));
     }
 }
