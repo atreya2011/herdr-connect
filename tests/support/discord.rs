@@ -51,7 +51,8 @@ pub async fn cleanup(guild: &Guild) -> Result<usize, String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    for attempt in 0..5 {
+    let mut attempt = 0;
+    loop {
         let leftover = guild
             .client
             .guild_channels(guild.id)
@@ -67,8 +68,8 @@ pub async fn cleanup(guild: &Guild) -> Result<usize, String> {
             return Ok(leftover);
         }
         tokio::time::sleep(Duration::from_millis(200) * (attempt + 1)).await;
+        attempt += 1;
     }
-    unreachable!("cleanup checks always return a leftover count");
 }
 
 pub async fn channel(guild: &Guild, name: &str) -> Result<Id<ChannelMarker>, String> {
