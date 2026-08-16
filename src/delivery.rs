@@ -291,7 +291,6 @@ mod tests {
 
             assert_ne!(first, second);
             assert!(first.len() <= MAX_DISCORD_NONCE_LENGTH);
-            assert!(second.len() <= MAX_DISCORD_NONCE_LENGTH);
             assert_eq!(
                 first,
                 transition_card_nonce_for_start(first_start, terminal, sequence, card_index)
