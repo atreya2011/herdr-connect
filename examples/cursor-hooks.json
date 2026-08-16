@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "herdr-connect-rs hook --vendor cursor",
+        "timeout": 30000,
+        "failClosed": true
+      }
+    ]
+  }
+}
