@@ -1,0 +1,16 @@
+{
+  "conversation_id": "603de9c6-4aa5-4e18-87fa-336ed03fcd70",
+  "generation_id": "7ab2e513-0373-40b1-aa59-71077298c992",
+  "model": "grok-4.6",
+  "command": "touch <tmp>/herdr-connect-rs-gauntlet-20260815-102236/t8-proof.txt",
+  "cwd": "",
+  "sandbox": false,
+  "session_id": "603de9c6-4aa5-4e18-87fa-336ed03fcd70",
+  "hook_event_name": "beforeShellExecution",
+  "cursor_version": "2026.08.11-e8db854",
+  "workspace_roots": [
+    "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t8-trigger"
+  ],
+  "user_email": "user@example.com",
+  "transcript_path": null
+}

@@ -29,6 +29,14 @@ struct CodexPermissionToolInput {
     command: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CursorPermissionRequest {
+    session_id: String,
+    generation_id: String,
+    command: String,
+    hook_event_name: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Interaction {
     pub session_id: String,
@@ -115,6 +123,32 @@ pub fn decode_codex_permission_request(input: &[u8]) -> Result<Interaction, Stri
     })
 }
 
+/// Decodes one Cursor `beforeShellExecution` hook payload into the broker interaction.
+///
+/// Cursor's `generation_id` is the vendor-neutral request id used by the broker in the existing
+/// `prompt_id` field. Cursor's shell hook supplies the command at the top level.
+///
+/// # Errors
+///
+/// Returns an error when the payload is not JSON, does not have the required fields, or names a
+/// different hook event.
+pub fn decode_cursor_permission_request(input: &[u8]) -> Result<Interaction, String> {
+    let request: CursorPermissionRequest =
+        serde_json::from_slice(input).map_err(|error| error.to_string())?;
+    if request.hook_event_name != "beforeShellExecution" {
+        return Err("unexpected Cursor hook event".to_owned());
+    }
+    Ok(Interaction {
+        session_id: request.session_id,
+        prompt_id: request.generation_id,
+        tool_name: "Shell".to_owned(),
+        tool_input: ClaudePermissionToolInput {
+            command: request.command,
+            description: String::new(),
+        },
+    })
+}
+
 /// Encodes a broker decision in Claude's object-form hook response schema.
 ///
 /// # Errors
@@ -131,6 +165,22 @@ pub fn encode_claude_decision(decision: &Decision) -> Result<Vec<u8>, String> {
 /// Returns an error if the response cannot be serialized.
 pub fn encode_codex_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     encode_permission_decision(decision)
+}
+
+/// Encodes a broker decision in Cursor's native shell-hook response schema.
+///
+/// # Errors
+///
+/// Returns an error if the response cannot be serialized.
+pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
+    let output = match decision.behavior {
+        DecisionBehavior::Allow => serde_json::json!({"permission": "allow"}),
+        DecisionBehavior::Deny => serde_json::json!({
+            "permission": "deny",
+            "agent_message": decision.message.as_deref().unwrap_or("permission denied"),
+        }),
+    };
+    serde_json::to_vec(&output).map_err(|error| error.to_string())
 }
 
 fn encode_permission_decision(decision: &Decision) -> Result<Vec<u8>, String> {

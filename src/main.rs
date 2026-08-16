@@ -6,8 +6,9 @@ use herdr_connect_rs::{
     route_topology, sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
-    PermissionResponder, decode_claude_permission_request, decode_codex_permission_request,
-    encode_claude_decision, encode_codex_decision, handle_component, request_decision,
+    Decision, PermissionResponder, decode_claude_permission_request,
+    decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
+    encode_codex_decision, encode_cursor_decision, handle_component, request_decision,
     run_broker as run_permission_broker,
 };
 use std::collections::{HashMap, HashSet};
@@ -559,18 +560,23 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some((interaction, vendor)) = decode_hook_request(&input) else {
         return Ok(());
     };
-    let socket_path = socket_path(&args).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "hook requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>",
-        )
-    })?;
-    let Some(decision) = request_decision(&interaction, &socket_path, hook_timeout()).await else {
-        return Ok(());
+    let socket_path = match socket_path(&args) {
+        Some(path) => Some(path),
+        None if matches!(vendor, HookVendor::Cursor) => None,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hook requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>",
+            )
+            .into());
+        }
     };
-    let output = match vendor {
-        HookVendor::Claude => encode_claude_decision(&decision)?,
-        HookVendor::Codex => encode_codex_decision(&decision)?,
+    let decision = match socket_path.as_deref() {
+        Some(path) => request_decision(&interaction, path, hook_timeout()).await,
+        None => None,
+    };
+    let Some(output) = encode_hook_decision(vendor, decision.as_ref())? else {
+        return Ok(());
     };
     tokio::io::stdout().write_all(&output).await?;
     Ok(())
@@ -580,6 +586,7 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 enum HookVendor {
     Claude,
     Codex,
+    Cursor,
 }
 
 fn decode_hook_request(input: &[u8]) -> Option<(herdr_connect_rs::Interaction, HookVendor)> {
@@ -589,7 +596,32 @@ fn decode_hook_request(input: &[u8]) -> Option<(herdr_connect_rs::Interaction, H
             decode_codex_permission_request(input)
                 .map(|interaction| (interaction, HookVendor::Codex))
         })
+        .or_else(|_| {
+            decode_cursor_permission_request(input)
+                .map(|interaction| (interaction, HookVendor::Cursor))
+        })
         .ok()
+}
+
+fn encode_hook_decision(
+    vendor: HookVendor,
+    decision: Option<&Decision>,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(decision) = decision else {
+        return match vendor {
+            HookVendor::Claude | HookVendor::Codex => Ok(None),
+            HookVendor::Cursor => encode_cursor_decision(&Decision::deny(Some(
+                "permission broker did not return a decision; denying by default".to_owned(),
+            )))
+            .map(Some),
+        };
+    };
+    let output = match vendor {
+        HookVendor::Claude => encode_claude_decision(decision)?,
+        HookVendor::Codex => encode_codex_decision(decision)?,
+        HookVendor::Cursor => encode_cursor_decision(decision)?,
+    };
+    Ok(Some(output))
 }
 
 async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -705,6 +737,22 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cursor_broker_failures_emit_deny_objects() {
+        for failure in ["timeout", "malformed broker response", "unavailable"] {
+            let output = super::encode_hook_decision(super::HookVendor::Cursor, None)
+                .unwrap_or_else(|error| panic!("{failure} failure must encode: {error}"))
+                .expect("Cursor failures must produce output");
+            let value: Value =
+                serde_json::from_slice(&output).expect("Cursor failure output is JSON");
+            assert_eq!(value["permission"], "deny", "failure: {failure}");
+            assert!(
+                value["agent_message"].as_str().is_some(),
+                "failure: {failure}"
+            );
+        }
+    }
 
     #[test]
     fn state_change_nonce_survives_terminal_departure_and_return() {
