@@ -1,5 +1,5 @@
 use crate::delivery::expire_permission_card;
-use crate::permission::{Decision, DecisionBehavior, Interaction};
+use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
 use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
 use crate::{deliver_permission_card, list_agents, route_topology, sync_topology, tab_list_result};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ use twilight_model::id::{Id, marker::GuildMarker};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
+const CURSOR_PERMISSION_TIMEOUT: Duration = Duration::from_secs(25);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[must_use]
@@ -109,6 +110,10 @@ impl PermissionResponder {
         let route = self.route(interaction, &liveness).await?;
         let channel = self.sync_channel(&route, &liveness).await?;
         let created_at = std::time::Instant::now();
+        let permission_timeout = match interaction.vendor {
+            PermissionVendor::Cursor => CURSOR_PERMISSION_TIMEOUT,
+            PermissionVendor::Claude | PermissionVendor::Codex => PERMISSION_TIMEOUT,
+        };
         let issued = self
             .registry
             .issue_with_liveness(
@@ -117,7 +122,7 @@ impl PermissionResponder {
                     session_id: interaction.session_id.clone(),
                 },
                 created_at,
-                created_at + PERMISSION_TIMEOUT,
+                created_at + permission_timeout,
                 Arc::clone(&liveness.alive),
             )
             .ok()?;
@@ -402,6 +407,10 @@ pub async fn request_decision(
     socket_path: &Path,
     timeout_duration: Duration,
 ) -> Option<Decision> {
+    let timeout_duration = match interaction.vendor {
+        PermissionVendor::Cursor => timeout_duration.min(CURSOR_PERMISSION_TIMEOUT),
+        PermissionVendor::Claude | PermissionVendor::Codex => timeout_duration,
+    };
     tokio::time::timeout(timeout_duration, async {
         let mut stream = UnixStream::connect(socket_path).await.map_err(|_| ())?;
         write_json_line(&mut stream, interaction)

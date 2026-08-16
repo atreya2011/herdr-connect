@@ -6,7 +6,7 @@ use herdr_connect_rs::{
     route_topology, sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
-    Decision, PermissionResponder, decode_claude_permission_request,
+    Decision, Interaction, PermissionResponder, PermissionVendor, decode_claude_permission_request,
     decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
     encode_codex_decision, encode_cursor_decision, handle_component, request_decision,
     run_broker as run_permission_broker,
@@ -597,14 +597,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let (explicit_vendor, requested_socket) = parse_hook_args(&args)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
-    let Some((interaction, vendor)) = decode_hook_request(&input) else {
+    let Some(interaction) = decode_hook_request(&input, explicit_vendor) else {
+        if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
+            write_hook_decision(PermissionVendor::Cursor, None).await?;
+        }
         return Ok(());
     };
-    let socket_path = match socket_path(&args) {
+    let socket_path = match requested_socket
+        .or_else(|| std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET").map(std::path::PathBuf::from))
+    {
         Some(path) => Some(path),
-        None if matches!(vendor, HookVendor::Cursor) => None,
+        None if matches!(interaction.vendor, PermissionVendor::Cursor) => None,
         None => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -617,53 +624,88 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => request_decision(&interaction, path, hook_timeout()).await,
         None => None,
     };
-    let Some(output) = encode_hook_decision(vendor, decision.as_ref())? else {
+    write_hook_decision(interaction.vendor, decision.as_ref()).await
+}
+
+async fn write_hook_decision(
+    vendor: PermissionVendor,
+    decision: Option<&Decision>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(output) = encode_hook_decision(vendor, decision)? else {
         return Ok(());
     };
-    tokio::io::stdout().write_all(&output).await?;
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(&output).await?;
+    stdout.flush().await?;
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum HookVendor {
-    Claude,
-    Codex,
-    Cursor,
-}
-
-fn decode_hook_request(input: &[u8]) -> Option<(herdr_connect_rs::Interaction, HookVendor)> {
-    decode_claude_permission_request(input)
-        .map(|interaction| (interaction, HookVendor::Claude))
-        .or_else(|_| {
-            decode_codex_permission_request(input)
-                .map(|interaction| (interaction, HookVendor::Codex))
-        })
-        .or_else(|_| {
-            decode_cursor_permission_request(input)
-                .map(|interaction| (interaction, HookVendor::Cursor))
-        })
-        .ok()
+fn decode_hook_request(input: &[u8], vendor: Option<PermissionVendor>) -> Option<Interaction> {
+    match vendor {
+        Some(PermissionVendor::Claude) => decode_claude_permission_request(input).ok(),
+        Some(PermissionVendor::Codex) => decode_codex_permission_request(input).ok(),
+        Some(PermissionVendor::Cursor) => decode_cursor_permission_request(input).ok(),
+        None => decode_claude_permission_request(input)
+            .or_else(|_| decode_codex_permission_request(input))
+            .or_else(|_| decode_cursor_permission_request(input))
+            .ok(),
+    }
 }
 
 fn encode_hook_decision(
-    vendor: HookVendor,
+    vendor: PermissionVendor,
     decision: Option<&Decision>,
 ) -> Result<Option<Vec<u8>>, String> {
     let Some(decision) = decision else {
         return match vendor {
-            HookVendor::Claude | HookVendor::Codex => Ok(None),
-            HookVendor::Cursor => encode_cursor_decision(&Decision::deny(Some(
+            PermissionVendor::Claude | PermissionVendor::Codex => Ok(None),
+            PermissionVendor::Cursor => encode_cursor_decision(&Decision::deny(Some(
                 "permission broker did not return a decision; denying by default".to_owned(),
             )))
             .map(Some),
         };
     };
     let output = match vendor {
-        HookVendor::Claude => encode_claude_decision(decision)?,
-        HookVendor::Codex => encode_codex_decision(decision)?,
-        HookVendor::Cursor => encode_cursor_decision(decision)?,
+        PermissionVendor::Claude => encode_claude_decision(decision)?,
+        PermissionVendor::Codex => encode_codex_decision(decision)?,
+        PermissionVendor::Cursor => encode_cursor_decision(decision)?,
     };
     Ok(Some(output))
+}
+
+fn parse_hook_args(
+    args: &[String],
+) -> Result<(Option<PermissionVendor>, Option<std::path::PathBuf>), String> {
+    let mut vendor = None;
+    let mut socket = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--vendor" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or("--vendor requires claude, codex, or cursor")?;
+                vendor = Some(match value.as_str() {
+                    "claude" => PermissionVendor::Claude,
+                    "codex" => PermissionVendor::Codex,
+                    "cursor" => PermissionVendor::Cursor,
+                    _ => return Err("--vendor requires claude, codex, or cursor".to_owned()),
+                });
+            }
+            "--socket" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("--socket requires a path")?;
+                socket = Some(std::path::PathBuf::from(value));
+            }
+            argument => return Err(format!("unknown hook argument: {argument}")),
+        }
+        index += 1;
+    }
+    Ok((vendor, socket))
 }
 
 async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -791,7 +833,7 @@ mod tests {
     #[test]
     fn cursor_broker_failures_emit_deny_objects() {
         for failure in ["timeout", "malformed broker response", "unavailable"] {
-            let output = super::encode_hook_decision(super::HookVendor::Cursor, None)
+            let output = super::encode_hook_decision(super::PermissionVendor::Cursor, None)
                 .unwrap_or_else(|error| panic!("{failure} failure must encode: {error}"))
                 .expect("Cursor failures must produce output");
             let value: Value =
