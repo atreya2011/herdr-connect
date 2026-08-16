@@ -3,7 +3,7 @@ use herdr_connect_rs::{
     decode_claude_permission_request, encode_claude_decision, request_decision,
 };
 use serde_json::Value;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,7 +84,7 @@ impl BrokerProcess {
             .arg(&path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn shipped broker");
         Self { child, path }
@@ -114,6 +114,19 @@ impl BrokerProcess {
         let status = self.child.wait().expect("wait for shipped broker");
         assert!(!self.path.exists(), "broker socket was not cleaned up");
         status
+    }
+
+    fn terminate_with_stderr(mut self) -> (ExitStatus, String) {
+        self.signal("CONT");
+        self.signal("TERM");
+        let mut stderr = self.child.stderr.take().expect("broker stderr is piped");
+        let status = self.child.wait().expect("wait for shipped broker");
+        let mut stderr_contents = String::new();
+        stderr
+            .read_to_string(&mut stderr_contents)
+            .expect("read broker stderr");
+        assert!(!self.path.exists(), "broker socket was not cleaned up");
+        (status, stderr_contents)
     }
 }
 
@@ -224,6 +237,65 @@ async fn oversized_frame_is_rejected_before_the_peer_closes() {
         .expect("read broker close");
     assert_eq!(read, 0, "broker must close the oversized request");
     broker.terminate();
+}
+
+#[tokio::test]
+async fn real_broker_drops_a_partial_initial_frame_within_the_deadline() {
+    let broker = BrokerProcess::start("partial-initial-frame");
+    broker.wait_until_ready().await;
+    let mut stream = UnixStream::connect(&broker.path)
+        .await
+        .expect("connect broker");
+    stream.write_all(b"{").await.expect("write partial frame");
+    let mut byte = [0; 1];
+    let read = tokio::time::timeout(Duration::from_secs(11), stream.read(&mut byte))
+        .await
+        .expect("broker must drop an incomplete frame within its deadline")
+        .expect("read broker close");
+    assert_eq!(read, 0, "broker must close the incomplete request");
+    broker.terminate();
+}
+
+#[tokio::test]
+async fn real_broker_logs_initial_frame_rejection_reasons() {
+    let cases = [
+        (
+            "oversized-frame-log",
+            vec![b'x'; 64 * 1024 + 1],
+            "oversized broker frame",
+        ),
+        (
+            "malformed-frame-log",
+            b"not json\n".to_vec(),
+            "malformed broker frame",
+        ),
+        ("empty-frame-log", b"\n".to_vec(), "empty broker frame"),
+    ];
+    for (label, frame, reason) in cases {
+        let broker = BrokerProcess::start(label);
+        broker.wait_until_ready().await;
+        let mut stream = UnixStream::connect(&broker.path)
+            .await
+            .expect("connect broker");
+        stream
+            .write_all(&frame)
+            .await
+            .expect("write rejected frame");
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut byte))
+            .await
+            .expect("broker must reject the frame promptly")
+            .expect("read broker close");
+        assert_eq!(read, 0, "broker must close the rejected request");
+        let (status, stderr) = broker.terminate_with_stderr();
+        assert!(status.success(), "broker did not stop cleanly: {status}");
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains(&format!("broker rejected initial frame: {reason}")),),
+            "broker stderr did not name {reason}: {stderr}"
+        );
+    }
 }
 
 #[tokio::test]

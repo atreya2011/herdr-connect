@@ -25,6 +25,7 @@ use twilight_model::id::{Id, marker::GuildMarker};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
+const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[must_use]
 pub const fn hook_timeout() -> Duration {
@@ -554,10 +555,19 @@ async fn handle_connection(
     responder: Arc<PermissionResponder>,
     connection_id: u64,
 ) {
-    let interaction = match read_json_line(&mut stream).await {
-        Ok(interaction) if is_valid_interaction(&interaction) => interaction,
-        _ => return,
-    };
+    let interaction =
+        match tokio::time::timeout(INITIAL_FRAME_TIMEOUT, read_json_line(&mut stream)).await {
+            Ok(Ok(interaction)) if is_valid_interaction(&interaction) => interaction,
+            Ok(Ok(_)) => return,
+            Ok(Err(error)) => {
+                eprintln!("broker rejected initial frame: {error}");
+                return;
+            }
+            Err(_) => {
+                eprintln!("broker rejected initial frame: initial frame read timed out");
+                return;
+            }
+        };
     let (read_half, mut write_half) = stream.into_split();
     let liveness = HookLiveness::new();
     let monitor = spawn_hook_monitor(read_half, liveness.clone());
@@ -597,10 +607,20 @@ where
         .read_until(b'\n', &mut bytes)
         .await
         .map_err(|error| error.to_string())?;
-    if length == 0 || length > MAX_FRAME_BYTES || bytes.last() != Some(&b'\n') {
-        return Err("invalid broker frame".to_owned());
+    if length == 0 {
+        return Err("empty broker frame".to_owned());
     }
-    serde_json::from_slice(&bytes[..bytes.len() - 1]).map_err(|error| error.to_string())
+    if length > MAX_FRAME_BYTES {
+        return Err("oversized broker frame".to_owned());
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err("incomplete broker frame".to_owned());
+    }
+    let payload = &bytes[..bytes.len() - 1];
+    if payload.is_empty() {
+        return Err("empty broker frame".to_owned());
+    }
+    serde_json::from_slice(payload).map_err(|error| format!("malformed broker frame: {error}"))
 }
 
 async fn write_json_line<T, W>(stream: &mut W, value: &T) -> Result<(), String>
