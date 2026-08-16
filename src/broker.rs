@@ -580,7 +580,6 @@ const fn is_valid_interaction(interaction: &Interaction) -> bool {
         && !interaction.prompt_id.is_empty()
         && !interaction.tool_name.is_empty()
         && !interaction.tool_input.command.is_empty()
-        && !interaction.tool_input.description.is_empty()
 }
 
 async fn read_json_line<T>(stream: &mut UnixStream) -> Result<T, String>

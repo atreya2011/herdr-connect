@@ -5,8 +5,9 @@ use herdr_connect_rs::{
     route_topology, sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
-    PermissionResponder, decode_claude_permission_request, encode_claude_decision,
-    handle_component, request_decision, run_broker as run_permission_broker,
+    PermissionResponder, decode_claude_permission_request, decode_codex_permission_request,
+    encode_claude_decision, encode_codex_decision, handle_component, request_decision,
+    run_broker as run_permission_broker,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -328,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
-    let Ok(interaction) = decode_claude_permission_request(&input) else {
+    let Some((interaction, vendor)) = decode_hook_request(&input) else {
         return Ok(());
     };
     let socket_path = socket_path(&args).ok_or_else(|| {
@@ -340,9 +341,28 @@ async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(decision) = request_decision(&interaction, &socket_path, hook_timeout()).await else {
         return Ok(());
     };
-    let output = encode_claude_decision(&decision)?;
+    let output = match vendor {
+        HookVendor::Claude => encode_claude_decision(&decision)?,
+        HookVendor::Codex => encode_codex_decision(&decision)?,
+    };
     tokio::io::stdout().write_all(&output).await?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum HookVendor {
+    Claude,
+    Codex,
+}
+
+fn decode_hook_request(input: &[u8]) -> Option<(herdr_connect_rs::Interaction, HookVendor)> {
+    decode_claude_permission_request(input)
+        .map(|interaction| (interaction, HookVendor::Claude))
+        .or_else(|_| {
+            decode_codex_permission_request(input)
+                .map(|interaction| (interaction, HookVendor::Codex))
+        })
+        .ok()
 }
 
 async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {

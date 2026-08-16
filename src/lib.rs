@@ -34,7 +34,8 @@ pub use herdr::{
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
-    decode_claude_permission_request, encode_claude_decision,
+    decode_claude_permission_request, decode_codex_permission_request, encode_claude_decision,
+    encode_codex_decision,
 };
 pub use prompting::should_handle_owner_message;
 pub use readers::{AgentLog, read_agent_log};
