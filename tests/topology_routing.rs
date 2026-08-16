@@ -1,19 +1,12 @@
 use herdr_connect_rs::{AgentSnapshot, HerdrTab, route_topology};
 use serde_json::Value;
 
-fn snapshot<T: serde::de::DeserializeOwned>(name: &str, key: &str) -> T {
-    let value: Value = serde_json::from_str(match name {
-        "agents" => include_str!("fixtures/herdr-agent-list.json"),
-        "tabs" => include_str!("fixtures/herdr-tab-list.json"),
-        _ => unreachable!(),
-    })
-    .expect("captured snapshot is JSON");
-    serde_json::from_value(value["result"][key].clone()).expect("captured shape is valid")
-}
-
 #[test]
 fn route_captured_herdr_snapshots() {
-    let agents: Vec<AgentSnapshot> = snapshot("agents", "agents");
+    let value: Value = serde_json::from_str(include_str!("fixtures/herdr-agent-list.json"))
+        .expect("captured snapshot is JSON");
+    let agents: Vec<AgentSnapshot> =
+        serde_json::from_value(value["result"]["agents"].clone()).expect("captured shape is valid");
     let tabs: Vec<HerdrTab> = agents
         .iter()
         .take(2)
