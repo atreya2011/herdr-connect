@@ -187,7 +187,13 @@ impl PermissionResponder {
             route_topology(&agents, &tabs, &agent.terminal_id)
         });
         let route = tokio::select! {
-            result = route_task => result.ok().and_then(Result::ok),
+            result = route_task => result.ok().and_then(|result| match result {
+                Ok(route) => Some(route),
+                Err(error) => {
+                    eprintln!("{error}");
+                    None
+                }
+            }),
             () = liveness.wait_closed() => None,
         }?;
         liveness.is_alive().then_some(route)
@@ -207,7 +213,10 @@ impl PermissionResponder {
             &route.tab_id,
         );
         let channel = tokio::select! {
-            result = channel_task => result.ok(),
+            result = channel_task => result.map_err(|error| {
+                eprintln!("{error}");
+                error
+            }).ok(),
             () = liveness.wait_closed() => None,
         }?;
         liveness.is_alive().then_some(channel)
