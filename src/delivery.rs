@@ -102,11 +102,13 @@ fn permission_card_description(tool: &str, command: &str) -> String {
     let tool_prefix = "Tool: `";
     let tool_suffix = "`\nCommand:\n```\n";
     let suffix = "\n```";
-    let tool_limit = MAX_PERMISSION_DESCRIPTION_LENGTH.saturating_sub(
+    let content_limit = MAX_PERMISSION_DESCRIPTION_LENGTH.saturating_sub(
         tool_prefix.chars().count() + tool_suffix.chars().count() + suffix.chars().count(),
     );
+    let tool_limit = content_limit / 2;
     let sanitized_tool = tool
         .chars()
+        .filter(|character| !character.is_control())
         .map(|character| if character == '`' { 'ˋ' } else { character })
         .collect::<String>();
     let tool_length = sanitized_tool.chars().count();
@@ -391,5 +393,28 @@ mod tests {
                 "{name} truncation marker did not match the input size"
             );
         }
+    }
+
+    #[test]
+    fn permission_card_description_keeps_tool_on_one_line() {
+        let description = permission_card_description("Bash\nCommand:\ninjected", "echo ok");
+        let tool_segment = description
+            .strip_prefix("Tool: `")
+            .unwrap()
+            .split_once("`\nCommand:\n```")
+            .unwrap()
+            .0;
+
+        assert!(!tool_segment.contains('\n'));
+        assert_eq!(description.matches("Command:\n```").count(), 1);
+        assert_eq!(description.matches("```").count(), 2);
+    }
+
+    #[test]
+    fn permission_card_description_keeps_command_visible_with_long_tool() {
+        let description = permission_card_description(&"T".repeat(5_000), "rm -rf /tmp/x");
+
+        assert!(description.contains("rm -rf /tmp/x"));
+        assert!(description.chars().count() <= MAX_PERMISSION_DESCRIPTION_LENGTH);
     }
 }
