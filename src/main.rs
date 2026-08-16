@@ -369,7 +369,7 @@ async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
             eprintln!("{notice}");
         }
     });
-    let gateway = tokio::spawn(drive_gateway_with_components(
+    let mut gateway = tokio::spawn(drive_gateway_with_components(
         config.token,
         None,
         client,
@@ -378,10 +378,15 @@ async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         notices_tx,
         component_handler(Arc::clone(&responder)),
     ));
-    let result = run_permission_broker(&socket_path, responder).await;
-    gateway.abort();
-    result?;
-    Ok(())
+    tokio::select! {
+        result = run_permission_broker(&socket_path, responder) => {
+            gateway.abort();
+            result.map_err(Into::into)
+        }
+        result = &mut gateway => result
+            .map_err(|error| format!("discord gateway task failed: {error}").into())
+            .and_then(|result| result.map_err(Into::into)),
+    }
 }
 
 fn socket_path(args: &[String]) -> Option<std::path::PathBuf> {
