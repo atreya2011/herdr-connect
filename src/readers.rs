@@ -9,8 +9,6 @@ const POINTER: &str = "agent stopped, no log available";
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentLog {
     pub message: String,
-    pub tool_calls: u32,
-    pub details: Option<String>,
     pub question: Option<String>,
     pub failure: Option<String>,
 }
@@ -103,7 +101,6 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         .collect();
     let mut message = None;
     let mut question = None;
-    let mut tools = 0;
     let mut failure = None;
     for record in tail {
         if let Some(contents) = record
@@ -126,9 +123,7 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
                         {
                             question = format_question(part.get("input"));
                         }
-                        tools += 1;
                     }
-                    Some("tool_use") => tools += 1,
                     Some("tool_result") if part.get("is_error") == Some(&Value::Bool(true)) => {
                         failure = part
                             .get("content")
@@ -151,8 +146,6 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
     Ok(AgentLog {
         message,
-        tool_calls: tools,
-        details: Some(format!("{tools} tool calls")),
         question,
         failure,
     })
@@ -194,28 +187,6 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
             })
         })
         .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
-    let tools = tail
-        .iter()
-        .filter(|r| {
-            r.get("type").and_then(Value::as_str) == Some("response_item")
-                && r.get("payload")
-                    .and_then(|p| p.get("type"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| {
-                        [
-                            "local_shell_call",
-                            "function_call",
-                            "tool_search_call",
-                            "custom_tool_call",
-                            "web_search_call",
-                            "image_generation_call",
-                        ]
-                        .contains(&t)
-                    })
-        })
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX);
     let failure = tail.iter().rev().find_map(|r| {
         (r.get("payload")
             .and_then(|p| p.get("type"))
@@ -231,8 +202,6 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
     });
     Ok(AgentLog {
         message,
-        tool_calls: tools,
-        details: Some(format!("{tools} tool calls")),
         question: None,
         failure,
     })
@@ -264,25 +233,8 @@ fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
                 })
         })
         .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
-    let tool_calls = tail
-        .iter()
-        .filter(|row| {
-            row.get("data")
-                .and_then(|data| data.get("content"))
-                .and_then(Value::as_array)
-                .is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .any(|part| part.get("type").and_then(Value::as_str) == Some("tool-call"))
-                })
-        })
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX);
     Ok(AgentLog {
         message: message.into(),
-        tool_calls,
-        details: Some(format!("{tool_calls} tool calls")),
         question: None,
         failure: None,
     })
@@ -322,16 +274,8 @@ fn parse_cursor_json(value: &Value) -> Result<AgentLog, serde_json::Error> {
         })
         .filter(|s| !s.is_empty())
         .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
-    let tool_calls = tail
-        .iter()
-        .filter(|row| row.to_string().contains("\"tool-call\""))
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX);
     Ok(AgentLog {
         message: message.into(),
-        tool_calls,
-        details: None,
         question: None,
         failure: None,
     })
