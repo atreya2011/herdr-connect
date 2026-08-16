@@ -99,6 +99,11 @@ impl PermissionResponder {
         }
     }
 
+    #[must_use]
+    pub fn has_pending_session(&self, session_id: &str) -> bool {
+        self.registry.has_pending_session(session_id)
+    }
+
     async fn request(&self, interaction: &Interaction, liveness: HookLiveness) -> Option<Decision> {
         let route = self.route(interaction, &liveness).await?;
         let channel = self.sync_channel(&route, &liveness).await?;
@@ -108,6 +113,7 @@ impl PermissionResponder {
             .issue_with_liveness(
                 ApprovalRequest {
                     channel_id: channel.get(),
+                    session_id: interaction.session_id.clone(),
                 },
                 created_at,
                 created_at + PERMISSION_TIMEOUT,

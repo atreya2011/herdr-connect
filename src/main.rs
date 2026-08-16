@@ -1,6 +1,7 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, TopologyRoute, Transition,
-    create_transition_messages, deliver_transition_card, drive_gateway_with_components,
+    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrTab, TopologyRoute,
+    Transition, create_transition_messages, create_unsupported_blocked_card,
+    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
     hook_timeout, is_postable_transition, list_agents, load_config, load_discord_config,
     route_topology, sync_topology, tab_list_result, transition_card_nonce,
 };
@@ -13,12 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twilight_http::Client;
 use twilight_model::id::{
     Id,
-    marker::{GuildMarker, MessageMarker},
+    marker::{ChannelMarker, GuildMarker, MessageMarker},
 };
 
 type DiscordConnection = (
@@ -29,6 +30,33 @@ type DiscordConnection = (
 );
 type GatewayTask = tokio::task::JoinHandle<Result<(), String>>;
 type BrokerTask = tokio::task::JoinHandle<Result<(), String>>;
+
+#[derive(Clone, Copy)]
+struct InformationalCard {
+    channel: Id<ChannelMarker>,
+    message: Id<MessageMarker>,
+}
+
+#[derive(Default)]
+struct BridgeState {
+    previous: HashMap<String, (String, String)>,
+    state_change_sequences: HashMap<String, u64>,
+    blocked_since: HashMap<String, Instant>,
+    informational_cards: HashMap<String, InformationalCard>,
+}
+
+struct BlockedCardContext<'a> {
+    client: &'a Client,
+    guild: Id<GuildMarker>,
+    owner_id: &'a str,
+    responder: &'a PermissionResponder,
+    route: &'a TopologyRoute,
+    snapshot: &'a AgentSnapshot,
+    terminal: &'a str,
+    blocked_since: Option<&'a Instant>,
+    state_change_seq: u64,
+    informational_cards: &'a mut HashMap<String, InformationalCard>,
+}
 
 async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), String> {
     match gateway {
@@ -46,6 +74,183 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
             .map_err(|error| format!("permission broker task failed: {error}"))?,
         None => std::future::pending().await,
     }
+}
+
+async fn handle_blocked_card(context: BlockedCardContext<'_>) {
+    let BlockedCardContext {
+        client,
+        guild,
+        owner_id,
+        responder,
+        route,
+        snapshot,
+        terminal,
+        blocked_since,
+        state_change_seq,
+        informational_cards,
+    } = context;
+    let target = match sync_route(client, guild, route).await {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    };
+    let supported_broker_pending = matches!(snapshot.agent.as_str(), "claude" | "codex")
+        && snapshot
+            .session
+            .as_ref()
+            .is_some_and(|session| responder.has_pending_session(&session.value));
+    if supported_broker_pending {
+        return;
+    }
+    let capture = capture_for_blocked(snapshot);
+    let card = create_unsupported_blocked_card(
+        &snapshot.agent,
+        &route.pane_id,
+        capture.question.as_deref().unwrap_or(&capture.message),
+        owner_id,
+        blocked_since.map_or(Duration::ZERO, |started| {
+            Instant::now().saturating_duration_since(*started)
+        }),
+    );
+    let nonce = transition_card_nonce(terminal, state_change_seq, 0);
+    match deliver_transition_card(client, target, &card, &nonce).await {
+        Ok(message) => {
+            informational_cards.insert(
+                terminal.to_owned(),
+                InformationalCard {
+                    channel: target,
+                    message,
+                },
+            );
+        }
+        Err(error) => eprintln!("discord delivery error: {error}"),
+    }
+}
+
+async fn expire_blocked_card(
+    discord: Option<&DiscordConnection>,
+    terminal: &str,
+    informational_cards: &mut HashMap<String, InformationalCard>,
+) {
+    if let Some(card) = informational_cards.get(terminal).copied()
+        && let Some((client, _guild, _owner_id, _responder)) = discord
+    {
+        if let Err(error) = expire_informational_card(
+            client.as_ref(),
+            card.channel,
+            card.message,
+            "resolved: pane left blocked",
+        )
+        .await
+        {
+            eprintln!("discord blocked-card expiry error: {error}");
+        } else {
+            informational_cards.remove(terminal);
+        }
+    }
+}
+
+async fn process_snapshot(
+    snapshot: &AgentSnapshot,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+    discord: Option<&DiscordConnection>,
+    state: &mut BridgeState,
+) {
+    let agent = snapshot.agent.clone();
+    let terminal = snapshot.terminal_id.clone();
+    let status = snapshot.agent_status.clone();
+    println!("{agent} {terminal}: {status}");
+    if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned()
+        && old != status
+    {
+        let state_change_seq =
+            next_state_change_sequence(&mut state.state_change_sequences, &terminal);
+        let prior_status = old.clone();
+        let leaving_blocked = prior_status == "blocked" && status != "blocked";
+        let transition = Transition {
+            from: old,
+            to: status.clone(),
+            terminal_id: terminal.clone(),
+            agent: prior_agent,
+        };
+        if leaving_blocked {
+            state.blocked_since.remove(&terminal);
+            expire_blocked_card(discord, &terminal, &mut state.informational_cards).await;
+        }
+        if status == "blocked" {
+            state
+                .blocked_since
+                .entry(terminal.clone())
+                .or_insert_with(Instant::now);
+        }
+        if !is_postable_transition(&transition) {
+            state
+                .previous
+                .insert(terminal.clone(), (status.clone(), agent));
+            return;
+        }
+        let route = match route_topology(agents, tabs, &terminal) {
+            Ok(route) => route,
+            Err(error) => {
+                eprintln!("{error}");
+                state
+                    .previous
+                    .insert(terminal.clone(), (status.clone(), agent));
+                return;
+            }
+        };
+        let Some((client, guild, owner_id, responder)) = discord else {
+            state
+                .previous
+                .insert(terminal.clone(), (status.clone(), agent));
+            return;
+        };
+        if status == "blocked" {
+            handle_blocked_card(BlockedCardContext {
+                client: client.as_ref(),
+                guild: *guild,
+                owner_id,
+                responder: responder.as_ref(),
+                route: &route,
+                snapshot,
+                terminal: &terminal,
+                blocked_since: state.blocked_since.get(&terminal),
+                state_change_seq,
+                informational_cards: &mut state.informational_cards,
+            })
+            .await;
+        } else {
+            let Some(capture) = capture_for_or_report(snapshot) else {
+                state
+                    .previous
+                    .insert(terminal.clone(), (status.clone(), agent));
+                return;
+            };
+            if let Err(error) = deliver_to_route(
+                client.as_ref(),
+                *guild,
+                owner_id,
+                &route,
+                &transition,
+                &capture,
+                state_change_seq,
+            )
+            .await
+            {
+                eprintln!("{error}");
+                state
+                    .previous
+                    .insert(terminal.clone(), (status.clone(), agent));
+                return;
+            }
+        }
+    }
+    state
+        .previous
+        .insert(terminal.clone(), (status.clone(), agent));
 }
 
 fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
@@ -225,6 +430,20 @@ fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
     }
 }
 
+fn capture_for_blocked(snapshot: &AgentSnapshot) -> AgentLogCapture {
+    match capture_for(snapshot) {
+        Ok(capture) => capture,
+        Err(error) => {
+            eprintln!("agent blocked-context capture error: {error}");
+            AgentLogCapture {
+                message: format!("blocked context unavailable: {error}"),
+                failure: None,
+                question: None,
+            }
+        }
+    }
+}
+
 /// Delivers a transition's cards to the route resolved from one Herdr snapshot, including its `format_thread_name` result.
 ///
 /// # Errors
@@ -240,16 +459,7 @@ async fn deliver_to_route(
     state_change_seq: u64,
 ) -> Result<Id<MessageMarker>, String> {
     let messages = create_transition_messages(transition, capture, owner_id);
-    let target = sync_topology(
-        client,
-        guild,
-        &route.workspace_id,
-        &route.channel_name,
-        &route.thread_name,
-        &route.tab_id,
-    )
-    .await
-    .map_err(|error| format!("discord topology error: {error}"))?;
+    let target = sync_route(client, guild, route).await?;
     let mut last_message_id = None;
     for (index, message) in messages.iter().enumerate() {
         let nonce = transition_card_nonce(&transition.terminal_id, state_change_seq, index);
@@ -260,6 +470,23 @@ async fn deliver_to_route(
         );
     }
     last_message_id.ok_or_else(|| "discord delivery produced no messages".to_owned())
+}
+
+async fn sync_route(
+    client: &Client,
+    guild: Id<GuildMarker>,
+    route: &TopologyRoute,
+) -> Result<Id<ChannelMarker>, String> {
+    sync_topology(
+        client,
+        guild,
+        &route.workspace_id,
+        &route.channel_name,
+        &route.thread_name,
+        &route.tab_id,
+    )
+    .await
+    .map_err(|error| format!("discord topology error: {error}"))
 }
 
 fn next_state_change_sequence(
@@ -445,8 +672,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         None => (None, None, None),
     };
     let interval = load_config().poll_interval_ms;
-    let mut previous: HashMap<String, (String, String)> = HashMap::new();
-    let mut state_change_sequences: HashMap<String, u64> = HashMap::new();
+    let mut state = BridgeState::default();
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         let agents = match list_agents() {
@@ -466,60 +692,11 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let current: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
-        previous.retain(|terminal, _| current.contains(terminal));
+        state
+            .previous
+            .retain(|terminal, _| current.contains(terminal));
         for snapshot in &agents {
-            let agent = snapshot.agent.clone();
-            let terminal = snapshot.terminal_id.clone();
-            let status = snapshot.agent_status.clone();
-            println!("{agent} {terminal}: {status}");
-            if let Some((old, prior_agent)) = previous.get(&terminal).cloned()
-                && old != status
-            {
-                let state_change_seq =
-                    next_state_change_sequence(&mut state_change_sequences, &terminal);
-                let transition = Transition {
-                    from: old,
-                    to: status.clone(),
-                    terminal_id: terminal.clone(),
-                    agent: prior_agent,
-                };
-                if !is_postable_transition(&transition) {
-                    previous.insert(terminal.clone(), (status.clone(), agent));
-                    continue;
-                }
-                let Some(capture) = capture_for_or_report(snapshot) else {
-                    previous.insert(terminal.clone(), (status.clone(), agent));
-                    continue;
-                };
-                let route = match route_topology(&agents, &tabs, &terminal) {
-                    Ok(route) => route,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        previous.insert(terminal.clone(), (status.clone(), agent));
-                        continue;
-                    }
-                };
-                let Some((client, guild, owner_id, _responder)) = discord.as_ref() else {
-                    previous.insert(terminal.clone(), (status.clone(), agent));
-                    continue;
-                };
-                if let Err(error) = deliver_to_route(
-                    client.as_ref(),
-                    *guild,
-                    owner_id,
-                    &route,
-                    &transition,
-                    &capture,
-                    state_change_seq,
-                )
-                .await
-                {
-                    eprintln!("{error}");
-                    previous.insert(terminal.clone(), (status.clone(), agent));
-                    continue;
-                }
-            }
-            previous.insert(terminal.clone(), (status.clone(), agent));
+            process_snapshot(snapshot, &agents, &tabs, discord.as_ref(), &mut state).await;
         }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(interval)) => {},

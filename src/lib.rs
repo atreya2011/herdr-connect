@@ -20,10 +20,14 @@ pub use broker::{
     PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
 };
 pub use cards::{
-    AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,
+    AgentLogCapture, TransitionMessage, create_transition_messages,
+    create_unsupported_blocked_card, format_thread_name,
 };
 pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
-pub use delivery::{deliver_permission_card, deliver_transition_card, transition_card_nonce};
+pub use delivery::{
+    deliver_permission_card, deliver_transition_card, expire_informational_card,
+    transition_card_nonce,
+};
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
     AgentSession, AgentSnapshot, HerdrTab, list_agents, request_rpc_result, tab_list_result,

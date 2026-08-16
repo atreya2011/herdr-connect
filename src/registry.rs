@@ -13,6 +13,7 @@ const TOKEN_BYTES: usize = 24;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
     pub channel_id: u64,
+    pub session_id: String,
 }
 #[derive(Debug)]
 pub struct IssuedApproval {
@@ -158,6 +159,13 @@ impl InteractionRegistry {
                 .is_some_and(|entry| entry.hook_alive.load(Ordering::Acquire))
         })
     }
+    pub fn has_pending_session(&self, session_id: &str) -> bool {
+        self.entries.lock().ok().is_some_and(|entries| {
+            entries.values().any(|entry| {
+                entry.request.session_id == session_id && entry.hook_alive.load(Ordering::Acquire)
+            })
+        })
+    }
     pub fn remove(&self, token: &str) -> bool {
         self.entries
             .lock()
@@ -173,8 +181,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-    fn request(channel_id: u64) -> ApprovalRequest {
-        ApprovalRequest { channel_id }
+    fn request(channel_id: u64, session_id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            channel_id,
+            session_id: session_id.to_owned(),
+        }
     }
     #[test]
     fn registry_state_machine_rejects_invalid_taps() {
@@ -185,7 +196,7 @@ mod tests {
             let issued = registry
                 .issue_with_token(
                     "token".to_owned(),
-                    request(7),
+                    request(7, "session"),
                     now,
                     now + Duration::from_secs(30),
                 )
@@ -196,6 +207,23 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn pending_lookup_is_scoped_to_the_vendor_session() {
+        let now = Instant::now();
+        let registry = InteractionRegistry::default();
+        registry
+            .issue_with_token(
+                "session-scoped-token".to_owned(),
+                request(7, "session-a"),
+                now,
+                now + Duration::from_secs(30),
+            )
+            .expect("issue token");
+
+        for (session_id, expected) in [("session-a", true), ("session-b", false)] {
+            assert_eq!(registry.has_pending_session(session_id), expected);
+        }
+    }
     #[tokio::test]
     async fn registry_issues_and_resolves_exactly_once() {
         let now = Instant::now();
@@ -203,7 +231,7 @@ mod tests {
         let issued = registry
             .issue_with_token(
                 "opaque-token".to_owned(),
-                request(7),
+                request(7, "session"),
                 now,
                 now + Duration::from_secs(30),
             )
@@ -228,7 +256,7 @@ mod tests {
         let issued = registry
             .issue_with_token_and_liveness(
                 "disconnected-token".to_owned(),
-                request(7),
+                request(7, "session"),
                 now,
                 now + Duration::from_secs(30),
                 Arc::clone(&hook_alive),

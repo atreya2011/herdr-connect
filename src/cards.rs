@@ -1,7 +1,9 @@
 use crate::watcher::Transition;
+use std::time::Duration;
 
 const MAX_PART_LENGTH: usize = 1_900;
 const MAX_THREAD_NAME_LENGTH: usize = 100;
+const MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH: usize = 3_800;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct TransitionMessage {
@@ -14,6 +16,67 @@ pub struct AgentLogCapture {
     pub message: String,
     pub failure: Option<String>,
     pub question: Option<String>,
+}
+
+#[must_use]
+pub fn create_unsupported_blocked_card(
+    agent_kind: &str,
+    pane_id: &str,
+    context: &str,
+    owner: &str,
+    blocked_age: Duration,
+) -> TransitionMessage {
+    TransitionMessage {
+        description: unsupported_blocked_description(agent_kind, pane_id, context, blocked_age),
+        color: 0x00fe_e75c,
+        mention: Some(format!("<@{owner}>")),
+    }
+}
+
+fn unsupported_blocked_description(
+    agent_kind: &str,
+    pane_id: &str,
+    context: &str,
+    blocked_age: Duration,
+) -> String {
+    let agent_kind = bounded_inline(agent_kind, 128);
+    let pane_id = bounded_inline(pane_id, 128);
+    let prefix = format!(
+        "Unsupported blocked pane\nVendor/agent: `{agent_kind}`\nPane: `{pane_id}`\nBlocked for: {}\nContext:\n```\n",
+        format_blocked_age(blocked_age)
+    );
+    let suffix = "\n```\nAction: OPEN/FOCUS the pane in Herdr.";
+    let context_limit = MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH
+        .saturating_sub(prefix.chars().count() + suffix.chars().count());
+    let context = bounded_inline(context, context_limit);
+    format!("{prefix}{context}{suffix}")
+}
+
+fn bounded_inline(value: &str, limit: usize) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| if character == '`' { 'ˋ' } else { character })
+        .collect::<String>();
+    if sanitized.chars().count() <= limit {
+        return sanitized;
+    }
+    let mut bounded = sanitized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn format_blocked_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
 }
 
 #[must_use]
@@ -147,6 +210,7 @@ fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
     }
     out
 }
+
 /// Formats a bounded Discord thread name.
 ///
 /// # Errors
@@ -181,4 +245,51 @@ pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<Stri
         base.chars().take(capacity).collect::<String>(),
         suffix
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH, create_unsupported_blocked_card};
+    use std::time::Duration;
+
+    #[test]
+    fn unsupported_blocked_card_is_informational_and_bounded() {
+        let cases = vec![
+            (
+                "cursor",
+                "pane-1",
+                "login prompt with ``` unsafe context".to_owned(),
+                Duration::from_secs(3),
+                "3s",
+            ),
+            (
+                "claude",
+                "pane-2",
+                "x".repeat(4_000),
+                Duration::from_secs(123),
+                "2m 3s",
+            ),
+        ];
+        for (agent, pane, context, age, expected_age) in cases {
+            let card = create_unsupported_blocked_card(agent, pane, &context, "42", age);
+            assert!(card.description.chars().count() <= MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH);
+            assert!(
+                card.description
+                    .contains(&format!("Vendor/agent: `{agent}`"))
+            );
+            assert!(card.description.contains(&format!("Pane: `{pane}`")));
+            assert!(
+                card.description
+                    .contains(&format!("Blocked for: {expected_age}"))
+            );
+            assert!(
+                card.description
+                    .contains("Action: OPEN/FOCUS the pane in Herdr.")
+            );
+            assert!(!card.description.contains("Allow"));
+            assert!(!card.description.contains("Deny"));
+            assert_eq!(card.description.matches("```").count(), 2);
+            assert_eq!(card.mention.as_deref(), Some("<@42>"));
+        }
+    }
 }

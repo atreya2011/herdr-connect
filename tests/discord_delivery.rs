@@ -6,8 +6,8 @@ mod support;
 mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
-        AgentLogCapture, Transition, create_transition_messages, deliver_permission_card,
-        deliver_transition_card, transition_card_nonce,
+        AgentLogCapture, Transition, create_transition_messages, create_unsupported_blocked_card,
+        deliver_permission_card, deliver_transition_card, sync_topology, transition_card_nonce,
     };
     use serial_test::serial;
     use twilight_model::channel::message::component::Component::{ActionRow, Button};
@@ -151,6 +151,46 @@ mod real_guild {
             return Err("distinct cards reused one message".to_owned());
         }
         permission_card_exercise(guild).await?;
+        unsupported_blocked_card_exercise(guild).await?;
+        Ok(())
+    }
+
+    async fn unsupported_blocked_card_exercise(guild: &Guild) -> Result<(), String> {
+        let thread = sync_topology(
+            guild.client.as_ref(),
+            guild.id,
+            "testrun-unsupported",
+            "testrun-unsupported",
+            "blocked [testrun-unsupported-tab]",
+            "testrun-unsupported-tab",
+        )
+        .await?;
+        let card = create_unsupported_blocked_card(
+            "cursor",
+            "testrun-unsupported-pane",
+            "login prompt with ``` escaped",
+            &std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?,
+            std::time::Duration::from_secs(7),
+        );
+        let message = deliver_transition_card(
+            guild.client.as_ref(),
+            thread,
+            &card,
+            &transition_card_nonce("testrun-unsupported-terminal", 1, 0),
+        )
+        .await?;
+        let delivered = fetch_message(guild, thread, message).await?;
+        if !delivered.components.is_empty() {
+            return Err("unsupported blocked card unexpectedly had components".to_owned());
+        }
+        if !delivered.content.contains("OPEN/FOCUS")
+            || !delivered.content.contains("<@")
+            || !delivered.content.contains("Vendor/agent")
+        {
+            return Err(
+                "unsupported blocked card omitted required informational fields".to_owned(),
+            );
+        }
         Ok(())
     }
 
