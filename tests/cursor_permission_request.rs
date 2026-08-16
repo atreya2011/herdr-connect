@@ -53,7 +53,7 @@ fn cursor_hook_denies_when_broker_is_unavailable() {
         std::thread::current().name().unwrap_or("test")
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
-        .args(["hook", "--socket"])
+        .args(["hook", "--vendor", "cursor", "--socket"])
         .arg(socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -73,4 +73,46 @@ fn cursor_hook_denies_when_broker_is_unavailable() {
     let value: Value = serde_json::from_slice(&output.stdout).expect("denial is JSON");
     assert_eq!(value["permission"], "deny");
     assert!(value["agent_message"].as_str().is_some());
+}
+
+#[test]
+fn explicit_cursor_vendor_denies_when_payload_is_undecodable() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
+        .args(["hook", "--vendor", "cursor"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn hook subcommand");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin is piped")
+        .write_all(b"{}")
+        .expect("write undecodable hook payload");
+    let output = child.wait_with_output().expect("wait for hook subcommand");
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("denial is JSON");
+    assert_eq!(value["permission"], "deny");
+    assert!(value["agent_message"].as_str().is_some());
+}
+
+#[test]
+fn explicit_codex_vendor_preserves_empty_output_when_payload_is_undecodable() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
+        .args(["hook", "--vendor", "codex"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn hook subcommand");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin is piped")
+        .write_all(b"{}")
+        .expect("write undecodable hook payload");
+    let output = child.wait_with_output().expect("wait for hook subcommand");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
 }
