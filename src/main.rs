@@ -153,6 +153,26 @@ async fn expire_blocked_card(
     }
 }
 
+async fn expire_departed_card(
+    discord: Option<&DiscordConnection>,
+    terminal: &str,
+    card: InformationalCard,
+) {
+    let Some((client, _guild, _owner_id, _responder)) = discord else {
+        return;
+    };
+    if let Err(error) = expire_informational_card(
+        client.as_ref(),
+        card.channel,
+        card.message,
+        "resolved: pane left blocked",
+    )
+    .await
+    {
+        eprintln!("discord blocked-card expiry error for {terminal}: {error}");
+    }
+}
+
 async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -500,6 +520,28 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
+fn prune_departed_state(
+    state: &mut BridgeState,
+    current: &HashSet<String>,
+) -> Vec<(String, InformationalCard)> {
+    state
+        .blocked_since
+        .retain(|terminal, _| current.contains(terminal));
+    state
+        .state_change_sequences
+        .retain(|terminal, _| current.contains(terminal));
+    let departed_cards = state
+        .informational_cards
+        .iter()
+        .filter(|(terminal, _)| !current.contains(*terminal))
+        .map(|(terminal, card)| (terminal.clone(), *card))
+        .collect();
+    state
+        .informational_cards
+        .retain(|terminal, _| current.contains(terminal));
+    departed_cards
+}
+
 fn discord_connection()
 -> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
     match (
@@ -706,6 +748,10 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         state
             .previous
             .retain(|terminal, _| current.contains(terminal));
+        let departed_cards = prune_departed_state(&mut state, &current);
+        for (terminal, card) in departed_cards {
+            expire_departed_card(discord.as_ref(), &terminal, card).await;
+        }
         for snapshot in &agents {
             process_snapshot(snapshot, &agents, &tabs, discord.as_ref(), &mut state).await;
         }
@@ -728,15 +774,19 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_for_with_search_root, create_transition_messages, next_state_change_sequence,
-        resolve_session_path,
+        BridgeState, InformationalCard, capture_for_with_search_root, create_transition_messages,
+        next_state_change_sequence, prune_departed_state, resolve_session_path,
     };
     use herdr_connect_rs::{AgentSession, AgentSnapshot, Transition, transition_card_nonce};
     use serde_json::Value;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use twilight_model::id::{
+        Id,
+        marker::{ChannelMarker, MessageMarker},
+    };
 
     #[test]
     fn cursor_broker_failures_emit_deny_objects() {
@@ -775,6 +825,38 @@ mod tests {
         );
 
         assert_ne!(pre_departure_nonce, returned_nonce);
+    }
+
+    #[test]
+    fn departed_terminals_are_pruned_from_reconciled_state() {
+        let departed = "departed";
+        let current = "current";
+        let mut state = BridgeState::default();
+        for terminal in [departed, current] {
+            state
+                .blocked_since
+                .insert(terminal.to_owned(), Instant::now());
+            state.state_change_sequences.insert(terminal.to_owned(), 1);
+            state.informational_cards.insert(
+                terminal.to_owned(),
+                InformationalCard {
+                    channel: Id::<ChannelMarker>::new(1),
+                    message: Id::<MessageMarker>::new(2),
+                },
+            );
+        }
+
+        let current_terminals = HashSet::from([current.to_owned()]);
+        let expired = prune_departed_state(&mut state, &current_terminals);
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, departed);
+        assert!(!state.blocked_since.contains_key(departed));
+        assert!(!state.state_change_sequences.contains_key(departed));
+        assert!(!state.informational_cards.contains_key(departed));
+        assert!(state.blocked_since.contains_key(current));
+        assert!(state.state_change_sequences.contains_key(current));
+        assert!(state.informational_cards.contains_key(current));
     }
 
     #[test]
