@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use twilight_http::Client;
 use twilight_model::{
     channel::ChannelType,
@@ -9,6 +10,8 @@ use twilight_model::{
 };
 
 const PREFIX: &str = "testrun-";
+const CLEANUP_CHECKS: u32 = 5;
+const CLEANUP_BACKOFF: Duration = Duration::from_millis(200);
 
 pub struct Guild {
     pub client: Arc<Client>,
@@ -48,22 +51,29 @@ pub async fn cleanup(guild: &Guild) -> Result<usize, String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok(guild
-        .client
-        .guild_channels(guild.id)
-        .await
-        .map_err(|e| e.to_string())?
-        .model()
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|channel| {
-            channel
-                .name
-                .as_deref()
-                .is_some_and(|name| name.starts_with(PREFIX))
-        })
-        .count())
+    for attempt in 0..CLEANUP_CHECKS {
+        let leftover = guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|channel| {
+                channel
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(PREFIX))
+            })
+            .count();
+        if leftover == 0 || attempt + 1 == CLEANUP_CHECKS {
+            return Ok(leftover);
+        }
+        tokio::time::sleep(CLEANUP_BACKOFF * (attempt + 1)).await;
+    }
+    unreachable!("cleanup checks always return a leftover count");
 }
 
 pub async fn channel(guild: &Guild, name: &str) -> Result<Id<ChannelMarker>, String> {
