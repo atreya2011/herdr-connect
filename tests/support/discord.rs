@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use twilight_http::Client;
 use twilight_model::{
-    channel::ChannelType,
+    channel::{Channel, ChannelType},
     id::{
         Id,
         marker::{ChannelMarker, GuildMarker},
@@ -10,8 +10,13 @@ use twilight_model::{
 };
 
 const PREFIX: &str = "testrun-";
-const CLEANUP_CHECKS: u32 = 5;
-const CLEANUP_BACKOFF: Duration = Duration::from_millis(200);
+
+fn is_test_channel(channel: &Channel) -> bool {
+    channel
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with(PREFIX))
+}
 
 pub struct Guild {
     pub client: Arc<Client>,
@@ -39,19 +44,14 @@ pub async fn cleanup(guild: &Guild) -> Result<usize, String> {
         .model()
         .await
         .map_err(|e| e.to_string())?;
-    for channel in channels.into_iter().filter(|channel| {
-        channel
-            .name
-            .as_deref()
-            .is_some_and(|name| name.starts_with(PREFIX))
-    }) {
+    for channel in channels.into_iter().filter(is_test_channel) {
         guild
             .client
             .delete_channel(channel.id)
             .await
             .map_err(|e| e.to_string())?;
     }
-    for attempt in 0..CLEANUP_CHECKS {
+    for attempt in 0..5 {
         let leftover = guild
             .client
             .guild_channels(guild.id)
@@ -61,17 +61,12 @@ pub async fn cleanup(guild: &Guild) -> Result<usize, String> {
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter(|channel| {
-                channel
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.starts_with(PREFIX))
-            })
+            .filter(is_test_channel)
             .count();
-        if leftover == 0 || attempt + 1 == CLEANUP_CHECKS {
+        if leftover == 0 || attempt == 4 {
             return Ok(leftover);
         }
-        tokio::time::sleep(CLEANUP_BACKOFF * (attempt + 1)).await;
+        tokio::time::sleep(Duration::from_millis(200) * (attempt + 1)).await;
     }
     unreachable!("cleanup checks always return a leftover count");
 }
