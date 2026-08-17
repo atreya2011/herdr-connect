@@ -28,5 +28,5 @@ Never print or commit the env file's contents. Real-guild tests create only `tes
 
 - Commits go straight to `main` in small atomic chunks. No PRs, no remote.
 - Source is organized as modules under `src/` with crate-root re-exports (post folder-split).
-- Cursor prompts may stall at the Herdr level; the bridge acknowledges submission with state unconfirmed and never injects keys.
+- Cursor prompts may stall at the Herdr level; the bridge acknowledges submission with state unconfirmed and, for Cursor panes only, follows a stalled submission with an Enter key press over the Herdr socket so the prompt is actually submitted.
 - Refusal replies exist only inside threads with a `[tab_id]` suffix whose parent topic is `herdr workspace [workspace_id]`; all other surfaces stay silent.

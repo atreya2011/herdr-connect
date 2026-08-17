@@ -3,7 +3,7 @@
 //! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
 //! message creation responses do not carry the guild identifier required by the gateway handler.
 
-use crate::herdr::agent_prompt;
+use crate::herdr::{PROMPT_ACKNOWLEDGED_UNCONFIRMED, agent_prompt, agent_send_keys};
 use crate::{AgentSnapshot, list_agents};
 use std::future::Future;
 use std::sync::Arc;
@@ -19,6 +19,8 @@ use twilight_model::{
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
+const CURSOR_AGENT_KIND: &str = "cursor";
+const CURSOR_STALL_FOLLOWUP_KEYS: [&str; 1] = ["enter"];
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
@@ -88,8 +90,8 @@ pub async fn handle_owner_message(
             return Err(error);
         }
     };
-    let pane_id = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
-        Ok(pane_id) => pane_id,
+    let (pane_id, kind) = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
+        Ok(target) => target,
         Err(reason) => {
             reply(&client, &message, &reason).await?;
             return Ok(());
@@ -102,9 +104,10 @@ pub async fn handle_owner_message(
     ));
     let text = message.content.clone();
     let prompt_pane = pane_id.clone();
-    let result = tokio::task::spawn_blocking(move || agent_prompt(&prompt_pane, &text))
-        .await
-        .map_err(|error| format!("agent.prompt task failed: {error}"))?;
+    let result =
+        tokio::task::spawn_blocking(move || submit_owner_prompt(&kind, &prompt_pane, &text))
+            .await
+            .map_err(|error| format!("agent.prompt task failed: {error}"))?;
     match result {
         Ok(_) => reply(&client, &message, PROMPT_ACCEPTED_REPLY).await,
         Err(error) => {
@@ -150,7 +153,7 @@ fn resolve_prompt_pane(
     tab_id: &str,
     workspace_id: &str,
     agents: &[AgentSnapshot],
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let matches: Vec<&AgentSnapshot> = agents
         .iter()
         .filter(|agent| agent.tab_id.as_deref() == Some(tab_id))
@@ -167,12 +170,29 @@ fn resolve_prompt_pane(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "refused: unmapped pane".to_owned())?;
     match agent.agent_status.trim() {
-        "idle" | "done" => Ok(pane_id.to_owned()),
+        "idle" | "done" => Ok((pane_id.to_owned(), agent.agent.clone())),
         "working" => Err("refused: agent state is working".to_owned()),
         "blocked" => Err("refused: agent state is blocked".to_owned()),
         "" => Err("refused: agent state is unknown".to_owned()),
         state => Err(format!("refused: agent state is {state}")),
     }
+}
+
+/// Submits an owner prompt to a Herdr agent pane.
+///
+/// A Cursor pane that reports a stalled submission receives a follow-up Enter key press over the
+/// Herdr socket, because the Cursor composer treats the pasted prompt as unsubmitted input; the
+/// prompt is then treated as submitted. No other agent kind receives a key press.
+///
+/// # Errors
+///
+/// Returns Herdr submission or follow-up key press errors.
+pub fn submit_owner_prompt(kind: &str, target: &str, text: &str) -> Result<String, String> {
+    let result = agent_prompt(target, text);
+    if kind == CURSOR_AGENT_KIND && result.as_deref() == Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
+        agent_send_keys(target, &CURSOR_STALL_FOLLOWUP_KEYS)?;
+    }
+    result
 }
 
 /// Keeps the Discord typing indicator alive in `channel` while `still_working` reports true.

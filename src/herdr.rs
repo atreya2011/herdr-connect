@@ -98,10 +98,12 @@ fn request_rpc_result_with_params_and_timeout(
     result.map(|value| value.to_string())
 }
 
+pub const PROMPT_ACKNOWLEDGED_UNCONFIRMED: &str = "prompt submitted; Herdr state unconfirmed";
+
 fn acknowledge_prompt_result(result: Result<String, String>) -> Result<String, String> {
     match result {
         Err(error) if is_agent_prompt_stalled(&error) => {
-            Ok("prompt submitted; Herdr state unconfirmed".to_owned())
+            Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED.to_owned())
         }
         result => result,
     }
@@ -136,6 +138,15 @@ pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
         &params,
         Duration::from_secs(10),
     ))
+}
+
+/// Sends key presses to a Herdr-tracked agent pane.
+///
+/// # Errors
+///
+/// Returns socket, protocol, or Herdr-declared errors.
+pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
+    request_rpc_result_with_params("agent.send_keys", &json!({"target": target, "keys": keys}))
 }
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 pub struct HerdrTab {
