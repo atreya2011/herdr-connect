@@ -7,7 +7,7 @@ use crate::herdr::{PROMPT_ACKNOWLEDGED_UNCONFIRMED, agent_prompt, agent_send_key
 use crate::{AgentSnapshot, list_agents};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use twilight_http::Client;
 use twilight_model::{
     channel::{ChannelType, Message},
@@ -19,8 +19,8 @@ use twilight_model::{
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
-const CURSOR_AGENT_KIND: &str = "cursor";
-const CURSOR_STALL_FOLLOWUP_KEYS: [&str; 1] = ["enter"];
+const STALL_RECOVERY_POLL_BOUND: Duration = Duration::from_secs(5);
+const STALL_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
@@ -90,7 +90,7 @@ pub async fn handle_owner_message(
             return Err(error);
         }
     };
-    let (pane_id, kind) = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
+    let pane_id = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
         Ok(target) => target,
         Err(reason) => {
             reply(&client, &message, &reason).await?;
@@ -104,10 +104,9 @@ pub async fn handle_owner_message(
     ));
     let text = message.content.clone();
     let prompt_pane = pane_id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || submit_owner_prompt(&kind, &prompt_pane, &text))
-            .await
-            .map_err(|error| format!("agent.prompt task failed: {error}"))?;
+    let result = tokio::task::spawn_blocking(move || submit_owner_prompt(&prompt_pane, &text))
+        .await
+        .map_err(|error| format!("agent.prompt task failed: {error}"))?;
     match result {
         Ok(_) => reply(&client, &message, PROMPT_ACCEPTED_REPLY).await,
         Err(error) => {
@@ -153,7 +152,7 @@ fn resolve_prompt_pane(
     tab_id: &str,
     workspace_id: &str,
     agents: &[AgentSnapshot],
-) -> Result<(String, String), String> {
+) -> Result<String, String> {
     let matches: Vec<&AgentSnapshot> = agents
         .iter()
         .filter(|agent| agent.tab_id.as_deref() == Some(tab_id))
@@ -170,7 +169,7 @@ fn resolve_prompt_pane(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "refused: unmapped pane".to_owned())?;
     match agent.agent_status.trim() {
-        "idle" | "done" => Ok((pane_id.to_owned(), agent.agent.clone())),
+        "idle" | "done" => Ok(pane_id.to_owned()),
         "working" => Err("refused: agent state is working".to_owned()),
         "blocked" => Err("refused: agent state is blocked".to_owned()),
         "" => Err("refused: agent state is unknown".to_owned()),
@@ -180,19 +179,45 @@ fn resolve_prompt_pane(
 
 /// Submits an owner prompt to a Herdr agent pane.
 ///
-/// A Cursor pane that reports a stalled submission receives a follow-up Enter key press over the
-/// Herdr socket, because the Cursor composer treats the pasted prompt as unsubmitted input; the
-/// prompt is then treated as submitted. No other agent kind receives a key press.
+/// A pane that reports a stalled submission (the composer received the text but never actually
+/// submitted it) is recovered with a two-rung ladder: an Enter key press first, since that alone
+/// submits a paste-block-stuck composer; if the pane still has not left `idle` shortly after,
+/// a Ctrl+U clear followed by one fresh `agent.prompt` resubmission.
 ///
 /// # Errors
 ///
 /// Returns Herdr submission or follow-up key press errors.
-pub fn submit_owner_prompt(kind: &str, target: &str, text: &str) -> Result<String, String> {
+pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
     let result = agent_prompt(target, text);
-    if kind == CURSOR_AGENT_KIND && result.as_deref() == Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
-        agent_send_keys(target, &CURSOR_STALL_FOLLOWUP_KEYS)?;
+    if result.as_deref() != Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
+        return result;
     }
-    result
+    agent_send_keys(target, &["enter"])?;
+    if pane_left_idle(target, STALL_RECOVERY_POLL_BOUND) {
+        return result;
+    }
+    agent_send_keys(target, &["ctrl+u"])?;
+    agent_prompt(target, text)
+}
+
+/// Polls `list_agents` for up to `bound`, returning true as soon as `target`'s pane is observed
+/// with an `agent_status` other than `idle`.
+fn pane_left_idle(target: &str, bound: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        let left_idle = list_agents().is_ok_and(|agents| {
+            agents.iter().any(|agent| {
+                agent.pane_id.as_deref() == Some(target) && agent.agent_status.trim() != "idle"
+            })
+        });
+        if left_idle {
+            return true;
+        }
+        if start.elapsed() >= bound {
+            return false;
+        }
+        std::thread::sleep(STALL_RECOVERY_POLL_INTERVAL);
+    }
 }
 
 /// Keeps the Discord typing indicator alive in `channel` while `still_working` reports true.
