@@ -40,6 +40,62 @@ fn read_captured_vendor_logs() {
 }
 
 #[test]
+fn read_agent_log_tolerates_one_incomplete_trailing_line() {
+    let cases = [
+        (
+            AgentSession {
+                agent: "claude".into(),
+                value: "session".into(),
+            },
+            "tests/fixtures/claude-session-mid-write.jsonl",
+        ),
+        (
+            AgentSession {
+                agent: "codex".into(),
+                value: "session".into(),
+            },
+            "tests/fixtures/codex-session-mid-write.jsonl",
+        ),
+    ];
+    for (session, path) in cases {
+        let agent = session.agent.clone();
+        let result = read_agent_log(Some(session), Path::new(path));
+        assert!(
+            result.is_ok(),
+            "{agent}: expected a truncated trailing line to be tolerated, got {result:?}"
+        );
+    }
+
+    let claude = read_agent_log(
+        Some(AgentSession {
+            agent: "claude".into(),
+            value: "session".into(),
+        }),
+        Path::new("tests/fixtures/claude-session-mid-write.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(
+        claude.question.as_deref(),
+        Some("Which approach should we take?\n1. rewrite\n2. patch")
+    );
+}
+
+#[test]
+fn read_agent_log_rejects_non_trailing_corruption() {
+    let result = read_agent_log(
+        Some(AgentSession {
+            agent: "claude".into(),
+            value: "session".into(),
+        }),
+        Path::new("tests/fixtures/claude-session-mid-corrupt.jsonl"),
+    );
+    assert!(
+        result.is_err(),
+        "a malformed non-final line must still fail the whole read"
+    );
+}
+
+#[test]
 fn missing_cursor_store_is_not_created() {
     let cases = [("cursor", "vendor-log")];
     for (agent, suffix) in cases {

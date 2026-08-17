@@ -56,10 +56,20 @@ fn parse_cursor_path(path: &Path) -> Result<AgentLog, serde_json::Error> {
 }
 
 fn lines(text: &str) -> Result<Vec<Value>, serde_json::Error> {
-    text.lines()
+    let relevant: Vec<&str> = text
+        .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(serde_json::from_str)
-        .collect()
+        .collect();
+    let last = relevant.len().saturating_sub(1);
+    let mut records = Vec::with_capacity(relevant.len());
+    for (i, line) in relevant.into_iter().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(value) => records.push(value),
+            Err(_) if i == last => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(records)
 }
 fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
     let records = lines(text)?;

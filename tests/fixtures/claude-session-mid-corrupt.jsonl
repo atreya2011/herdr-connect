@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"question"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"broken
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"final answer"}]}}

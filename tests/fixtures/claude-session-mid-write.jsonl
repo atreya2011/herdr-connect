@@ -1,0 +1,5 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"how should we handle the migration?"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/srv/bridge/src/readers.rs"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file contents"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"AskUserQuestion","input":{"questions":[{"question":"Which approach should we take?","header":"Approach","options":[{"label":"rewrite","description":"rewrite the reader from scratch"},{"label":"patch","description":"patch the existing parser"}]}]}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_03","content":[{"type":"text","text":"attachment chunk one attachment chunk two attachment ch
