@@ -215,10 +215,7 @@ async fn deliver_payload(
     let allowed = allowed_mentions(card);
     let message_content = card
         .and_then(|message| message.mention.as_deref())
-        .map_or_else(
-            || content.to_owned(),
-            |mention| format!("{mention} {content}"),
-        );
+        .unwrap_or_default();
     let payload = serde_json::json!({
         "content": message_content,
         "embeds": [embed],

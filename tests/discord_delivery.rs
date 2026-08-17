@@ -167,11 +167,12 @@ mod real_guild {
             "testrun-unsupported-tab",
         )
         .await?;
+        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
         let card = create_unsupported_blocked_card(
             "cursor",
             "testrun-unsupported-pane",
             "login prompt with ``` escaped",
-            &std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?,
+            &owner_id,
             std::time::Duration::from_secs(7),
         );
         let message = deliver_transition_card(
@@ -185,13 +186,24 @@ mod real_guild {
         if !delivered.components.is_empty() {
             return Err("unsupported blocked card unexpectedly had components".to_owned());
         }
-        if !delivered.content.contains("OPEN/FOCUS")
-            || !delivered.content.contains("<@")
-            || !delivered.content.contains("Vendor/agent")
-        {
+        let description = delivered
+            .embeds
+            .first()
+            .ok_or("unsupported blocked card had no embed")?
+            .description
+            .as_deref()
+            .ok_or("unsupported blocked card embed had no description")?;
+        if !description.contains("OPEN/FOCUS") || !description.contains("Vendor/agent") {
             return Err(
                 "unsupported blocked card omitted required informational fields".to_owned(),
             );
+        }
+        let expected_content = format!("<@{owner_id}>");
+        if delivered.content != expected_content {
+            return Err(format!(
+                "unsupported blocked card content was {:?}, expected {expected_content:?}",
+                delivered.content
+            ));
         }
         Ok(())
     }
