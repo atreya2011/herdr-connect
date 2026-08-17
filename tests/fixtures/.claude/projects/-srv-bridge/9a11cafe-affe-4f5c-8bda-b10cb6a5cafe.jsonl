@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"please decide"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"AskUserQuestion","id":"question-pending-1","input":{"questions":[{"question":"Which environment should the fix target?","options":[{"label":"staging"},{"label":"production"}]}]}}]}}
