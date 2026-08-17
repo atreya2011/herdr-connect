@@ -45,6 +45,7 @@ struct BridgeState {
     blocked_since: HashMap<String, Instant>,
     informational_cards: HashMap<String, InformationalCard>,
     blocked_capture_attempts: HashMap<String, u32>,
+    herdr_state_change_seq: HashMap<String, u64>,
 }
 
 struct BlockedCardContext<'a> {
@@ -266,6 +267,21 @@ async fn expire_departed_card(
     }
 }
 
+/// Detects a completed turn Herdr's own poll cadence missed: the pane went `working` and back to
+/// a settled status between two bridge polls, so the naive `old` to `status` transition never saw
+/// `working` as its `from`. Herdr's own `state_change_seq` advancing past what the previous poll
+/// recorded for this terminal is the only signal available to catch this without polling faster.
+#[must_use]
+fn is_missed_fast_turn(
+    transition: &Transition,
+    previous_herdr_seq: Option<u64>,
+    current_herdr_seq: u64,
+) -> bool {
+    !is_postable_transition(transition)
+        && matches!(transition.to.as_str(), "idle" | "done")
+        && previous_herdr_seq.is_some_and(|previous| current_herdr_seq > previous)
+}
+
 async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -277,6 +293,9 @@ async fn process_snapshot(
     let terminal = snapshot.terminal_id.clone();
     let status = snapshot.agent_status.clone();
     println!("{agent} {terminal}: {status}");
+    let previous_herdr_seq = state
+        .herdr_state_change_seq
+        .insert(terminal.clone(), snapshot.state_change_seq);
     if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned()
         && old != status
     {
@@ -284,86 +303,39 @@ async fn process_snapshot(
             next_state_change_sequence(&mut state.state_change_sequences, &terminal);
         let prior_status = old.clone();
         let leaving_blocked = prior_status == "blocked" && status != "blocked";
-        let transition = Transition {
+        let mut transition = Transition {
             from: old,
             to: status.clone(),
             terminal_id: terminal.clone(),
             agent: prior_agent,
         };
-        if leaving_blocked {
-            state.blocked_since.remove(&terminal);
-            state.blocked_capture_attempts.remove(&terminal);
-            expire_blocked_card(discord, &terminal, &mut state.informational_cards).await;
+        if is_missed_fast_turn(&transition, previous_herdr_seq, snapshot.state_change_seq) {
+            "working".clone_into(&mut transition.from);
         }
-        if status == "blocked" {
-            state
-                .blocked_since
-                .entry(terminal.clone())
-                .or_insert_with(Instant::now);
-        }
-        if !is_postable_transition(&transition) {
-            state
-                .previous
-                .insert(terminal.clone(), (status.clone(), agent));
-            return;
-        }
-        let route = match route_topology(agents, tabs, &terminal) {
-            Ok(route) => route,
-            Err(error) => {
-                eprintln!("{error}");
-                state
-                    .previous
-                    .insert(terminal.clone(), (status.clone(), agent));
-                return;
-            }
-        };
-        let Some((client, guild, owner_id, responder)) = discord else {
-            state
-                .previous
-                .insert(terminal.clone(), (status.clone(), agent));
-            return;
-        };
-        if status == "blocked" {
-            handle_blocked_card(BlockedCardContext {
-                client: client.as_ref(),
-                guild: *guild,
-                owner_id,
-                responder: responder.as_ref(),
-                route: &route,
-                snapshot,
-                terminal: &terminal,
-                from_status: &transition.from,
-                blocked_since: state.blocked_since.get(&terminal),
-                state_change_seq,
-                informational_cards: &mut state.informational_cards,
-                blocked_capture_attempts: &mut state.blocked_capture_attempts,
-                search_root: None,
-            })
-            .await;
-        } else {
-            let Some(capture) = capture_for_or_report(snapshot) else {
-                state
-                    .previous
-                    .insert(terminal.clone(), (status.clone(), agent));
-                return;
-            };
-            if let Err(error) = deliver_to_route(
-                client.as_ref(),
-                *guild,
-                owner_id,
-                &route,
-                &transition,
-                &capture,
-                state_change_seq,
+        update_blocked_lifecycle(
+            discord,
+            &terminal,
+            leaving_blocked,
+            status == "blocked",
+            state,
+        )
+        .await;
+        if is_postable_transition(&transition)
+            && let Err(error) = deliver_postable_transition(
+                PostableTransitionContext {
+                    snapshot,
+                    agents,
+                    tabs,
+                    discord,
+                    terminal: &terminal,
+                    transition: &transition,
+                    state_change_seq,
+                },
+                state,
             )
             .await
-            {
-                eprintln!("{error}");
-                state
-                    .previous
-                    .insert(terminal.clone(), (status.clone(), agent));
-                return;
-            }
+        {
+            eprintln!("{error}");
         }
     } else if status == "blocked" && state.blocked_capture_attempts.contains_key(&terminal) {
         retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
@@ -371,6 +343,88 @@ async fn process_snapshot(
     state
         .previous
         .insert(terminal.clone(), (status.clone(), agent));
+}
+
+struct PostableTransitionContext<'a> {
+    snapshot: &'a AgentSnapshot,
+    agents: &'a [AgentSnapshot],
+    tabs: &'a [HerdrTab],
+    discord: Option<&'a DiscordConnection>,
+    terminal: &'a str,
+    transition: &'a Transition,
+    state_change_seq: u64,
+}
+
+async fn deliver_postable_transition(
+    context: PostableTransitionContext<'_>,
+    state: &mut BridgeState,
+) -> Result<(), String> {
+    let PostableTransitionContext {
+        snapshot,
+        agents,
+        tabs,
+        discord,
+        terminal,
+        transition,
+        state_change_seq,
+    } = context;
+    let route = route_topology(agents, tabs, terminal)?;
+    let Some((client, guild, owner_id, responder)) = discord else {
+        return Ok(());
+    };
+    if transition.to == "blocked" {
+        handle_blocked_card(BlockedCardContext {
+            client: client.as_ref(),
+            guild: *guild,
+            owner_id,
+            responder: responder.as_ref(),
+            route: &route,
+            snapshot,
+            terminal,
+            from_status: &transition.from,
+            blocked_since: state.blocked_since.get(terminal),
+            state_change_seq,
+            informational_cards: &mut state.informational_cards,
+            blocked_capture_attempts: &mut state.blocked_capture_attempts,
+            search_root: None,
+        })
+        .await;
+        return Ok(());
+    }
+    let Some(capture) = capture_for_or_report(snapshot) else {
+        return Ok(());
+    };
+    deliver_to_route(
+        client.as_ref(),
+        *guild,
+        owner_id,
+        &route,
+        transition,
+        &capture,
+        state_change_seq,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn update_blocked_lifecycle(
+    discord: Option<&DiscordConnection>,
+    terminal: &str,
+    leaving_blocked: bool,
+    entering_blocked: bool,
+    state: &mut BridgeState,
+) {
+    if leaving_blocked {
+        state.blocked_since.remove(terminal);
+        state.blocked_capture_attempts.remove(terminal);
+        expire_blocked_card(discord, terminal, &mut state.informational_cards).await;
+    }
+    if entering_blocked {
+        state
+            .blocked_since
+            .entry(terminal.to_owned())
+            .or_insert_with(Instant::now);
+    }
 }
 
 async fn retry_pending_blocked_capture(
@@ -687,6 +741,9 @@ fn prune_departed_state(
     state
         .blocked_capture_attempts
         .retain(|terminal, _| current.contains(terminal));
+    state
+        .herdr_state_change_seq
+        .retain(|terminal, _| current.contains(terminal));
     let departed_cards = state
         .informational_cards
         .iter()
@@ -976,7 +1033,8 @@ mod tests {
         BlockedCardContext, BlockedResponse, BridgeState, Client, InformationalCard,
         PermissionResponder, TopologyRoute, capture_for_with_search_root,
         create_transition_messages, decide_blocked_response, handle_blocked_card,
-        next_state_change_sequence, process_snapshot, prune_departed_state, resolve_session_path,
+        is_missed_fast_turn, list_agents, next_state_change_sequence, process_snapshot,
+        prune_departed_state, resolve_session_path, route_topology, sync_route, tab_list_result,
     };
     use herdr_connect_rs::{AgentSession, AgentSnapshot, Transition, transition_card_nonce};
     use serde_json::Value;
@@ -984,8 +1042,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
     use std::sync::Arc;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use twilight_model::id::{
         Id,
         marker::{ChannelMarker, GuildMarker, MessageMarker},
@@ -1040,6 +1099,7 @@ mod tests {
                 .blocked_since
                 .insert(terminal.to_owned(), Instant::now());
             state.state_change_sequences.insert(terminal.to_owned(), 1);
+            state.herdr_state_change_seq.insert(terminal.to_owned(), 7);
             state.informational_cards.insert(
                 terminal.to_owned(),
                 InformationalCard {
@@ -1056,10 +1116,66 @@ mod tests {
         assert_eq!(expired[0].0, departed);
         assert!(!state.blocked_since.contains_key(departed));
         assert!(!state.state_change_sequences.contains_key(departed));
+        assert!(!state.herdr_state_change_seq.contains_key(departed));
         assert!(!state.informational_cards.contains_key(departed));
         assert!(state.blocked_since.contains_key(current));
         assert!(state.state_change_sequences.contains_key(current));
+        assert!(state.herdr_state_change_seq.contains_key(current));
         assert!(state.informational_cards.contains_key(current));
+    }
+
+    #[test]
+    fn missed_fast_turn_is_detected_only_when_seq_advanced_and_status_settled() {
+        let transition = |from: &str, to: &str| Transition {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            terminal_id: "terminal".to_owned(),
+            agent: "claude".to_owned(),
+        };
+        let cases = [
+            (
+                "seq advanced, settled: missed",
+                transition("idle", "done"),
+                Some(10),
+                11,
+                true,
+            ),
+            (
+                "seq unchanged: nothing missed",
+                transition("idle", "done"),
+                Some(11),
+                11,
+                false,
+            ),
+            (
+                "no prior seq recorded: cannot tell",
+                transition("idle", "done"),
+                None,
+                11,
+                false,
+            ),
+            (
+                "still blocked: not settled",
+                transition("idle", "blocked"),
+                Some(10),
+                11,
+                false,
+            ),
+            (
+                "already caught normally",
+                transition("working", "done"),
+                Some(10),
+                11,
+                false,
+            ),
+        ];
+        for (label, transition, previous_seq, current_seq, expected) in cases {
+            assert_eq!(
+                is_missed_fast_turn(&transition, previous_seq, current_seq),
+                expected,
+                "{label}: {transition:?} previous_seq={previous_seq:?} current_seq={current_seq}"
+            );
+        }
     }
 
     #[test]
@@ -1105,6 +1221,7 @@ mod tests {
                     agent: "claude".to_owned(),
                     value: "slug-session".to_owned(),
                 }),
+                state_change_seq: 0,
             };
             assert_eq!(
                 resolve_session_path(
@@ -1203,6 +1320,7 @@ mod tests {
                 agent: "claude".to_owned(),
                 value: "9a11cafe-affe-4f5c-8bda-b10cb6a5cafe".to_owned(),
             }),
+            state_change_seq: 0,
         };
         let capture = capture_for_with_search_root(&snapshot, Path::new("tests/fixtures"))
             .expect("fixture-backed claude session resolves");
@@ -1237,6 +1355,7 @@ mod tests {
             cwd: None,
             terminal_title_stripped: None,
             session: None,
+            state_change_seq: 0,
         };
         let mut state = BridgeState::default();
         state.previous.insert(
@@ -1384,6 +1503,7 @@ mod tests {
             cwd: None,
             terminal_title_stripped: None,
             session: None,
+            state_change_seq: 0,
         };
         let mut informational_cards = HashMap::new();
         let mut blocked_capture_attempts = HashMap::new();
@@ -1475,6 +1595,7 @@ mod tests {
                 agent: "claude".to_owned(),
                 value: "9a11cafe-affe-4f5c-8bda-b10cb6a5cafe".to_owned(),
             }),
+            state_change_seq: 0,
         };
         let mut informational_cards = HashMap::new();
         let mut blocked_capture_attempts = HashMap::new();
@@ -1543,5 +1664,255 @@ mod tests {
             .model()
             .await
             .map_err(|e| e.to_string())
+    }
+
+    #[cfg(unix)]
+    struct MissedTurnTab {
+        tab_id: String,
+        pane_id: String,
+    }
+
+    #[cfg(unix)]
+    const MISSED_TURN_LABEL: &str = "testrun-missed-turn";
+
+    #[cfg(unix)]
+    fn create_missed_turn_tab(workspace_id: &str, cwd: &str) -> Result<MissedTurnTab, String> {
+        let created = herdr_json(&[
+            "tab",
+            "create",
+            "--workspace",
+            workspace_id,
+            "--cwd",
+            cwd,
+            "--label",
+            MISSED_TURN_LABEL,
+            "--no-focus",
+        ])?;
+        let tab_id = created["result"]["tab"]["tab_id"]
+            .as_str()
+            .ok_or("herdr tab create result missing tab_id")?
+            .to_owned();
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .ok_or("herdr tab create result missing pane_id")?
+            .to_owned();
+        Ok(MissedTurnTab { tab_id, pane_id })
+    }
+
+    #[cfg(unix)]
+    fn close_missed_turn_tab(tab_id: &str) {
+        let _ = Command::new("herdr")
+            .args(["tab", "close", tab_id])
+            .output();
+    }
+
+    #[cfg(unix)]
+    fn report_agent_state(pane_id: &str, state: &str) -> Result<(), String> {
+        let args = [
+            "pane",
+            "report-agent",
+            pane_id,
+            "--source",
+            "herdr:claude",
+            "--agent",
+            MISSED_TURN_LABEL,
+            "--state",
+            state,
+        ];
+        let output = Command::new("herdr")
+            .args(args)
+            .output()
+            .map_err(|error| format!("herdr {args:?} spawn failed: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "herdr {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn herdr_json(args: &[&str]) -> Result<Value, String> {
+        let output = Command::new("herdr")
+            .args(args)
+            .output()
+            .map_err(|error| format!("herdr {args:?} spawn failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "herdr {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("herdr {args:?} produced non-JSON stdout: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn remaining_missed_turn_tabs() -> Result<usize, String> {
+        Ok(tab_list_result()?
+            .into_iter()
+            .filter(|tab| tab.label == MISSED_TURN_LABEL)
+            .count())
+    }
+
+    #[cfg(unix)]
+    fn snapshot_for_pane(pane_id: &str) -> Result<AgentSnapshot, String> {
+        list_agents()?
+            .into_iter()
+            .find(|agent| agent.pane_id.as_deref() == Some(pane_id))
+            .ok_or_else(|| format!("agent.list has no entry for pane {pane_id}"))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_status(
+        pane_id: &str,
+        status: &str,
+        bound: Duration,
+    ) -> Result<AgentSnapshot, String> {
+        let start = Instant::now();
+        loop {
+            let snapshot = snapshot_for_pane(pane_id)?;
+            if snapshot.agent_status == status {
+                return Ok(snapshot);
+            }
+            if start.elapsed() > bound {
+                return Err(format!(
+                    "pane {pane_id} did not reach status {status} within {bound:?}, last saw {}",
+                    snapshot.agent_status
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Drives a real pane through `idle -> working -> idle` fast enough that both transitions land
+    /// inside one `report_agent_state` round trip, so the bridge's own poll only ever observes the
+    /// naive `idle -> done` transition; the missed-turn detection is what must still post a card.
+    #[cfg(unix)]
+    async fn missed_fast_turn_round_trip(
+        guild: &BlockedCaptureGuild,
+        tab: &MissedTurnTab,
+    ) -> Result<(), String> {
+        report_agent_state(&tab.pane_id, "idle")?;
+        let baseline = wait_for_status(&tab.pane_id, "idle", Duration::from_secs(10)).await?;
+        let terminal = baseline.terminal_id.clone();
+
+        let mut state = BridgeState::default();
+        process_snapshot(
+            &baseline,
+            std::slice::from_ref(&baseline),
+            &[],
+            None,
+            &mut state,
+        )
+        .await;
+
+        report_agent_state(&tab.pane_id, "working")?;
+        report_agent_state(&tab.pane_id, "idle")?;
+        let missed = wait_for_status(&tab.pane_id, "done", Duration::from_secs(10)).await?;
+        if missed.state_change_seq <= baseline.state_change_seq {
+            return Err(format!(
+                "herdr state_change_seq did not advance between polls: baseline={} missed={}",
+                baseline.state_change_seq, missed.state_change_seq
+            ));
+        }
+
+        let matching_tab = tab_list_result()?
+            .into_iter()
+            .find(|candidate| candidate.tab_id == tab.tab_id)
+            .ok_or_else(|| format!("tab.list has no entry for {}", tab.tab_id))?;
+        let tabs = std::slice::from_ref(&matching_tab);
+        let agents = std::slice::from_ref(&missed);
+        let route = route_topology(agents, tabs, &terminal)?;
+
+        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
+        let responder = Arc::new(PermissionResponder::new(
+            Arc::clone(&guild.client),
+            guild.id,
+            owner_id.clone(),
+        ));
+        let connection = (Arc::clone(&guild.client), guild.id, owner_id, responder);
+
+        process_snapshot(&missed, agents, tabs, Some(&connection), &mut state).await;
+
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route).await?;
+        let messages = guild
+            .client
+            .channel_messages(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let posted = messages.iter().any(|message| {
+            message
+                .embeds
+                .first()
+                .and_then(|embed| embed.description.as_deref())
+                == Some("agent stopped, no log available")
+        });
+        if posted {
+            Ok(())
+        } else {
+            Err(
+                "missed fast turn (idle -> working -> done inside one poll) did not post a card"
+                    .to_owned(),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn missed_fast_turn_between_polls_still_posts_a_card() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_missed_turn_tabs().expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-missed-turn-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create missed-turn test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_missed_turn_tab(&workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = missed_fast_turn_round_trip(&guild, &tab).await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_missed_turn_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_missed_turn_tabs().expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 }
