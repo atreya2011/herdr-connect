@@ -38,7 +38,7 @@ pub use permission::{
     decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
     encode_cursor_decision,
 };
-pub use prompting::should_handle_owner_message;
+pub use prompting::{maintain_typing_until_settled, should_handle_owner_message};
 pub use readers::{AgentLog, read_agent_log};
 pub use topology::{TopologyRoute, route_topology, sync_topology, workspace_channel_name};
 pub use watcher::{Transition, is_postable_transition};

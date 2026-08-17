@@ -5,14 +5,20 @@
 
 use crate::herdr::agent_prompt;
 use crate::{AgentSnapshot, list_agents};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use twilight_http::Client;
 use twilight_model::{
     channel::{ChannelType, Message},
-    id::{Id, marker::GuildMarker},
+    id::{
+        Id,
+        marker::{ChannelMarker, GuildMarker},
+    },
 };
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
+const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
@@ -89,6 +95,11 @@ pub async fn handle_owner_message(
             return Ok(());
         }
     };
+    tokio::spawn(keep_typing_while_working(
+        Arc::clone(&client),
+        message.channel_id,
+        pane_id.clone(),
+    ));
     let text = message.content.clone();
     let prompt_pane = pane_id.clone();
     let result = tokio::task::spawn_blocking(move || agent_prompt(&prompt_pane, &text))
@@ -164,6 +175,56 @@ fn resolve_prompt_pane(
     }
 }
 
+/// Keeps the Discord typing indicator alive in `channel` while `still_working` reports true.
+///
+/// Re-triggers on `interval` and stops as soon as `still_working` reports false or errors.
+pub async fn maintain_typing_until_settled<F, Fut>(
+    client: &Client,
+    channel: Id<ChannelMarker>,
+    interval: Duration,
+    mut still_working: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    loop {
+        if client.create_typing_trigger(channel).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(interval).await;
+        if !matches!(still_working().await, Ok(true)) {
+            return;
+        }
+    }
+}
+
+async fn keep_typing_while_working(
+    client: Arc<Client>,
+    channel: Id<ChannelMarker>,
+    pane_id: String,
+) {
+    maintain_typing_until_settled(&client, channel, TYPING_KEEPALIVE_INTERVAL, move || {
+        let pane_id = pane_id.clone();
+        async move { pane_still_working(&pane_id).await }
+    })
+    .await;
+}
+
+async fn pane_still_working(pane_id: &str) -> Result<bool, String> {
+    let agents = tokio::task::spawn_blocking(list_agents)
+        .await
+        .map_err(|error| format!("herdr agent.list task failed: {error}"))?
+        .map_err(|error| format!("agent.list failed: {error}"))?;
+    Ok(pane_status_is_working(&agents, pane_id))
+}
+
+#[must_use]
+fn pane_status_is_working(agents: &[AgentSnapshot], pane_id: &str) -> bool {
+    agents.iter().any(|agent| {
+        agent.pane_id.as_deref() == Some(pane_id) && agent.agent_status.trim() == "working"
+    })
+}
+
 fn agent_list_failure_reply(error: &str) -> String {
     format!("refused: agent.list failed: {error}")
 }
@@ -181,8 +242,8 @@ async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_list_failure_reply, has_prompt_content, is_thread_channel, prompt_surface_markers,
-        resolve_prompt_pane,
+        agent_list_failure_reply, has_prompt_content, is_thread_channel, pane_status_is_working,
+        prompt_surface_markers, resolve_prompt_pane,
     };
     use crate::AgentSnapshot;
     use serde_json::Value;
@@ -331,6 +392,37 @@ mod tests {
             assert_eq!(
                 resolve_prompt_pane(tab_id, workspace_id, &agents),
                 Err(expected.to_owned()),
+                "branch={branch}"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_status_is_working_captured_snapshot_branches() {
+        let value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
+                .expect("captured agent snapshot is JSON");
+        let captured: Vec<AgentSnapshot> =
+            serde_json::from_value(value["result"]["agents"].clone())
+                .expect("captured agent snapshot has the expected shape");
+        let pane_id = captured[0]
+            .pane_id
+            .as_deref()
+            .expect("captured agent has a pane id")
+            .to_owned();
+        let mut working = captured[0].clone();
+        working.agent_status = "working".to_owned();
+        let mut idle = captured[0].clone();
+        idle.agent_status = "idle".to_owned();
+        let cases = [
+            ("working pane matches", vec![working], true),
+            ("idle pane does not match", vec![idle], false),
+            ("no matching pane", vec![], false),
+        ];
+        for (branch, agents, expected) in cases {
+            assert_eq!(
+                pane_status_is_working(&agents, &pane_id),
+                expected,
                 "branch={branch}"
             );
         }
