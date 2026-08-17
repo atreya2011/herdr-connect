@@ -19,10 +19,10 @@ fn cursor_pane_stall_is_followed_by_enter_and_the_turn_starts() {
         "named zero-leftover check"
     );
 
-    let created = create_cursor_tab(&workspace_id, cwd);
+    let created = create_tab(&workspace_id, cwd);
     let (tab_id, result) = match created {
         Ok(tab) => {
-            let outcome = exercise(&tab.pane_id);
+            let outcome = start_cursor_agent(&tab.pane_id).and_then(|()| exercise(&tab.pane_id));
             (Some(tab.tab_id), outcome)
         }
         Err(error) => (None, Err(error)),
@@ -50,7 +50,7 @@ struct TestTab {
     pane_id: String,
 }
 
-fn create_cursor_tab(workspace_id: &str, cwd: &str) -> Result<TestTab, String> {
+fn create_tab(workspace_id: &str, cwd: &str) -> Result<TestTab, String> {
     let created = herdr_json(&[
         "tab",
         "create",
@@ -70,18 +70,43 @@ fn create_cursor_tab(workspace_id: &str, cwd: &str) -> Result<TestTab, String> {
         .as_str()
         .ok_or("herdr tab create result missing pane_id")?
         .to_owned();
-    herdr_json(&[
-        "agent",
-        "start",
-        LABEL,
-        "--kind",
-        CURSOR_KIND,
-        "--pane",
-        &pane_id,
-        "--timeout",
-        "60000",
-    ])?;
     Ok(TestTab { tab_id, pane_id })
+}
+
+/// Starts the cursor agent on a freshly created pane, polling against real `agent.start`
+/// rejections until Herdr reports the pane as an available shell.
+///
+/// A freshly created pane's shell briefly forks startup-script subprocesses (oh-my-zsh compinit,
+/// profile hooks, ...) before settling; `agent start` rejects with `agent_pane_busy` while that
+/// window is open, and a plain pre-check of pane process state cannot close the gap because the
+/// state can change again between the check and the follow-up `agent start` call. Retrying the
+/// actual `agent start` call is Herdr's own authoritative answer to "is this pane available".
+fn start_cursor_agent(pane_id: &str) -> Result<(), String> {
+    let bound = Duration::from_secs(10);
+    let start = Instant::now();
+    loop {
+        match herdr_json(&[
+            "agent",
+            "start",
+            LABEL,
+            "--kind",
+            CURSOR_KIND,
+            "--pane",
+            pane_id,
+            "--timeout",
+            "60000",
+        ]) {
+            Ok(_) => return Ok(()),
+            Err(error) if is_agent_pane_busy(&error) && start.elapsed() < bound => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_agent_pane_busy(error: &str) -> bool {
+    error.contains("\"code\":\"agent_pane_busy\"")
 }
 
 fn close_tab(tab_id: &str) {
