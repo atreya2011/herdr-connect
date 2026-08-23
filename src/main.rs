@@ -768,6 +768,35 @@ async fn sync_route(
     .map_err(|error| format!("discord topology error: {error}"))
 }
 
+/// Ensures every workspace channel and tab thread exists before the event loop starts. A
+/// per-tab routing or naming error is logged and skipped; the lazy sync inside delivery still
+/// covers that tab once a card is due.
+async fn sync_startup_topology(
+    discord: &DiscordConnection,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+) {
+    let (client, guild, _, _) = discord;
+    let mut synced_tabs = HashSet::new();
+    for agent in agents {
+        if let Some(tab_id) = agent.tab_id.as_deref()
+            && !synced_tabs.insert(tab_id.to_owned())
+        {
+            continue;
+        }
+        let route = match route_topology(agents, tabs, &agent.terminal_id) {
+            Ok(route) => route,
+            Err(error) => {
+                eprintln!("herdr startup topology error: {error}");
+                continue;
+            }
+        };
+        if let Err(error) = sync_route(client.as_ref(), *guild, &route).await {
+            eprintln!("herdr startup topology error: {error}");
+        }
+    }
+}
+
 fn next_state_change_sequence(
     state_change_sequences: &mut HashMap<String, u64>,
     terminal: &str,
@@ -1431,6 +1460,12 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Ok(());
     }
+    if let Some(discord) = discord.as_ref() {
+        match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
+            Ok((agents, tabs)) => sync_startup_topology(discord, &agents, &tabs).await,
+            Err(error) => eprintln!("herdr startup topology snapshot error: {error}"),
+        }
+    }
     bridge_event_loop(
         discord.as_ref(),
         &mut gateway,
@@ -1452,7 +1487,7 @@ mod tests {
         lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
         prune_departed_state, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
-        subscribe_status_with_backoff, sync_route, tab_list_result,
+        subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
@@ -2843,6 +2878,114 @@ mod tests {
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(SEQ_BACKSTOP_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const STARTUP_TOPOLOGY_LABEL: &str = "testrun-startup-topology";
+
+    #[cfg(unix)]
+    async fn startup_topology_sync_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&tab.pane_id, "idle")?;
+        let listed = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, agents, tabs).await;
+
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let channel = guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+            .ok_or_else(|| "startup sync did not create the workspace channel".to_owned())?;
+
+        let thread_suffix = format!(" [{}]", route.tab_id);
+        let threads = guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .threads;
+        let has_thread = threads.iter().any(|thread| {
+            thread.parent_id == Some(channel.id)
+                && thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&thread_suffix))
+        });
+        if has_thread {
+            Ok(())
+        } else {
+            Err("startup sync did not create the tab thread".to_owned())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn startup_topology_sync_creates_channel_and_thread_before_event_loop() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(STARTUP_TOPOLOGY_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create startup-topology test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_tab(STARTUP_TOPOLOGY_LABEL, &workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = startup_topology_sync_exercise(&guild, &tab).await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(STARTUP_TOPOLOGY_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
