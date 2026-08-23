@@ -1,20 +1,10 @@
 #[derive(Debug, PartialEq, Eq)]
-pub struct AppConfig {
-    pub poll_interval_ms: u64,
-}
-#[derive(Debug, PartialEq, Eq)]
 pub struct DiscordConfig {
     pub guild_id: String,
     pub owner_id: String,
     pub token: String,
 }
 
-#[must_use]
-pub const fn load_config() -> AppConfig {
-    AppConfig {
-        poll_interval_ms: 1_500,
-    }
-}
 /// Loads and validates Discord configuration.
 ///
 /// # Errors

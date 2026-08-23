@@ -29,7 +29,7 @@ The current Rust delivery and permission paths call `sync_topology`, which downl
 
 ### Late terminal titles
 
-`format_thread_name` currently errors every time a numeric tab label has no terminal title. Preserve the outcome of [historical issue #28](https://github.com/atreya2011/herdr-connect/issues/28): wait quietly while a cold-start title is absent, create the thread when it arrives, and surface a permanently unusable name once rather than once per poll.
+`format_thread_name` currently errors every time a numeric tab label has no terminal title. Preserve the outcome of [historical issue #28](https://github.com/atreya2011/herdr-connect/issues/28): wait quietly while a cold-start title is absent, create the thread when it arrives, and surface a permanently unusable name once rather than once per snapshot.
 
 ## Unported product backlog
 

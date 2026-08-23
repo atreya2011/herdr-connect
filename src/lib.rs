@@ -23,14 +23,15 @@ pub use cards::{
     AgentLogCapture, TransitionMessage, create_transition_messages,
     create_unsupported_blocked_card, format_thread_name,
 };
-pub use config::{AppConfig, DiscordConfig, load_config, load_discord_config};
+pub use config::{DiscordConfig, load_discord_config};
 pub use delivery::{
     deliver_permission_card, deliver_transition_card, expire_informational_card,
     transition_card_nonce,
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
-    AgentSession, AgentSnapshot, HerdrTab, list_agents, request_rpc_result, tab_list_result,
+    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, lifecycle_subscriptions, list_agents,
+    request_rpc_result, status_subscriptions, subscribe_herdr_events, tab_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,

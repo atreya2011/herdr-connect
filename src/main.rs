@@ -1,9 +1,10 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrTab, TopologyRoute,
-    Transition, TransitionMessage, create_transition_messages, create_unsupported_blocked_card,
-    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
-    hook_timeout, is_postable_transition, list_agents, load_config, load_discord_config,
-    route_topology, sync_topology, tab_list_result, transition_card_nonce,
+    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
+    TopologyRoute, Transition, TransitionMessage, create_transition_messages,
+    create_unsupported_blocked_card, deliver_transition_card, drive_gateway_with_components,
+    expire_informational_card, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, load_discord_config, route_topology, status_subscriptions, subscribe_herdr_events,
+    sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, decode_claude_permission_request,
@@ -42,10 +43,10 @@ struct InformationalCard {
 struct BridgeState {
     previous: HashMap<String, (String, String)>,
     state_change_sequences: HashMap<String, u64>,
+    herdr_state_change_seq: HashMap<String, u64>,
     blocked_since: HashMap<String, Instant>,
     informational_cards: HashMap<String, InformationalCard>,
     blocked_capture_attempts: HashMap<String, u32>,
-    herdr_state_change_seq: HashMap<String, u64>,
 }
 
 struct BlockedCardContext<'a> {
@@ -64,11 +65,17 @@ struct BlockedCardContext<'a> {
     search_root: Option<&'a Path>,
 }
 
-/// Bounded number of blocked-poll capture attempts before falling back to the
+/// Bounded number of blocked-capture attempts before falling back to the
 /// informational card. The herdr "blocked" status can flip before the vendor log
 /// file is flushed with the pending question, so a single capture miss is not
-/// treated as "no question" — it is retried on the next few polls instead.
+/// treated as "no question" — it is retried on the next few snapshots instead.
 const MAX_BLOCKED_CAPTURE_ATTEMPTS: u32 = 3;
+
+/// Retries blocked-capture while a pane stays blocked without another status event.
+const BLOCKED_CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(1_500);
+
+const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq, Eq)]
 enum BlockedResponse {
@@ -267,18 +274,27 @@ async fn expire_departed_card(
     }
 }
 
-/// Detects a completed turn Herdr's own poll cadence missed: the pane went `working` and back to
-/// a settled status between two bridge polls, so the naive `old` to `status` transition never saw
-/// `working` as its `from`. Herdr's own `state_change_seq` advancing past what the previous poll
-/// recorded for this terminal is the only signal available to catch this without polling faster.
+/// Herdr's `state_change_seq` advancing while the bridge only sees a settled status means a
+/// `working` phase happened between snapshots; rewrite `from` so the card still posts.
 #[must_use]
-fn is_missed_fast_turn(
+fn seq_backstop_rewrites_working_from(
     transition: &Transition,
     previous_herdr_seq: Option<u64>,
     current_herdr_seq: u64,
 ) -> bool {
     !is_postable_transition(transition)
         && matches!(transition.to.as_str(), "idle" | "done")
+        && previous_herdr_seq.is_some_and(|previous| current_herdr_seq > previous)
+}
+
+/// Settled status unchanged between snapshots while Herdr's seq advanced: a full turn collapsed.
+#[must_use]
+fn seq_backstop_collapsed_settled_turn(
+    status: &str,
+    previous_herdr_seq: Option<u64>,
+    current_herdr_seq: u64,
+) -> bool {
+    matches!(status, "idle" | "done")
         && previous_herdr_seq.is_some_and(|previous| current_herdr_seq > previous)
 }
 
@@ -296,46 +312,80 @@ async fn process_snapshot(
     let previous_herdr_seq = state
         .herdr_state_change_seq
         .insert(terminal.clone(), snapshot.state_change_seq);
-    if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned()
-        && old != status
-    {
-        let state_change_seq =
-            next_state_change_sequence(&mut state.state_change_sequences, &terminal);
-        let prior_status = old.clone();
-        let leaving_blocked = prior_status == "blocked" && status != "blocked";
-        let mut transition = Transition {
-            from: old,
-            to: status.clone(),
-            terminal_id: terminal.clone(),
-            agent: prior_agent,
-        };
-        if is_missed_fast_turn(&transition, previous_herdr_seq, snapshot.state_change_seq) {
-            "working".clone_into(&mut transition.from);
-        }
-        update_blocked_lifecycle(
-            discord,
-            &terminal,
-            leaving_blocked,
-            status == "blocked",
-            state,
-        )
-        .await;
-        if is_postable_transition(&transition)
-            && let Err(error) = deliver_postable_transition(
-                PostableTransitionContext {
-                    snapshot,
-                    agents,
-                    tabs,
-                    discord,
-                    terminal: &terminal,
-                    transition: &transition,
-                    state_change_seq,
-                },
+    if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned() {
+        if old != status {
+            let state_change_seq =
+                next_state_change_sequence(&mut state.state_change_sequences, &terminal);
+            let prior_status = old.clone();
+            let leaving_blocked = prior_status == "blocked" && status != "blocked";
+            let mut transition = Transition {
+                from: old,
+                to: status.clone(),
+                terminal_id: terminal.clone(),
+                agent: prior_agent,
+            };
+            if seq_backstop_rewrites_working_from(
+                &transition,
+                previous_herdr_seq,
+                snapshot.state_change_seq,
+            ) {
+                "working".clone_into(&mut transition.from);
+            }
+            update_blocked_lifecycle(
+                discord,
+                &terminal,
+                leaving_blocked,
+                status == "blocked",
                 state,
             )
-            .await
-        {
-            eprintln!("{error}");
+            .await;
+            if is_postable_transition(&transition)
+                && let Err(error) = deliver_postable_transition(
+                    PostableTransitionContext {
+                        snapshot,
+                        agents,
+                        tabs,
+                        discord,
+                        terminal: &terminal,
+                        transition: &transition,
+                        state_change_seq,
+                    },
+                    state,
+                )
+                .await
+            {
+                eprintln!("{error}");
+            }
+        } else if seq_backstop_collapsed_settled_turn(
+            &status,
+            previous_herdr_seq,
+            snapshot.state_change_seq,
+        ) {
+            let state_change_seq =
+                next_state_change_sequence(&mut state.state_change_sequences, &terminal);
+            let transition = Transition {
+                from: "working".to_owned(),
+                to: status.clone(),
+                terminal_id: terminal.clone(),
+                agent: prior_agent,
+            };
+            if is_postable_transition(&transition)
+                && let Err(error) = deliver_postable_transition(
+                    PostableTransitionContext {
+                        snapshot,
+                        agents,
+                        tabs,
+                        discord,
+                        terminal: &terminal,
+                        transition: &transition,
+                        state_change_seq,
+                    },
+                    state,
+                )
+                .await
+            {
+                eprintln!("{error}");
+            }
         }
     } else if status == "blocked" && state.blocked_capture_attempts.contains_key(&terminal) {
         retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
@@ -739,10 +789,10 @@ fn prune_departed_state(
         .state_change_sequences
         .retain(|terminal, _| current.contains(terminal));
     state
-        .blocked_capture_attempts
+        .herdr_state_change_seq
         .retain(|terminal, _| current.contains(terminal));
     state
-        .herdr_state_change_seq
+        .blocked_capture_attempts
         .retain(|terminal, _| current.contains(terminal));
     let departed_cards = state
         .informational_cards
@@ -972,47 +1022,160 @@ fn abort_broker(broker: &mut Option<BrokerTask>) {
     }
 }
 
-async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    let (discord, mut gateway, mut broker) = match discord_connection()? {
-        Some((connection, gateway)) => {
-            let broker = start_broker(&connection);
-            (Some(connection), Some(gateway), broker)
+fn pane_ids_from_agents(agents: &[AgentSnapshot]) -> Vec<String> {
+    let mut ids: Vec<String> = agents
+        .iter()
+        .filter_map(|agent| agent.pane_id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Membership {
+    Add(String),
+    Remove(String),
+}
+
+fn canonical_event_name(event: &str) -> String {
+    event.replace('.', "_")
+}
+
+fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
+    match canonical_event_name(event.get("event")?.as_str()?).as_str() {
+        "pane_created" => event
+            .pointer("/data/pane/pane_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| Membership::Add(id.to_owned())),
+        "pane_closed" => event
+            .pointer("/data/pane_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| Membership::Remove(id.to_owned())),
+        "pane_agent_detected" => {
+            let pane_id = event
+                .pointer("/data/pane_id")
+                .and_then(serde_json::Value::as_str)?;
+            if event
+                .pointer("/data/released")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                Some(Membership::Remove(pane_id.to_owned()))
+            } else {
+                Some(Membership::Add(pane_id.to_owned()))
+            }
         }
-        None => (None, None, None),
-    };
-    let interval = load_config().poll_interval_ms;
-    let mut state = BridgeState::default();
-    let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        _ => None,
+    }
+}
+
+fn apply_membership(pane_ids: &mut Vec<String>, change: Membership) -> bool {
+    match change {
+        Membership::Add(id) => {
+            if let Err(index) = pane_ids.binary_search(&id) {
+                pane_ids.insert(index, id);
+                true
+            } else {
+                false
+            }
+        }
+        Membership::Remove(id) => pane_ids.binary_search(&id).is_ok_and(|index| {
+            pane_ids.remove(index);
+            true
+        }),
+    }
+}
+
+fn reconcile_pane_ids(current: &mut Vec<String>, from_snapshot: Vec<String>) -> bool {
+    if *current == from_snapshot {
+        false
+    } else {
+        *current = from_snapshot;
+        true
+    }
+}
+
+#[derive(Debug)]
+struct BridgeInterrupt;
+
+impl std::fmt::Display for BridgeInterrupt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "bridge interrupted")
+    }
+}
+
+impl std::error::Error for BridgeInterrupt {}
+
+fn unwrap_or_shutdown<T>(
+    result: Result<T, BridgeInterrupt>,
+    broker: &mut Option<BrokerTask>,
+) -> Option<T> {
+    result.map_or_else(
+        |_| {
+            abort_broker(broker);
+            None
+        },
+        Some,
+    )
+}
+
+struct BridgeRuntime {
+    lifecycle: HerdrSubscription,
+    pane_ids: Vec<String>,
+    status: Option<HerdrSubscription>,
+    state: BridgeState,
+}
+
+async fn doorbell_unless_shutdown(
+    discord: Option<&DiscordConnection>,
+    state: &mut BridgeState,
+    pane_ids: &mut Vec<String>,
+    status: &mut Option<HerdrSubscription>,
+    stop: &mut tokio::signal::unix::Signal,
+    broker: &mut Option<BrokerTask>,
+) -> bool {
+    unwrap_or_shutdown(
+        doorbell_snapshot(discord, state, pane_ids, status, stop).await,
+        broker,
+    )
+    .is_some()
+}
+
+async fn bridge_event_loop(
+    discord: Option<&DiscordConnection>,
+    gateway: &mut Option<GatewayTask>,
+    broker: &mut Option<BrokerTask>,
+    stop: &mut tokio::signal::unix::Signal,
+    runtime: &mut BridgeRuntime,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let agents = match list_agents() {
-            Ok(agents) => agents,
-            Err(error) => {
-                eprintln!("herdr poll error: {error}");
-                tokio::time::sleep(Duration::from_millis(interval)).await;
-                continue;
-            }
-        };
-        let tabs = match tab_list_result() {
-            Ok(tabs) => tabs,
-            Err(error) => {
-                eprintln!("herdr tab poll error: {error}");
-                tokio::time::sleep(Duration::from_millis(interval)).await;
-                continue;
-            }
-        };
-        let current: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
-        state
-            .previous
-            .retain(|terminal, _| current.contains(terminal));
-        let departed_cards = prune_departed_state(&mut state, &current);
-        for (terminal, card) in departed_cards {
-            expire_departed_card(discord.as_ref(), &terminal, card).await;
-        }
-        for snapshot in &agents {
-            process_snapshot(snapshot, &agents, &tabs, discord.as_ref(), &mut state).await;
-        }
+        let blocked_retry_pending = !runtime.state.blocked_capture_attempts.is_empty();
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(interval)) => {},
+            result = runtime.lifecycle.next_event() => {
+                if !handle_lifecycle_select_result(result, discord, stop, broker, runtime).await {
+                    break;
+                }
+            }
+            result = next_status_event(&mut runtime.status) => {
+                if !handle_status_select_result(result, discord, stop, broker, runtime).await {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(BLOCKED_CAPTURE_RETRY_INTERVAL), if blocked_retry_pending => {
+                if !doorbell_unless_shutdown(
+                    discord,
+                    &mut runtime.state,
+                    &mut runtime.pane_ids,
+                    &mut runtime.status,
+                    stop,
+                    broker,
+                )
+                .await
+                {
+                    break;
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
             _ = stop.recv() => break,
             result = wait_for_gateway(gateway.as_mut()) => {
@@ -1023,6 +1186,242 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+async fn handle_lifecycle_select_result(
+    result: Result<serde_json::Value, String>,
+    discord: Option<&DiscordConnection>,
+    stop: &mut tokio::signal::unix::Signal,
+    broker: &mut Option<BrokerTask>,
+    runtime: &mut BridgeRuntime,
+) -> bool {
+    match result {
+        Ok(event) => {
+            if let Some(change) = lifecycle_membership(&event)
+                && apply_membership(&mut runtime.pane_ids, change)
+            {
+                let Some(next_status) = unwrap_or_shutdown(
+                    subscribe_status_with_backoff(&runtime.pane_ids, stop).await,
+                    broker,
+                ) else {
+                    return false;
+                };
+                runtime.status = next_status;
+            }
+            doorbell_unless_shutdown(
+                discord,
+                &mut runtime.state,
+                &mut runtime.pane_ids,
+                &mut runtime.status,
+                stop,
+                broker,
+            )
+            .await
+        }
+        Err(error) => {
+            eprintln!("herdr lifecycle subscribe error: {error}");
+            let Some(next_lifecycle) = unwrap_or_shutdown(
+                subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), stop).await,
+                broker,
+            ) else {
+                return false;
+            };
+            runtime.lifecycle = next_lifecycle;
+            doorbell_unless_shutdown(
+                discord,
+                &mut runtime.state,
+                &mut runtime.pane_ids,
+                &mut runtime.status,
+                stop,
+                broker,
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_status_select_result(
+    result: Result<serde_json::Value, String>,
+    discord: Option<&DiscordConnection>,
+    stop: &mut tokio::signal::unix::Signal,
+    broker: &mut Option<BrokerTask>,
+    runtime: &mut BridgeRuntime,
+) -> bool {
+    match result {
+        Ok(_event) => {
+            doorbell_unless_shutdown(
+                discord,
+                &mut runtime.state,
+                &mut runtime.pane_ids,
+                &mut runtime.status,
+                stop,
+                broker,
+            )
+            .await
+        }
+        Err(error) => {
+            eprintln!("herdr status subscribe error: {error}");
+            let Some(next_status) = unwrap_or_shutdown(
+                subscribe_status_with_backoff(&runtime.pane_ids, stop).await,
+                broker,
+            ) else {
+                return false;
+            };
+            runtime.status = next_status;
+            doorbell_unless_shutdown(
+                discord,
+                &mut runtime.state,
+                &mut runtime.pane_ids,
+                &mut runtime.status,
+                stop,
+                broker,
+            )
+            .await
+        }
+    }
+}
+
+async fn subscribe_herdr_events_with_backoff(
+    subscriptions: &[serde_json::Value],
+    stop: &mut tokio::signal::unix::Signal,
+) -> Result<HerdrSubscription, BridgeInterrupt> {
+    let mut delay = SUBSCRIBE_RETRY_INITIAL;
+    loop {
+        match subscribe_herdr_events(subscriptions).await {
+            Ok(subscription) => return Ok(subscription),
+            Err(error) => {
+                eprintln!("herdr subscribe error: {error}; retrying in {delay:?}");
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {
+                        delay = delay.saturating_mul(2).min(SUBSCRIBE_RETRY_MAX);
+                    }
+                    _ = tokio::signal::ctrl_c() => return Err(BridgeInterrupt),
+                    _ = stop.recv() => return Err(BridgeInterrupt),
+                }
+            }
+        }
+    }
+}
+
+async fn subscribe_status_with_backoff(
+    pane_ids: &[String],
+    stop: &mut tokio::signal::unix::Signal,
+) -> Result<Option<HerdrSubscription>, BridgeInterrupt> {
+    if pane_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        subscribe_herdr_events_with_backoff(&status_subscriptions(pane_ids), stop).await?,
+    ))
+}
+
+#[cfg(test)]
+async fn subscribe_status(pane_ids: &[String]) -> Result<Option<HerdrSubscription>, String> {
+    if pane_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        subscribe_herdr_events(&status_subscriptions(pane_ids)).await?,
+    ))
+}
+
+async fn apply_herdr_snapshot(
+    discord: Option<&DiscordConnection>,
+    state: &mut BridgeState,
+) -> Result<Vec<String>, String> {
+    let agents = list_agents()?;
+    let tabs = tab_list_result()?;
+    let current: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
+    state
+        .previous
+        .retain(|terminal, _| current.contains(terminal));
+    let departed_cards = prune_departed_state(state, &current);
+    for (terminal, card) in departed_cards {
+        expire_departed_card(discord, &terminal, card).await;
+    }
+    for snapshot in &agents {
+        process_snapshot(snapshot, &agents, &tabs, discord, state).await;
+    }
+    Ok(pane_ids_from_agents(&agents))
+}
+
+async fn doorbell_snapshot(
+    discord: Option<&DiscordConnection>,
+    state: &mut BridgeState,
+    pane_ids: &mut Vec<String>,
+    status: &mut Option<HerdrSubscription>,
+    stop: &mut tokio::signal::unix::Signal,
+) -> Result<(), BridgeInterrupt> {
+    match apply_herdr_snapshot(discord, state).await {
+        Ok(from_snapshot) => {
+            if reconcile_pane_ids(pane_ids, from_snapshot) {
+                *status = subscribe_status_with_backoff(pane_ids, stop).await?;
+            }
+        }
+        Err(error) => eprintln!("herdr snapshot error: {error}"),
+    }
+    Ok(())
+}
+
+async fn next_status_event(
+    status: &mut Option<HerdrSubscription>,
+) -> Result<serde_json::Value, String> {
+    match status.as_mut() {
+        Some(stream) => stream.next_event().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    let (discord, mut gateway, mut broker) = match discord_connection()? {
+        Some((connection, gateway)) => {
+            let broker = start_broker(&connection);
+            (Some(connection), Some(gateway), broker)
+        }
+        None => (None, None, None),
+    };
+    let state = BridgeState::default();
+    let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let Some(lifecycle) = unwrap_or_shutdown(
+        subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), &mut stop).await,
+        &mut broker,
+    ) else {
+        return Ok(());
+    };
+    let pane_ids = Vec::new();
+    let Some(status) = unwrap_or_shutdown(
+        subscribe_status_with_backoff(&pane_ids, &mut stop).await,
+        &mut broker,
+    ) else {
+        return Ok(());
+    };
+    let mut runtime = BridgeRuntime {
+        lifecycle,
+        pane_ids,
+        status,
+        state,
+    };
+    if !doorbell_unless_shutdown(
+        discord.as_ref(),
+        &mut runtime.state,
+        &mut runtime.pane_ids,
+        &mut runtime.status,
+        &mut stop,
+        &mut broker,
+    )
+    .await
+    {
+        return Ok(());
+    }
+    bridge_event_loop(
+        discord.as_ref(),
+        &mut gateway,
+        &mut broker,
+        &mut stop,
+        &mut runtime,
+    )
+    .await?;
     abort_broker(&mut broker);
     Ok(())
 }
@@ -1030,18 +1429,23 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockedCardContext, BlockedResponse, BridgeState, Client, InformationalCard,
-        PermissionResponder, TopologyRoute, capture_for_with_search_root,
+        BlockedCardContext, BlockedResponse, BridgeState, Client, InformationalCard, Membership,
+        PermissionResponder, TopologyRoute, apply_membership, capture_for_with_search_root,
         create_transition_messages, decide_blocked_response, handle_blocked_card,
-        is_missed_fast_turn, list_agents, next_state_change_sequence, process_snapshot,
-        prune_departed_state, resolve_session_path, route_topology, sync_route, tab_list_result,
+        lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
+        prune_departed_state, resolve_session_path, route_topology,
+        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
+        sync_route, tab_list_result,
     };
-    use herdr_connect_rs::{AgentSession, AgentSnapshot, Transition, transition_card_nonce};
+    use herdr_connect_rs::{
+        AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
+        subscribe_herdr_events, transition_card_nonce,
+    };
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1125,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn missed_fast_turn_is_detected_only_when_seq_advanced_and_status_settled() {
+    fn seq_backstop_rewrites_settled_turn_only_when_herdr_seq_advanced() {
         let transition = |from: &str, to: &str| Transition {
             from: from.to_owned(),
             to: to.to_owned(),
@@ -1134,48 +1538,105 @@ mod tests {
         };
         let cases = [
             (
-                "seq advanced, settled: missed",
+                "seq advanced, settled: rewrite",
                 transition("idle", "done"),
                 Some(10),
                 11,
                 true,
             ),
             (
-                "seq unchanged: nothing missed",
+                "seq unchanged: no rewrite",
                 transition("idle", "done"),
-                Some(11),
-                11,
-                false,
-            ),
-            (
-                "no prior seq recorded: cannot tell",
-                transition("idle", "done"),
-                None,
-                11,
-                false,
-            ),
-            (
-                "still blocked: not settled",
-                transition("idle", "blocked"),
                 Some(10),
-                11,
+                10,
                 false,
             ),
             (
-                "already caught normally",
+                "already postable: no rewrite",
                 transition("working", "done"),
                 Some(10),
+                11,
+                false,
+            ),
+            (
+                "settled but seq missing: no rewrite",
+                transition("idle", "idle"),
+                None,
                 11,
                 false,
             ),
         ];
         for (label, transition, previous_seq, current_seq, expected) in cases {
             assert_eq!(
-                is_missed_fast_turn(&transition, previous_seq, current_seq),
+                seq_backstop_rewrites_working_from(&transition, previous_seq, current_seq),
                 expected,
                 "{label}: {transition:?} previous_seq={previous_seq:?} current_seq={current_seq}"
             );
         }
+    }
+
+    #[test]
+    fn seq_backstop_collapsed_settled_turn_when_status_unchanged() {
+        let cases = [
+            ("done unchanged, seq advanced", "done", Some(10), 11, true),
+            ("idle unchanged, seq advanced", "idle", Some(4), 5, true),
+            ("done unchanged, seq flat", "done", Some(10), 10, false),
+            ("working unchanged", "working", Some(10), 11, false),
+            ("done unchanged, no prior seq", "done", None, 11, false),
+        ];
+        for (label, status, previous_seq, current_seq, expected) in cases {
+            assert_eq!(
+                seq_backstop_collapsed_settled_turn(status, previous_seq, current_seq),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_membership_matches_real_payload_shapes() {
+        use serde_json::json;
+
+        let created = json!({"event": "pane_created", "data": {"pane": {"pane_id": "w1:p1"}}});
+        assert_eq!(
+            lifecycle_membership(&created),
+            Some(Membership::Add("w1:p1".to_owned()))
+        );
+
+        let closed = json!({"event": "pane_closed", "data": {"pane_id": "w1:p2"}});
+        assert_eq!(
+            lifecycle_membership(&closed),
+            Some(Membership::Remove("w1:p2".to_owned()))
+        );
+
+        let detected = json!({
+            "event": "pane_agent_detected",
+            "data": {"pane_id": "w1:p3", "released": false}
+        });
+        assert_eq!(
+            lifecycle_membership(&detected),
+            Some(Membership::Add("w1:p3".to_owned()))
+        );
+
+        let released = json!({
+            "event": "pane_agent_detected",
+            "data": {"pane_id": "w1:p4", "released": true}
+        });
+        assert_eq!(
+            lifecycle_membership(&released),
+            Some(Membership::Remove("w1:p4".to_owned()))
+        );
+
+        let mut pane_ids = vec!["w1:p1".to_owned()];
+        assert!(!apply_membership(
+            &mut pane_ids,
+            Membership::Add("w1:p1".to_owned())
+        ));
+        assert!(apply_membership(
+            &mut pane_ids,
+            Membership::Add("w1:p2".to_owned())
+        ));
+        assert_eq!(pane_ids, vec!["w1:p1".to_owned(), "w1:p2".to_owned()]);
     }
 
     #[test]
@@ -1667,16 +2128,19 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct MissedTurnTab {
+    struct Tab {
         tab_id: String,
         pane_id: String,
     }
 
     #[cfg(unix)]
-    const MISSED_TURN_LABEL: &str = "testrun-missed-turn";
+    const SUBSCRIBE_LABEL: &str = "testrun-subscribe";
 
     #[cfg(unix)]
-    fn create_missed_turn_tab(workspace_id: &str, cwd: &str) -> Result<MissedTurnTab, String> {
+    const SEQ_BACKSTOP_LABEL: &str = "testrun-seq-backstop";
+
+    #[cfg(unix)]
+    fn create_tab(label: &str, workspace_id: &str, cwd: &str) -> Result<Tab, String> {
         let created = herdr_json(&[
             "tab",
             "create",
@@ -1685,7 +2149,7 @@ mod tests {
             "--cwd",
             cwd,
             "--label",
-            MISSED_TURN_LABEL,
+            label,
             "--no-focus",
         ])?;
         let tab_id = created["result"]["tab"]["tab_id"]
@@ -1696,11 +2160,11 @@ mod tests {
             .as_str()
             .ok_or("herdr tab create result missing pane_id")?
             .to_owned();
-        Ok(MissedTurnTab { tab_id, pane_id })
+        Ok(Tab { tab_id, pane_id })
     }
 
     #[cfg(unix)]
-    fn close_missed_turn_tab(tab_id: &str) {
+    fn close_tab(tab_id: &str) {
         let _ = Command::new("herdr")
             .args(["tab", "close", tab_id])
             .output();
@@ -1715,7 +2179,7 @@ mod tests {
             "--source",
             "herdr:claude",
             "--agent",
-            MISSED_TURN_LABEL,
+            SUBSCRIBE_LABEL,
             "--state",
             state,
         ];
@@ -1750,10 +2214,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn remaining_missed_turn_tabs() -> Result<usize, String> {
+    fn remaining_tabs(label: &str) -> Result<usize, String> {
         Ok(tab_list_result()?
             .into_iter()
-            .filter(|tab| tab.label == MISSED_TURN_LABEL)
+            .filter(|tab| tab.label == label)
             .count())
     }
 
@@ -1766,37 +2230,380 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn event_pane_id_at<'a>(event: &'a Value, pointer: &str) -> Option<&'a str> {
+        event.pointer(pointer).and_then(Value::as_str)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_event(
+        sub: &mut herdr_connect_rs::HerdrSubscription,
+        event_name: &str,
+        pane_id: &str,
+        pane_id_pointer: &str,
+        agent_status: Option<&str>,
+        bound: Duration,
+    ) -> Result<Value, String> {
+        let deadline = Instant::now() + bound;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "timed out waiting for {event_name} pane={pane_id} status={agent_status:?}"
+                ));
+            }
+            let event = tokio::time::timeout(remaining, sub.next_event())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "timed out waiting for {event_name} pane={pane_id} status={agent_status:?}"
+                    )
+                })??;
+            let got = event.get("event").and_then(Value::as_str).unwrap_or("");
+            if got != event_name {
+                continue;
+            }
+            if event_pane_id_at(&event, pane_id_pointer) != Some(pane_id) {
+                continue;
+            }
+            if let Some(status) = agent_status
+                && event.pointer("/data/agent_status").and_then(Value::as_str) != Some(status)
+            {
+                continue;
+            }
+            return Ok(event);
+        }
+    }
+
+    #[cfg(unix)]
+    fn matching_tab(tab_id: &str) -> Result<herdr_connect_rs::HerdrTab, String> {
+        tab_list_result()?
+            .into_iter()
+            .find(|candidate| candidate.tab_id == tab_id)
+            .ok_or_else(|| format!("tab.list has no entry for {tab_id}"))
+    }
+
+    #[cfg(unix)]
+    fn discord_tuple(guild: &BlockedCaptureGuild) -> super::DiscordConnection {
+        let owner_id = std::env::var("DISCORD_OWNER_ID").expect("DISCORD_OWNER_ID is set");
+        let responder = Arc::new(PermissionResponder::new(
+            Arc::clone(&guild.client),
+            guild.id,
+            owner_id.clone(),
+        ));
+        (Arc::clone(&guild.client), guild.id, owner_id, responder)
+    }
+
+    #[cfg(unix)]
+    fn thread_has_stopped_card(messages: &[twilight_model::channel::Message]) -> bool {
+        messages.iter().any(|message| {
+            message
+                .embeds
+                .first()
+                .and_then(|embed| embed.description.as_deref())
+                == Some("agent stopped, no log available")
+        })
+    }
+
+    #[cfg(unix)]
+    fn subscribe_tab_fixture() -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-subscribe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).map_err(|error| error.to_string())?;
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        match create_tab(SUBSCRIBE_LABEL, &workspace_id, cwd) {
+            Ok(tab) => Ok((tab, cwd_dir)),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&cwd_dir);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_ack_then_status_event_doorbells_list() {
+        assert_eq!(
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
+        let result = async {
+            report_agent_state(&tab.pane_id, "idle")?;
+            let mut sub = subscribe_herdr_events(&status_subscriptions(std::slice::from_ref(&tab.pane_id)))
+                .await?;
+            report_agent_state(&tab.pane_id, "working")?;
+            let event = wait_for_event(
+                &mut sub,
+                "pane.agent_status_changed",
+                &tab.pane_id,
+                "/data/pane_id",
+                Some("working"),
+                Duration::from_secs(10),
+            )
+            .await?;
+            assert!(
+                event.get("cwd").is_none() && event.pointer("/data/cwd").is_none(),
+                "status event must not carry cwd: {event}"
+            );
+            let snapshot = snapshot_for_pane(&tab.pane_id)?;
+            assert_eq!(snapshot.agent_status, "working");
+            assert!(
+                snapshot.cwd.is_some() || snapshot.session.is_some() || snapshot.state_change_seq > 0,
+                "doorbell agent.list must carry cwd, reported session, or state_change_seq: {snapshot:?}"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        close_tab(&tab.tab_id);
+        let _ = fs::remove_dir_all(&cwd_dir);
+        let tabs_left =
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_created_resubscribes_status_and_doorbells() {
+        assert_eq!(
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+            .await
+            .expect("lifecycle subscribe");
+        let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
+        let result = async {
+            wait_for_event(
+                &mut lifecycle,
+                "pane_created",
+                &tab.pane_id,
+                "/data/pane/pane_id",
+                None,
+                Duration::from_secs(10),
+            )
+            .await?;
+            let mut status = subscribe_status(std::slice::from_ref(&tab.pane_id))
+                .await?
+                .ok_or_else(|| "status subscribe requires pane ids".to_owned())?;
+            report_agent_state(&tab.pane_id, "working")?;
+            wait_for_event(
+                &mut status,
+                "pane.agent_status_changed",
+                &tab.pane_id,
+                "/data/pane_id",
+                Some("working"),
+                Duration::from_secs(10),
+            )
+            .await?;
+            Ok::<(), String>(())
+        }
+        .await;
+        close_tab(&tab.tab_id);
+        let _ = fs::remove_dir_all(&cwd_dir);
+        let tabs_left =
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    async fn seed_then_working_then_done_card(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&tab.pane_id, "idle")?;
+        wait_for_status(&tab.pane_id, &["idle", "done"], Duration::from_secs(10)).await?;
+        let listed = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = listed.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+        let mut state = BridgeState::default();
+        let connection = discord_tuple(guild);
+        process_snapshot(&listed, agents, tabs, Some(&connection), &mut state).await;
+
+        let route = route_topology(agents, tabs, &terminal)?;
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route).await?;
+        let before = guild
+            .client
+            .channel_messages(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        if thread_has_stopped_card(&before) {
+            return Err("silent seed posted a transition card".to_owned());
+        }
+
+        let mut sub =
+            subscribe_herdr_events(&status_subscriptions(std::slice::from_ref(&tab.pane_id)))
+                .await?;
+        report_agent_state(&tab.pane_id, "working")?;
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some("working"),
+            Duration::from_secs(10),
+        )
+        .await?;
+        let working = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&working);
+        process_snapshot(&working, agents, tabs, Some(&connection), &mut state).await;
+
+        report_agent_state(&tab.pane_id, "idle")?;
+        loop {
+            let event = wait_for_event(
+                &mut sub,
+                "pane.agent_status_changed",
+                &tab.pane_id,
+                "/data/pane_id",
+                None,
+                Duration::from_secs(10),
+            )
+            .await?;
+            if matches!(
+                event.pointer("/data/agent_status").and_then(Value::as_str),
+                Some("done" | "idle")
+            ) {
+                break;
+            }
+        }
+        let settled = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&settled);
+        process_snapshot(&settled, agents, tabs, Some(&connection), &mut state).await;
+
+        let messages = guild
+            .client
+            .channel_messages(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        if thread_has_stopped_card(&messages) {
+            Ok(())
+        } else {
+            Err("idle -> working -> settled via subscribe did not post a card".to_owned())
+        }
+    }
+
+    #[cfg(unix)]
     async fn wait_for_status(
         pane_id: &str,
-        status: &str,
+        statuses: &[&str],
         bound: Duration,
     ) -> Result<AgentSnapshot, String> {
         let start = Instant::now();
         loop {
-            let snapshot = snapshot_for_pane(pane_id)?;
-            if snapshot.agent_status == status {
-                return Ok(snapshot);
-            }
-            if start.elapsed() > bound {
-                return Err(format!(
-                    "pane {pane_id} did not reach status {status} within {bound:?}, last saw {}",
-                    snapshot.agent_status
-                ));
+            match snapshot_for_pane(pane_id) {
+                Ok(snapshot) if statuses.contains(&snapshot.agent_status.as_str()) => {
+                    return Ok(snapshot);
+                }
+                Ok(snapshot) => {
+                    if start.elapsed() > bound {
+                        return Err(format!(
+                            "pane {pane_id} did not reach {statuses:?} within {bound:?}, last saw {}",
+                            snapshot.agent_status
+                        ));
+                    }
+                }
+                Err(error) => {
+                    if start.elapsed() > bound {
+                        return Err(error);
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
-    /// Drives a real pane through `idle -> working -> idle` fast enough that both transitions land
-    /// inside one `report_agent_state` round trip, so the bridge's own poll only ever observes the
-    /// naive `idle -> done` transition; the missed-turn detection is what must still post a card.
     #[cfg(unix)]
-    async fn missed_fast_turn_round_trip(
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_idle_working_done_posts_transition_card() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let created = subscribe_tab_fixture();
+        let (tab_id, cwd_dir, result) = match created {
+            Ok((tab, cwd_dir)) => {
+                let outcome = seed_then_working_then_done_card(&guild, &tab).await;
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = fs::remove_dir_all(cwd_dir);
+        }
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    /// Drives a real pane through a settled round-trip fast enough that only the settled status
+    /// is observed between snapshots; the seq backstop must still post a card. When
+    /// `same_status_collapse` is set, the baseline is first driven to `done` so the round-trip
+    /// collapses onto the same status instead of advancing from `idle`; `scenario` names the case
+    /// for the failure message.
+    #[cfg(unix)]
+    async fn seq_backstop_round_trip(
         guild: &BlockedCaptureGuild,
-        tab: &MissedTurnTab,
+        tab: &Tab,
+        same_status_collapse: bool,
+        scenario: &str,
     ) -> Result<(), String> {
         report_agent_state(&tab.pane_id, "idle")?;
-        let baseline = wait_for_status(&tab.pane_id, "idle", Duration::from_secs(10)).await?;
+        let idle_baseline =
+            wait_for_status(&tab.pane_id, &["idle"], Duration::from_secs(10)).await?;
+        let baseline = if same_status_collapse {
+            report_agent_state(&tab.pane_id, "working")?;
+            report_agent_state(&tab.pane_id, "idle")?;
+            wait_for_status(&tab.pane_id, &["done"], Duration::from_secs(10)).await?
+        } else {
+            idle_baseline
+        };
         let terminal = baseline.terminal_id.clone();
 
         let mut state = BridgeState::default();
@@ -1811,11 +2618,17 @@ mod tests {
 
         report_agent_state(&tab.pane_id, "working")?;
         report_agent_state(&tab.pane_id, "idle")?;
-        let missed = wait_for_status(&tab.pane_id, "done", Duration::from_secs(10)).await?;
-        if missed.state_change_seq <= baseline.state_change_seq {
+        let settled = wait_for_status(&tab.pane_id, &["done"], Duration::from_secs(10)).await?;
+        if same_status_collapse && settled.agent_status != baseline.agent_status {
             return Err(format!(
-                "herdr state_change_seq did not advance between polls: baseline={} missed={}",
-                baseline.state_change_seq, missed.state_change_seq
+                "expected same-status collapse on {}, saw {} -> {}",
+                baseline.agent_status, baseline.agent_status, settled.agent_status
+            ));
+        }
+        if settled.state_change_seq <= baseline.state_change_seq {
+            return Err(format!(
+                "herdr state_change_seq did not advance between snapshots: baseline={} settled={}",
+                baseline.state_change_seq, settled.state_change_seq
             ));
         }
 
@@ -1824,7 +2637,7 @@ mod tests {
             .find(|candidate| candidate.tab_id == tab.tab_id)
             .ok_or_else(|| format!("tab.list has no entry for {}", tab.tab_id))?;
         let tabs = std::slice::from_ref(&matching_tab);
-        let agents = std::slice::from_ref(&missed);
+        let agents = std::slice::from_ref(&settled);
         let route = route_topology(agents, tabs, &terminal)?;
 
         let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
@@ -1835,7 +2648,7 @@ mod tests {
         ));
         let connection = (Arc::clone(&guild.client), guild.id, owner_id, responder);
 
-        process_snapshot(&missed, agents, tabs, Some(&connection), &mut state).await;
+        process_snapshot(&settled, agents, tabs, Some(&connection), &mut state).await;
 
         let thread = sync_route(guild.client.as_ref(), guild.id, &route).await?;
         let messages = guild
@@ -1846,27 +2659,17 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
-        let posted = messages.iter().any(|message| {
-            message
-                .embeds
-                .first()
-                .and_then(|embed| embed.description.as_deref())
-                == Some("agent stopped, no log available")
-        });
-        if posted {
+        if thread_has_stopped_card(&messages) {
             Ok(())
         } else {
-            Err(
-                "missed fast turn (idle -> working -> done inside one poll) did not post a card"
-                    .to_owned(),
-            )
+            Err(format!("seq backstop ({scenario}) did not post a card"))
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn missed_fast_turn_between_polls_still_posts_a_card() {
+    async fn seq_backstop_between_snapshots_still_posts_a_card() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -1877,7 +2680,7 @@ mod tests {
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_missed_turn_tabs().expect("tab.list succeeds"),
+            remaining_tabs(SEQ_BACKSTOP_LABEL).expect("tab.list succeeds"),
             0,
             "named zero-leftover check"
         );
@@ -1885,32 +2688,97 @@ mod tests {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
             .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
         let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-missed-turn-{}-{}",
+            "testrun-seq-backstop-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         ));
-        fs::create_dir_all(&cwd_dir).expect("create missed-turn test cwd");
+        fs::create_dir_all(&cwd_dir).expect("create seq-backstop test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let created = create_missed_turn_tab(&workspace_id, cwd);
+        let created = create_tab(SEQ_BACKSTOP_LABEL, &workspace_id, cwd);
         let (tab_id, result) = match created {
             Ok(tab) => {
-                let outcome = missed_fast_turn_round_trip(&guild, &tab).await;
+                let outcome = seq_backstop_round_trip(
+                    &guild,
+                    &tab,
+                    false,
+                    "idle -> working -> done between snapshots",
+                )
+                .await;
                 (Some(tab.tab_id), outcome)
             }
             Err(error) => (None, Err(error)),
         };
         if let Some(tab_id) = &tab_id {
-            close_missed_turn_tab(tab_id);
+            close_tab(tab_id);
         }
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left =
-            remaining_missed_turn_tabs().expect("tab.list succeeds for the zero-leftover check");
+        let tabs_left = remaining_tabs(SEQ_BACKSTOP_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn seq_backstop_same_status_collapse_still_posts_a_card() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(SEQ_BACKSTOP_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-seq-same-status-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create seq-same-status test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_tab(SEQ_BACKSTOP_LABEL, &workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = seq_backstop_round_trip(
+                    &guild,
+                    &tab,
+                    true,
+                    "done -> working -> done same-status collapse",
+                )
+                .await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(SEQ_BACKSTOP_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");

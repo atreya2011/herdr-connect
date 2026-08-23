@@ -17,12 +17,12 @@ flowchart LR
   owner -->|message in a tab thread| discord
   discord -->|"Gateway WebSocket<br/>MESSAGE_CREATE"| bridge
   bridge -->|HTTP: cards, channels, threads| discord
-  bridge -->|"Unix JSON-RPC poll 1.5s<br/>agent.list, tab.list"| herdr
-  bridge -->|Unix JSON-RPC: agent.prompt| herdr
+  bridge -->|"Unix JSON-RPC events.subscribe doorbell"| herdr
+  bridge -->|"Unix JSON-RPC: agent.list, tab.list, agent.prompt"| herdr
   herdr --> panes
 ```
 
-- **Herdr → Discord:** snapshot+diff. A card posts only on `working` → `blocked`, `done`, or `idle`. The first poll after start is silent. Content comes from the vendor session Herdr reported, not from scraping the pane.
+- **Herdr → Discord:** a Herdr subscribe event wakes the bridge. It then lists agents and tabs and diffs snapshots. A card posts only on `working` → `blocked`, `done`, or `idle`. The first snapshot after start is silent. Content comes from the vendor session Herdr reported, not from scraping the pane.
 - **Discord → Herdr:** gateway events. An owner message in a thread named `… [tab_id]` under topic `herdr workspace [workspace_id]` becomes `agent.prompt` when exactly one matching pane is `idle` or `done`. Other surfaces stay silent.
 - **Permissions (optional):** `herdr-connect-rs hook` speaks to a second Unix socket, `HERDR_CLAUDE_BROKER_SOCKET`. That path is not on by default; install [examples/cursor-hooks.json](examples/cursor-hooks.json) (or the Claude/Codex equivalent) if you want Allow/Deny cards.
 

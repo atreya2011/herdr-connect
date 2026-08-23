@@ -5,8 +5,26 @@ use std::os::unix::net::{SocketAddr, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 static RPC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn herdr_socket_path() -> String {
+    std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/.config/herdr/herdr.sock",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    })
+}
+
+fn next_rpc_id() -> String {
+    format!(
+        "herdr-connect:{}:{}",
+        std::process::id(),
+        RPC_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+    )
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 pub struct AgentSession {
@@ -40,17 +58,8 @@ fn request_rpc_result_with_params_and_timeout(
     if !params.is_object() {
         return Err("herdr RPC params must be a JSON object".to_owned());
     }
-    let path = std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
-        format!(
-            "{}/.config/herdr/herdr.sock",
-            std::env::var("HOME").unwrap_or_default()
-        )
-    });
-    let id = format!(
-        "herdr-connect:{}:{}",
-        std::process::id(),
-        RPC_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
-    );
+    let path = herdr_socket_path();
+    let id = next_rpc_id();
     let request = serde_json::json!({"id": id, "method": method, "params": params});
     let result = (|| -> Result<Value, String> {
         let address = SocketAddr::from_pathname(&path).map_err(|e| e.to_string())?;
@@ -207,6 +216,135 @@ pub fn list_agents() -> Result<Vec<AgentSnapshot>, String> {
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
+}
+
+/// Session-wide pane membership watches for the lifecycle subscribe socket.
+#[must_use]
+pub fn lifecycle_subscriptions() -> Vec<Value> {
+    vec![
+        json!({"type": "pane.created"}),
+        json!({"type": "pane.closed"}),
+        json!({"type": "pane.agent_detected"}),
+    ]
+}
+
+/// Per-pane status watches. `pane.agent_status_changed` requires `pane_id` and must not filter
+/// status, so `working` is observed.
+#[must_use]
+pub fn status_subscriptions(pane_ids: &[String]) -> Vec<Value> {
+    pane_ids
+        .iter()
+        .map(|pane_id| json!({"type": "pane.agent_status_changed", "pane_id": pane_id}))
+        .collect()
+}
+
+/// Long-lived Herdr `events.subscribe` stream. The first JSON line is the subscribe ack; later
+/// lines are pushed events.
+pub struct HerdrSubscription {
+    reader: tokio::io::BufReader<tokio::net::UnixStream>,
+}
+
+/// Opens `events.subscribe` and consumes the ack. The connection stays open for [`HerdrSubscription::next_event`].
+///
+/// # Errors
+///
+/// Returns connect, timeout, protocol, empty-subscription, or Herdr-declared errors.
+pub async fn subscribe_herdr_events(subscriptions: &[Value]) -> Result<HerdrSubscription, String> {
+    if subscriptions.is_empty() {
+        return Err("herdr events.subscribe requires at least one subscription".to_owned());
+    }
+    let path = herdr_socket_path();
+    let id = next_rpc_id();
+    let request = json!({
+        "id": id,
+        "method": "events.subscribe",
+        "params": {"subscriptions": subscriptions},
+    });
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .map_err(|error| format!("herdr subscribe connect failed: {error}"))?;
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        stream.flush().await.map_err(|error| error.to_string())?;
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("herdr subscribe stream closed before ack".to_owned());
+        }
+        let response: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if let Some(error) = response.get("error") {
+            return Err(format!(
+                "herdr events.subscribe failed: {} {}",
+                error.get("code").map_or(Value::Null, Clone::clone),
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            ));
+        }
+        let returned_id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if returned_id != id {
+            return Err(format!(
+                "herdr returned response id {returned_id} for request {id}"
+            ));
+        }
+        let started = response
+            .pointer("/result/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if started != "subscription_started" {
+            return Err(format!(
+                "herdr events.subscribe ack was not subscription_started: {response}"
+            ));
+        }
+        Ok(HerdrSubscription { reader })
+    })
+    .await
+    .map_err(|_| "herdr subscribe connect timed out".to_owned())?
+}
+
+impl HerdrSubscription {
+    /// Reads the next pushed JSON event line.
+    ///
+    /// # Errors
+    ///
+    /// Returns stream-closed, parse, or Herdr-declared errors.
+    pub async fn next_event(&mut self) -> Result<Value, String> {
+        let mut line = String::new();
+        let read = self
+            .reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("herdr subscribe stream closed".to_owned());
+        }
+        let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if let Some(error) = value.get("error") {
+            return Err(format!(
+                "herdr subscribe event error: {} {}",
+                error.get("code").map_or(Value::Null, Clone::clone),
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            ));
+        }
+        if value.get("event").and_then(Value::as_str).is_none() {
+            return Err(format!("herdr subscribe line was not an event: {value}"));
+        }
+        Ok(value)
+    }
 }
 
 #[cfg(test)]

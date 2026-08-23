@@ -1,8 +1,7 @@
-use herdr_connect_rs::{load_config, load_discord_config};
+use herdr_connect_rs::load_discord_config;
 
 #[test]
 fn config_loading() {
-    assert_eq!(load_config().poll_interval_ms, 1_500);
     let discord = [
         (
             vec![
