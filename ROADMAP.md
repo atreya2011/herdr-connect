@@ -53,7 +53,7 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 
 - One workspace channel per Herdr workspace and one tab thread per Herdr tab.
 - Topic and tab suffix are identity. Existing channel names and frozen thread names are not reconciled after creation.
-- Reported vendor sessions provide transition content; pane scraping and guessed session paths are forbidden.
+- Reported vendor sessions provide transition content; pane scraping and guessed session paths are forbidden, except for reading a Claude pane's Herdr detection snapshot to extract a pending blocked question.
 - Blocked-only owner mentions; explicit mention allowlists; all other transitions are silent.
 - Owner-only semantic prompts inside qualifying mapped threads; all unrelated Discord surfaces remain silent.
 - Permission decisions are correlated, expiring, exactly once, and invalid when the requesting hook disconnects.

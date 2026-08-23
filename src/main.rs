@@ -1,9 +1,10 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
-    SubscribeError, TopologyRoute, Transition, TransitionMessage, create_transition_messages,
-    create_unsupported_blocked_card, deliver_transition_card, drive_gateway_with_components,
-    expire_informational_card, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, load_discord_config, route_topology, status_subscriptions, subscribe_herdr_events,
+    SubscribeError, TopologyRoute, Transition, TransitionMessage, agent_read_detection,
+    create_transition_messages, create_unsupported_blocked_card, deliver_transition_card,
+    drive_gateway_with_components, expire_informational_card, format_detection_question,
+    hook_timeout, is_postable_transition, lifecycle_subscriptions, list_agents,
+    load_discord_config, route_topology, status_subscriptions, subscribe_herdr_events,
     sync_topology, tab_list_result, transition_card_nonce,
 };
 use herdr_connect_rs::{
@@ -152,9 +153,22 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     if supported_broker_pending {
         return;
     }
-    let capture = search_root.map_or_else(
-        || capture_for_blocked(snapshot),
-        |root| capture_for_blocked_with_search_root(snapshot, root),
+    let detection_question = (snapshot.agent == "claude")
+        .then(|| agent_read_detection(&route.pane_id).ok())
+        .flatten()
+        .and_then(|text| format_detection_question(&text));
+    let capture = detection_question.map_or_else(
+        || {
+            search_root.map_or_else(
+                || capture_for_blocked(snapshot),
+                |root| capture_for_blocked_with_search_root(snapshot, root),
+            )
+        },
+        |question| AgentLogCapture {
+            message: question.clone(),
+            question: Some(question),
+            failure: None,
+        },
     );
     let attempts_so_far = blocked_capture_attempts.get(terminal).copied().unwrap_or(0);
     let messages = match decide_blocked_response(
@@ -1482,10 +1496,10 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         BlockedCardContext, BlockedResponse, BridgeState, Client, InformationalCard, Membership,
-        PermissionResponder, TopologyRoute, apply_membership, capture_for_with_search_root,
-        create_transition_messages, decide_blocked_response, handle_blocked_card,
-        lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
-        prune_departed_state, resolve_session_path, route_topology,
+        PermissionResponder, TopologyRoute, agent_read_detection, apply_membership,
+        capture_for_with_search_root, create_transition_messages, decide_blocked_response,
+        handle_blocked_card, lifecycle_membership, list_agents, next_state_change_sequence,
+        process_snapshot, prune_departed_state, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
         subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
     };
@@ -2423,6 +2437,120 @@ mod tests {
         let _ = fs::remove_dir_all(&cwd_dir);
         let tabs_left =
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const DETECTION_LABEL: &str = "testrun-detection";
+
+    #[cfg(unix)]
+    fn detection_tab_fixture() -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-detection-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).map_err(|error| error.to_string())?;
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        match create_tab(DETECTION_LABEL, &workspace_id, cwd) {
+            Ok(tab) => Ok((tab, cwd_dir)),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&cwd_dir);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pane_run(pane_id: &str, command: &str) -> Result<(), String> {
+        let output = Command::new("herdr")
+            .args(["pane", "run", pane_id, command])
+            .output()
+            .map_err(|error| format!("herdr pane run spawn failed: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "herdr pane run failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pane_output(pane_id: &str, needle: &str, timeout_ms: &str) -> Result<(), String> {
+        let output = Command::new("herdr")
+            .args([
+                "pane",
+                "wait-output",
+                pane_id,
+                "--match",
+                needle,
+                "--timeout",
+                timeout_ms,
+            ])
+            .output()
+            .map_err(|error| format!("herdr pane wait-output spawn failed: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "herdr pane wait-output failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn detection_read_round_trips_fixture_text_from_a_real_pane() {
+        assert_eq!(
+            remaining_tabs(DETECTION_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        let (tab, cwd_dir) = detection_tab_fixture().expect("create testrun tab");
+        let result = (|| -> Result<(), String> {
+            report_agent_state(&tab.pane_id, "idle")?;
+            let fixture_path = cwd_dir.join("fixture.txt");
+            fs::write(
+                &fixture_path,
+                include_str!("../tests/fixtures/claude-detection-blocked-question.txt"),
+            )
+            .map_err(|error| error.to_string())?;
+            let fixture_path_str = fixture_path
+                .to_str()
+                .ok_or_else(|| "fixture path is valid UTF-8".to_owned())?;
+            pane_run(
+                &tab.pane_id,
+                &format!("printf '%s' \"$(cat '{fixture_path_str}')\""),
+            )?;
+            wait_for_pane_output(&tab.pane_id, "Which color do you prefer?", "10000")?;
+            let text = agent_read_detection(&tab.pane_id)?;
+            assert!(
+                text.contains("Which color do you prefer?"),
+                "detection read must round-trip the printed question: {text}"
+            );
+            assert!(
+                text.contains("The color red") && text.contains("The color blue"),
+                "detection read must round-trip the printed options: {text}"
+            );
+            Ok(())
+        })();
+        close_tab(&tab.tab_id);
+        let _ = fs::remove_dir_all(&cwd_dir);
+        let tabs_left =
+            remaining_tabs(DETECTION_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }

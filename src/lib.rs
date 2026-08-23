@@ -30,7 +30,7 @@ pub use delivery::{
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
-    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, SubscribeError,
+    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, SubscribeError, agent_read_detection,
     lifecycle_subscriptions, list_agents, request_rpc_result, status_subscriptions,
     subscribe_herdr_events, tab_list_result,
 };
@@ -43,6 +43,6 @@ pub use permission::{
 pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
 };
-pub use readers::{AgentLog, read_agent_log};
+pub use readers::{AgentLog, format_detection_question, read_agent_log};
 pub use topology::{TopologyRoute, route_topology, sync_topology, workspace_channel_name};
 pub use watcher::{Transition, is_postable_transition};

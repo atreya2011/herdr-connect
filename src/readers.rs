@@ -291,6 +291,54 @@ fn parse_cursor_json(value: &Value) -> Result<AgentLog, serde_json::Error> {
     })
 }
 
+/// Extracts a pending dialog question from a Herdr detection snapshot.
+///
+/// The question is the block between the last two horizontal rules (lines made only of
+/// U+2500), with the checkbox header line and the `❯` cursor glyph dropped.
+#[must_use]
+pub fn format_detection_question(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let rule_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty() && trimmed.chars().all(|ch| ch == '─')).then_some(index)
+        })
+        .collect();
+    if rule_lines.len() < 2 {
+        return None;
+    }
+    let header_rule = rule_lines[rule_lines.len() - 2];
+    let last_rule = rule_lines[rule_lines.len() - 1];
+    let block: Vec<String> = lines
+        .get(header_rule + 2..last_rule)?
+        .iter()
+        .map(|line| normalize_dialog_line(line))
+        .collect();
+    let start = block.iter().position(|line| !line.trim().is_empty())?;
+    let end = block.iter().rposition(|line| !line.trim().is_empty())? + 1;
+    Some(block[start..end].join("\n"))
+}
+
+fn normalize_dialog_line(line: &str) -> String {
+    if let Some(stripped) = line.strip_prefix("❯ ") {
+        return stripped.to_owned();
+    }
+    let trimmed = line.trim_start();
+    let leading_spaces = line.len() - trimmed.len();
+    if leading_spaces == 2 && starts_with_option_number(trimmed) {
+        trimmed.to_owned()
+    } else {
+        line.to_owned()
+    }
+}
+
+fn starts_with_option_number(text: &str) -> bool {
+    let digits_end = text.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(0);
+    digits_end > 0 && text[digits_end..].starts_with('.')
+}
+
 fn format_question(input: Option<&Value>) -> Option<String> {
     let rendered: Vec<String> = input?
         .get("questions")?
@@ -313,4 +361,26 @@ fn format_question(input: Option<&Value>) -> Option<String> {
         .flatten()
         .collect();
     (!rendered.is_empty()).then(|| rendered.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_detection_question;
+
+    #[test]
+    fn detection_snapshot_with_a_pending_dialog_yields_the_question_and_options() {
+        let text = include_str!("../tests/fixtures/claude-detection-blocked-question.txt");
+        assert_eq!(
+            format_detection_question(text).as_deref(),
+            Some(
+                "Which color do you prefer?\n\n1. Red\n     The color red\n2. Blue\n     The color blue\n3. Type something."
+            )
+        );
+    }
+
+    #[test]
+    fn detection_snapshot_with_no_dialog_yields_none() {
+        let text = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
+        assert_eq!(format_detection_question(text), None);
+    }
 }

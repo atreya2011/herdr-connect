@@ -157,6 +157,25 @@ pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
 pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
     request_rpc_result_with_params("agent.send_keys", &json!({"target": target, "keys": keys}))
 }
+
+/// Reads a pane's Herdr detection snapshot: the TUI-state detector's own screen render, distinct
+/// from the vendor's on-disk session log.
+///
+/// # Errors
+///
+/// Returns socket, envelope, or payload errors.
+pub fn agent_read_detection(target: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(&request_rpc_result_with_params(
+        "agent.read",
+        &json!({"target": target, "source": "detection", "strip_ansi": true}),
+    )?)
+    .map_err(|error| error.to_string())?;
+    value
+        .pointer("/read/text")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "agent.read response did not contain read.text".to_owned())
+}
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 pub struct HerdrTab {
     pub tab_id: String,
