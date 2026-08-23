@@ -1,6 +1,6 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
-    TopologyRoute, Transition, TransitionMessage, create_transition_messages,
+    SubscribeError, TopologyRoute, Transition, TransitionMessage, create_transition_messages,
     create_unsupported_blocked_card, deliver_transition_card, drive_gateway_with_components,
     expire_informational_card, hook_timeout, is_postable_transition, lifecycle_subscriptions,
     list_agents, load_discord_config, route_topology, status_subscriptions, subscribe_herdr_events,
@@ -1202,7 +1202,7 @@ async fn handle_lifecycle_select_result(
                 && apply_membership(&mut runtime.pane_ids, change)
             {
                 let Some(next_status) = unwrap_or_shutdown(
-                    subscribe_status_with_backoff(&runtime.pane_ids, stop).await,
+                    subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
                     broker,
                 ) else {
                     return false;
@@ -1263,7 +1263,7 @@ async fn handle_status_select_result(
         Err(error) => {
             eprintln!("herdr status subscribe error: {error}");
             let Some(next_status) = unwrap_or_shutdown(
-                subscribe_status_with_backoff(&runtime.pane_ids, stop).await,
+                subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
                 broker,
             ) else {
                 return false;
@@ -1305,11 +1305,28 @@ async fn subscribe_herdr_events_with_backoff(
 }
 
 async fn subscribe_status_with_backoff(
-    pane_ids: &[String],
+    pane_ids: &mut Vec<String>,
     stop: &mut tokio::signal::unix::Signal,
 ) -> Result<Option<HerdrSubscription>, BridgeInterrupt> {
     if pane_ids.is_empty() {
         return Ok(None);
+    }
+    match subscribe_herdr_events(&status_subscriptions(pane_ids)).await {
+        Ok(subscription) => return Ok(Some(subscription)),
+        Err(SubscribeError::PaneNotFound) => {
+            if let Ok(agents) = list_agents() {
+                reconcile_pane_ids(pane_ids, pane_ids_from_agents(&agents));
+                if pane_ids.is_empty() {
+                    return Ok(None);
+                }
+                if let Ok(subscription) =
+                    subscribe_herdr_events(&status_subscriptions(pane_ids)).await
+                {
+                    return Ok(Some(subscription));
+                }
+            }
+        }
+        Err(SubscribeError::Other(_)) => {}
     }
     Ok(Some(
         subscribe_herdr_events_with_backoff(&status_subscriptions(pane_ids), stop).await?,
@@ -1389,9 +1406,9 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     ) else {
         return Ok(());
     };
-    let pane_ids = Vec::new();
+    let mut pane_ids = Vec::new();
     let Some(status) = unwrap_or_shutdown(
-        subscribe_status_with_backoff(&pane_ids, &mut stop).await,
+        subscribe_status_with_backoff(&mut pane_ids, &mut stop).await,
         &mut broker,
     ) else {
         return Ok(());
@@ -1435,7 +1452,7 @@ mod tests {
         lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
         prune_departed_state, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
-        sync_route, tab_list_result,
+        subscribe_status_with_backoff, sync_route, tab_list_result,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
@@ -2419,6 +2436,54 @@ mod tests {
         let tabs_left =
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_status_with_backoff_recovers_from_stale_pane_id() {
+        assert_eq!(
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        let (live_tab, live_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
+        let (closed_tab, closed_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
+        close_tab(&closed_tab.tab_id);
+        let _ = fs::remove_dir_all(&closed_cwd_dir);
+
+        let mut pane_ids = vec![closed_tab.pane_id.clone(), live_tab.pane_id.clone()];
+        pane_ids.sort();
+
+        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            subscribe_status_with_backoff(&mut pane_ids, &mut stop),
+        )
+        .await;
+
+        close_tab(&live_tab.tab_id);
+        let _ = fs::remove_dir_all(&live_cwd_dir);
+        let tabs_left =
+            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
+
+        match outcome {
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => panic!("expected Some(subscription) for the live pane, got None"),
+            Ok(Err(super::BridgeInterrupt)) => {
+                panic!("subscribe_status_with_backoff returned BridgeInterrupt")
+            }
+            Err(elapsed) => panic!(
+                "subscribe_status_with_backoff did not recover from the stale pane id within the timeout: {elapsed}"
+            ),
+        }
+        assert!(
+            !pane_ids.contains(&closed_tab.pane_id),
+            "closed pane id must be dropped from membership"
+        );
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 

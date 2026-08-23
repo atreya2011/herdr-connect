@@ -30,8 +30,9 @@ pub use delivery::{
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
-    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, lifecycle_subscriptions, list_agents,
-    request_rpc_result, status_subscriptions, subscribe_herdr_events, tab_list_result,
+    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, SubscribeError,
+    lifecycle_subscriptions, list_agents, request_rpc_result, status_subscriptions,
+    subscribe_herdr_events, tab_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
