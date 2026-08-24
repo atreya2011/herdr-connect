@@ -1,5 +1,14 @@
 use crate::{AgentSnapshot, HerdrTab, format_thread_name};
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use twilight_model::channel::Channel;
+use twilight_model::id::Id;
+use twilight_model::id::marker::{ChannelMarker, GuildMarker};
+
+/// Shared, per-process cache of one guild's channel list and active-thread list, reused across
+/// tabs so a startup sweep does not refetch both lists for every tab.
+pub type TopologyCache = Arc<Mutex<Option<(Vec<Channel>, Vec<Channel>)>>>;
 
 /// The Discord topology and sole pane that owns it for one agent transition.
 #[derive(Debug, PartialEq, Eq)]
@@ -141,19 +150,15 @@ pub fn workspace_channel_name(workspace_id: &str, cwds: &[String]) -> Result<Str
     ))
 }
 
-/// Synchronizes the Discord workspace topology.
+/// Fetches one guild's channel list and active-thread list.
 ///
 /// # Errors
 ///
 /// Returns Discord request or response errors.
-pub async fn sync_topology(
+pub async fn fetch_topology_lists(
     client: &twilight_http::Client,
-    guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
-    workspace_id: &str,
-    channel_name: &str,
-    thread_name: &str,
-    tab_id: &str,
-) -> Result<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>, String> {
+    guild: Id<GuildMarker>,
+) -> Result<(Vec<Channel>, Vec<Channel>), String> {
     let channels = client
         .guild_channels(guild)
         .await
@@ -161,6 +166,102 @@ pub async fn sync_topology(
         .model()
         .await
         .map_err(|error| error.to_string())?;
+    let active_threads = client
+        .active_threads(guild)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map_err(|error| error.to_string())?
+        .threads;
+    Ok((channels, active_threads))
+}
+
+/// Installs a freshly fetched list pair into the cache and returns the stored lists.
+///
+/// A cached entry the fetch did not return is carried over only when it is newer than every
+/// entry the fetch did return. Discord snowflake ids increase with creation time, so anything
+/// older than that watermark would have come back in the fetch: its absence means it is gone or
+/// archived, and only a newer entry can be a create this fetch raced.
+pub fn reconcile_topology_cache(
+    cached: &mut Option<(Vec<Channel>, Vec<Channel>)>,
+    fetched: (Vec<Channel>, Vec<Channel>),
+) -> (&mut Vec<Channel>, &mut Vec<Channel>) {
+    let (mut channels, mut active_threads) = fetched;
+    if let Some((cached_channels, cached_threads)) = cached.take() {
+        carry_over_recent(&mut channels, cached_channels);
+        carry_over_recent(&mut active_threads, cached_threads);
+    }
+    let (channels, active_threads) = cached.insert((channels, active_threads));
+    (channels, active_threads)
+}
+
+fn carry_over_recent(fetched: &mut Vec<Channel>, cached: Vec<Channel>) {
+    let known: HashSet<_> = fetched.iter().map(|entry| entry.id).collect();
+    let watermark = fetched
+        .iter()
+        .map(|entry| entry.id.get())
+        .max()
+        .unwrap_or(0);
+    fetched.extend(
+        cached
+            .into_iter()
+            .filter(|entry| !known.contains(&entry.id) && entry.id.get() > watermark),
+    );
+}
+
+/// Resolves the one thread that identifies a tab, ignoring repeated entries for the same id.
+///
+/// # Errors
+///
+/// Returns an error when more than one distinct thread claims the tab.
+fn single_matching_thread(
+    threads: &[Channel],
+    workspace_channel: Id<ChannelMarker>,
+    thread_suffix: &str,
+    tab_id: &str,
+) -> Result<Option<Channel>, String> {
+    let mut seen = HashSet::new();
+    let mut matching = threads
+        .iter()
+        .rev()
+        .filter(|thread| seen.insert(thread.id))
+        .filter(|thread| {
+            thread.parent_id == Some(workspace_channel)
+                && thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(thread_suffix))
+        });
+    let resolved = matching.next();
+    if matching.next().is_some() {
+        return Err(format!(
+            "Discord topology has duplicate threads for tab {tab_id}"
+        ));
+    }
+    Ok(resolved.cloned())
+}
+
+/// Synchronizes the Discord workspace topology against caller-supplied channel and
+/// active-thread lists, extending them in place when a channel or thread is created.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn sync_topology(
+    client: &twilight_http::Client,
+    guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
+    channels: &mut Vec<Channel>,
+    active_threads: &mut Vec<Channel>,
+    route: &TopologyRoute,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>, String> {
+    let TopologyRoute {
+        workspace_id,
+        tab_id,
+        channel_name,
+        thread_name,
+        ..
+    } = route;
     if workspace_id.trim().is_empty()
         || channel_name.trim().is_empty()
         || thread_name.trim().is_empty()
@@ -184,58 +285,51 @@ pub async fn sync_topology(
             "Discord topology has duplicate channels for workspace {workspace_id}"
         ));
     }
-    let workspace_channel = if let Some(channel) = matching_channels.first() {
-        channel.id
+    let matching_channel_id = matching_channels.first().map(|channel| channel.id);
+    let workspace_channel = if let Some(id) = matching_channel_id {
+        id
     } else {
-        client
+        let created = client
             .create_guild_channel(guild, channel_name)
             .topic(&topic)
             .await
             .map_err(|error| error.to_string())?
             .model()
             .await
-            .map_err(|error| error.to_string())?
-            .id
+            .map_err(|error| error.to_string())?;
+        let id = created.id;
+        channels.push(created);
+        id
     };
-    let mut existing = client
-        .active_threads(guild)
-        .await
-        .map_err(|error| error.to_string())?
-        .model()
-        .await
-        .map_err(|error| error.to_string())?
-        .threads;
-    existing.extend(archived_threads(client, workspace_channel).await?);
-    let mut matching_threads: Vec<_> = existing
-        .into_iter()
-        .filter(|thread| {
-            thread.parent_id == Some(workspace_channel)
-                && thread
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.ends_with(&thread_suffix))
-        })
-        .collect();
-    if matching_threads.len() > 1 {
-        return Err(format!(
-            "Discord topology has duplicate threads for tab {tab_id}"
-        ));
+    let mut resolved =
+        single_matching_thread(active_threads, workspace_channel, &thread_suffix, tab_id)?;
+    if resolved.is_none() {
+        resolved = single_matching_thread(
+            &archived_threads(client, workspace_channel).await?,
+            workspace_channel,
+            &thread_suffix,
+            tab_id,
+        )?;
     }
-    if let Some(thread) = matching_threads.pop() {
+    if let Some(thread) = resolved {
         if thread
             .thread_metadata
             .as_ref()
             .is_some_and(|metadata| metadata.archived)
         {
-            client
+            let unarchived = client
                 .update_thread(thread.id)
                 .archived(false)
                 .await
+                .map_err(|error| error.to_string())?
+                .model()
+                .await
                 .map_err(|error| error.to_string())?;
+            active_threads.push(unarchived);
         }
         return Ok(thread.id);
     }
-    Ok(client
+    let created = client
         .create_thread(
             workspace_channel,
             thread_name,
@@ -245,14 +339,22 @@ pub async fn sync_topology(
         .map_err(|error| error.to_string())?
         .model()
         .await
-        .map_err(|error| error.to_string())?
-        .id)
+        .map_err(|error| error.to_string())?;
+    let id = created.id;
+    active_threads.push(created);
+    Ok(id)
 }
 
-async fn archived_threads(
+/// Lists one channel's public archived threads, following every pagination page.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors, and an error when Discord's pagination cursor
+/// does not advance.
+pub async fn archived_threads(
     client: &twilight_http::Client,
-    workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-) -> Result<Vec<twilight_model::channel::Channel>, String> {
+    workspace_channel: Id<ChannelMarker>,
+) -> Result<Vec<Channel>, String> {
     let mut before: Option<String> = None;
     let mut threads = Vec::new();
     loop {

@@ -1,7 +1,10 @@
 use crate::delivery::expire_permission_card;
 use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
 use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
-use crate::{deliver_permission_card, list_agents, route_topology, sync_topology, tab_list_result};
+use crate::{
+    TopologyCache, deliver_permission_card, fetch_topology_lists, list_agents, route_topology,
+    sync_topology, tab_list_result,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
@@ -38,6 +41,7 @@ pub struct PermissionResponder {
     guild: Id<GuildMarker>,
     owner_id: String,
     registry: Arc<InteractionRegistry>,
+    topology_cache: TopologyCache,
 }
 
 #[derive(Clone)]
@@ -92,18 +96,29 @@ where
 
 impl PermissionResponder {
     #[must_use]
-    pub fn new(client: Arc<Client>, guild: Id<GuildMarker>, owner_id: String) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        guild: Id<GuildMarker>,
+        owner_id: String,
+        topology_cache: TopologyCache,
+    ) -> Self {
         Self {
             client,
             guild,
             owner_id,
             registry: Arc::new(InteractionRegistry::default()),
+            topology_cache,
         }
     }
 
     #[must_use]
     pub fn has_pending_session(&self, session_id: &str) -> bool {
         self.registry.has_pending_session(session_id)
+    }
+
+    #[must_use]
+    pub const fn topology_cache(&self) -> &TopologyCache {
+        &self.topology_cache
     }
 
     async fn request(&self, interaction: &Interaction, liveness: HookLiveness) -> Option<Decision> {
@@ -211,13 +226,11 @@ impl PermissionResponder {
         route: &crate::TopologyRoute,
         liveness: &HookLiveness,
     ) -> Option<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>> {
-        let channel_task = sync_topology(
+        let channel_task = Self::sync_channel_with_fresh_lists(
             self.client.as_ref(),
             self.guild,
-            &route.workspace_id,
-            &route.channel_name,
-            &route.thread_name,
-            &route.tab_id,
+            &self.topology_cache,
+            route,
         );
         let channel = tokio::select! {
             result = channel_task => result.map_err(|error| {
@@ -227,6 +240,18 @@ impl PermissionResponder {
             () = liveness.wait_closed() => None,
         }?;
         liveness.is_alive().then_some(channel)
+    }
+
+    async fn sync_channel_with_fresh_lists(
+        client: &Client,
+        guild: Id<GuildMarker>,
+        topology_cache: &TopologyCache,
+        route: &crate::TopologyRoute,
+    ) -> Result<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>, String> {
+        let fetched = fetch_topology_lists(client, guild).await?;
+        let mut guard = topology_cache.lock().await;
+        let (channels, active_threads) = crate::reconcile_topology_cache(&mut guard, fetched);
+        sync_topology(client, guild, channels, active_threads, route).await
     }
 
     async fn deliver_card(

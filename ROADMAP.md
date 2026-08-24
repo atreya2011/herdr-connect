@@ -25,7 +25,7 @@ The informational blocked card is implemented and bounded, but its handoff task 
 
 ### Topology synchronization cost
 
-The current Rust delivery and permission paths call `sync_topology`, which downloads guild channels plus active and archived threads for each route. Preserve the outcome of [historical issue #27](https://github.com/atreya2011/herdr-connect/issues/27): ordinary checks read gateway-maintained local state, while archived-thread listing remains a miss-path HTTP read. Port the behavior, not the old discord.js implementation details.
+The startup sweep fetches guild channels and active threads once at its start into a mutex-guarded `TopologyCache`, reusing that pair across every tab it syncs instead of refetching per tab. The delivery and permission paths (`sync_route`, `sync_channel`) still fetch a fresh pair on every call, so a card delivered after startup always syncs against current state; each fetch runs outside the cache lock, and the lock is taken only to reconcile that fetch into the cache and create what is missing, so concurrent requests do not serialize their whole sync. Preserve the outcome of [historical issue #27](https://github.com/atreya2011/herdr-connect/issues/27): ordinary checks read the fetched lists, while archived-thread listing is a miss-path HTTP read, skipped whenever the active list already resolves the tab. Port the behavior, not the old discord.js implementation details.
 
 ### Late terminal titles
 

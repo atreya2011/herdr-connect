@@ -8,7 +8,7 @@ mod support;
 #[cfg(unix)]
 mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
-    use herdr_connect_rs::sync_topology;
+    use herdr_connect_rs::{TopologyRoute, fetch_topology_lists, sync_topology};
     use serial_test::serial;
 
     #[tokio::test]
@@ -30,13 +30,21 @@ mod real_guild {
     }
 
     async fn exercise(guild: &Guild) -> Result<(), String> {
+        let route = TopologyRoute {
+            workspace_id: "testrun-ws".to_owned(),
+            tab_id: "testrun-tab".to_owned(),
+            pane_id: "testrun-pane".to_owned(),
+            channel_name: "testrun-ws".to_owned(),
+            thread_name: "tab [testrun-tab]".to_owned(),
+        };
+        let (mut channels, mut active_threads) =
+            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
         let first = sync_topology(
             guild.client.as_ref(),
             guild.id,
-            "testrun-ws",
-            "testrun-ws",
-            "tab [testrun-tab]",
-            "testrun-tab",
+            &mut channels,
+            &mut active_threads,
+            &route,
         )
         .await?;
         guild
@@ -45,13 +53,18 @@ mod real_guild {
             .archived(true)
             .await
             .map_err(|e| e.to_string())?;
+        let route = TopologyRoute {
+            thread_name: "changed [testrun-tab]".to_owned(),
+            ..route
+        };
+        let (mut channels, mut active_threads) =
+            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
         let second = sync_topology(
             guild.client.as_ref(),
             guild.id,
-            "testrun-ws",
-            "testrun-ws",
-            "changed [testrun-tab]",
-            "testrun-tab",
+            &mut channels,
+            &mut active_threads,
+            &route,
         )
         .await?;
         if first != second {
@@ -75,13 +88,21 @@ mod real_guild {
             .model()
             .await
             .map_err(|e| e.to_string())?;
+        let route = TopologyRoute {
+            workspace_id: "testrun-duplicate".to_owned(),
+            tab_id: "testrun-tab".to_owned(),
+            pane_id: "testrun-pane".to_owned(),
+            channel_name: "testrun-duplicate-one".to_owned(),
+            thread_name: "tab [testrun-tab]".to_owned(),
+        };
+        let (mut channels, mut active_threads) =
+            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
         let Err(error) = sync_topology(
             guild.client.as_ref(),
             guild.id,
-            "testrun-duplicate",
-            "testrun-duplicate-one",
-            "tab [testrun-tab]",
-            "testrun-tab",
+            &mut channels,
+            &mut active_threads,
+            &route,
         )
         .await
         else {
@@ -92,5 +113,61 @@ mod real_guild {
         } else {
             Err(error)
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_active_list_double_counts_an_archived_thread() {
+        let Some(guild) = guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let result = stale_active_list_exercise(&guild).await;
+        let left = cleanup(&guild).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(left, 0, "named zero-leftover check");
+    }
+
+    async fn stale_active_list_exercise(guild: &Guild) -> Result<(), String> {
+        let route = TopologyRoute {
+            workspace_id: "testrun-stale".to_owned(),
+            tab_id: "testrun-stale-tab".to_owned(),
+            pane_id: "testrun-stale-pane".to_owned(),
+            channel_name: "testrun-stale".to_owned(),
+            thread_name: "tab [testrun-stale-tab]".to_owned(),
+        };
+        let (mut channels, mut active_threads) =
+            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
+        let first = sync_topology(
+            guild.client.as_ref(),
+            guild.id,
+            &mut channels,
+            &mut active_threads,
+            &route,
+        )
+        .await?;
+        guild
+            .client
+            .update_thread(first)
+            .archived(true)
+            .await
+            .map_err(|e| e.to_string())?;
+        let second = sync_topology(
+            guild.client.as_ref(),
+            guild.id,
+            &mut channels,
+            &mut active_threads,
+            &route,
+        )
+        .await?;
+        if second != first {
+            return Err("archived thread was not reused across the reused lists".to_owned());
+        }
+        Ok(())
     }
 }

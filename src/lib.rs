@@ -44,5 +44,8 @@ pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
 };
 pub use readers::{AgentLog, format_detection_question, read_agent_log};
-pub use topology::{TopologyRoute, route_topology, sync_topology, workspace_channel_name};
+pub use topology::{
+    TopologyCache, TopologyRoute, archived_threads, fetch_topology_lists, reconcile_topology_cache,
+    route_topology, sync_topology, workspace_channel_name,
+};
 pub use watcher::{Transition, is_postable_transition};

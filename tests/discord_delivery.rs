@@ -6,9 +6,9 @@ mod support;
 mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
-        AgentLogCapture, PermissionVendor, Transition, create_transition_messages,
+        AgentLogCapture, PermissionVendor, TopologyRoute, Transition, create_transition_messages,
         create_unsupported_blocked_card, deliver_permission_card, deliver_transition_card,
-        sync_topology, transition_card_nonce,
+        fetch_topology_lists, sync_topology, transition_card_nonce,
     };
     use serial_test::serial;
     use twilight_model::channel::message::component::Component::{ActionRow, Button};
@@ -158,13 +158,21 @@ mod real_guild {
     }
 
     async fn unsupported_blocked_card_exercise(guild: &Guild) -> Result<(), String> {
+        let route = TopologyRoute {
+            workspace_id: "testrun-unsupported".to_owned(),
+            tab_id: "testrun-unsupported-tab".to_owned(),
+            pane_id: "testrun-unsupported-pane".to_owned(),
+            channel_name: "testrun-unsupported".to_owned(),
+            thread_name: "blocked [testrun-unsupported-tab]".to_owned(),
+        };
+        let (mut channels, mut active_threads) =
+            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
         let thread = sync_topology(
             guild.client.as_ref(),
             guild.id,
-            "testrun-unsupported",
-            "testrun-unsupported",
-            "blocked [testrun-unsupported-tab]",
-            "testrun-unsupported-tab",
+            &mut channels,
+            &mut active_threads,
+            &route,
         )
         .await?;
         let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;

@@ -1,11 +1,12 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
-    SubscribeError, TopologyRoute, Transition, TransitionMessage, agent_read_detection,
-    create_transition_messages, create_unsupported_blocked_card, deliver_transition_card,
-    drive_gateway_with_components, expire_informational_card, format_detection_question,
-    hook_timeout, is_postable_transition, lifecycle_subscriptions, list_agents,
-    load_discord_config, route_topology, status_subscriptions, subscribe_herdr_events,
-    sync_topology, tab_list_result, transition_card_nonce,
+    SubscribeError, TopologyCache, TopologyRoute, Transition, TransitionMessage,
+    agent_read_detection, create_transition_messages, create_unsupported_blocked_card,
+    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
+    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
+    lifecycle_subscriptions, list_agents, load_discord_config, reconcile_topology_cache,
+    route_topology, status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
+    transition_card_nonce,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, decode_claude_permission_request,
@@ -55,6 +56,7 @@ struct BlockedCardContext<'a> {
     guild: Id<GuildMarker>,
     owner_id: &'a str,
     responder: &'a PermissionResponder,
+    topology_cache: &'a TopologyCache,
     route: &'a TopologyRoute,
     snapshot: &'a AgentSnapshot,
     terminal: &'a str,
@@ -127,6 +129,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         guild,
         owner_id,
         responder,
+        topology_cache,
         route,
         snapshot,
         terminal,
@@ -137,7 +140,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         blocked_capture_attempts,
         search_root,
     } = context;
-    let target = match sync_route(client, guild, route).await {
+    let target = match sync_route(client, guild, route, topology_cache).await {
         Ok(target) => target,
         Err(error) => {
             eprintln!("{error}");
@@ -433,15 +436,17 @@ async fn deliver_postable_transition(
         state_change_seq,
     } = context;
     let route = route_topology(agents, tabs, terminal)?;
-    let Some((client, guild, owner_id, responder)) = discord else {
+    let Some(connection) = discord else {
         return Ok(());
     };
+    let (client, guild, owner_id, responder) = connection;
     if transition.to == "blocked" {
         handle_blocked_card(BlockedCardContext {
             client: client.as_ref(),
             guild: *guild,
             owner_id,
             responder: responder.as_ref(),
+            topology_cache: responder.topology_cache(),
             route: &route,
             snapshot,
             terminal,
@@ -458,16 +463,7 @@ async fn deliver_postable_transition(
     let Some(capture) = capture_for_or_report(snapshot) else {
         return Ok(());
     };
-    deliver_to_route(
-        client.as_ref(),
-        *guild,
-        owner_id,
-        &route,
-        transition,
-        &capture,
-        state_change_seq,
-    )
-    .await?;
+    deliver_to_route(connection, &route, transition, &capture, state_change_seq).await?;
     Ok(())
 }
 
@@ -519,6 +515,7 @@ async fn retry_pending_blocked_capture(
         guild: *guild,
         owner_id,
         responder: responder.as_ref(),
+        topology_cache: responder.topology_cache(),
         route: &route,
         snapshot,
         terminal,
@@ -743,21 +740,20 @@ fn capture_for_blocked_with_search_root(
 ///
 /// Returns Discord topology or card-delivery errors.
 async fn deliver_to_route(
-    client: &Client,
-    guild: Id<GuildMarker>,
-    owner_id: &str,
+    discord: &DiscordConnection,
     route: &TopologyRoute,
     transition: &Transition,
     capture: &AgentLogCapture,
     state_change_seq: u64,
 ) -> Result<Id<MessageMarker>, String> {
+    let (client, guild, owner_id, responder) = discord;
     let messages = create_transition_messages(transition, capture, owner_id);
-    let target = sync_route(client, guild, route).await?;
+    let target = sync_route(client.as_ref(), *guild, route, responder.topology_cache()).await?;
     let mut last_message_id = None;
     for (index, message) in messages.iter().enumerate() {
         let nonce = transition_card_nonce(&transition.terminal_id, state_change_seq, index);
         last_message_id = Some(
-            deliver_transition_card(client, target, message, &nonce)
+            deliver_transition_card(client.as_ref(), target, message, &nonce)
                 .await
                 .map_err(|error| format!("discord delivery error: {error}"))?,
         );
@@ -769,28 +765,40 @@ async fn sync_route(
     client: &Client,
     guild: Id<GuildMarker>,
     route: &TopologyRoute,
+    topology_cache: &TopologyCache,
 ) -> Result<Id<ChannelMarker>, String> {
-    sync_topology(
-        client,
-        guild,
-        &route.workspace_id,
-        &route.channel_name,
-        &route.thread_name,
-        &route.tab_id,
-    )
-    .await
-    .map_err(|error| format!("discord topology error: {error}"))
+    let fetched = fetch_topology_lists(client, guild)
+        .await
+        .map_err(|error| format!("discord topology error: {error}"))?;
+    let mut guard = topology_cache.lock().await;
+    let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
+    sync_topology(client, guild, channels, active_threads, route)
+        .await
+        .map_err(|error| format!("discord topology error: {error}"))
 }
 
 /// Ensures every workspace channel and tab thread exists before the event loop starts. A
 /// per-tab routing or naming error is logged and skipped; the lazy sync inside delivery still
-/// covers that tab once a card is due.
+/// covers that tab once a card is due. The sweep refetches both lists once at its start rather
+/// than adopting whatever the shared cache already holds, so a cache that missed an earlier
+/// create cannot make the sweep recreate an existing channel or thread.
 async fn sync_startup_topology(
     discord: &DiscordConnection,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
 ) {
-    let (client, guild, _, _) = discord;
+    let (client, guild, _, responder) = discord;
+    let topology_cache = responder.topology_cache();
+    let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
+        Ok(lists) => lists,
+        Err(error) => {
+            eprintln!("herdr startup topology error: {error}");
+            return;
+        }
+    };
+    let mut guard = topology_cache.lock().await;
+    reconcile_topology_cache(&mut guard, fetched);
+    drop(guard);
     let mut synced_tabs = HashSet::new();
     for agent in agents {
         if let Some(tab_id) = agent.tab_id.as_deref()
@@ -805,7 +813,14 @@ async fn sync_startup_topology(
                 continue;
             }
         };
-        if let Err(error) = sync_route(client.as_ref(), *guild, &route).await {
+        let mut guard = topology_cache.lock().await;
+        let Some((channels, active_threads)) = guard.as_mut() else {
+            eprintln!("herdr startup topology error: topology cache was cleared");
+            return;
+        };
+        let result = sync_topology(client.as_ref(), *guild, channels, active_threads, &route).await;
+        drop(guard);
+        if let Err(error) = result {
             eprintln!("herdr startup topology error: {error}");
         }
     }
@@ -849,8 +864,9 @@ fn prune_departed_state(
     departed_cards
 }
 
-fn discord_connection()
--> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
+fn discord_connection(
+    topology_cache: TopologyCache,
+) -> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
     match (
         std::env::var("DISCORD_TOKEN"),
         std::env::var("DISCORD_GUILD_ID"),
@@ -874,6 +890,7 @@ fn discord_connection()
                 Arc::clone(&client),
                 guild,
                 config.owner_id.clone(),
+                topology_cache,
             ));
             let gateway = tokio::spawn(drive_gateway_with_components(
                 config.token,
@@ -1028,10 +1045,12 @@ async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     ])?;
     let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
     let client = Arc::new(Client::builder().token(config.token.clone()).build());
+    let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let responder = Arc::new(PermissionResponder::new(
         Arc::clone(&client),
         guild,
         config.owner_id.clone(),
+        topology_cache,
     ));
     run_permission_broker(&socket_path, responder)
         .await
@@ -1434,7 +1453,9 @@ async fn next_status_event(
 }
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    let (discord, mut gateway, mut broker) = match discord_connection()? {
+    let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+    let (discord, mut gateway, mut broker) = match discord_connection(Arc::clone(&topology_cache))?
+    {
         Some((connection, gateway)) => {
             let broker = start_broker(&connection);
             (Some(connection), Some(gateway), broker)
@@ -1476,7 +1497,18 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(discord) = discord.as_ref() {
         match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
-            Ok((agents, tabs)) => sync_startup_topology(discord, &agents, &tabs).await,
+            Ok((agents, tabs)) => {
+                let discord = discord.clone();
+                let startup_task =
+                    tokio::spawn(
+                        async move { sync_startup_topology(&discord, &agents, &tabs).await },
+                    );
+                tokio::spawn(async move {
+                    if let Err(error) = startup_task.await {
+                        eprintln!("herdr startup topology task error: {error}");
+                    }
+                });
+            }
             Err(error) => eprintln!("herdr startup topology snapshot error: {error}"),
         }
     }
@@ -1498,10 +1530,11 @@ mod tests {
         BlockedCardContext, BlockedResponse, BridgeState, Client, InformationalCard, Membership,
         PermissionResponder, TopologyRoute, agent_read_detection, apply_membership,
         capture_for_with_search_root, create_transition_messages, decide_blocked_response,
-        handle_blocked_card, lifecycle_membership, list_agents, next_state_change_sequence,
-        process_snapshot, prune_departed_state, resolve_session_path, route_topology,
-        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
-        subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
+        fetch_topology_lists, handle_blocked_card, lifecycle_membership, list_agents,
+        next_state_change_sequence, process_snapshot, prune_departed_state, resolve_session_path,
+        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
+        subscribe_status, subscribe_status_with_backoff, sync_route, sync_startup_topology,
+        tab_list_result,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
@@ -1918,13 +1951,108 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn blocked_capture_cleanup(guild: &BlockedCaptureGuild) -> Result<usize, String> {
-        let is_test_channel = |channel: &twilight_model::channel::Channel| {
+    fn is_test_channel(channel: &twilight_model::channel::Channel) -> bool {
+        channel
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("testrun-"))
+    }
+
+    /// Every `testrun-` thread in the guild, active or archived, whichever channel parents it. Suite
+    /// threads outlive their tests when they hang off a channel the prefix filter does not delete.
+    ///
+    /// Archived threads are listed only under channels the bridge marks as a herdr workspace, the
+    /// only channels it ever creates a thread in. This is the delete pass, so it pays for the full
+    /// reach.
+    #[cfg(unix)]
+    async fn blocked_capture_testrun_threads(
+        guild: &BlockedCaptureGuild,
+    ) -> Result<Vec<Id<ChannelMarker>>, String> {
+        let channels = guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut threads = guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())?
+            .threads;
+        for parent in channels.iter().filter(|channel| {
             channel
-                .name
+                .topic
                 .as_deref()
-                .is_some_and(|name| name.starts_with("testrun-"))
-        };
+                .is_some_and(|topic| topic.starts_with("herdr workspace ["))
+        }) {
+            threads.extend(
+                herdr_connect_rs::archived_threads(guild.client.as_ref(), parent.id).await?,
+            );
+        }
+        Ok(threads
+            .into_iter()
+            .filter(is_test_channel)
+            .map(|thread| thread.id)
+            .collect())
+    }
+
+    /// The `testrun-` threads a leftover recount has to see: the guild-wide active list only.
+    ///
+    /// The recount deliberately skips the per-channel archived listings the delete pass runs. A
+    /// thread the delete pass just deleted cannot come back as an archived thread, and a thread the
+    /// suite leaked is active, because the suite never archives one. So an archived listing here
+    /// could only repeat what the active list already shows.
+    #[cfg(unix)]
+    async fn blocked_capture_active_testrun_threads(
+        guild: &BlockedCaptureGuild,
+    ) -> Result<usize, String> {
+        Ok(guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())?
+            .threads
+            .iter()
+            .filter(|thread| is_test_channel(thread))
+            .count())
+    }
+
+    /// Deletes one thread, treating an already-deleted thread as done.
+    #[cfg(unix)]
+    async fn blocked_capture_delete_thread(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+    ) -> Result<(), String> {
+        match guild.client.delete_channel(thread).await {
+            Ok(_) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    twilight_http::error::ErrorType::Response {
+                        status,
+                        error: twilight_http::api_error::ApiError::General(api_error),
+                        ..
+                    } if *status == twilight_http::response::StatusCode::NOT_FOUND
+                        && api_error.code == 10003
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn blocked_capture_cleanup(guild: &BlockedCaptureGuild) -> Result<usize, String> {
         let channels = guild
             .client
             .guild_channels(guild.id)
@@ -1940,6 +2068,9 @@ mod tests {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        for thread in blocked_capture_testrun_threads(guild).await? {
+            blocked_capture_delete_thread(guild, thread).await?;
+        }
         let mut attempt = 0;
         loop {
             let leftover = guild
@@ -1952,7 +2083,8 @@ mod tests {
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .filter(is_test_channel)
-                .count();
+                .count()
+                + blocked_capture_active_testrun_threads(guild).await?;
             if leftover == 0 || attempt == 4 {
                 return Ok(leftover);
             }
@@ -1987,6 +2119,7 @@ mod tests {
             guild.client.clone(),
             guild.id,
             owner_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
         ));
         let route = TopologyRoute {
             workspace_id: "testrun-blocked-capture-workspace".to_owned(),
@@ -2041,6 +2174,7 @@ mod tests {
                 guild: guild.id,
                 owner_id,
                 responder,
+                topology_cache: responder.topology_cache(),
                 route,
                 snapshot: &no_question_snapshot,
                 terminal: &terminal,
@@ -2069,6 +2203,7 @@ mod tests {
             guild: guild.id,
             owner_id,
             responder,
+            topology_cache: responder.topology_cache(),
             route,
             snapshot: &no_question_snapshot,
             terminal: &terminal,
@@ -2131,6 +2266,7 @@ mod tests {
             guild: guild.id,
             owner_id,
             responder,
+            topology_cache: responder.topology_cache(),
             route,
             snapshot: &question_snapshot,
             terminal: &question_terminal,
@@ -2350,11 +2486,20 @@ mod tests {
 
     #[cfg(unix)]
     fn discord_tuple(guild: &BlockedCaptureGuild) -> super::DiscordConnection {
+        discord_tuple_with_cache(guild, Arc::new(tokio::sync::Mutex::new(None)))
+    }
+
+    #[cfg(unix)]
+    fn discord_tuple_with_cache(
+        guild: &BlockedCaptureGuild,
+        topology_cache: herdr_connect_rs::TopologyCache,
+    ) -> super::DiscordConnection {
         let owner_id = std::env::var("DISCORD_OWNER_ID").expect("DISCORD_OWNER_ID is set");
         let responder = Arc::new(PermissionResponder::new(
             Arc::clone(&guild.client),
             guild.id,
             owner_id.clone(),
+            topology_cache,
         ));
         (Arc::clone(&guild.client), guild.id, owner_id, responder)
     }
@@ -2667,7 +2812,9 @@ mod tests {
         process_snapshot(&listed, agents, tabs, Some(&connection), &mut state).await;
 
         let route = route_topology(agents, tabs, &terminal)?;
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route).await?;
+        let topology_cache: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
         let before = guild
             .client
             .channel_messages(thread)
@@ -2873,12 +3020,15 @@ mod tests {
             Arc::clone(&guild.client),
             guild.id,
             owner_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
         ));
         let connection = (Arc::clone(&guild.client), guild.id, owner_id, responder);
 
         process_snapshot(&settled, agents, tabs, Some(&connection), &mut state).await;
 
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route).await?;
+        let topology_cache: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
         let messages = guild
             .client
             .channel_messages(thread)
@@ -3114,6 +3264,379 @@ mod tests {
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(STARTUP_TOPOLOGY_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const PREFETCH_REUSE_LABEL: &str = "testrun-startup-prefetch-reuse";
+
+    #[cfg(unix)]
+    async fn startup_topology_prefetch_reuse_exercise(
+        guild: &BlockedCaptureGuild,
+        tab_a: &Tab,
+        tab_b: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&tab_a.pane_id, "idle")?;
+        report_agent_state(&tab_b.pane_id, "idle")?;
+        let agent_a = snapshot_for_pane(&tab_a.pane_id)?;
+        let agent_b = snapshot_for_pane(&tab_b.pane_id)?;
+        let tabs = [matching_tab(&tab_a.tab_id)?, matching_tab(&tab_b.tab_id)?];
+        let agents = [agent_a.clone(), agent_b.clone()];
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
+
+        let route_a = route_topology(&agents, &tabs, &agent_a.terminal_id)?;
+        let route_b = route_topology(&agents, &tabs, &agent_b.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route_a.workspace_id);
+        let matching_channels: Vec<_> = guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+            .collect();
+        let [channel] = matching_channels.as_slice() else {
+            return Err(format!(
+                "expected exactly one prefetched workspace channel, found {}",
+                matching_channels.len()
+            ));
+        };
+
+        let threads = guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .threads;
+        let suffix_a = format!(" [{}]", route_a.tab_id);
+        let suffix_b = format!(" [{}]", route_b.tab_id);
+        let thread_a = threads
+            .iter()
+            .find(|thread| {
+                thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&suffix_a))
+            })
+            .ok_or_else(|| "startup sync did not create tab a's thread".to_owned())?;
+        let thread_b = threads
+            .iter()
+            .find(|thread| {
+                thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&suffix_b))
+            })
+            .ok_or_else(|| "startup sync did not create tab b's thread".to_owned())?;
+        if thread_a.parent_id != Some(channel.id) || thread_b.parent_id != Some(channel.id) {
+            return Err(
+                "both tabs' threads must share the one prefetched workspace channel".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn startup_topology_prefetch_reuses_one_channel_across_two_tabs() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(PREFETCH_REUSE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let make_cwd = |suffix: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "testrun-cwd-{}-{}-{suffix}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).expect("create prefetch-reuse test cwd");
+            dir
+        };
+        let cwd_a_dir = make_cwd("a");
+        let cwd_b_dir = make_cwd("b");
+        let cwd_a = cwd_a_dir.to_str().expect("temp cwd is valid UTF-8");
+        let cwd_b = cwd_b_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created_a = create_tab(PREFETCH_REUSE_LABEL, &workspace_id, cwd_a);
+        let created_b = create_tab(PREFETCH_REUSE_LABEL, &workspace_id, cwd_b);
+        let (tab_ids, result) = match (created_a, created_b) {
+            (Ok(tab_a), Ok(tab_b)) => {
+                let outcome =
+                    startup_topology_prefetch_reuse_exercise(&guild, &tab_a, &tab_b).await;
+                (vec![tab_a.tab_id, tab_b.tab_id], outcome)
+            }
+            (Ok(tab_a), Err(error)) => (vec![tab_a.tab_id], Err(error)),
+            (Err(error), Ok(tab_b)) => (vec![tab_b.tab_id], Err(error)),
+            (Err(error), Err(_)) => (vec![], Err(error)),
+        };
+        for tab_id in &tab_ids {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_a_dir);
+        let _ = fs::remove_dir_all(&cwd_b_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(PREFETCH_REUSE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const STARTUP_RACE_LABEL: &str = "testrun-startup-race";
+
+    #[cfg(unix)]
+    async fn startup_and_delivery_race_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&tab.pane_id, "idle")?;
+        let listed = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+
+        let startup = sync_startup_topology(&connection, agents, tabs);
+        let delivery = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache);
+        let ((), delivery_result) = tokio::join!(startup, delivery);
+        delivery_result?;
+
+        let threads = guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .threads;
+        let suffix = format!(" [{}]", route.tab_id);
+        let matching_threads: Vec<_> = threads
+            .iter()
+            .filter(|thread| {
+                thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .collect();
+        if matching_threads.len() == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected exactly one thread for tab {}, found {}",
+                route.tab_id,
+                matching_threads.len()
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn startup_and_delivery_sync_race_creates_one_thread() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(STARTUP_RACE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create startup-race test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_tab(STARTUP_RACE_LABEL, &workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = startup_and_delivery_race_exercise(&guild, &tab).await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(STARTUP_RACE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const STALE_CACHE_LABEL: &str = "testrun-stale-cache";
+
+    #[cfg(unix)]
+    async fn startup_sweep_stale_cache_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&tab.pane_id, "idle")?;
+        let listed = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+
+        let stale = fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
+        sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &Arc::new(tokio::sync::Mutex::new(None)),
+        )
+        .await?;
+        let shared: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(Some(stale)));
+        sync_startup_topology(
+            &discord_tuple_with_cache(guild, Arc::clone(&shared)),
+            agents,
+            tabs,
+        )
+        .await;
+
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let matching_channels = guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+            .count();
+        let suffix = format!(" [{}]", route.tab_id);
+        let matching_threads = guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .threads
+            .into_iter()
+            .filter(|thread| {
+                thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .count();
+        if matching_channels == 1 && matching_threads == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected exactly one channel and one thread for workspace {} tab {}, \
+                 found {matching_channels} channels and {matching_threads} threads",
+                route.workspace_id, route.tab_id
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn startup_sweep_duplicates_thread_after_dropped_write_back() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(STALE_CACHE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create stale-cache test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_tab(STALE_CACHE_LABEL, &workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = startup_sweep_stale_cache_exercise(&guild, &tab).await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(STALE_CACHE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
