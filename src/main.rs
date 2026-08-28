@@ -1,11 +1,11 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
-    SubscribeError, TopologyCache, TopologyRoute, Transition, TransitionMessage,
-    agent_read_detection, create_transition_messages, create_unsupported_blocked_card,
-    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
-    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
-    lifecycle_subscriptions, list_agents, load_discord_config, reconcile_topology_cache,
-    route_topology, status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
+    TopologyCache, TopologyRoute, Transition, TransitionMessage, agent_read_detection,
+    create_transition_messages, create_unsupported_blocked_card, deliver_transition_card,
+    drive_gateway_with_components, expire_informational_card, fetch_topology_lists,
+    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, load_discord_config, reconcile_topology_cache, route_topology,
+    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
     transition_card_nonce,
 };
 use herdr_connect_rs::{
@@ -1366,33 +1366,39 @@ async fn subscribe_herdr_events_with_backoff(
     }
 }
 
+/// Resubscribes to per-pane status, rebuilding `pane_ids` from a fresh `list_agents` call before
+/// every attempt so a pane closing between attempts can never leave the subscription frozen on a
+/// stale membership list.
 async fn subscribe_status_with_backoff(
     pane_ids: &mut Vec<String>,
     stop: &mut tokio::signal::unix::Signal,
 ) -> Result<Option<HerdrSubscription>, BridgeInterrupt> {
-    if pane_ids.is_empty() {
-        return Ok(None);
-    }
-    match subscribe_herdr_events(&status_subscriptions(pane_ids)).await {
-        Ok(subscription) => return Ok(Some(subscription)),
-        Err(SubscribeError::PaneNotFound) => {
-            if let Ok(agents) = list_agents() {
-                reconcile_pane_ids(pane_ids, pane_ids_from_agents(&agents));
-                if pane_ids.is_empty() {
-                    return Ok(None);
-                }
-                if let Ok(subscription) =
-                    subscribe_herdr_events(&status_subscriptions(pane_ids)).await
-                {
-                    return Ok(Some(subscription));
+    let mut delay = SUBSCRIBE_RETRY_INITIAL;
+    loop {
+        let outcome: Result<Option<HerdrSubscription>, String> = async {
+            let agents = list_agents()?;
+            reconcile_pane_ids(pane_ids, pane_ids_from_agents(&agents));
+            if pane_ids.is_empty() {
+                return Ok(None);
+            }
+            let subscription = subscribe_herdr_events(&status_subscriptions(pane_ids)).await?;
+            Ok(Some(subscription))
+        }
+        .await;
+        match outcome {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                eprintln!("herdr status subscribe error: {error}; retrying in {delay:?}");
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {
+                        delay = delay.saturating_mul(2).min(SUBSCRIBE_RETRY_MAX);
+                    }
+                    _ = tokio::signal::ctrl_c() => return Err(BridgeInterrupt),
+                    _ = stop.recv() => return Err(BridgeInterrupt),
                 }
             }
         }
-        Err(SubscribeError::Other(_)) => {}
     }
-    Ok(Some(
-        subscribe_herdr_events_with_backoff(&status_subscriptions(pane_ids), stop).await?,
-    ))
 }
 
 #[cfg(test)]
@@ -2748,51 +2754,88 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct StalePaneCase {
+        name: &'static str,
+        initial_pane_ids: fn(&str, &str) -> Vec<String>,
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn subscribe_status_with_backoff_recovers_from_stale_pane_id() {
-        assert_eq!(
-            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
-            0,
-            "named zero-leftover check"
-        );
-        let (live_tab, live_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
-        let (closed_tab, closed_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
-        close_tab(&closed_tab.tab_id);
-        let _ = fs::remove_dir_all(&closed_cwd_dir);
+    async fn subscribe_status_with_backoff_recovers_from_stale_pane_ids() {
+        let cases = [
+            StalePaneCase {
+                name: "closed pane id tracked alongside the live pane",
+                initial_pane_ids: |closed, live| {
+                    let mut ids = vec![closed.to_owned(), live.to_owned()];
+                    ids.sort();
+                    ids
+                },
+            },
+            StalePaneCase {
+                name: "pane_ids holds only closed ids; live pane is untracked",
+                initial_pane_ids: |closed, _live| vec![closed.to_owned()],
+            },
+        ];
 
-        let mut pane_ids = vec![closed_tab.pane_id.clone(), live_tab.pane_id.clone()];
-        pane_ids.sort();
+        for case in cases {
+            assert_eq!(
+                remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
+            let (live_tab, live_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
+            report_agent_state(&live_tab.pane_id, "idle")
+                .expect("register the live pane as a herdr agent");
+            let (closed_tab, closed_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
+            close_tab(&closed_tab.tab_id);
+            let _ = fs::remove_dir_all(&closed_cwd_dir);
 
-        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
+            let mut pane_ids = (case.initial_pane_ids)(&closed_tab.pane_id, &live_tab.pane_id);
 
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(20),
-            subscribe_status_with_backoff(&mut pane_ids, &mut stop),
-        )
-        .await;
+            let mut stop =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
 
-        close_tab(&live_tab.tab_id);
-        let _ = fs::remove_dir_all(&live_cwd_dir);
-        let tabs_left =
-            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(20),
+                subscribe_status_with_backoff(&mut pane_ids, &mut stop),
+            )
+            .await;
 
-        match outcome {
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => panic!("expected Some(subscription) for the live pane, got None"),
-            Ok(Err(super::BridgeInterrupt)) => {
-                panic!("subscribe_status_with_backoff returned BridgeInterrupt")
+            close_tab(&live_tab.tab_id);
+            let _ = fs::remove_dir_all(&live_cwd_dir);
+            let tabs_left = remaining_tabs(SUBSCRIBE_LABEL)
+                .expect("tab.list succeeds for the zero-leftover check");
+
+            match outcome {
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None)) => panic!(
+                    "{}: expected Some(subscription) for the live pane, got None",
+                    case.name
+                ),
+                Ok(Err(super::BridgeInterrupt)) => panic!(
+                    "{}: subscribe_status_with_backoff returned BridgeInterrupt",
+                    case.name
+                ),
+                Err(elapsed) => panic!(
+                    "{}: subscribe_status_with_backoff did not recover from the stale pane id within the timeout: {elapsed}",
+                    case.name
+                ),
             }
-            Err(elapsed) => panic!(
-                "subscribe_status_with_backoff did not recover from the stale pane id within the timeout: {elapsed}"
-            ),
+            assert!(
+                !pane_ids.contains(&closed_tab.pane_id),
+                "{}: closed pane id must be dropped from membership",
+                case.name
+            );
+            assert!(
+                pane_ids.contains(&live_tab.pane_id),
+                "{}: live pane id must be present in the recovered membership",
+                case.name
+            );
+            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
         }
-        assert!(
-            !pane_ids.contains(&closed_tab.pane_id),
-            "closed pane id must be dropped from membership"
-        );
-        assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
