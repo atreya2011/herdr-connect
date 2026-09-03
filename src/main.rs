@@ -49,6 +49,11 @@ struct BridgeState {
     blocked_since: HashMap<String, Instant>,
     informational_cards: HashMap<String, InformationalCard>,
     blocked_capture_attempts: HashMap<String, u32>,
+    /// Last reply card text delivered per terminal, for session-carrying panes only. A reply
+    /// card whose captured text equals this entry is not posted again, whether it arrives on the
+    /// status-change path or the seq-backstop path; a legitimately identical consecutive reply
+    /// is intentionally not reposted.
+    last_posted: HashMap<String, String>,
 }
 
 struct BlockedCardContext<'a> {
@@ -422,6 +427,17 @@ struct PostableTransitionContext<'a> {
     state_change_seq: u64,
 }
 
+/// Delivers one postable transition's card to Discord: a blocked transition goes through
+/// `handle_blocked_card` unconditionally, while a reply-card transition is captured from the
+/// vendor log and delivered. For a session-carrying snapshot, a reply card whose captured text
+/// equals the last one delivered for this terminal is skipped instead of reposted. The check
+/// applies on both the status-change path and the seq-backstop path, so a legitimately identical
+/// consecutive reply is intentionally not reposted either. A snapshot without a session keeps
+/// posting every capture, since it has no vendor log to compare against.
+///
+/// # Errors
+///
+/// Returns topology or Discord delivery errors.
 async fn deliver_postable_transition(
     context: PostableTransitionContext<'_>,
     state: &mut BridgeState,
@@ -463,7 +479,16 @@ async fn deliver_postable_transition(
     let Some(capture) = capture_for_or_report(snapshot) else {
         return Ok(());
     };
+    if snapshot.session.is_some() && state.last_posted.get(terminal) == Some(&capture.message) {
+        println!("{terminal}: skipped duplicate reply card");
+        return Ok(());
+    }
     deliver_to_route(connection, &route, transition, &capture, state_change_seq).await?;
+    if snapshot.session.is_some() {
+        state
+            .last_posted
+            .insert(terminal.to_owned(), capture.message);
+    }
     Ok(())
 }
 
@@ -851,6 +876,9 @@ fn prune_departed_state(
         .retain(|terminal, _| current.contains(terminal));
     state
         .blocked_capture_attempts
+        .retain(|terminal, _| current.contains(terminal));
+    state
+        .last_posted
         .retain(|terminal, _| current.contains(terminal));
     let departed_cards = state
         .informational_cards
@@ -1546,10 +1574,11 @@ mod tests {
         AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
         subscribe_herdr_events, transition_card_nonce,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -1616,6 +1645,9 @@ mod tests {
                     message: Id::<MessageMarker>::new(2),
                 },
             );
+            state
+                .last_posted
+                .insert(terminal.to_owned(), format!("{terminal} reply"));
         }
 
         let current_terminals = HashSet::from([current.to_owned()]);
@@ -1627,10 +1659,15 @@ mod tests {
         assert!(!state.state_change_sequences.contains_key(departed));
         assert!(!state.herdr_state_change_seq.contains_key(departed));
         assert!(!state.informational_cards.contains_key(departed));
+        assert!(!state.last_posted.contains_key(departed));
         assert!(state.blocked_since.contains_key(current));
         assert!(state.state_change_sequences.contains_key(current));
         assert!(state.herdr_state_change_seq.contains_key(current));
         assert!(state.informational_cards.contains_key(current));
+        assert_eq!(
+            state.last_posted.get(current).map(String::as_str),
+            Some("current reply")
+        );
     }
 
     #[test]
@@ -3203,6 +3240,290 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const SEQ_DEDUP_LABEL: &str = "testrun-seq-dedup";
+
+    /// Real on-disk Claude project directory a session log for `cwd` resolves under, mirroring
+    /// `resolve_session_path`'s slug so the test can place a fixture where production code will
+    /// read it.
+    #[cfg(unix)]
+    fn claude_session_project_dir(home: &Path, cwd: &str) -> PathBuf {
+        let cwd_slug: String = cwd
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        home.join(".claude-one/projects").join(cwd_slug)
+    }
+
+    #[cfg(unix)]
+    fn claude_session_log_path(home: &Path, cwd: &str, session_id: &str) -> PathBuf {
+        claude_session_project_dir(home, cwd).join(format!("{session_id}.jsonl"))
+    }
+
+    /// Appends one user/assistant turn to a real Claude session log, in the same record shape as
+    /// `tests/fixtures/claude-session.jsonl`.
+    #[cfg(unix)]
+    fn append_claude_turn(path: &Path, prompt: &str, reply: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        for record in [
+            json!({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            }),
+            json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+            }),
+        ] {
+            writeln!(file, "{record}").map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Reports a real Claude session identity on a pane through Herdr's own
+    /// `pane.report_agent_session` RPC.
+    #[cfg(unix)]
+    fn report_agent_session(pane_id: &str, session_id: &str) -> Result<(), String> {
+        let args = [
+            "pane",
+            "report-agent-session",
+            pane_id,
+            "--source",
+            "herdr:claude",
+            "--agent",
+            "claude",
+            "--agent-session-id",
+            session_id,
+        ];
+        let output = Command::new("herdr")
+            .args(args)
+            .output()
+            .map_err(|error| format!("herdr {args:?} spawn failed: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "herdr {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    async fn thread_card_descriptions(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+    ) -> Result<Vec<String>, String> {
+        let messages = guild
+            .client
+            .channel_messages(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(messages
+            .into_iter()
+            .filter_map(|message| {
+                message
+                    .embeds
+                    .into_iter()
+                    .next()
+                    .and_then(|embed| embed.description)
+            })
+            .collect())
+    }
+
+    /// Drives one real pane carrying a real reported Claude session through the seq backstop
+    /// with `state_change_seq` set by hand: Herdr freezes its own counter against synthetic
+    /// `report-agent` state reports once a pane carries a session, so the counter cannot be
+    /// advanced through Herdr itself for this scenario. Everything else stays real: a real Herdr
+    /// tab, a real reported session, a real on-disk session log, and a real Discord thread.
+    #[cfg(unix)]
+    async fn seq_backstop_session_dedup_round_trip(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        home: &Path,
+        cwd: &str,
+    ) -> Result<(), String> {
+        report_agent_state(&tab.pane_id, "idle")?;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let session_id = format!(
+            "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+            std::process::id(),
+            (nanos >> 48) & 0xffff,
+            (nanos >> 36) & 0xfff,
+            (nanos >> 24) & 0xfff,
+            nanos & 0xffff_ffff_ffff,
+        );
+        report_agent_session(&tab.pane_id, &session_id)?;
+
+        let confirmed = snapshot_for_pane(&tab.pane_id)?;
+        let expected_session = AgentSession {
+            agent: "claude".to_owned(),
+            value: session_id.clone(),
+        };
+        if confirmed.session.as_ref() != Some(&expected_session) {
+            return Err(format!(
+                "expected session {expected_session:?} on pane {}, agent.list reported {confirmed:?}",
+                tab.pane_id
+            ));
+        }
+        let terminal = confirmed.terminal_id.clone();
+
+        let log_path = claude_session_log_path(home, cwd, &session_id);
+        append_claude_turn(&log_path, "first prompt", "reply one")?;
+
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let route = route_topology(std::slice::from_ref(&confirmed), tabs, &terminal)?;
+        let connection = discord_tuple(guild);
+        let topology_cache: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+
+        let base_seq = confirmed.state_change_seq;
+        let mut state = BridgeState {
+            previous: HashMap::from([(
+                terminal.clone(),
+                (confirmed.agent_status.clone(), confirmed.agent.clone()),
+            )]),
+            herdr_state_change_seq: HashMap::from([(terminal.clone(), base_seq.saturating_sub(1))]),
+            ..Default::default()
+        };
+        let mut snapshot = confirmed.clone();
+
+        snapshot.state_change_seq = base_seq;
+        process_snapshot(
+            &snapshot,
+            std::slice::from_ref(&snapshot),
+            tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
+        let after_first = thread_card_descriptions(guild, thread).await?;
+        if after_first.len() != 1 || after_first.first().map(String::as_str) != Some("reply one") {
+            return Err(format!(
+                "expected exactly one card carrying \"reply one\" after the baseline settled snapshot, thread has {after_first:?}"
+            ));
+        }
+
+        snapshot.state_change_seq = base_seq + 1;
+        process_snapshot(
+            &snapshot,
+            std::slice::from_ref(&snapshot),
+            tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
+        let after_duplicate = thread_card_descriptions(guild, thread).await?;
+        if after_duplicate != after_first {
+            return Err(format!(
+                "expected the duplicate settled snapshot (unchanged session log) to post no new card, thread now has {after_duplicate:?}"
+            ));
+        }
+
+        append_claude_turn(&log_path, "second prompt", "reply two")?;
+        snapshot.state_change_seq = base_seq + 2;
+        process_snapshot(
+            &snapshot,
+            std::slice::from_ref(&snapshot),
+            tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
+        let after_new_turn = thread_card_descriptions(guild, thread).await?;
+        if after_new_turn.len() != 2 || !after_new_turn.contains(&"reply two".to_owned()) {
+            return Err(format!(
+                "expected exactly one new card carrying \"reply two\" after the new-turn settled snapshot, thread now has {after_new_turn:?}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn seq_backstop_session_dedup_suppresses_duplicate_and_posts_new_turn() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(SEQ_DEDUP_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-seq-dedup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create seq-dedup test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+        let project_dir = claude_session_project_dir(&home, cwd);
+
+        let created = create_tab(SEQ_DEDUP_LABEL, &workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = seq_backstop_session_dedup_round_trip(&guild, &tab, &home, cwd).await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+        let _ = fs::remove_dir_all(&project_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(SEQ_DEDUP_LABEL).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert!(
+            !project_dir.exists(),
+            "named zero-leftover check: claude-one project directory removed"
+        );
     }
 
     #[cfg(unix)]
