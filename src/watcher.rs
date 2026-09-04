@@ -1,3 +1,5 @@
+use crate::herdr::{STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING};
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Transition {
     pub from: String,
@@ -8,5 +10,5 @@ pub struct Transition {
 
 #[must_use]
 pub fn is_postable_transition(t: &Transition) -> bool {
-    t.from == "working" && matches!(t.to.as_str(), "blocked" | "done" | "idle")
+    t.from == STATUS_WORKING && matches!(t.to.as_str(), STATUS_BLOCKED | STATUS_DONE | STATUS_IDLE)
 }

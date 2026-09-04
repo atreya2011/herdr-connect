@@ -1,10 +1,29 @@
 use crate::herdr::AgentSession;
+use crate::permission::{VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR};
 use rusqlite::{Connection, OpenFlags};
 use serde::de::Error as _;
 use serde_json::Value;
 use std::path::Path;
 
 const POINTER: &str = "agent stopped, no log available";
+/// Key for a vendor log record's own type field (Claude: `user`/`assistant`; Codex: `turn_context`/`event_msg`).
+const RECORD_TYPE_KEY: &str = "type";
+/// Key for a Claude message content part's type field (e.g. `text`, `tool_use`, `tool_result`).
+const CONTENT_PART_TYPE_KEY: &str = "type";
+/// Key for a Codex payload's type field (e.g. `task_started`, `turn_aborted`).
+const PAYLOAD_TYPE_KEY: &str = "type";
+const CONTENT_KEY: &str = "content";
+/// Key holding a Claude/Codex/Cursor content part's own text payload.
+const TEXT_KEY: &str = "text";
+/// The `text` content part's type-discriminant value.
+const CONTENT_PART_TEXT_VALUE: &str = "text";
+const MESSAGE_KEY: &str = "message";
+const PAYLOAD_KEY: &str = "payload";
+/// Value of a Cursor row's `role` field marking it as user-authored.
+const USER_ROLE_VALUE: &str = "user";
+/// Value of a Claude record's own `type` field marking it as user-authored.
+const USER_RECORD_TYPE_VALUE: &str = "user";
+const ROW_DATA_KEY: &str = "data";
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentLog {
@@ -20,7 +39,7 @@ pub struct AgentLog {
 /// Returns the stable pointer error when the session, file, or parsed response is unavailable.
 pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<AgentLog, String> {
     let session = session.ok_or_else(|| POINTER.to_owned())?;
-    if session.agent == "cursor" {
+    if session.agent == VENDOR_CURSOR {
         if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
             let bytes = std::fs::read(path).map_err(|_| POINTER.to_owned())?;
             let value: Value = serde_json::from_slice(&bytes).map_err(|_| POINTER.to_owned())?;
@@ -31,8 +50,8 @@ pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<Agen
     let bytes = std::fs::read(path).map_err(|_| POINTER.to_owned())?;
     let text = String::from_utf8(bytes).map_err(|_| POINTER.to_owned())?;
     match session.agent.as_str() {
-        "claude" => parse_claude(&text),
-        "codex" => parse_codex(&text),
+        VENDOR_CLAUDE => parse_claude(&text),
+        VENDOR_CODEX => parse_codex(&text),
         _ => Err(serde_json::Error::custom(POINTER)),
     }
     .map_err(|_| POINTER.to_owned())
@@ -76,18 +95,19 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
     let start = records
         .iter()
         .rposition(|r| {
-            if r.get("type").and_then(Value::as_str) != Some("user")
+            if r.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(USER_RECORD_TYPE_VALUE)
                 || r.get("isMeta") == Some(&Value::Bool(true))
             {
                 return false;
             }
-            let content = r.get("message").and_then(|m| m.get("content"));
+            let content = r.get(MESSAGE_KEY).and_then(|m| m.get(CONTENT_KEY));
             content.is_some_and(|c| {
                 c.is_string()
                     || c.as_array().is_some_and(|parts| {
-                        parts
-                            .iter()
-                            .any(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                        parts.iter().any(|p| {
+                            p.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                                == Some(CONTENT_PART_TEXT_VALUE)
+                        })
                     })
             })
         })
@@ -97,14 +117,14 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         .iter()
         .flat_map(|record| {
             record
-                .get("message")
-                .and_then(|message| message.get("content"))
+                .get(MESSAGE_KEY)
+                .and_then(|message| message.get(CONTENT_KEY))
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
         })
         .filter_map(|part| {
-            (part.get("type").and_then(Value::as_str) == Some("tool_result"))
+            (part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str) == Some("tool_result"))
                 .then(|| part.get("tool_use_id").and_then(Value::as_str))
                 .flatten()
         })
@@ -114,14 +134,17 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
     let mut failure = None;
     for record in tail {
         if let Some(contents) = record
-            .get("message")
-            .and_then(|m| m.get("content"))
+            .get(MESSAGE_KEY)
+            .and_then(|m| m.get(CONTENT_KEY))
             .and_then(Value::as_array)
         {
             for part in contents {
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        message = part.get("text").and_then(Value::as_str).map(str::to_owned);
+                match part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str) {
+                    Some(CONTENT_PART_TEXT_VALUE) => {
+                        message = part
+                            .get(TEXT_KEY)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                     }
                     Some("tool_use")
                         if part.get("name").and_then(Value::as_str) == Some("AskUserQuestion") =>
@@ -136,7 +159,7 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
                     }
                     Some("tool_result") if part.get("is_error") == Some(&Value::Bool(true)) => {
                         failure = part
-                            .get("content")
+                            .get(CONTENT_KEY)
                             .and_then(Value::as_str)
                             .map(str::to_owned);
                     }
@@ -144,8 +167,8 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
                 }
             }
         }
-        if record.get("type").and_then(Value::as_str) == Some("assistant")
-            && let Some(s) = record.get("message").and_then(Value::as_str)
+        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("assistant")
+            && let Some(s) = record.get(MESSAGE_KEY).and_then(Value::as_str)
         {
             message = Some(s.to_owned());
         }
@@ -165,10 +188,10 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
     let start = records
         .iter()
         .rposition(|r| {
-            r.get("type").and_then(Value::as_str) == Some("turn_context")
-                || (r.get("type").and_then(Value::as_str) == Some("event_msg")
-                    && r.get("payload")
-                        .and_then(|p| p.get("type"))
+            r.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("turn_context")
+                || (r.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("event_msg")
+                    && r.get(PAYLOAD_KEY)
+                        .and_then(|p| p.get(PAYLOAD_TYPE_KEY))
                         .and_then(Value::as_str)
                         == Some("task_started"))
         })
@@ -178,19 +201,19 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
         .iter()
         .rev()
         .find_map(|r| {
-            r.get("payload")
-                .and_then(|p| p.get("last_agent_message").or_else(|| p.get("message")))
+            r.get(PAYLOAD_KEY)
+                .and_then(|p| p.get("last_agent_message").or_else(|| p.get(MESSAGE_KEY)))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
         .or_else(|| {
             tail.iter().rev().find_map(|r| {
-                r.get("payload")
-                    .and_then(|p| p.get("content"))
+                r.get(PAYLOAD_KEY)
+                    .and_then(|p| p.get(CONTENT_KEY))
                     .and_then(Value::as_array)
                     .map(|a| {
                         a.iter()
-                            .filter_map(|x| x.get("text").and_then(Value::as_str))
+                            .filter_map(|x| x.get(TEXT_KEY).and_then(Value::as_str))
                             .collect::<String>()
                     })
                     .filter(|s| !s.is_empty())
@@ -198,12 +221,12 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
         })
         .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
     let failure = tail.iter().rev().find_map(|r| {
-        (r.get("payload")
-            .and_then(|p| p.get("type"))
+        (r.get(PAYLOAD_KEY)
+            .and_then(|p| p.get(PAYLOAD_TYPE_KEY))
             .and_then(Value::as_str)
             == Some("turn_aborted"))
         .then(|| {
-            r.get("payload")
+            r.get(PAYLOAD_KEY)
                 .and_then(|p| p.get("reason"))
                 .and_then(Value::as_str)
                 .unwrap_or("turn aborted")
@@ -219,13 +242,13 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
 fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
     let records: Vec<Value> = rows
         .iter()
-        .filter_map(|row| row.get("data").cloned().or_else(|| Some(row.clone())))
+        .filter_map(|row| row.get(ROW_DATA_KEY).cloned().or_else(|| Some(row.clone())))
         .collect();
     let start = records
         .iter()
         .rposition(|row| {
-            row.get("role").and_then(Value::as_str) == Some("user")
-                && row.get("content").is_some_and(Value::is_array)
+            row.get("role").and_then(Value::as_str) == Some(USER_ROLE_VALUE)
+                && row.get(CONTENT_KEY).is_some_and(Value::is_array)
         })
         .map_or(0, |i| i + 1);
     let tail = &records[start..];
@@ -233,13 +256,13 @@ fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
         .iter()
         .rev()
         .find_map(|row| {
-            row.get("content")
+            row.get(CONTENT_KEY)
                 .and_then(Value::as_array)
                 .and_then(|parts| {
                     parts
                         .iter()
                         .rev()
-                        .find_map(|part| part.get("text").and_then(Value::as_str))
+                        .find_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
                 })
         })
         .ok_or_else(|| serde_json::Error::custom("empty assistant message"))?;
@@ -257,13 +280,13 @@ fn parse_cursor_json(value: &Value) -> Result<AgentLog, serde_json::Error> {
     let start = rows
         .iter()
         .rposition(|row| {
-            row.get("data")
+            row.get(ROW_DATA_KEY)
                 .and_then(|d| d.get("role"))
                 .and_then(Value::as_str)
-                == Some("user")
+                == Some(USER_ROLE_VALUE)
                 && row
-                    .get("data")
-                    .and_then(|d| d.get("content"))
+                    .get(ROW_DATA_KEY)
+                    .and_then(|d| d.get(CONTENT_KEY))
                     .is_some_and(Value::is_array)
         })
         .map_or(0, |i| i + 1);
@@ -272,14 +295,14 @@ fn parse_cursor_json(value: &Value) -> Result<AgentLog, serde_json::Error> {
         .iter()
         .rev()
         .find_map(|row| {
-            row.get("data")
-                .and_then(|d| d.get("content"))
+            row.get(ROW_DATA_KEY)
+                .and_then(|d| d.get(CONTENT_KEY))
                 .and_then(Value::as_array)
                 .and_then(|parts| {
                     parts
                         .iter()
                         .rev()
-                        .find_map(|p| p.get("text").and_then(Value::as_str))
+                        .find_map(|p| p.get(TEXT_KEY).and_then(Value::as_str))
                 })
         })
         .filter(|s| !s.is_empty())

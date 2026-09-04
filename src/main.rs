@@ -1,18 +1,20 @@
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
-    TopologyCache, TopologyRoute, Transition, TransitionMessage, agent_read_detection,
-    create_transition_messages, create_unsupported_blocked_card, delete_tab_thread,
-    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_transition_card,
-    drive_gateway_with_components, expire_informational_card, fetch_topology_lists,
-    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, load_discord_config, reconcile_topology_cache, route_topology,
-    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
-    transition_card_nonce, workspace_list_result,
+    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
+    ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
+    STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyRoute,
+    Transition, TransitionMessage, agent_read_detection, create_transition_messages,
+    create_unsupported_blocked_card, delete_tab_thread, delete_topology_absent_from_herdr,
+    delete_workspace_channel, deliver_transition_card, drive_gateway_with_components,
+    expire_informational_card, fetch_topology_lists, format_detection_question, hook_timeout,
+    is_postable_transition, lifecycle_subscriptions, list_agents, load_discord_config,
+    reconcile_topology_cache, route_topology, status_subscriptions, subscribe_herdr_events,
+    sync_topology, tab_list_result, transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
-    Decision, Interaction, PermissionResponder, PermissionVendor, decode_claude_permission_request,
-    decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
-    encode_codex_decision, encode_cursor_decision, handle_component, request_decision,
+    Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
+    VENDOR_CURSOR, decode_claude_permission_request, decode_codex_permission_request,
+    decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
+    encode_cursor_decision, handle_component, request_decision,
     run_broker as run_permission_broker,
 };
 use std::collections::{HashMap, HashSet};
@@ -153,7 +155,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
             return;
         }
     };
-    let vendor_supported = matches!(snapshot.agent.as_str(), "claude" | "codex");
+    let vendor_supported = matches!(snapshot.agent.as_str(), VENDOR_CLAUDE | VENDOR_CODEX);
     let supported_broker_pending = vendor_supported
         && snapshot
             .session
@@ -162,7 +164,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     if supported_broker_pending {
         return;
     }
-    let detection_question = (snapshot.agent == "claude")
+    let detection_question = (snapshot.agent == VENDOR_CLAUDE)
         .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten()
         .and_then(|text| format_detection_question(&text));
@@ -193,7 +195,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
             blocked_capture_attempts.remove(terminal);
             let transition = Transition {
                 from: from_status.to_owned(),
-                to: "blocked".to_owned(),
+                to: STATUS_BLOCKED.to_owned(),
                 terminal_id: terminal.to_owned(),
                 agent: snapshot.agent.clone(),
             };
@@ -306,7 +308,7 @@ fn seq_backstop_rewrites_working_from(
     current_herdr_seq: u64,
 ) -> bool {
     !is_postable_transition(transition)
-        && matches!(transition.to.as_str(), "idle" | "done")
+        && matches!(transition.to.as_str(), STATUS_IDLE | STATUS_DONE)
         && previous_herdr_seq.is_some_and(|previous| current_herdr_seq > previous)
 }
 
@@ -317,7 +319,7 @@ fn seq_backstop_collapsed_settled_turn(
     previous_herdr_seq: Option<u64>,
     current_herdr_seq: u64,
 ) -> bool {
-    matches!(status, "idle" | "done")
+    matches!(status, STATUS_IDLE | STATUS_DONE)
         && previous_herdr_seq.is_some_and(|previous| current_herdr_seq > previous)
 }
 
@@ -340,7 +342,7 @@ async fn process_snapshot(
             let state_change_seq =
                 next_state_change_sequence(&mut state.state_change_sequences, &terminal);
             let prior_status = old.clone();
-            let leaving_blocked = prior_status == "blocked" && status != "blocked";
+            let leaving_blocked = prior_status == STATUS_BLOCKED && status != STATUS_BLOCKED;
             let mut transition = Transition {
                 from: old,
                 to: status.clone(),
@@ -352,13 +354,13 @@ async fn process_snapshot(
                 previous_herdr_seq,
                 snapshot.state_change_seq,
             ) {
-                "working".clone_into(&mut transition.from);
+                STATUS_WORKING.clone_into(&mut transition.from);
             }
             update_blocked_lifecycle(
                 discord,
                 &terminal,
                 leaving_blocked,
-                status == "blocked",
+                status == STATUS_BLOCKED,
                 state,
             )
             .await;
@@ -387,7 +389,7 @@ async fn process_snapshot(
             let state_change_seq =
                 next_state_change_sequence(&mut state.state_change_sequences, &terminal);
             let transition = Transition {
-                from: "working".to_owned(),
+                from: STATUS_WORKING.to_owned(),
                 to: status.clone(),
                 terminal_id: terminal.clone(),
                 agent: prior_agent,
@@ -410,7 +412,7 @@ async fn process_snapshot(
                 eprintln!("{error}");
             }
         }
-    } else if status == "blocked" && state.blocked_capture_attempts.contains_key(&terminal) {
+    } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
         retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
     }
     state
@@ -457,7 +459,7 @@ async fn deliver_postable_transition(
         return Ok(());
     };
     let (client, guild, owner_id, responder) = connection;
-    if transition.to == "blocked" {
+    if transition.to == STATUS_BLOCKED {
         handle_blocked_card(BlockedCardContext {
             client: client.as_ref(),
             guild: *guild,
@@ -545,7 +547,7 @@ async fn retry_pending_blocked_capture(
         route: &route,
         snapshot,
         terminal,
-        from_status: "blocked",
+        from_status: STATUS_BLOCKED,
         blocked_since: state.blocked_since.get(terminal),
         state_change_seq,
         informational_cards: &mut state.informational_cards,
@@ -563,7 +565,7 @@ fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
 }
 
 fn capture_for(snapshot: &AgentSnapshot) -> Result<AgentLogCapture, String> {
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not configured".to_owned())?;
+    let home = std::env::var_os(ENV_HOME).ok_or_else(|| "HOME is not configured".to_owned())?;
     capture_for_with_search_root(snapshot, Path::new(&home))
 }
 
@@ -593,7 +595,7 @@ fn resolve_session_path(
     session: &AgentSession,
 ) -> Result<PathBuf, String> {
     match session.agent.as_str() {
-        "claude" => {
+        VENDOR_CLAUDE => {
             let cwd = snapshot
                 .cwd
                 .as_deref()
@@ -625,7 +627,7 @@ fn resolve_session_path(
                 .collect::<Vec<_>>();
             unique_existing_path(&existing, "claude session log")
         }
-        "codex" => find_unique_session_path(
+        VENDOR_CODEX => find_unique_session_path(
             &search_root.join(".codex/sessions"),
             &session.value,
             |path| {
@@ -641,7 +643,7 @@ fn resolve_session_path(
             },
             "codex session log",
         ),
-        "cursor" => {
+        VENDOR_CURSOR => {
             let chats = search_root.join(".cursor/chats");
             let mut candidates = Vec::new();
             for workspace in read_directories(&chats, "Cursor chat directory")? {
@@ -733,7 +735,7 @@ fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
 }
 
 fn capture_for_blocked(snapshot: &AgentSnapshot) -> AgentLogCapture {
-    std::env::var_os("HOME").map_or_else(
+    std::env::var_os(ENV_HOME).map_or_else(
         || AgentLogCapture {
             message: "blocked context unavailable: HOME is not configured".to_owned(),
             failure: None,
@@ -964,15 +966,15 @@ fn discord_connection(
     topology_cache: TopologyCache,
 ) -> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
     match (
-        std::env::var("DISCORD_TOKEN"),
-        std::env::var("DISCORD_GUILD_ID"),
-        std::env::var("DISCORD_OWNER_ID"),
+        std::env::var(ENV_DISCORD_TOKEN),
+        std::env::var(ENV_DISCORD_GUILD_ID),
+        std::env::var(ENV_DISCORD_OWNER_ID),
     ) {
         (Ok(token), Ok(guild_id), Ok(owner_id)) => {
             let config = load_discord_config(&[
-                ("DISCORD_TOKEN", &token),
-                ("DISCORD_GUILD_ID", &guild_id),
-                ("DISCORD_OWNER_ID", &owner_id),
+                (ENV_DISCORD_TOKEN, &token),
+                (ENV_DISCORD_GUILD_ID, &guild_id),
+                (ENV_DISCORD_OWNER_ID, &owner_id),
             ])?;
             let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
             let client = Arc::new(Client::builder().token(config.token.clone()).build());
@@ -1107,9 +1109,9 @@ fn parse_hook_args(
                     .get(index)
                     .ok_or("--vendor requires claude, codex, or cursor")?;
                 vendor = Some(match value.as_str() {
-                    "claude" => PermissionVendor::Claude,
-                    "codex" => PermissionVendor::Codex,
-                    "cursor" => PermissionVendor::Cursor,
+                    VENDOR_CLAUDE => PermissionVendor::Claude,
+                    VENDOR_CODEX => PermissionVendor::Codex,
+                    VENDOR_CURSOR => PermissionVendor::Cursor,
                     _ => return Err("--vendor requires claude, codex, or cursor".to_owned()),
                 });
             }
@@ -1131,13 +1133,13 @@ fn parse_hook_args(
 async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path(&args)
         .ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
-    let token = std::env::var("DISCORD_TOKEN")?;
-    let guild_id = std::env::var("DISCORD_GUILD_ID")?;
-    let owner_id = std::env::var("DISCORD_OWNER_ID")?;
+    let token = std::env::var(ENV_DISCORD_TOKEN)?;
+    let guild_id = std::env::var(ENV_DISCORD_GUILD_ID)?;
+    let owner_id = std::env::var(ENV_DISCORD_OWNER_ID)?;
     let config = load_discord_config(&[
-        ("DISCORD_TOKEN", &token),
-        ("DISCORD_GUILD_ID", &guild_id),
-        ("DISCORD_OWNER_ID", &owner_id),
+        (ENV_DISCORD_TOKEN, &token),
+        (ENV_DISCORD_GUILD_ID, &guild_id),
+        (ENV_DISCORD_OWNER_ID, &owner_id),
     ])?;
     let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
     let client = Arc::new(Client::builder().token(config.token.clone()).build());
@@ -1201,7 +1203,7 @@ fn canonical_event_name(event: &str) -> String {
 }
 
 fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
-    match canonical_event_name(event.get("event")?.as_str()?).as_str() {
+    match canonical_event_name(event.get(EVENT_KEY)?.as_str()?).as_str() {
         "pane_created" => event
             .pointer("/data/pane/pane_id")
             .and_then(serde_json::Value::as_str)
@@ -1241,7 +1243,7 @@ enum TopologyClosure {
 }
 
 fn lifecycle_closure(event: &serde_json::Value) -> Option<TopologyClosure> {
-    match canonical_event_name(event.get("event")?.as_str()?).as_str() {
+    match canonical_event_name(event.get(EVENT_KEY)?.as_str()?).as_str() {
         "tab_closed" => Some(TopologyClosure::Tab {
             workspace_id: event.pointer("/data/workspace_id")?.as_str()?.to_owned(),
             tab_id: event.pointer("/data/tab_id")?.as_str()?.to_owned(),

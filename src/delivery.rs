@@ -9,6 +9,12 @@ const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
 const STARTUP_COMPONENT_MASK: u64 = (1_u64 << 44) - 1;
 const PAYLOAD_COMPONENT_MASK: u64 = (1_u64 << 52) - 1;
+const COMPONENT_TYPE_KEY: &str = "type";
+const PAYLOAD_CONTENT_KEY: &str = "content";
+const PAYLOAD_EMBEDS_KEY: &str = "embeds";
+const PAYLOAD_COMPONENTS_KEY: &str = "components";
+const ALLOWED_MENTIONS_KEY: &str = "allowed_mentions";
+const ALLOWED_MENTIONS_PARSE_KEY: &str = "parse";
 static PROCESS_START_COMPONENT: OnceLock<u64> = OnceLock::new();
 
 /// Derives one process-stable nonce for a transition card delivery.
@@ -52,10 +58,10 @@ pub async fn expire_informational_card(
     content: &str,
 ) -> Result<(), String> {
     let payload = serde_json::json!({
-        "content": content,
-        "embeds": [],
-        "components": [],
-        "allowed_mentions": {"parse": []},
+        PAYLOAD_CONTENT_KEY: content,
+        PAYLOAD_EMBEDS_KEY: [],
+        PAYLOAD_COMPONENTS_KEY: [],
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
     let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
     client
@@ -80,13 +86,13 @@ pub async fn deliver_permission_card(
     token: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
     let payload = serde_json::json!({
-        "embeds": [{
+        PAYLOAD_EMBEDS_KEY: [{
             "title": permission_card_title(vendor),
             "description": permission_card_description(tool, command),
             "color": 0x00f1_c40f,
         }],
-        "components": permission_components(token, false),
-        "allowed_mentions": {"parse": []},
+        PAYLOAD_COMPONENTS_KEY: permission_components(token, false),
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
     let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
     client
@@ -166,9 +172,9 @@ pub async fn expire_permission_card(
     content: &str,
 ) -> Result<(), String> {
     let payload = serde_json::json!({
-        "content": content,
-        "components": permission_components(token, true),
-        "allowed_mentions": {"parse": []},
+        PAYLOAD_CONTENT_KEY: content,
+        PAYLOAD_COMPONENTS_KEY: permission_components(token, true),
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
     let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
     client
@@ -181,10 +187,10 @@ pub async fn expire_permission_card(
 
 fn permission_components(token: &str, disabled: bool) -> serde_json::Value {
     serde_json::json!([{
-        "type": 1,
-        "components": [
-            {"type": 2, "style": 3, "label": "Allow", "custom_id": format!("herdr:allow:{token}"), "disabled": disabled},
-            {"type": 2, "style": 4, "label": "Deny", "custom_id": format!("herdr:deny:{token}"), "disabled": disabled}
+        COMPONENT_TYPE_KEY: 1,
+        PAYLOAD_COMPONENTS_KEY: [
+            {COMPONENT_TYPE_KEY: 2, "style": 3, "label": "Allow", "custom_id": format!("herdr:allow:{token}"), "disabled": disabled},
+            {COMPONENT_TYPE_KEY: 2, "style": 4, "label": "Deny", "custom_id": format!("herdr:deny:{token}"), "disabled": disabled}
         ]
     }])
 }
@@ -217,9 +223,9 @@ async fn deliver_payload(
         .and_then(|message| message.mention.as_deref())
         .unwrap_or_default();
     let payload = serde_json::json!({
-        "content": message_content,
-        "embeds": [embed],
-        "allowed_mentions": allowed,
+        PAYLOAD_CONTENT_KEY: message_content,
+        PAYLOAD_EMBEDS_KEY: [embed],
+        ALLOWED_MENTIONS_KEY: allowed,
         "nonce": nonce,
         "enforce_nonce": true,
     });
@@ -237,16 +243,16 @@ async fn deliver_payload(
 
 fn allowed_mentions(card: Option<&TransitionMessage>) -> Value {
     let Some(owner_mention) = card.and_then(|message| message.mention.as_deref()) else {
-        return json!({"parse": []});
+        return json!({ALLOWED_MENTIONS_PARSE_KEY: []});
     };
     let Some(owner_id) = owner_mention
         .strip_prefix("<@")
         .and_then(|mention| mention.strip_suffix('>'))
         .filter(|owner_id| !owner_id.is_empty())
     else {
-        return json!({"parse": []});
+        return json!({ALLOWED_MENTIONS_PARSE_KEY: []});
     };
-    json!({"parse": [], "users": [owner_id]})
+    json!({ALLOWED_MENTIONS_PARSE_KEY: [], "users": [owner_id]})
 }
 
 fn bounded_nonce(nonce: &str) -> String {

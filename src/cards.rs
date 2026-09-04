@@ -1,3 +1,4 @@
+use crate::herdr::STATUS_BLOCKED;
 use crate::watcher::Transition;
 use std::time::Duration;
 
@@ -97,7 +98,7 @@ pub fn create_transition_messages(
     capture: &AgentLogCapture,
     owner: &str,
 ) -> Vec<TransitionMessage> {
-    let mut body = if transition.to == "blocked" {
+    let mut body = if transition.to == STATUS_BLOCKED {
         capture
             .question
             .as_deref()
@@ -112,7 +113,7 @@ pub fn create_transition_messages(
     }
     let color = if capture.failure.is_some() {
         0x00ed_4245
-    } else if transition.to == "blocked" {
+    } else if transition.to == STATUS_BLOCKED {
         0x00fe_e75c
     } else {
         0x0057_f287
@@ -130,7 +131,7 @@ pub fn create_transition_messages(
         .map(|(i, description)| TransitionMessage {
             description,
             color,
-            mention: (transition.to == "blocked" && i == 0).then(|| format!("<@{owner}>")),
+            mention: (transition.to == STATUS_BLOCKED && i == 0).then(|| format!("<@{owner}>")),
         })
         .collect()
 }

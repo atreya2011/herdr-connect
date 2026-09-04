@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// The Claude hook event name for a synchronous permission request.
+const PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
+
+pub const VENDOR_CLAUDE: &str = "claude";
+pub const VENDOR_CODEX: &str = "codex";
+pub const VENDOR_CURSOR: &str = "cursor";
+
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 pub struct ClaudePermissionRequest {
     pub session_id: String,
@@ -97,7 +104,7 @@ impl Decision {
 pub fn decode_claude_permission_request(input: &[u8]) -> Result<Interaction, String> {
     let request: ClaudePermissionRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
-    if request.hook_event_name != "PermissionRequest" {
+    if request.hook_event_name != PERMISSION_REQUEST_EVENT {
         return Err("unexpected Claude hook event".to_owned());
     }
     Ok(Interaction {
@@ -121,7 +128,7 @@ pub fn decode_claude_permission_request(input: &[u8]) -> Result<Interaction, Str
 pub fn decode_codex_permission_request(input: &[u8]) -> Result<Interaction, String> {
     let request: CodexPermissionRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
-    if request.hook_event_name != "PermissionRequest" {
+    if request.hook_event_name != PERMISSION_REQUEST_EVENT {
         return Err("unexpected Codex hook event".to_owned());
     }
     Ok(Interaction {
@@ -200,7 +207,7 @@ pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
 fn encode_permission_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&serde_json::json!({
         "hookSpecificOutput": {
-            "hookEventName": "PermissionRequest",
+            "hookEventName": PERMISSION_REQUEST_EVENT,
             "decision": decision,
         },
     }))

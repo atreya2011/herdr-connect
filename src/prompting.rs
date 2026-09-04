@@ -3,7 +3,10 @@
 //! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
 //! message creation responses do not carry the guild identifier required by the gateway handler.
 
-use crate::herdr::{PROMPT_ACKNOWLEDGED_UNCONFIRMED, agent_prompt, agent_send_keys};
+use crate::herdr::{
+    PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
+    agent_prompt, agent_send_keys,
+};
 use crate::{AgentSnapshot, list_agents};
 use std::future::Future;
 use std::sync::Arc;
@@ -169,9 +172,9 @@ fn resolve_prompt_pane(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "refused: unmapped pane".to_owned())?;
     match agent.agent_status.trim() {
-        "idle" | "done" => Ok(pane_id.to_owned()),
-        "working" => Err("refused: agent state is working".to_owned()),
-        "blocked" => Err("refused: agent state is blocked".to_owned()),
+        STATUS_IDLE | STATUS_DONE => Ok(pane_id.to_owned()),
+        STATUS_WORKING => Err("refused: agent state is working".to_owned()),
+        STATUS_BLOCKED => Err("refused: agent state is blocked".to_owned()),
         "" => Err("refused: agent state is unknown".to_owned()),
         state => Err(format!("refused: agent state is {state}")),
     }
@@ -207,7 +210,7 @@ fn pane_left_idle(target: &str, bound: Duration) -> bool {
     loop {
         let left_idle = list_agents().is_ok_and(|agents| {
             agents.iter().any(|agent| {
-                agent.pane_id.as_deref() == Some(target) && agent.agent_status.trim() != "idle"
+                agent.pane_id.as_deref() == Some(target) && agent.agent_status.trim() != STATUS_IDLE
             })
         });
         if left_idle {
@@ -266,7 +269,7 @@ async fn pane_still_working(pane_id: &str) -> Result<bool, String> {
 #[must_use]
 fn pane_status_is_working(agents: &[AgentSnapshot], pane_id: &str) -> bool {
     agents.iter().any(|agent| {
-        agent.pane_id.as_deref() == Some(pane_id) && agent.agent_status.trim() == "working"
+        agent.pane_id.as_deref() == Some(pane_id) && agent.agent_status.trim() == STATUS_WORKING
     })
 }
 

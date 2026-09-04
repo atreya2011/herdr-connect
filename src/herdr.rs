@@ -1,3 +1,4 @@
+use crate::config::ENV_HOME;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -7,13 +8,33 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+pub const STATUS_IDLE: &str = "idle";
+pub const STATUS_WORKING: &str = "working";
+pub const STATUS_BLOCKED: &str = "blocked";
+pub const STATUS_DONE: &str = "done";
+
+pub const EVENT_KEY: &str = "event";
+
+const SUBSCRIPTION_TYPE_KEY: &str = "type";
+
+/// Key for a JSON-RPC message's request/response correlation identifier.
+const RPC_ID_KEY: &str = "id";
+/// Key for a Herdr error object's machine-readable code.
+const ERROR_CODE_KEY: &str = "code";
+/// Key for a JSON-RPC response's error object.
+const ERROR_KEY: &str = "error";
+/// Key for a Herdr error object's human-readable message.
+const ERROR_MESSAGE_KEY: &str = "message";
+/// Key for the Herdr pane or agent targeted by an RPC call.
+const TARGET_KEY: &str = "target";
+
 static RPC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn herdr_socket_path() -> String {
     std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
         format!(
             "{}/.config/herdr/herdr.sock",
-            std::env::var("HOME").unwrap_or_default()
+            std::env::var(ENV_HOME).unwrap_or_default()
         )
     })
 }
@@ -60,7 +81,7 @@ fn request_rpc_result_with_params_and_timeout(
     }
     let path = herdr_socket_path();
     let id = next_rpc_id();
-    let request = serde_json::json!({"id": id, "method": method, "params": params});
+    let request = serde_json::json!({RPC_ID_KEY: id, "method": method, "params": params});
     let result = (|| -> Result<Value, String> {
         let address = SocketAddr::from_pathname(&path).map_err(|e| e.to_string())?;
         let (sender, receiver) = mpsc::channel();
@@ -83,18 +104,18 @@ fn request_rpc_result_with_params_and_timeout(
             .read_line(&mut line)
             .map_err(|e| e.to_string())?;
         let response: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-        if let Some(error) = response.get("error") {
+        if let Some(error) = response.get(ERROR_KEY) {
             return Err(format!(
                 "herdr {method} failed: {} {}",
-                error.get("code").map_or(Value::Null, Clone::clone),
+                error.get(ERROR_CODE_KEY).map_or(Value::Null, Clone::clone),
                 error
-                    .get("message")
+                    .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
             ));
         }
         let returned_id = response
-            .get("id")
+            .get(RPC_ID_KEY)
             .and_then(Value::as_str)
             .unwrap_or("<missing>");
         if returned_id != id {
@@ -135,10 +156,10 @@ fn is_agent_prompt_stalled(error: &str) -> bool {
 /// Returns socket, protocol, or Herdr-declared submission errors.
 pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
     let params = json!({
-        "target": target,
+        TARGET_KEY: target,
         "text": text,
         "wait": {
-            "until": ["idle", "done", "blocked", "working"],
+            "until": [STATUS_IDLE, STATUS_DONE, STATUS_BLOCKED, STATUS_WORKING],
             "timeout_ms": 6000,
         },
     });
@@ -155,7 +176,10 @@ pub fn agent_prompt(target: &str, text: &str) -> Result<String, String> {
 ///
 /// Returns socket, protocol, or Herdr-declared errors.
 pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
-    request_rpc_result_with_params("agent.send_keys", &json!({"target": target, "keys": keys}))
+    request_rpc_result_with_params(
+        "agent.send_keys",
+        &json!({TARGET_KEY: target, "keys": keys}),
+    )
 }
 
 /// Reads a pane's Herdr detection snapshot: the TUI-state detector's own screen render, distinct
@@ -167,7 +191,7 @@ pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
 pub fn agent_read_detection(target: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(&request_rpc_result_with_params(
         "agent.read",
-        &json!({"target": target, "source": "detection", "strip_ansi": true}),
+        &json!({TARGET_KEY: target, "source": "detection", "strip_ansi": true}),
     )?)
     .map_err(|error| error.to_string())?;
     value
@@ -267,11 +291,11 @@ pub fn workspace_list_result() -> Result<Vec<HerdrWorkspace>, String> {
 #[must_use]
 pub fn lifecycle_subscriptions() -> Vec<Value> {
     vec![
-        json!({"type": "pane.created"}),
-        json!({"type": "pane.closed"}),
-        json!({"type": "pane.agent_detected"}),
-        json!({"type": "tab.closed"}),
-        json!({"type": "workspace.closed"}),
+        json!({SUBSCRIPTION_TYPE_KEY: "pane.created"}),
+        json!({SUBSCRIPTION_TYPE_KEY: "pane.closed"}),
+        json!({SUBSCRIPTION_TYPE_KEY: "pane.agent_detected"}),
+        json!({SUBSCRIPTION_TYPE_KEY: "tab.closed"}),
+        json!({SUBSCRIPTION_TYPE_KEY: "workspace.closed"}),
     ]
 }
 
@@ -281,7 +305,7 @@ pub fn lifecycle_subscriptions() -> Vec<Value> {
 pub fn status_subscriptions(pane_ids: &[String]) -> Vec<Value> {
     pane_ids
         .iter()
-        .map(|pane_id| json!({"type": "pane.agent_status_changed", "pane_id": pane_id}))
+        .map(|pane_id| json!({SUBSCRIPTION_TYPE_KEY: "pane.agent_status_changed", "pane_id": pane_id}))
         .collect()
 }
 
@@ -330,7 +354,7 @@ pub async fn subscribe_herdr_events(
     let path = herdr_socket_path();
     let id = next_rpc_id();
     let request = json!({
-        "id": id,
+        RPC_ID_KEY: id,
         "method": "events.subscribe",
         "params": {"subscriptions": subscriptions},
     });
@@ -361,21 +385,21 @@ pub async fn subscribe_herdr_events(
         }
         let response: Value = serde_json::from_str(&line)
             .map_err(|error| SubscribeError::Other(error.to_string()))?;
-        if let Some(error) = response.get("error") {
-            if error.get("code").and_then(Value::as_str) == Some("pane_not_found") {
+        if let Some(error) = response.get(ERROR_KEY) {
+            if error.get(ERROR_CODE_KEY).and_then(Value::as_str) == Some("pane_not_found") {
                 return Err(SubscribeError::PaneNotFound);
             }
             return Err(SubscribeError::Other(format!(
                 "herdr events.subscribe failed: {} {}",
-                error.get("code").map_or(Value::Null, Clone::clone),
+                error.get(ERROR_CODE_KEY).map_or(Value::Null, Clone::clone),
                 error
-                    .get("message")
+                    .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
             )));
         }
         let returned_id = response
-            .get("id")
+            .get(RPC_ID_KEY)
             .and_then(Value::as_str)
             .unwrap_or("<missing>");
         if returned_id != id {
@@ -415,17 +439,17 @@ impl HerdrSubscription {
             return Err("herdr subscribe stream closed".to_owned());
         }
         let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
-        if let Some(error) = value.get("error") {
+        if let Some(error) = value.get(ERROR_KEY) {
             return Err(format!(
                 "herdr subscribe event error: {} {}",
-                error.get("code").map_or(Value::Null, Clone::clone),
+                error.get(ERROR_CODE_KEY).map_or(Value::Null, Clone::clone),
                 error
-                    .get("message")
+                    .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
             ));
         }
-        if value.get("event").and_then(Value::as_str).is_none() {
+        if value.get(EVENT_KEY).and_then(Value::as_str).is_none() {
             return Err(format!("herdr subscribe line was not an event: {value}"));
         }
         Ok(value)
