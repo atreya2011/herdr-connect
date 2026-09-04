@@ -1,7 +1,9 @@
-use herdr_connect_rs::{list_agents, submit_owner_prompt, tab_list_result};
-use serde_json::Value;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use herdr_connect_rs::{list_agents, submit_owner_prompt, tab_list_result};
 
 const LABEL_PREFIX: &str = "testrun-stall";
 const PROMPT_TEXT: &str = "Reply with exactly the word acknowledged and nothing else.";

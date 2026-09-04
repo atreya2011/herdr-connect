@@ -1,10 +1,12 @@
-use crate::{AgentSnapshot, HerdrTab, format_thread_name};
 use std::collections::HashSet;
 use std::sync::Arc;
+
 use tokio::sync::Mutex;
 use twilight_model::channel::Channel;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker};
+
+use crate::{AgentSnapshot, HerdrTab, format_thread_name};
 
 /// Shared, per-process cache of one guild's channel list and active-thread list, reused across
 /// tabs so a startup sweep does not refetch both lists for every tab.

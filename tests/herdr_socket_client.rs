@@ -1,5 +1,6 @@
-use herdr_connect_rs::request_rpc_result;
 use serde_json::Value;
+
+use herdr_connect_rs::request_rpc_result;
 
 #[test]
 fn real_socket_read_only_contract() {

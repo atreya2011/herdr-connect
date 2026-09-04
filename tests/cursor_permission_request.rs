@@ -1,7 +1,9 @@
-use herdr_connect_rs::{Decision, decode_cursor_permission_request, encode_cursor_decision};
-use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
+
+use serde_json::Value;
+
+use herdr_connect_rs::{Decision, decode_cursor_permission_request, encode_cursor_decision};
 
 #[test]
 fn captured_cursor_permission_fixture_decodes_into_interaction() {

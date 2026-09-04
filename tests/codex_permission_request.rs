@@ -1,5 +1,6 @@
-use herdr_connect_rs::{Decision, decode_codex_permission_request, encode_codex_decision};
 use serde_json::Value;
+
+use herdr_connect_rs::{Decision, decode_codex_permission_request, encode_codex_decision};
 
 #[test]
 fn codex_permission_fixture_decodes_and_encodes_allow_and_deny() {

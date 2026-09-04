@@ -4,13 +4,15 @@ mod support;
 
 #[cfg(unix)]
 mod real_guild {
-    use super::support::{Guild, channel, cleanup, guild};
-    use herdr_connect_rs::maintain_typing_until_settled;
-    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use serial_test::serial;
     use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
+
+    use super::support::{Guild, channel, cleanup, guild};
+    use herdr_connect_rs::maintain_typing_until_settled;
 
     #[tokio::test]
     #[serial]

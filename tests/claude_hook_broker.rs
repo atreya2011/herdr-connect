@@ -1,14 +1,16 @@
-use herdr_connect_rs::{
-    ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction, PermissionVendor,
-    decode_claude_permission_request, encode_claude_decision, request_decision,
-};
-use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+use herdr_connect_rs::{
+    ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction, PermissionVendor,
+    decode_claude_permission_request, encode_claude_decision, request_decision,
+};
 
 const DEFAULT_FIXTURE: &str = include_str!("fixtures/claude-permission-request/default.json");
 const ALLOW_FIXTURE: &str = include_str!("fixtures/claude-permission-request/allow.json");

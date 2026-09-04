@@ -1,5 +1,6 @@
-use herdr_connect_rs::{AgentSession, read_agent_log};
 use std::{fs, path::Path};
+
+use herdr_connect_rs::{AgentSession, read_agent_log};
 
 #[test]
 fn read_captured_vendor_logs() {

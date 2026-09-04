@@ -1,11 +1,3 @@
-use crate::delivery::expire_permission_card;
-use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
-use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
-use crate::{
-    TopologyCache, deliver_permission_card, fetch_topology_lists, list_agents, route_topology,
-    sync_topology, tab_list_result,
-};
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::io;
@@ -13,6 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, oneshot};
@@ -25,6 +19,14 @@ use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
 use twilight_model::id::{Id, marker::GuildMarker};
+
+use crate::delivery::expire_permission_card;
+use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
+use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
+use crate::{
+    TopologyCache, deliver_permission_card, fetch_topology_lists, list_agents, route_topology,
+    sync_topology, tab_list_result,
+};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
@@ -675,18 +677,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+    use tokio::sync::oneshot;
+
     use super::{
         BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingKey, PendingRequests,
         PermissionResponder, correlate_decision, read_json_line, return_decision_before_card_edit,
         spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
-    use tokio::sync::oneshot;
 
     fn interaction() -> Interaction {
         Interaction {

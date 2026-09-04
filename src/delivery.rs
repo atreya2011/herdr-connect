@@ -1,9 +1,11 @@
-use crate::cards::TransitionMessage;
-use crate::permission::PermissionVendor;
-use serde_json::{Value, json};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
 use twilight_model::channel::message::Embed;
+
+use crate::cards::TransitionMessage;
+use crate::permission::PermissionVendor;
 
 const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
@@ -308,13 +310,14 @@ fn new_process_start_component() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
         MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
         permission_card_description, permission_card_title, transition_card_nonce_for_start,
     };
     use crate::cards::TransitionMessage;
     use crate::permission::PermissionVendor;
-    use serde_json::json;
 
     #[test]
     fn allowed_mentions_only_allows_the_blocked_card_owner() {

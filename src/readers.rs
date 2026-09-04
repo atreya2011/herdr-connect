@@ -1,9 +1,11 @@
-use crate::herdr::AgentSession;
-use crate::permission::{VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR};
+use std::path::Path;
+
 use rusqlite::{Connection, OpenFlags};
 use serde::de::Error as _;
 use serde_json::Value;
-use std::path::Path;
+
+use crate::herdr::AgentSession;
+use crate::permission::{VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR};
 
 const POINTER: &str = "agent stopped, no log available";
 /// Key for a vendor log record's own type field (Claude: `user`/`assistant`; Codex: `turn_context`/`event_msg`).

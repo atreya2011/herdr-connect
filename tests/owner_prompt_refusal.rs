@@ -24,10 +24,11 @@ mod support;
 
 #[cfg(unix)]
 mod real_guild {
-    use super::support::{Guild, channel, cleanup, guild};
-    use herdr_connect_rs::should_handle_owner_message;
     use serial_test::serial;
     use twilight_model::id::{Id, marker::UserMarker};
+
+    use super::support::{Guild, channel, cleanup, guild};
+    use herdr_connect_rs::should_handle_owner_message;
 
     #[tokio::test]
     #[serial]

@@ -3,14 +3,10 @@
 //! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
 //! message creation responses do not carry the guild identifier required by the gateway handler.
 
-use crate::herdr::{
-    PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-    agent_prompt, agent_send_keys,
-};
-use crate::{AgentSnapshot, list_agents};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 use twilight_http::Client;
 use twilight_model::{
     channel::{ChannelType, Message},
@@ -19,6 +15,12 @@ use twilight_model::{
         marker::{ChannelMarker, GuildMarker},
     },
 };
+
+use crate::herdr::{
+    PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
+    agent_prompt, agent_send_keys,
+};
+use crate::{AgentSnapshot, list_agents};
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
@@ -289,13 +291,14 @@ async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+    use twilight_model::channel::ChannelType;
+
     use super::{
         agent_list_failure_reply, has_prompt_content, is_thread_channel, pane_status_is_working,
         prompt_surface_markers, resolve_prompt_pane,
     };
     use crate::AgentSnapshot;
-    use serde_json::Value;
-    use twilight_model::channel::ChannelType;
 
     #[test]
     fn empty_prompt_content_is_refused_before_herdr() {

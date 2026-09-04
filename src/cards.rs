@@ -1,6 +1,7 @@
+use std::time::Duration;
+
 use crate::herdr::STATUS_BLOCKED;
 use crate::watcher::Transition;
-use std::time::Duration;
 
 const MAX_PART_LENGTH: usize = 1_900;
 const MAX_THREAD_NAME_LENGTH: usize = 100;
@@ -262,8 +263,9 @@ pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH, create_unsupported_blocked_card};
     use std::time::Duration;
+
+    use super::{MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH, create_unsupported_blocked_card};
 
     #[test]
     fn unsupported_blocked_card_is_informational_and_bounded() {

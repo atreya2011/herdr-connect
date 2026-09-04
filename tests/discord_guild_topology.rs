@@ -7,9 +7,10 @@ mod support;
 
 #[cfg(unix)]
 mod real_guild {
+    use serial_test::serial;
+
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{TopologyRoute, fetch_topology_lists, sync_topology};
-    use serial_test::serial;
 
     #[tokio::test]
     #[serial]

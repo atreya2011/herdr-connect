@@ -1,5 +1,6 @@
-use herdr_connect_rs::{AgentSnapshot, HerdrTab, route_topology};
 use serde_json::Value;
+
+use herdr_connect_rs::{AgentSnapshot, HerdrTab, route_topology};
 
 #[test]
 fn route_captured_herdr_snapshots() {

@@ -1,3 +1,16 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use twilight_http::Client;
+use twilight_model::id::{
+    Id,
+    marker::{ChannelMarker, GuildMarker, MessageMarker},
+};
+
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
@@ -16,17 +29,6 @@ use herdr_connect_rs::{
     decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
     encode_cursor_decision, handle_component, request_decision,
     run_broker as run_permission_broker,
-};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use twilight_http::Client;
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, GuildMarker, MessageMarker},
 };
 
 type DiscordConnection = (
@@ -1660,6 +1662,21 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use serde_json::{Value, json};
+    use serial_test::serial;
+    use twilight_model::id::{
+        Id,
+        marker::{ChannelMarker, GuildMarker, MessageMarker},
+    };
+
     use super::{
         BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
         InformationalCard, Membership, PermissionResponder, TopologyClosure, TopologyRoute,
@@ -1674,19 +1691,6 @@ mod tests {
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
         subscribe_herdr_events, transition_card_nonce, workspace_list_result,
-    };
-    use serde_json::{Value, json};
-    use serial_test::serial;
-    use std::collections::{HashMap, HashSet};
-    use std::fs;
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    use twilight_model::id::{
-        Id,
-        marker::{ChannelMarker, GuildMarker, MessageMarker},
     };
 
     #[test]

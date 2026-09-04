@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use std::{future::Future, sync::Arc};
+
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use twilight_gateway::{
     ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
@@ -139,9 +140,10 @@ fn gateway_closed_result() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{consume_in_order, gateway_closed_result};
     use std::sync::Arc;
     use std::time::Duration;
+
+    use super::{consume_in_order, gateway_closed_result};
 
     #[tokio::test]
     async fn owner_prompt_queue_consumes_messages_in_receive_order() {

@@ -1,4 +1,3 @@
-use crate::Decision;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -7,7 +6,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
 use tokio::sync::oneshot;
+
+use crate::Decision;
 const TOKEN_BYTES: usize = 24;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,11 +178,12 @@ impl InteractionRegistry {
 }
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalRequest, InteractionRegistry, ResolveError};
-    use crate::Decision;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    use super::{ApprovalRequest, InteractionRegistry, ResolveError};
+    use crate::Decision;
     fn request(channel_id: u64, session_id: &str) -> ApprovalRequest {
         ApprovalRequest {
             channel_id,
