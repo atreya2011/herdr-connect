@@ -32,7 +32,7 @@ fn read_captured_vendor_logs() {
     ];
     for (session, path, expected) in cases {
         assert_eq!(
-            read_agent_log(Some(session), Path::new(path))
+            read_agent_log(Some(&session), Path::new(path))
                 .unwrap()
                 .message,
             expected
@@ -60,7 +60,7 @@ fn read_agent_log_tolerates_one_incomplete_trailing_line() {
     ];
     for (session, path) in cases {
         let agent = session.agent.clone();
-        let result = read_agent_log(Some(session), Path::new(path));
+        let result = read_agent_log(Some(&session), Path::new(path));
         assert!(
             result.is_ok(),
             "{agent}: expected a truncated trailing line to be tolerated, got {result:?}"
@@ -68,7 +68,7 @@ fn read_agent_log_tolerates_one_incomplete_trailing_line() {
     }
 
     let claude = read_agent_log(
-        Some(AgentSession {
+        Some(&AgentSession {
             agent: "claude".into(),
             value: "session".into(),
         }),
@@ -84,7 +84,7 @@ fn read_agent_log_tolerates_one_incomplete_trailing_line() {
 #[test]
 fn read_agent_log_rejects_non_trailing_corruption() {
     let result = read_agent_log(
-        Some(AgentSession {
+        Some(&AgentSession {
             agent: "claude".into(),
             value: "session".into(),
         }),
@@ -107,7 +107,7 @@ fn missing_cursor_store_is_not_created() {
         let _ = fs::remove_file(&path);
 
         let result = read_agent_log(
-            Some(AgentSession {
+            Some(&AgentSession {
                 agent: agent.into(),
                 value: "session".into(),
             }),

@@ -39,7 +39,7 @@ pub struct AgentLog {
 /// # Errors
 ///
 /// Returns the stable pointer error when the session, file, or parsed response is unavailable.
-pub fn read_agent_log(session: Option<AgentSession>, path: &Path) -> Result<AgentLog, String> {
+pub fn read_agent_log(session: Option<&AgentSession>, path: &Path) -> Result<AgentLog, String> {
     let session = session.ok_or_else(|| POINTER.to_owned())?;
     if session.agent == VENDOR_CURSOR {
         if path.extension().and_then(|ext| ext.to_str()) == Some("json") {

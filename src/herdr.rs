@@ -109,7 +109,7 @@ fn request_rpc_result_with_params_and_timeout(
         if let Some(error) = response.get(ERROR_KEY) {
             return Err(format!(
                 "herdr {method} failed: {} {}",
-                error.get(ERROR_CODE_KEY).map_or(Value::Null, Clone::clone),
+                error.get(ERROR_CODE_KEY).unwrap_or(&Value::Null),
                 error
                     .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)
@@ -222,7 +222,7 @@ pub fn tab_list_result() -> Result<Vec<HerdrTab>, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "tab.list response did not contain tabs".to_owned())?
         .iter()
-        .map(|tab| serde_json::from_value(tab.clone()).map_err(|error| error.to_string()))
+        .map(|tab| HerdrTab::deserialize(tab).map_err(|error| error.to_string()))
         .collect()
 }
 
@@ -255,10 +255,7 @@ pub fn list_agents() -> Result<Vec<AgentSnapshot>, String> {
         .ok_or_else(|| "agent.list response did not contain agents".into())
         .and_then(|a| {
             a.iter()
-                .map(|v| {
-                    serde_json::from_value::<AgentSnapshot>(v.clone())
-                        .map_err(|error| error.to_string())
-                })
+                .map(|v| AgentSnapshot::deserialize(v).map_err(|error| error.to_string()))
                 .collect::<Result<Vec<_>, _>>()
         })
 }
@@ -282,9 +279,7 @@ pub fn workspace_list_result() -> Result<Vec<HerdrWorkspace>, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "workspace.list response did not contain workspaces".to_owned())?
         .iter()
-        .map(|workspace| {
-            serde_json::from_value(workspace.clone()).map_err(|error| error.to_string())
-        })
+        .map(|workspace| HerdrWorkspace::deserialize(workspace).map_err(|error| error.to_string()))
         .collect()
 }
 
@@ -393,7 +388,7 @@ pub async fn subscribe_herdr_events(
             }
             return Err(SubscribeError::Other(format!(
                 "herdr events.subscribe failed: {} {}",
-                error.get(ERROR_CODE_KEY).map_or(Value::Null, Clone::clone),
+                error.get(ERROR_CODE_KEY).unwrap_or(&Value::Null),
                 error
                     .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)
@@ -444,7 +439,7 @@ impl HerdrSubscription {
         if let Some(error) = value.get(ERROR_KEY) {
             return Err(format!(
                 "herdr subscribe event error: {} {}",
-                error.get(ERROR_CODE_KEY).map_or(Value::Null, Clone::clone),
+                error.get(ERROR_CODE_KEY).unwrap_or(&Value::Null),
                 error
                     .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)

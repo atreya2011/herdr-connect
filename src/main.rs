@@ -343,8 +343,7 @@ async fn process_snapshot(
         if old != status {
             let state_change_seq =
                 next_state_change_sequence(&mut state.state_change_sequences, &terminal);
-            let prior_status = old.clone();
-            let leaving_blocked = prior_status == STATUS_BLOCKED && status != STATUS_BLOCKED;
+            let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
             let mut transition = Transition {
                 from: old,
                 to: status.clone(),
@@ -575,14 +574,14 @@ fn capture_for_with_search_root(
     snapshot: &AgentSnapshot,
     search_root: &Path,
 ) -> Result<AgentLogCapture, String> {
-    let Some(session) = snapshot.session.clone() else {
+    let Some(session) = snapshot.session.as_ref() else {
         return Ok(AgentLogCapture {
             message: "agent stopped, no log available".to_owned(),
             failure: None,
             question: None,
         });
     };
-    let path = resolve_session_path(search_root, snapshot, &session)?;
+    let path = resolve_session_path(search_root, snapshot, session)?;
     let log = herdr_connect_rs::read_agent_log(Some(session), &path)?;
     Ok(AgentLogCapture {
         message: log.message,
@@ -1013,15 +1012,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args();
     let _program = args.next();
     match args.next().as_deref() {
-        Some("hook") => return run_hook(args.collect()).await,
-        Some("broker") => return run_broker(args.collect()).await,
+        Some("hook") => {
+            let args: Vec<String> = args.collect();
+            return run_hook(&args).await;
+        }
+        Some("broker") => {
+            let args: Vec<String> = args.collect();
+            return run_broker(&args).await;
+        }
         _ => {}
     }
     run_bridge().await
 }
 
-async fn run_hook(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let (explicit_vendor, requested_socket) = parse_hook_args(&args)
+async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (explicit_vendor, requested_socket) = parse_hook_args(args)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
@@ -1132,9 +1137,9 @@ fn parse_hook_args(
     Ok((vendor, socket))
 }
 
-async fn run_broker(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_path = socket_path(&args)
-        .ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
+async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path =
+        socket_path(args).ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
     let token = std::env::var(ENV_DISCORD_TOKEN)?;
     let guild_id = std::env::var(ENV_DISCORD_GUILD_ID)?;
     let owner_id = std::env::var(ENV_DISCORD_OWNER_ID)?;
