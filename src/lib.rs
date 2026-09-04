@@ -30,9 +30,9 @@ pub use delivery::{
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
-    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, SubscribeError, agent_read_detection,
-    lifecycle_subscriptions, list_agents, request_rpc_result, status_subscriptions,
-    subscribe_herdr_events, tab_list_result,
+    AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, HerdrWorkspace, SubscribeError,
+    agent_read_detection, lifecycle_subscriptions, list_agents, request_rpc_result,
+    status_subscriptions, subscribe_herdr_events, tab_list_result, workspace_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
@@ -45,7 +45,8 @@ pub use prompting::{
 };
 pub use readers::{AgentLog, format_detection_question, read_agent_log};
 pub use topology::{
-    TopologyCache, TopologyRoute, archived_threads, fetch_topology_lists, reconcile_topology_cache,
-    route_topology, sync_topology, workspace_channel_name,
+    TopologyCache, TopologyRoute, archived_threads, delete_tab_thread,
+    delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
+    reconcile_topology_cache, route_topology, sync_topology, workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};

@@ -35,7 +35,6 @@ The startup sweep fetches guild channels and active threads once at its start in
 
 These behaviors existed as TypeScript product decisions or reviewed branches but are absent from the current Rust implementation. They are not part of the immediate handoff unless the owner prioritizes them.
 
-- [Close behavior](https://github.com/atreya2011/herdr-connect/issues/5): post one tab-closing note; let Discord archive the thread; move a closed workspace channel to an Archived category; never delete Discord topology.
 - [Dashboard and read commands](https://github.com/atreya2011/herdr-connect/issues/7): pinned cross-workspace status, ephemeral `/agents`, and on-demand `/read <tab_id>`.
 - [Operations](https://github.com/atreya2011/herdr-connect/issues/8): a systemd user service and a `doctor` preflight. The historical environment-file path is obsolete; this repository ignores `.env`.
 - [Rich result details](https://github.com/atreya2011/herdr-connect/issues/29): vendor-recorded model, effort, tool, token, plan, branch, changed-file, and bounded diff details, omitting fields the vendor does not record.
@@ -57,4 +56,4 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 - Blocked-only owner mentions; explicit mention allowlists; all other transitions are silent.
 - Owner-only semantic prompts inside qualifying mapped threads; all unrelated Discord surfaces remain silent.
 - Permission decisions are correlated, expiring, exactly once, and invalid when the requesting hook disconnects.
-- Discord topology is preserved. Archived threads may be revived; bridge-owned channels and threads are not deleted as normal lifecycle behavior.
+- A closed Herdr tab's thread is deleted; a closed Herdr workspace's channel is deleted (Discord removes its threads with it). Startup deletes every workspace channel and tab thread Herdr no longer lists. Deletion is the rule; nothing is archived.

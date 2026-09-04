@@ -391,3 +391,165 @@ pub async fn archived_threads(
         before = next_before;
     }
 }
+
+/// True when a Discord API error means the target channel or thread is already gone.
+fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
+    matches!(
+        error.kind(),
+        twilight_http::error::ErrorType::Response {
+            status,
+            error: twilight_http::api_error::ApiError::General(api_error),
+            ..
+        } if *status == twilight_http::response::StatusCode::NOT_FOUND && api_error.code == 10003
+    )
+}
+
+/// Deletes one Discord channel or thread, treating an already-deleted target as done.
+async fn delete_channel_if_present(
+    client: &twilight_http::Client,
+    id: Id<ChannelMarker>,
+) -> Result<(), String> {
+    match client.delete_channel(id).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_unknown_channel_error(&error) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The id of the channel whose topic identifies `workspace_id`, if one is present.
+fn workspace_channel_id(channels: &[Channel], workspace_id: &str) -> Option<Id<ChannelMarker>> {
+    let topic = format!("herdr workspace [{workspace_id}]");
+    channels
+        .iter()
+        .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+        .map(|channel| channel.id)
+}
+
+/// The workspace id named by a channel's `herdr workspace [id]` topic, if it has one.
+fn workspace_topic_id(channel: &Channel) -> Option<&str> {
+    channel
+        .topic
+        .as_deref()?
+        .strip_prefix("herdr workspace [")?
+        .strip_suffix(']')
+}
+
+/// The tab id named by a thread name's trailing ` [id]` suffix, if it has one.
+fn thread_tab_suffix(name: &str) -> Option<&str> {
+    let trimmed = name.strip_suffix(']')?;
+    trimmed.rfind(" [").map(|start| &trimmed[start + 2..])
+}
+
+/// Deletes the Discord thread identifying one closed Herdr tab.
+///
+/// Searches active threads first and the workspace channel's archived threads on a miss. A
+/// missing workspace channel or thread is not an error: the tab is already gone from Discord.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors, or a duplicate-thread topology error.
+pub async fn delete_tab_thread(
+    client: &twilight_http::Client,
+    channels: &[Channel],
+    active_threads: &mut Vec<Channel>,
+    workspace_id: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    let Some(workspace_channel) = workspace_channel_id(channels, workspace_id) else {
+        return Ok(());
+    };
+    let thread_suffix = format!(" [{tab_id}]");
+    let mut resolved =
+        single_matching_thread(active_threads, workspace_channel, &thread_suffix, tab_id)?;
+    if resolved.is_none() {
+        resolved = single_matching_thread(
+            &archived_threads(client, workspace_channel).await?,
+            workspace_channel,
+            &thread_suffix,
+            tab_id,
+        )?;
+    }
+    let Some(thread) = resolved else {
+        return Ok(());
+    };
+    delete_channel_if_present(client, thread.id).await?;
+    active_threads.retain(|entry| entry.id != thread.id);
+    Ok(())
+}
+
+/// Deletes the Discord channel representing one closed Herdr workspace, if one exists. Discord
+/// removes the channel's threads with it. A missing channel is not an error.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn delete_workspace_channel(
+    client: &twilight_http::Client,
+    channels: &mut Vec<Channel>,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let Some(channel_id) = workspace_channel_id(channels, workspace_id) else {
+        return Ok(());
+    };
+    delete_channel_if_present(client, channel_id).await?;
+    channels.retain(|channel| channel.id != channel_id);
+    Ok(())
+}
+
+/// Deletes every guild channel and tab thread that Herdr no longer lists.
+///
+/// A channel whose `herdr workspace [id]` topic names a workspace id absent from
+/// `live_workspace_ids` is deleted, and under each surviving workspace channel, a thread whose
+/// trailing ` [id]` suffix is that channel's own workspace id (Herdr tab ids are
+/// `<workspace_id>:t<...>`) and is absent from `live_tab_ids` is deleted. A thread whose suffix
+/// does not start with the channel's own workspace id is not bridge-owned and survives regardless
+/// of `live_tab_ids`. An empty `live_workspace_ids` or `live_tab_ids` is authoritative: everything
+/// bridge-owned and not named survives on nothing else, so it is deleted.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors, or a duplicate-thread topology error.
+pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>(
+    client: &twilight_http::Client,
+    channels: &mut Vec<Channel>,
+    active_threads: &mut Vec<Channel>,
+    live_workspace_ids: &HashSet<&str, S>,
+    live_tab_ids: &HashSet<&str, S>,
+) -> Result<(), String> {
+    let orphaned_workspace_ids: Vec<String> = channels
+        .iter()
+        .filter_map(workspace_topic_id)
+        .filter(|workspace_id| !live_workspace_ids.contains(workspace_id))
+        .map(ToOwned::to_owned)
+        .collect();
+    for workspace_id in orphaned_workspace_ids {
+        delete_workspace_channel(client, channels, &workspace_id).await?;
+    }
+    let surviving_channels: Vec<(Id<ChannelMarker>, String)> = channels
+        .iter()
+        .filter_map(|channel| {
+            workspace_topic_id(channel).map(|workspace_id| (channel.id, workspace_id.to_owned()))
+        })
+        .collect();
+    for (workspace_channel, workspace_id) in surviving_channels {
+        let mut threads: Vec<Channel> = active_threads
+            .iter()
+            .filter(|thread| thread.parent_id == Some(workspace_channel))
+            .cloned()
+            .collect();
+        threads.extend(archived_threads(client, workspace_channel).await?);
+        let tab_id_prefix = format!("{workspace_id}:t");
+        for thread in threads {
+            let Some(tab_id) = thread.name.as_deref().and_then(thread_tab_suffix) else {
+                continue;
+            };
+            // A bracket suffix that is not one of this workspace's own tab ids is an
+            // owner-made thread name coincidence, not a bridge-owned tab thread; leave it alone.
+            if tab_id.starts_with(&tab_id_prefix) && !live_tab_ids.contains(tab_id) {
+                delete_channel_if_present(client, thread.id).await?;
+                active_threads.retain(|entry| entry.id != thread.id);
+            }
+        }
+    }
+    Ok(())
+}

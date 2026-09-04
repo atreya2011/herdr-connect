@@ -1,12 +1,13 @@
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, HerdrSubscription, HerdrTab,
     TopologyCache, TopologyRoute, Transition, TransitionMessage, agent_read_detection,
-    create_transition_messages, create_unsupported_blocked_card, deliver_transition_card,
+    create_transition_messages, create_unsupported_blocked_card, delete_tab_thread,
+    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_transition_card,
     drive_gateway_with_components, expire_informational_card, fetch_topology_lists,
     format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
     list_agents, load_discord_config, reconcile_topology_cache, route_topology,
     status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
-    transition_card_nonce,
+    transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, decode_claude_permission_request,
@@ -802,11 +803,16 @@ async fn sync_route(
         .map_err(|error| format!("discord topology error: {error}"))
 }
 
-/// Ensures every workspace channel and tab thread exists before the event loop starts. A
-/// per-tab routing or naming error is logged and skipped; the lazy sync inside delivery still
-/// covers that tab once a card is due. The sweep refetches both lists once at its start rather
-/// than adopting whatever the shared cache already holds, so a cache that missed an earlier
-/// create cannot make the sweep recreate an existing channel or thread.
+/// Ensures every workspace channel and tab thread exists, then deletes every workspace channel
+/// and tab thread Herdr no longer lists. Runs in a spawned task beside the event loop rather than
+/// blocking it. A per-tab routing or
+/// naming error is logged and skipped; the lazy sync inside delivery still covers that tab once a
+/// card is due. The sweep refetches both lists once at its start rather than adopting whatever
+/// the shared cache already holds, so a cache that missed an earlier create cannot make the sweep
+/// recreate an existing channel or thread. The reconciliation pass that follows reuses this same
+/// cache rather than refetching per tab; an Ok but empty Herdr workspace or tab list is
+/// authoritative and deletes accordingly, while an Err from either Herdr call skips the whole
+/// delete pass with one logged error line.
 async fn sync_startup_topology(
     discord: &DiscordConnection,
     agents: &[AgentSnapshot],
@@ -847,6 +853,68 @@ async fn sync_startup_topology(
         drop(guard);
         if let Err(error) = result {
             eprintln!("herdr startup topology error: {error}");
+        }
+    }
+    let (workspaces, live_tabs) = match (workspace_list_result(), tab_list_result()) {
+        (Ok(workspaces), Ok(live_tabs)) => (workspaces, live_tabs),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("herdr startup topology reconciliation error: {error}");
+            return;
+        }
+    };
+    let live_workspace_ids: HashSet<&str> = workspaces
+        .iter()
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect();
+    let live_tab_ids: HashSet<&str> = live_tabs.iter().map(|tab| tab.tab_id.as_str()).collect();
+    let mut guard = topology_cache.lock().await;
+    let Some((channels, active_threads)) = guard.as_mut() else {
+        eprintln!("herdr startup topology error: topology cache was cleared");
+        return;
+    };
+    let result = delete_topology_absent_from_herdr(
+        client.as_ref(),
+        channels,
+        active_threads,
+        &live_workspace_ids,
+        &live_tab_ids,
+    )
+    .await;
+    drop(guard);
+    if let Err(error) = result {
+        eprintln!("herdr startup topology reconciliation error: {error}");
+    }
+}
+
+/// Applies one `tab.closed`/`workspace.closed` Herdr event to Discord: deletes the closed tab's
+/// thread or the closed workspace's channel. A missing target is not an error.
+async fn delete_closed_topology(
+    discord: Option<&DiscordConnection>,
+    closure: &TopologyClosure,
+) -> Result<(), String> {
+    let Some((client, guild, _, responder)) = discord else {
+        return Ok(());
+    };
+    let topology_cache = responder.topology_cache();
+    let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
+    let mut guard = topology_cache.lock().await;
+    let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
+    match closure {
+        TopologyClosure::Tab {
+            workspace_id,
+            tab_id,
+        } => {
+            delete_tab_thread(
+                client.as_ref(),
+                channels,
+                active_threads,
+                workspace_id,
+                tab_id,
+            )
+            .await
+        }
+        TopologyClosure::Workspace { workspace_id } => {
+            delete_workspace_channel(client.as_ref(), channels, workspace_id).await
         }
     }
 }
@@ -1160,6 +1228,31 @@ fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
     }
 }
 
+/// A Herdr `tab.closed`/`workspace.closed` event, naming the Discord topology it deletes.
+#[derive(Debug, PartialEq, Eq)]
+enum TopologyClosure {
+    Tab {
+        workspace_id: String,
+        tab_id: String,
+    },
+    Workspace {
+        workspace_id: String,
+    },
+}
+
+fn lifecycle_closure(event: &serde_json::Value) -> Option<TopologyClosure> {
+    match canonical_event_name(event.get("event")?.as_str()?).as_str() {
+        "tab_closed" => Some(TopologyClosure::Tab {
+            workspace_id: event.pointer("/data/workspace_id")?.as_str()?.to_owned(),
+            tab_id: event.pointer("/data/tab_id")?.as_str()?.to_owned(),
+        }),
+        "workspace_closed" => Some(TopologyClosure::Workspace {
+            workspace_id: event.pointer("/data/workspace_id")?.as_str()?.to_owned(),
+        }),
+        _ => None,
+    }
+}
+
 fn apply_membership(pane_ids: &mut Vec<String>, change: Membership) -> bool {
     match change {
         Membership::Add(id) => {
@@ -1298,6 +1391,11 @@ async fn handle_lifecycle_select_result(
                     return false;
                 };
                 runtime.status = next_status;
+            }
+            if let Some(closure) = lifecycle_closure(&event)
+                && let Err(error) = delete_closed_topology(discord, &closure).await
+            {
+                eprintln!("herdr topology closure error: {error}");
             }
             doorbell_unless_shutdown(
                 discord,
@@ -1561,18 +1659,19 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockedCardContext, BlockedResponse, BridgeState, Client, InformationalCard, Membership,
-        PermissionResponder, TopologyRoute, agent_read_detection, apply_membership,
-        capture_for_with_search_root, create_transition_messages, decide_blocked_response,
-        fetch_topology_lists, handle_blocked_card, lifecycle_membership, list_agents,
-        next_state_change_sequence, process_snapshot, prune_departed_state, resolve_session_path,
-        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
-        subscribe_status, subscribe_status_with_backoff, sync_route, sync_startup_topology,
-        tab_list_result,
+        BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
+        InformationalCard, Membership, PermissionResponder, TopologyClosure, TopologyRoute,
+        agent_read_detection, apply_membership, capture_for_with_search_root,
+        create_transition_messages, decide_blocked_response, fetch_topology_lists,
+        handle_blocked_card, handle_lifecycle_select_result, lifecycle_closure,
+        lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
+        prune_departed_state, resolve_session_path, route_topology,
+        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
+        subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
-        subscribe_herdr_events, transition_card_nonce,
+        subscribe_herdr_events, transition_card_nonce, workspace_list_result,
     };
     use serde_json::{Value, json};
     use serial_test::serial;
@@ -1779,6 +1878,46 @@ mod tests {
             Membership::Add("w1:p2".to_owned())
         ));
         assert_eq!(pane_ids, vec!["w1:p1".to_owned(), "w1:p2".to_owned()]);
+
+        // Captured from the live Herdr socket: closing a tab that is not a workspace's last tab.
+        let tab_closed = json!({
+            "event": "tab_closed",
+            "data": {"tab_id": "w32:t2", "type": "tab_closed", "workspace_id": "w32"}
+        });
+        assert_eq!(lifecycle_membership(&tab_closed), None);
+        assert_eq!(
+            lifecycle_closure(&tab_closed),
+            Some(TopologyClosure::Tab {
+                workspace_id: "w32".to_owned(),
+                tab_id: "w32:t2".to_owned(),
+            })
+        );
+
+        // Captured from the live Herdr socket: closing a workspace with a tab still open in it.
+        let workspace_closed = json!({
+            "event": "workspace_closed",
+            "data": {
+                "type": "workspace_closed",
+                "workspace_id": "w32",
+                "workspace": {
+                    "active_tab_id": "w32:t1",
+                    "agent_status": "unknown",
+                    "focused": false,
+                    "label": "testrun-payload-capture-2",
+                    "number": 16,
+                    "pane_count": 1,
+                    "tab_count": 1,
+                    "workspace_id": "w32"
+                }
+            }
+        });
+        assert_eq!(lifecycle_membership(&workspace_closed), None);
+        assert_eq!(
+            lifecycle_closure(&workspace_closed),
+            Some(TopologyClosure::Workspace {
+                workspace_id: "w32".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -2463,6 +2602,70 @@ mod tests {
         Ok(tab_list_result()?
             .into_iter()
             .filter(|tab| tab.label == label)
+            .count())
+    }
+
+    #[cfg(unix)]
+    struct Workspace {
+        id: String,
+        tab_id: String,
+        pane_id: String,
+    }
+
+    /// Creates a workspace and renames its root tab to the same label, so both the workspace and
+    /// its root tab are visible to a zero-leftover check by that one label.
+    #[cfg(unix)]
+    fn create_workspace(label: &str, cwd: &str) -> Result<Workspace, String> {
+        let created = herdr_json(&[
+            "workspace",
+            "create",
+            "--cwd",
+            cwd,
+            "--label",
+            label,
+            "--no-focus",
+        ])?;
+        let workspace_id = created["result"]["workspace"]["workspace_id"]
+            .as_str()
+            .ok_or("herdr workspace create result missing workspace_id")?
+            .to_owned();
+        let tab_id = created["result"]["tab"]["tab_id"]
+            .as_str()
+            .ok_or("herdr workspace create result missing tab_id")?
+            .to_owned();
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .ok_or("herdr workspace create result missing pane_id")?
+            .to_owned();
+        let output = Command::new("herdr")
+            .args(["tab", "rename", &tab_id, label])
+            .output()
+            .map_err(|error| format!("herdr tab rename spawn failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "herdr tab rename failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(Workspace {
+            id: workspace_id,
+            tab_id,
+            pane_id,
+        })
+    }
+
+    #[cfg(unix)]
+    fn close_workspace(workspace_id: &str) {
+        let _ = Command::new("herdr")
+            .args(["workspace", "close", workspace_id])
+            .output();
+    }
+
+    #[cfg(unix)]
+    fn remaining_workspaces(label: &str) -> Result<usize, String> {
+        Ok(workspace_list_result()?
+            .into_iter()
+            .filter(|workspace| workspace.label == label)
             .count())
     }
 
@@ -4005,5 +4208,427 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    async fn guild_channels_for_guild(
+        guild: &BlockedCaptureGuild,
+    ) -> Result<Vec<twilight_model::channel::Channel>, String> {
+        guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(unix)]
+    async fn guild_channel_with_topic(
+        guild: &BlockedCaptureGuild,
+        topic: &str,
+    ) -> Result<twilight_model::channel::Channel, String> {
+        guild_channels_for_guild(guild)
+            .await?
+            .into_iter()
+            .find(|channel| channel.topic.as_deref() == Some(topic))
+            .ok_or_else(|| format!("no channel found with topic {topic}"))
+    }
+
+    #[cfg(unix)]
+    async fn create_guild_thread(
+        guild: &BlockedCaptureGuild,
+        channel_id: Id<ChannelMarker>,
+        name: &str,
+    ) -> Result<twilight_model::channel::Channel, String> {
+        guild
+            .client
+            .create_thread(
+                channel_id,
+                name,
+                twilight_model::channel::ChannelType::PublicThread,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(unix)]
+    async fn active_threads_for_guild(
+        guild: &BlockedCaptureGuild,
+    ) -> Result<Vec<twilight_model::channel::Channel>, String> {
+        Ok(guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .threads)
+    }
+
+    /// Whether a thread whose name ends with `suffix` still exists under `channel_id`, active or
+    /// archived.
+    #[cfg(unix)]
+    async fn thread_with_suffix_survives(
+        guild: &BlockedCaptureGuild,
+        channel_id: Id<ChannelMarker>,
+        suffix: &str,
+    ) -> Result<bool, String> {
+        let has_suffix = |thread: &twilight_model::channel::Channel| {
+            thread
+                .name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(suffix))
+        };
+        if active_threads_for_guild(guild)
+            .await?
+            .iter()
+            .any(|thread| thread.parent_id == Some(channel_id) && has_suffix(thread))
+        {
+            return Ok(true);
+        }
+        let archived =
+            herdr_connect_rs::archived_threads(guild.client.as_ref(), channel_id).await?;
+        Ok(archived.iter().any(has_suffix))
+    }
+
+    #[cfg(unix)]
+    const LIVE_CLOSE_LABEL: &str = "testrun-live-close";
+
+    /// Drives a real `tab.closed` then a real `workspace.closed` event through the real lifecycle
+    /// handler and asserts the Discord effects the owner's deletion rule requires.
+    ///
+    /// Closing a workspace's last tab also closes the workspace, so this exercise keeps a second
+    /// tab alive through the tab-close step to observe tab close and workspace close as the two
+    /// separately-observable Discord effects.
+    #[cfg(unix)]
+    async fn live_close_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+        second_tab: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&workspace.pane_id, "idle")?;
+        report_agent_state(&second_tab.pane_id, "idle")?;
+        let root_agent = snapshot_for_pane(&workspace.pane_id)?;
+        let second_agent = snapshot_for_pane(&second_tab.pane_id)?;
+        let root_tab = matching_tab(&workspace.tab_id)?;
+        let second_matching_tab = matching_tab(&second_tab.tab_id)?;
+        let tabs = [root_tab, second_matching_tab];
+        let agents = [root_agent.clone(), second_agent.clone()];
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
+        let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
+        let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
+
+        let topic = format!("herdr workspace [{}]", root_route.workspace_id);
+        let channel = guild_channel_with_topic(guild, &topic).await?;
+        let root_suffix = format!(" [{}]", root_route.tab_id);
+        let second_suffix = format!(" [{}]", second_route.tab_id);
+        if !thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
+            return Err("sync did not create the second tab's thread".to_owned());
+        }
+
+        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| error.to_string())?;
+        let mut broker: Option<BrokerTask> = None;
+        let mut runtime = BridgeRuntime {
+            lifecycle,
+            pane_ids: Vec::new(),
+            status: None,
+            state: BridgeState::default(),
+        };
+
+        close_tab(&second_tab.tab_id);
+        let tab_closed = wait_for_event(
+            &mut runtime.lifecycle,
+            "tab_closed",
+            &second_tab.tab_id,
+            "/data/tab_id",
+            None,
+            Duration::from_secs(15),
+        )
+        .await?;
+        handle_lifecycle_select_result(
+            Ok(tab_closed),
+            Some(&connection),
+            &mut stop,
+            &mut broker,
+            &mut runtime,
+        )
+        .await;
+
+        if thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
+            return Err("tab close did not delete the tab's thread".to_owned());
+        }
+        if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
+            return Err("tab close deleted the root tab's thread".to_owned());
+        }
+
+        close_workspace(&workspace.id);
+        let workspace_closed = wait_for_event(
+            &mut runtime.lifecycle,
+            "workspace_closed",
+            &workspace.id,
+            "/data/workspace_id",
+            None,
+            Duration::from_secs(15),
+        )
+        .await?;
+        handle_lifecycle_select_result(
+            Ok(workspace_closed),
+            Some(&connection),
+            &mut stop,
+            &mut broker,
+            &mut runtime,
+        )
+        .await;
+
+        if guild_channel_with_topic(guild, &topic).await.is_ok() {
+            return Err("workspace close did not delete the workspace channel".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn live_tab_close_deletes_thread_then_workspace_close_deletes_channel() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(LIVE_CLOSE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(LIVE_CLOSE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-live-close-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create live-close test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = match create_workspace(LIVE_CLOSE_LABEL, cwd) {
+            Ok(workspace) => match create_tab(LIVE_CLOSE_LABEL, &workspace.id, cwd) {
+                Ok(second_tab) => Ok((workspace, second_tab)),
+                Err(error) => Err((Some(workspace.id), error)),
+            },
+            Err(error) => Err((None, error)),
+        };
+        let (workspace_id, result) = match created {
+            Ok((workspace, second_tab)) => {
+                let workspace_id = workspace.id.clone();
+                let outcome = live_close_exercise(&guild, &workspace, &second_tab).await;
+                (Some(workspace_id), outcome)
+            }
+            Err((workspace_id, error)) => (workspace_id, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(LIVE_CLOSE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(LIVE_CLOSE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const STARTUP_RECONCILE_LABEL: &str = "testrun-startup-reconcile";
+
+    /// Creates an orphan channel/thread pair and an orphan thread under a live workspace channel,
+    /// then runs the startup sweep and asserts it deletes exactly the topology Herdr no longer
+    /// lists.
+    #[cfg(unix)]
+    async fn startup_reconciliation_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+    ) -> Result<(), String> {
+        report_agent_state(&workspace.pane_id, "idle")?;
+        let listed = snapshot_for_pane(&workspace.pane_id)?;
+        let matching = matching_tab(&workspace.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, agents, tabs).await;
+
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let live_channel = guild_channel_with_topic(guild, &topic).await?;
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        let orphan_channel = guild
+            .client
+            .create_guild_channel(guild.id, &format!("testrun-orphan-{nonce}"))
+            .topic("herdr workspace [w9Z9]")
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let orphan_thread =
+            create_guild_thread(guild, orphan_channel.id, "testrun-orphan [w9Z9:t1]").await?;
+        let live_orphan_thread = create_guild_thread(
+            guild,
+            live_channel.id,
+            &format!("testrun-orphan [{}:t9Z]", route.workspace_id),
+        )
+        .await?;
+        // An owner-made thread whose bracket suffix is not this workspace's own tab id must
+        // survive: it is not a bridge-owned tab thread.
+        let bystander_thread =
+            create_guild_thread(guild, live_channel.id, "testrun-notes [staging]").await?;
+
+        sync_startup_topology(&connection, agents, tabs).await;
+
+        let channels_after = guild_channels_for_guild(guild).await?;
+        if channels_after
+            .iter()
+            .any(|channel| channel.id == orphan_channel.id)
+        {
+            return Err("startup sweep did not delete the orphan workspace channel".to_owned());
+        }
+        if !channels_after
+            .iter()
+            .any(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+        {
+            return Err("startup sweep deleted the live workspace channel".to_owned());
+        }
+
+        let active_after = active_threads_for_guild(guild).await?;
+        if active_after
+            .iter()
+            .any(|thread| thread.id == orphan_thread.id)
+        {
+            return Err("startup sweep did not delete the orphan channel's thread".to_owned());
+        }
+        if active_after
+            .iter()
+            .any(|thread| thread.id == live_orphan_thread.id)
+        {
+            return Err(
+                "startup sweep did not delete the orphaned thread under the live workspace channel"
+                    .to_owned(),
+            );
+        }
+        let suffix = format!(" [{}]", route.tab_id);
+        if !active_after.iter().any(|thread| {
+            thread.parent_id == Some(live_channel.id)
+                && thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&suffix))
+        }) {
+            return Err("startup sweep deleted the live tab's thread".to_owned());
+        }
+        if !active_after
+            .iter()
+            .any(|thread| thread.id == bystander_thread.id)
+        {
+            return Err(
+                "startup sweep deleted a non-tab thread that happened to end in brackets"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn startup_sweep_deletes_topology_absent_from_herdr() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(STARTUP_RECONCILE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(STARTUP_RECONCILE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-startup-reconcile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create startup-reconcile test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_workspace(STARTUP_RECONCILE_LABEL, cwd);
+        let (workspace_id, result) = match created {
+            Ok(workspace) => {
+                let workspace_id = workspace.id.clone();
+                let outcome = startup_reconciliation_exercise(&guild, &workspace).await;
+                (Some(workspace_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(STARTUP_RECONCILE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(STARTUP_RECONCILE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 }

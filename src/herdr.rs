@@ -237,13 +237,41 @@ pub fn list_agents() -> Result<Vec<AgentSnapshot>, String> {
         })
 }
 
-/// Session-wide pane membership watches for the lifecycle subscribe socket.
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
+pub struct HerdrWorkspace {
+    pub workspace_id: String,
+    pub label: String,
+}
+
+/// Lists workspaces while preserving Herdr and payload errors.
+///
+/// # Errors
+///
+/// Returns socket, envelope, or per-workspace deserialization errors.
+pub fn workspace_list_result() -> Result<Vec<HerdrWorkspace>, String> {
+    let value: Value =
+        serde_json::from_str(&request_rpc_result("workspace.list")?).map_err(|e| e.to_string())?;
+    value
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "workspace.list response did not contain workspaces".to_owned())?
+        .iter()
+        .map(|workspace| {
+            serde_json::from_value(workspace.clone()).map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// Session-wide pane-membership and tab/workspace-closure watches for the lifecycle subscribe
+/// socket.
 #[must_use]
 pub fn lifecycle_subscriptions() -> Vec<Value> {
     vec![
         json!({"type": "pane.created"}),
         json!({"type": "pane.closed"}),
         json!({"type": "pane.agent_detected"}),
+        json!({"type": "tab.closed"}),
+        json!({"type": "workspace.closed"}),
     ]
 }
 
