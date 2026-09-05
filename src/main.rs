@@ -54,10 +54,10 @@ struct BridgeState {
     blocked_since: HashMap<String, Instant>,
     informational_cards: HashMap<String, InformationalCard>,
     blocked_capture_attempts: HashMap<String, u32>,
-    /// Last reply card text delivered per terminal, for session-carrying panes only. A reply
-    /// card whose captured text equals this entry is not posted again, whether it arrives on the
-    /// status-change path or the seq-backstop path; a legitimately identical consecutive reply
-    /// is intentionally not reposted.
+    /// Last reply card text delivered per terminal. A reply card whose captured text equals this
+    /// entry is not posted again, whether it arrives on the status-change path or the
+    /// seq-backstop path; a legitimately identical consecutive reply is intentionally not
+    /// reposted.
     last_posted: HashMap<String, String>,
 }
 
@@ -431,13 +431,13 @@ struct PostableTransitionContext<'a> {
     state_change_seq: u64,
 }
 
-/// Delivers one postable transition's card to Discord: a blocked transition goes through
-/// `handle_blocked_card` unconditionally, while a reply-card transition is captured from the
-/// vendor log and delivered. For a session-carrying snapshot, a reply card whose captured text
-/// equals the last one delivered for this terminal is skipped instead of reposted. The check
-/// applies on both the status-change path and the seq-backstop path, so a legitimately identical
-/// consecutive reply is intentionally not reposted either. A snapshot without a session keeps
-/// posting every capture, since it has no vendor log to compare against.
+/// Delivers one postable transition's card to Discord: an agent reporting no session is not
+/// mirrored and returns before any topology is routed, blocked cards included. Otherwise, a
+/// blocked transition goes through `handle_blocked_card`, while a reply-card transition is
+/// captured from the vendor log and delivered. A reply card whose captured text equals the last
+/// one delivered for this terminal is skipped instead of reposted. The check applies on both the
+/// status-change path and the seq-backstop path, so a legitimately identical consecutive reply is
+/// intentionally not reposted either.
 ///
 /// # Errors
 ///
@@ -455,6 +455,10 @@ async fn deliver_postable_transition(
         transition,
         state_change_seq,
     } = context;
+    if snapshot.session.is_none() {
+        println!("{terminal}: no reported session, not mirrored");
+        return Ok(());
+    }
     let route = route_topology(agents, tabs, terminal)?;
     let Some(connection) = discord else {
         return Ok(());
@@ -483,16 +487,14 @@ async fn deliver_postable_transition(
     let Some(capture) = capture_for_or_report(snapshot) else {
         return Ok(());
     };
-    if snapshot.session.is_some() && state.last_posted.get(terminal) == Some(&capture.message) {
+    if state.last_posted.get(terminal) == Some(&capture.message) {
         println!("{terminal}: skipped duplicate reply card");
         return Ok(());
     }
     deliver_to_route(connection, &route, transition, &capture, state_change_seq).await?;
-    if snapshot.session.is_some() {
-        state
-            .last_posted
-            .insert(terminal.to_owned(), capture.message);
-    }
+    state
+        .last_posted
+        .insert(terminal.to_owned(), capture.message);
     Ok(())
 }
 
@@ -524,6 +526,10 @@ async fn retry_pending_blocked_capture(
     terminal: &str,
     state: &mut BridgeState,
 ) {
+    if snapshot.session.is_none() {
+        println!("{terminal}: no reported session, not mirrored");
+        return;
+    }
     let route = match route_topology(agents, tabs, terminal) {
         Ok(route) => route,
         Err(error) => {
@@ -574,13 +580,12 @@ fn capture_for_with_search_root(
     snapshot: &AgentSnapshot,
     search_root: &Path,
 ) -> Result<AgentLogCapture, String> {
-    let Some(session) = snapshot.session.as_ref() else {
-        return Ok(AgentLogCapture {
-            message: "agent stopped, no log available".to_owned(),
-            failure: None,
-            question: None,
-        });
-    };
+    let session = snapshot.session.as_ref().ok_or_else(|| {
+        format!(
+            "{}: no reported session, no log available",
+            snapshot.terminal_id
+        )
+    })?;
     let path = resolve_session_path(search_root, snapshot, session)?;
     let log = herdr_connect_rs::read_agent_log(Some(session), &path)?;
     Ok(AgentLogCapture {
@@ -808,14 +813,16 @@ async fn sync_route(
 
 /// Ensures every workspace channel and tab thread exists, then deletes every workspace channel
 /// and tab thread Herdr no longer lists. Runs in a spawned task beside the event loop rather than
-/// blocking it. A per-tab routing or
-/// naming error is logged and skipped; the lazy sync inside delivery still covers that tab once a
-/// card is due. The sweep refetches both lists once at its start rather than adopting whatever
+/// blocking it. An agent reporting no session is not mirrored: it is skipped in the create pass,
+/// so no channel or thread is created for it until a later snapshot reports one. A per-tab routing
+/// or naming error is logged and skipped; the lazy sync inside delivery still covers that tab once
+/// a card is due. The sweep refetches both lists once at its start rather than adopting whatever
 /// the shared cache already holds, so a cache that missed an earlier create cannot make the sweep
 /// recreate an existing channel or thread. The reconciliation pass that follows reuses this same
 /// cache rather than refetching per tab; an Ok but empty Herdr workspace or tab list is
 /// authoritative and deletes accordingly, while an Err from either Herdr call skips the whole
-/// delete pass with one logged error line.
+/// delete pass with one logged error line. The delete pass is unaffected by session: a live tab
+/// keeps any thread that already exists.
 async fn sync_startup_topology(
     discord: &DiscordConnection,
     agents: &[AgentSnapshot],
@@ -835,6 +842,9 @@ async fn sync_startup_topology(
     drop(guard);
     let mut synced_tabs = HashSet::new();
     for agent in agents {
+        if agent.session.is_none() {
+            continue;
+        }
         if let Some(tab_id) = agent.tab_id.as_deref()
             && !synced_tabs.insert(tab_id.to_owned())
         {
@@ -1694,8 +1704,8 @@ mod tests {
         subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
     };
     use herdr_connect_rs::{
-        AgentSession, AgentSnapshot, Transition, lifecycle_subscriptions, status_subscriptions,
-        subscribe_herdr_events, transition_card_nonce, workspace_list_result,
+        AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, Transition, lifecycle_subscriptions,
+        status_subscriptions, subscribe_herdr_events, transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -1989,33 +1999,24 @@ mod tests {
     }
 
     #[test]
-    fn captured_sessions_drive_transition_cards_and_pointer_posts() {
+    fn capture_for_with_search_root_errors_on_missing_session_or_log() {
         let response: Value =
             serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
                 .expect("captured agent.list fixture is JSON");
         let agents: Vec<AgentSnapshot> =
             serde_json::from_value(response["result"]["agents"].clone())
                 .expect("captured agent.list fixture has typed agents");
-        let cases = [(true, "agent stopped, no log available")];
-        for (without_session, expected_body) in cases {
-            let snapshot = agents
-                .iter()
-                .find(|snapshot| snapshot.session.is_none() == without_session)
-                .expect("fixture contains the requested agent");
-            let capture = capture_for_with_search_root(snapshot, Path::new("tests/fixtures"))
-                .expect("capture succeeds for a real session or explicit no-session pointer");
-            let transition = Transition {
-                from: "working".to_owned(),
-                to: "done".to_owned(),
-                terminal_id: snapshot.terminal_id.clone(),
-                agent: snapshot.agent.clone(),
-            };
-            let card = create_transition_messages(&transition, &capture, "owner")
-                .into_iter()
-                .next()
-                .expect("transition produces a card");
-            assert_eq!(card.description, expected_body);
-        }
+
+        let session_less = agents
+            .iter()
+            .find(|snapshot| snapshot.session.is_none())
+            .expect("fixture contains a session-less agent");
+        let error = capture_for_with_search_root(session_less, Path::new("tests/fixtures"))
+            .expect_err("a session-less snapshot must not resolve a capture");
+        assert!(
+            error.contains(&session_less.terminal_id),
+            "error must name the terminal missing its reported session: {error}"
+        );
 
         let mut missing_log = agents
             .iter()
@@ -2029,7 +2030,7 @@ mod tests {
             .value = "missing-session.jsonl".to_owned();
         assert!(
             capture_for_with_search_root(&missing_log, Path::new("tests/fixtures")).is_err(),
-            "reader errors for a reported session must surface instead of posting the pointer"
+            "reader errors for a reported session whose log is missing must surface"
         );
     }
 
@@ -2762,17 +2763,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn thread_has_stopped_card(messages: &[twilight_model::channel::Message]) -> bool {
-        messages.iter().any(|message| {
-            message
-                .embeds
-                .first()
-                .and_then(|embed| embed.description.as_deref())
-                == Some("agent stopped, no log available")
-        })
-    }
-
-    #[cfg(unix)]
     fn subscribe_tab_fixture() -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
             "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
@@ -3089,93 +3079,115 @@ mod tests {
         }
     }
 
+    /// Drives one real `claude --model haiku` agent through a genuine idle -> working -> settled
+    /// round-trip observed via real Herdr subscribe events (unlike `seq_backstop_round_trip`,
+    /// which only polls `agent.list`), and asserts a card carrying the real captured reply is
+    /// posted. Status comes only from live `agent.list` snapshots; nothing is set by hand.
     #[cfg(unix)]
     async fn seed_then_working_then_done_card(
         guild: &BlockedCaptureGuild,
         tab: &Tab,
+        agent_name: &str,
     ) -> Result<(), String> {
-        report_agent_state(&tab.pane_id, "idle")?;
-        wait_for_status(&tab.pane_id, &["idle", "done"], Duration::from_secs(10)).await?;
-        let listed = snapshot_for_pane(&tab.pane_id)?;
-        let terminal = listed.terminal_id.clone();
+        start_claude_haiku_agent(agent_name, &tab.pane_id)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let session = idle.session.as_ref().ok_or_else(|| {
+            format!(
+                "pane {} has no reported session after agent start",
+                tab.pane_id
+            )
+        })?;
+        if session.agent != "claude" {
+            return Err(format!(
+                "expected a claude session on pane {}, agent.list reported {session:?}",
+                tab.pane_id
+            ));
+        }
+        let terminal = idle.terminal_id.clone();
+
         let matching = matching_tab(&tab.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
-        let agents = std::slice::from_ref(&listed);
+        let agents = std::slice::from_ref(&idle);
         let mut state = BridgeState::default();
         let connection = discord_tuple(guild);
-        process_snapshot(&listed, agents, tabs, Some(&connection), &mut state).await;
+        process_snapshot(&idle, agents, tabs, Some(&connection), &mut state).await;
 
         let route = route_topology(agents, tabs, &terminal)?;
         let topology_cache: herdr_connect_rs::TopologyCache =
             Arc::new(tokio::sync::Mutex::new(None));
         let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
-        let before = guild
-            .client
-            .channel_messages(thread)
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
-        if thread_has_stopped_card(&before) {
+        let before = thread_card_descriptions(guild, thread).await?;
+        if before
+            .iter()
+            .any(|description| description.to_lowercase().contains("ready"))
+        {
             return Err("silent seed posted a transition card".to_owned());
         }
 
         let mut sub =
             subscribe_herdr_events(&status_subscriptions(std::slice::from_ref(&tab.pane_id)))
                 .await?;
-        report_agent_state(&tab.pane_id, "working")?;
+        herdr_json(&[
+            "agent",
+            "prompt",
+            agent_name,
+            "Reply with exactly the word ready.",
+        ])?;
         wait_for_event(
             &mut sub,
             "pane.agent_status_changed",
             &tab.pane_id,
             "/data/pane_id",
             Some("working"),
-            Duration::from_secs(10),
+            Duration::from_secs(15),
         )
         .await?;
         let working = snapshot_for_pane(&tab.pane_id)?;
-        let matching = matching_tab(&tab.tab_id)?;
-        let tabs = std::slice::from_ref(&matching);
-        let agents = std::slice::from_ref(&working);
-        process_snapshot(&working, agents, tabs, Some(&connection), &mut state).await;
+        process_snapshot(
+            &working,
+            std::slice::from_ref(&working),
+            tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
 
-        report_agent_state(&tab.pane_id, "idle")?;
-        loop {
+        let settled = loop {
             let event = wait_for_event(
                 &mut sub,
                 "pane.agent_status_changed",
                 &tab.pane_id,
                 "/data/pane_id",
                 None,
-                Duration::from_secs(10),
+                Duration::from_secs(30),
             )
             .await?;
             if matches!(
                 event.pointer("/data/agent_status").and_then(Value::as_str),
                 Some("done" | "idle")
             ) {
-                break;
+                break snapshot_for_pane(&tab.pane_id)?;
             }
-        }
-        let settled = snapshot_for_pane(&tab.pane_id)?;
-        let matching = matching_tab(&tab.tab_id)?;
-        let tabs = std::slice::from_ref(&matching);
-        let agents = std::slice::from_ref(&settled);
-        process_snapshot(&settled, agents, tabs, Some(&connection), &mut state).await;
+        };
+        process_snapshot(
+            &settled,
+            std::slice::from_ref(&settled),
+            tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
 
-        let messages = guild
-            .client
-            .channel_messages(thread)
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
-        if thread_has_stopped_card(&messages) {
+        let messages = thread_card_descriptions(guild, thread).await?;
+        if messages
+            .iter()
+            .any(|description| description.to_lowercase().contains("ready"))
+        {
             Ok(())
         } else {
-            Err("idle -> working -> settled via subscribe did not post a card".to_owned())
+            Err(format!(
+                "idle -> working -> settled via subscribe did not post a card, thread has {messages:?}"
+            ))
         }
     }
 
@@ -3228,10 +3240,18 @@ mod tests {
             "named zero-leftover check"
         );
 
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
         let created = subscribe_tab_fixture();
         let (tab_id, cwd_dir, result) = match created {
             Ok((tab, cwd_dir)) => {
-                let outcome = seed_then_working_then_done_card(&guild, &tab).await;
+                let agent_name = format!(
+                    "testrun-subscribe-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = seed_then_working_then_done_card(&guild, &tab, &agent_name).await;
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
                 (Some(tab.tab_id), Some(cwd_dir), outcome)
             }
             Err(error) => (None, None, Err(error)),
@@ -3240,7 +3260,7 @@ mod tests {
             close_tab(tab_id);
         }
         if let Some(cwd_dir) = cwd_dir {
-            let _ = fs::remove_dir_all(cwd_dir);
+            let _ = fs::remove_dir_all(&cwd_dir);
         }
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
@@ -3251,47 +3271,78 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
-    /// Drives a real pane through a settled round-trip fast enough that only the settled status
-    /// is observed between snapshots; the seq backstop must still post a card. When
-    /// `same_status_collapse` is set, the baseline is first driven to `done` so the round-trip
-    /// collapses onto the same status instead of advancing from `idle`; `scenario` names the case
-    /// for the failure message.
+    /// Drives one real `claude --model haiku` agent through a genuine settled round-trip and
+    /// asserts the seq backstop still posts a card carrying the real captured reply. Status and
+    /// the seq counter come only from live `agent.list` snapshots; nothing is set by hand (the
+    /// one owner-approved exception to that rule is `seq_backstop_session_dedup_round_trip`'s
+    /// counter, which is unrelated to this test). When `same_status_collapse` is set, a first
+    /// real turn settles the baseline so the second turn's settled status repeats it, exercising
+    /// `seq_backstop_collapsed_settled_turn`; otherwise the baseline is the agent's fresh
+    /// post-start status and one real turn's settled status differs from it, exercising
+    /// `seq_backstop_rewrites_working_from`. `scenario` names the case for the failure message.
     #[cfg(unix)]
     async fn seq_backstop_round_trip(
         guild: &BlockedCaptureGuild,
         tab: &Tab,
+        agent_name: &str,
         same_status_collapse: bool,
         scenario: &str,
     ) -> Result<(), String> {
-        report_agent_state(&tab.pane_id, "idle")?;
-        let idle_baseline =
-            wait_for_status(&tab.pane_id, &["idle"], Duration::from_secs(10)).await?;
-        let baseline = if same_status_collapse {
-            report_agent_state(&tab.pane_id, "working")?;
-            report_agent_state(&tab.pane_id, "idle")?;
-            wait_for_status(&tab.pane_id, &["done"], Duration::from_secs(10)).await?
-        } else {
-            idle_baseline
-        };
+        start_claude_haiku_agent(agent_name, &tab.pane_id)?;
+        if same_status_collapse {
+            prompt_claude_agent_and_wait(agent_name, "Reply with exactly the word ready.")?;
+        }
+        let baseline = snapshot_for_pane(&tab.pane_id)?;
+        let session = baseline.session.as_ref().ok_or_else(|| {
+            format!(
+                "pane {} has no reported session after agent start",
+                tab.pane_id
+            )
+        })?;
+        if session.agent != "claude" {
+            return Err(format!(
+                "expected a claude session on pane {}, agent.list reported {session:?}",
+                tab.pane_id
+            ));
+        }
+        if !matches!(baseline.agent_status.as_str(), STATUS_IDLE | STATUS_DONE) {
+            return Err(format!(
+                "expected an idle or done baseline so the backstop path is the one exercised, saw {}",
+                baseline.agent_status
+            ));
+        }
         let terminal = baseline.terminal_id.clone();
+
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let connection = discord_tuple(guild);
+        let route = route_topology(std::slice::from_ref(&baseline), tabs, &terminal)?;
+        let topology_cache: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
 
         let mut state = BridgeState::default();
         process_snapshot(
             &baseline,
             std::slice::from_ref(&baseline),
-            &[],
-            None,
+            tabs,
+            Some(&connection),
             &mut state,
         )
         .await;
 
-        report_agent_state(&tab.pane_id, "working")?;
-        report_agent_state(&tab.pane_id, "idle")?;
-        let settled = wait_for_status(&tab.pane_id, &["done"], Duration::from_secs(10)).await?;
+        prompt_claude_agent_and_wait(agent_name, "Reply with exactly the word ready.")?;
+        let settled = snapshot_for_pane(&tab.pane_id)?;
         if same_status_collapse && settled.agent_status != baseline.agent_status {
             return Err(format!(
                 "expected same-status collapse on {}, saw {} -> {}",
                 baseline.agent_status, baseline.agent_status, settled.agent_status
+            ));
+        }
+        if !same_status_collapse && settled.agent_status == baseline.agent_status {
+            return Err(format!(
+                "expected the settled status to differ from the baseline, both were {}",
+                baseline.agent_status
             ));
         }
         if settled.state_change_seq <= baseline.state_change_seq {
@@ -3300,41 +3351,25 @@ mod tests {
                 baseline.state_change_seq, settled.state_change_seq
             ));
         }
+        process_snapshot(
+            &settled,
+            std::slice::from_ref(&settled),
+            tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
 
-        let matching_tab = tab_list_result()?
-            .into_iter()
-            .find(|candidate| candidate.tab_id == tab.tab_id)
-            .ok_or_else(|| format!("tab.list has no entry for {}", tab.tab_id))?;
-        let tabs = std::slice::from_ref(&matching_tab);
-        let agents = std::slice::from_ref(&settled);
-        let route = route_topology(agents, tabs, &terminal)?;
-
-        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
-        let responder = Arc::new(PermissionResponder::new(
-            Arc::clone(&guild.client),
-            guild.id,
-            owner_id.clone(),
-            Arc::new(tokio::sync::Mutex::new(None)),
-        ));
-        let connection = (Arc::clone(&guild.client), guild.id, owner_id, responder);
-
-        process_snapshot(&settled, agents, tabs, Some(&connection), &mut state).await;
-
-        let topology_cache: herdr_connect_rs::TopologyCache =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
-        let messages = guild
-            .client
-            .channel_messages(thread)
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
-        if thread_has_stopped_card(&messages) {
+        let messages = thread_card_descriptions(guild, thread).await?;
+        if messages
+            .iter()
+            .any(|description| description.to_lowercase().contains("ready"))
+        {
             Ok(())
         } else {
-            Err(format!("seq backstop ({scenario}) did not post a card"))
+            Err(format!(
+                "seq backstop ({scenario}) did not post a card, thread has {messages:?}"
+            ))
         }
     }
 
@@ -3359,6 +3394,9 @@ mod tests {
 
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
             .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
         let cwd_dir = std::env::temp_dir().join(format!(
             "testrun-seq-backstop-{}-{}",
             std::process::id(),
@@ -3373,13 +3411,19 @@ mod tests {
         let created = create_tab(SEQ_BACKSTOP_LABEL, &workspace_id, cwd);
         let (tab_id, result) = match created {
             Ok(tab) => {
+                let agent_name = format!(
+                    "testrun-seq-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
                 let outcome = seq_backstop_round_trip(
                     &guild,
                     &tab,
+                    &agent_name,
                     false,
                     "idle -> working -> done between snapshots",
                 )
                 .await;
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
                 (Some(tab.tab_id), outcome)
             }
             Err(error) => (None, Err(error)),
@@ -3418,6 +3462,9 @@ mod tests {
 
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
             .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
         let cwd_dir = std::env::temp_dir().join(format!(
             "testrun-seq-same-status-{}-{}",
             std::process::id(),
@@ -3432,13 +3479,19 @@ mod tests {
         let created = create_tab(SEQ_BACKSTOP_LABEL, &workspace_id, cwd);
         let (tab_id, result) = match created {
             Ok(tab) => {
+                let agent_name = format!(
+                    "testrun-seqsame-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
                 let outcome = seq_backstop_round_trip(
                     &guild,
                     &tab,
+                    &agent_name,
                     true,
                     "done -> working -> done same-status collapse",
                 )
                 .await;
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
                 (Some(tab.tab_id), outcome)
             }
             Err(error) => (None, Err(error)),
@@ -3563,6 +3616,127 @@ mod tests {
             .collect())
     }
 
+    /// Generates a session id shaped like a real Claude session UUID, unique enough for a single
+    /// test run.
+    #[cfg(unix)]
+    fn generate_claude_session_id() -> Result<String, String> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        Ok(format!(
+            "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+            std::process::id(),
+            (nanos >> 48) & 0xffff,
+            (nanos >> 36) & 0xfff,
+            (nanos >> 24) & 0xfff,
+            nanos & 0xffff_ffff_ffff,
+        ))
+    }
+
+    /// Reports idle then attaches a fresh stub session to a shell pane, for topology/sweep
+    /// fixtures that need a session-carrying agent but never drive a real transition.
+    #[cfg(unix)]
+    fn report_idle_with_session(pane_id: &str) -> Result<(), String> {
+        report_agent_state(pane_id, "idle")?;
+        report_agent_session(pane_id, &generate_claude_session_id()?)
+    }
+
+    /// Starts a real `claude --model haiku` agent on a pane already at its interactive shell
+    /// prompt, retrying `agent_pane_busy` while a freshly created pane's shell settles (mirrors
+    /// `tests/prompt_stall_followup.rs`'s `start_agent`). Success means Herdr detected the real
+    /// agent and its real Claude-hook-reported session. The pane must never have carried a
+    /// synthetic `report-agent`/`report-agent-session` call: Herdr then treats it as occupied and
+    /// rejects a real `agent start` with `agent_pane_busy` regardless of how long this retries.
+    #[cfg(unix)]
+    fn start_claude_haiku_agent(name: &str, pane_id: &str) -> Result<(), String> {
+        herdr_json(&[
+            "pane",
+            "wait-output",
+            pane_id,
+            "--match",
+            "╰─",
+            "--timeout",
+            "15000",
+        ])?;
+        let bound = Duration::from_secs(10);
+        let start = Instant::now();
+        loop {
+            let args = [
+                "agent",
+                "start",
+                name,
+                "--kind",
+                "claude",
+                "--pane",
+                pane_id,
+                "--timeout",
+                "60000",
+                "--",
+                "--model",
+                "haiku",
+            ];
+            match herdr_json(&args) {
+                Ok(_) => return Ok(()),
+                Err(error) if is_agent_pane_busy(&error) && start.elapsed() < bound => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_agent_pane_busy(error: &str) -> bool {
+        error.contains("\"code\":\"agent_pane_busy\"")
+    }
+
+    /// A short, lowercase, digit-only nonce for building a Herdr agent name: names must match
+    /// `[a-z][a-z0-9_-]{0,31}`, so this is built from the clock, never from a pane or tab id
+    /// (which may contain uppercase letters).
+    #[cfg(unix)]
+    fn agent_name_nonce() -> Result<String, String> {
+        Ok(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis()
+            .to_string())
+    }
+
+    /// Submits one prompt to a real running agent and waits for the resulting settled state,
+    /// through Herdr's own `agent prompt --wait`, not the bridge's prompt-submission path.
+    #[cfg(unix)]
+    fn prompt_claude_agent_and_wait(name: &str, text: &str) -> Result<(), String> {
+        herdr_json(&[
+            "agent",
+            "prompt",
+            name,
+            text,
+            "--wait",
+            "--timeout",
+            "60000",
+        ])
+        .map(|_| ())
+    }
+
+    /// Removes the real on-disk Claude project directory a live pane's reported session resolves
+    /// under, if any. Best-effort: called from cleanup after a real agent has written its own
+    /// transcript, so nothing is left behind for `resolve_session_path` to find on a later run.
+    #[cfg(unix)]
+    fn cleanup_real_claude_session_dir(home: &Path, pane_id: &str) {
+        let Ok(snapshot) = snapshot_for_pane(pane_id) else {
+            return;
+        };
+        let Some(session) = snapshot.session.as_ref() else {
+            return;
+        };
+        if let Ok(path) = resolve_session_path(home, &snapshot, session)
+            && let Some(parent) = path.parent()
+        {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
     /// Drives one real pane carrying a real reported Claude session through the seq backstop
     /// with `state_change_seq` set by hand: Herdr freezes its own counter against synthetic
     /// `report-agent` state reports once a pane carries a session, so the counter cannot be
@@ -3577,18 +3751,7 @@ mod tests {
     ) -> Result<(), String> {
         report_agent_state(&tab.pane_id, "idle")?;
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos();
-        let session_id = format!(
-            "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-            std::process::id(),
-            (nanos >> 48) & 0xffff,
-            (nanos >> 36) & 0xfff,
-            (nanos >> 24) & 0xfff,
-            nanos & 0xffff_ffff_ffff,
-        );
+        let session_id = generate_claude_session_id()?;
         report_agent_session(&tab.pane_id, &session_id)?;
 
         let confirmed = snapshot_for_pane(&tab.pane_id)?;
@@ -3748,7 +3911,7 @@ mod tests {
         guild: &BlockedCaptureGuild,
         tab: &Tab,
     ) -> Result<(), String> {
-        report_agent_state(&tab.pane_id, "idle")?;
+        report_idle_with_session(&tab.pane_id)?;
         let listed = snapshot_for_pane(&tab.pane_id)?;
         let matching = matching_tab(&tab.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
@@ -3857,8 +4020,8 @@ mod tests {
         tab_a: &Tab,
         tab_b: &Tab,
     ) -> Result<(), String> {
-        report_agent_state(&tab_a.pane_id, "idle")?;
-        report_agent_state(&tab_b.pane_id, "idle")?;
+        report_idle_with_session(&tab_a.pane_id)?;
+        report_idle_with_session(&tab_b.pane_id)?;
         let agent_a = snapshot_for_pane(&tab_a.pane_id)?;
         let agent_b = snapshot_for_pane(&tab_b.pane_id)?;
         let tabs = [matching_tab(&tab_a.tab_id)?, matching_tab(&tab_b.tab_id)?];
@@ -3997,7 +4160,7 @@ mod tests {
         guild: &BlockedCaptureGuild,
         tab: &Tab,
     ) -> Result<(), String> {
-        report_agent_state(&tab.pane_id, "idle")?;
+        report_idle_with_session(&tab.pane_id)?;
         let listed = snapshot_for_pane(&tab.pane_id)?;
         let matching = matching_tab(&tab.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
@@ -4103,7 +4266,7 @@ mod tests {
         guild: &BlockedCaptureGuild,
         tab: &Tab,
     ) -> Result<(), String> {
-        report_agent_state(&tab.pane_id, "idle")?;
+        report_idle_with_session(&tab.pane_id)?;
         let listed = snapshot_for_pane(&tab.pane_id)?;
         let matching = matching_tab(&tab.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
@@ -4247,6 +4410,19 @@ mod tests {
             .ok_or_else(|| format!("no channel found with topic {topic}"))
     }
 
+    /// Whether no channel with `topic` exists, distinguishing a successful empty lookup from a
+    /// transport failure: the latter propagates as `Err` instead of being read as absence.
+    #[cfg(unix)]
+    async fn channel_with_topic_is_absent(
+        guild: &BlockedCaptureGuild,
+        topic: &str,
+    ) -> Result<bool, String> {
+        Ok(!guild_channels_for_guild(guild)
+            .await?
+            .iter()
+            .any(|channel| channel.topic.as_deref() == Some(topic)))
+    }
+
     #[cfg(unix)]
     async fn create_guild_thread(
         guild: &BlockedCaptureGuild,
@@ -4323,8 +4499,8 @@ mod tests {
         workspace: &Workspace,
         second_tab: &Tab,
     ) -> Result<(), String> {
-        report_agent_state(&workspace.pane_id, "idle")?;
-        report_agent_state(&second_tab.pane_id, "idle")?;
+        report_idle_with_session(&workspace.pane_id)?;
+        report_idle_with_session(&second_tab.pane_id)?;
         let root_agent = snapshot_for_pane(&workspace.pane_id)?;
         let second_agent = snapshot_for_pane(&second_tab.pane_id)?;
         let root_tab = matching_tab(&workspace.tab_id)?;
@@ -4486,7 +4662,7 @@ mod tests {
         guild: &BlockedCaptureGuild,
         workspace: &Workspace,
     ) -> Result<(), String> {
-        report_agent_state(&workspace.pane_id, "idle")?;
+        report_idle_with_session(&workspace.pane_id)?;
         let listed = snapshot_for_pane(&workspace.pane_id)?;
         let matching = matching_tab(&workspace.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
@@ -4636,6 +4812,498 @@ mod tests {
         let tabs_left = remaining_tabs(STARTUP_RECONCILE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
         let workspaces_left = remaining_workspaces(STARTUP_RECONCILE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const NO_SESSION_LABEL: &str = "testrun-no-session";
+
+    /// Drives one pane through a working -> settled round-trip via `process_snapshot`, returning
+    /// the settled snapshot. Used by `drive_idle_working_done`'s second half.
+    #[cfg(unix)]
+    async fn drive_working_then_settled(
+        workspace: &Workspace,
+        tabs: &[herdr_connect_rs::HerdrTab],
+        connection: &super::DiscordConnection,
+        state: &mut BridgeState,
+    ) -> Result<AgentSnapshot, String> {
+        report_agent_state(&workspace.pane_id, "working")?;
+        let working =
+            wait_for_status(&workspace.pane_id, &["working"], Duration::from_secs(10)).await?;
+        process_snapshot(
+            &working,
+            std::slice::from_ref(&working),
+            tabs,
+            Some(connection),
+            state,
+        )
+        .await;
+
+        report_agent_state(&workspace.pane_id, "idle")?;
+        let settled = wait_for_status(
+            &workspace.pane_id,
+            &["done", "idle"],
+            Duration::from_secs(10),
+        )
+        .await?;
+        process_snapshot(
+            &settled,
+            std::slice::from_ref(&settled),
+            tabs,
+            Some(connection),
+            state,
+        )
+        .await;
+        Ok(settled)
+    }
+
+    /// Drives one pane through a full idle -> working -> done round-trip via `process_snapshot`,
+    /// returning its route and the settled snapshot. Shared by `session_less_pane_exercise` and
+    /// `session_less_pane_stays_silent_while_session_pane_is_mirrored_exercise`'s silent-pane
+    /// half, which both start with this same silent phase.
+    #[cfg(unix)]
+    async fn drive_idle_working_done(
+        workspace: &Workspace,
+        connection: &super::DiscordConnection,
+        state: &mut BridgeState,
+    ) -> Result<(TopologyRoute, AgentSnapshot), String> {
+        report_agent_state(&workspace.pane_id, "idle")?;
+        let idle = wait_for_status(&workspace.pane_id, &["idle"], Duration::from_secs(10)).await?;
+        let matching = matching_tab(&workspace.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let route = route_topology(std::slice::from_ref(&idle), tabs, &idle.terminal_id)?;
+        process_snapshot(
+            &idle,
+            std::slice::from_ref(&idle),
+            tabs,
+            Some(connection),
+            state,
+        )
+        .await;
+
+        let settled = drive_working_then_settled(workspace, tabs, connection, state).await?;
+        Ok((route, settled))
+    }
+
+    /// Drives a session-less pane through idle -> working -> done and asserts the owner's rule
+    /// that a pane reporting no session is not mirrored: no tab thread and no card of any kind is
+    /// created or posted for it (README's "Herdr -> Discord" bullet). This test's workspace is
+    /// dedicated to the one pane, so its channel stays absent too, though the rule itself allows
+    /// a workspace channel to exist because another pane in it has a session.
+    #[cfg(unix)]
+    async fn session_less_pane_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+    ) -> Result<(), String> {
+        let mut state = BridgeState::default();
+        let connection = discord_tuple(guild);
+        let (route, _settled) = drive_idle_working_done(workspace, &connection, &mut state).await?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let thread_suffix = format!(" [{}]", route.tab_id);
+
+        if !channel_with_topic_is_absent(guild, &topic).await? {
+            return Err("session-less pane's workspace channel was created".to_owned());
+        }
+        if active_threads_for_guild(guild).await?.iter().any(|thread| {
+            thread
+                .name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(&thread_suffix))
+        }) {
+            return Err("session-less pane's tab thread was created".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn session_less_pane_idle_working_done_posts_nothing() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(NO_SESSION_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(NO_SESSION_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-no-session-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create no-session test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_workspace(NO_SESSION_LABEL, cwd);
+        let (workspace_id, result) = match created {
+            Ok(workspace) => {
+                let workspace_id = workspace.id.clone();
+                let outcome = session_less_pane_exercise(&guild, &workspace).await;
+                (Some(workspace_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(NO_SESSION_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(NO_SESSION_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const STARTUP_SESSION_SKIP_LABEL: &str = "testrun-startup-session-skip";
+
+    /// Runs the startup sweep over one session-less agent and one session-carrying agent sharing
+    /// a workspace, and asserts the create pass mirrors only the session-carrying one.
+    #[cfg(unix)]
+    async fn startup_topology_session_skip_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+        second_tab: &Tab,
+    ) -> Result<(), String> {
+        report_agent_state(&workspace.pane_id, "idle")?;
+        let no_session_agent = snapshot_for_pane(&workspace.pane_id)?;
+
+        report_agent_state(&second_tab.pane_id, "idle")?;
+        let session_id = generate_claude_session_id()?;
+        report_agent_session(&second_tab.pane_id, &session_id)?;
+        let session_agent = snapshot_for_pane(&second_tab.pane_id)?;
+        let expected_session = AgentSession {
+            agent: "claude".to_owned(),
+            value: session_id.clone(),
+        };
+        if session_agent.session.as_ref() != Some(&expected_session) {
+            return Err(format!(
+                "expected session {expected_session:?} on pane {}, agent.list reported {session_agent:?}",
+                second_tab.pane_id
+            ));
+        }
+
+        let tabs = [
+            matching_tab(&workspace.tab_id)?,
+            matching_tab(&second_tab.tab_id)?,
+        ];
+        let agents = [no_session_agent.clone(), session_agent.clone()];
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
+
+        let no_session_route = route_topology(&agents, &tabs, &no_session_agent.terminal_id)?;
+        let session_route = route_topology(&agents, &tabs, &session_agent.terminal_id)?;
+        let no_session_suffix = format!(" [{}]", no_session_route.tab_id);
+        let session_suffix = format!(" [{}]", session_route.tab_id);
+
+        let threads = active_threads_for_guild(guild).await?;
+        if threads.iter().any(|thread| {
+            thread
+                .name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(&no_session_suffix))
+        }) {
+            return Err("startup sweep created a thread for the session-less agent".to_owned());
+        }
+        if !threads.iter().any(|thread| {
+            thread
+                .name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(&session_suffix))
+        }) {
+            return Err(
+                "startup sweep did not create a thread for the session-carrying agent".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn startup_sweep_skips_session_less_agent_creates_for_session_carrying_agent() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(STARTUP_SESSION_SKIP_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(STARTUP_SESSION_SKIP_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-startup-session-skip-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create startup-session-skip test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_workspace(STARTUP_SESSION_SKIP_LABEL, cwd).and_then(|workspace| {
+            create_tab(STARTUP_SESSION_SKIP_LABEL, &workspace.id, cwd)
+                .map(|second_tab| (workspace, second_tab))
+        });
+        let (workspace_id, result) = match created {
+            Ok((workspace, second_tab)) => {
+                let workspace_id = workspace.id.clone();
+                let outcome =
+                    startup_topology_session_skip_exercise(&guild, &workspace, &second_tab).await;
+                (Some(workspace_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(STARTUP_SESSION_SKIP_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(STARTUP_SESSION_SKIP_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const SESSION_REPORTED_LATER_LABEL: &str = "testrun-session-reported-later";
+
+    /// Two-pane design, proving the owner's two rules in one exercise on two separate panes: a
+    /// session-less shell pane drives idle -> working -> done (mirroring `session_less_pane_exercise`)
+    /// to prove silence, while a separate, never-synthetically-reported pane starts a real
+    /// `claude --model haiku` agent and drives one real turn to prove that a session-carrying
+    /// pane's next qualifying transition creates the topology and posts a card. The two halves
+    /// cannot share one pane: Herdr treats a pane it has been told carries a synthetic agent (via
+    /// `report-agent`/`report-agent-session`) as occupied and rejects a real `agent start` on it
+    /// with `agent_pane_busy`. Status on the Claude pane comes only from its own live
+    /// `agent.list` snapshots; nothing is set by hand.
+    #[cfg(unix)]
+    async fn session_less_pane_stays_silent_while_session_pane_is_mirrored_exercise(
+        guild: &BlockedCaptureGuild,
+        silent_workspace: &Workspace,
+        claude_workspace: &Workspace,
+        agent_name: &str,
+    ) -> Result<(), String> {
+        let mut state = BridgeState::default();
+        let connection = discord_tuple(guild);
+        drive_idle_working_done(silent_workspace, &connection, &mut state).await?;
+        let silent_matching = matching_tab(&silent_workspace.tab_id)?;
+        let silent_snapshot = snapshot_for_pane(&silent_workspace.pane_id)?;
+        let silent_route = route_topology(
+            std::slice::from_ref(&silent_snapshot),
+            std::slice::from_ref(&silent_matching),
+            &silent_snapshot.terminal_id,
+        )?;
+        if !channel_with_topic_is_absent(
+            guild,
+            &format!("herdr workspace [{}]", silent_route.workspace_id),
+        )
+        .await?
+        {
+            return Err("session-less pane's workspace channel was created".to_owned());
+        }
+
+        start_claude_haiku_agent(agent_name, &claude_workspace.pane_id)?;
+        let with_session = snapshot_for_pane(&claude_workspace.pane_id)?;
+        let session = with_session.session.as_ref().ok_or_else(|| {
+            format!(
+                "pane {} has no reported session after agent start",
+                claude_workspace.pane_id
+            )
+        })?;
+        if session.agent != "claude" {
+            return Err(format!(
+                "expected a claude session on pane {}, agent.list reported {session:?}",
+                claude_workspace.pane_id
+            ));
+        }
+        let claude_terminal = with_session.terminal_id.clone();
+        let claude_matching = matching_tab(&claude_workspace.tab_id)?;
+        let claude_tabs = std::slice::from_ref(&claude_matching);
+        let claude_route = route_topology(
+            std::slice::from_ref(&with_session),
+            claude_tabs,
+            &claude_terminal,
+        )?;
+        let claude_topic = format!("herdr workspace [{}]", claude_route.workspace_id);
+        let claude_suffix = format!(" [{}]", claude_route.tab_id);
+
+        if !channel_with_topic_is_absent(guild, &claude_topic).await? {
+            return Err(
+                "reporting a session alone already created the workspace channel".to_owned(),
+            );
+        }
+        process_snapshot(
+            &with_session,
+            std::slice::from_ref(&with_session),
+            claude_tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
+
+        prompt_claude_agent_and_wait(agent_name, "Reply with exactly the word ready.")?;
+        let settled = snapshot_for_pane(&claude_workspace.pane_id)?;
+        process_snapshot(
+            &settled,
+            std::slice::from_ref(&settled),
+            claude_tabs,
+            Some(&connection),
+            &mut state,
+        )
+        .await;
+
+        let channel = guild_channel_with_topic(guild, &claude_topic)
+            .await
+            .map_err(|_| "reporting a session did not create the workspace channel".to_owned())?;
+        let thread = active_threads_for_guild(guild)
+            .await?
+            .into_iter()
+            .find(|thread| {
+                thread.parent_id == Some(channel.id)
+                    && thread
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with(&claude_suffix))
+            })
+            .ok_or_else(|| "reporting a session did not create the tab thread".to_owned())?;
+        let messages = thread_card_descriptions(guild, thread.id).await?;
+        if messages
+            .iter()
+            .any(|description| description.to_lowercase().contains("ready"))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "reporting a session did not post the new transition's card, thread has {messages:?}"
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn session_less_pane_stays_silent_while_session_pane_is_mirrored() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(SESSION_REPORTED_LATER_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(SESSION_REPORTED_LATER_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after unix epoch")
+            .as_nanos();
+        let silent_cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-session-reported-later-silent-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&silent_cwd_dir).expect("create session-reported-later silent cwd");
+        let silent_cwd = silent_cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+        let claude_cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-session-reported-later-claude-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&claude_cwd_dir).expect("create session-reported-later claude cwd");
+        let claude_cwd = claude_cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let (workspace_ids, result) =
+            match create_workspace(SESSION_REPORTED_LATER_LABEL, silent_cwd) {
+                Ok(silent_workspace) => {
+                    match create_workspace(SESSION_REPORTED_LATER_LABEL, claude_cwd) {
+                        Ok(claude_workspace) => {
+                            let workspace_ids =
+                                vec![silent_workspace.id.clone(), claude_workspace.id.clone()];
+                            let agent_name = format!(
+                                "testrun-late-{}",
+                                agent_name_nonce().expect("system clock is after unix epoch")
+                            );
+                            let outcome =
+                            session_less_pane_stays_silent_while_session_pane_is_mirrored_exercise(
+                                &guild,
+                                &silent_workspace,
+                                &claude_workspace,
+                                &agent_name,
+                            )
+                            .await;
+                            cleanup_real_claude_session_dir(&home, &claude_workspace.pane_id);
+                            (workspace_ids, outcome)
+                        }
+                        Err(error) => (vec![silent_workspace.id.clone()], Err(error)),
+                    }
+                }
+                Err(error) => (vec![], Err(error)),
+            };
+        for workspace_id in &workspace_ids {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&silent_cwd_dir);
+        let _ = fs::remove_dir_all(&claude_cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(SESSION_REPORTED_LATER_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(SESSION_REPORTED_LATER_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");

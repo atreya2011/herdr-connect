@@ -51,6 +51,7 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 ## Preserved product contracts
 
 - One workspace channel per Herdr workspace and one tab thread per Herdr tab.
+- A pane whose Herdr integration reports no session identity is not mirrored — no tab thread and no card of any kind — until a later snapshot reports one (its workspace channel is per workspace and may still exist because another pane in it has a session).
 - Topic and tab suffix are identity. Existing channel names and frozen thread names are not reconciled after creation.
 - Reported vendor sessions provide transition content; pane scraping and guessed session paths are forbidden, except for reading a Claude pane's Herdr detection snapshot to extract a pending blocked question.
 - Blocked-only owner mentions; explicit mention allowlists; all other transitions are silent.
