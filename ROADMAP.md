@@ -27,10 +27,6 @@ The informational blocked card is implemented and bounded, but its handoff task 
 
 The startup sweep fetches guild channels and active threads once at its start into a mutex-guarded `TopologyCache`, reusing that pair across every tab it syncs instead of refetching per tab. The delivery and permission paths (`sync_route`, `sync_channel`) still fetch a fresh pair on every call, so a card delivered after startup always syncs against current state; each fetch runs outside the cache lock, and the lock is taken only to reconcile that fetch into the cache and create what is missing, so concurrent requests do not serialize their whole sync. Preserve the outcome of [historical issue #27](https://github.com/atreya2011/herdr-connect/issues/27): ordinary checks read the fetched lists, while archived-thread listing is a miss-path HTTP read, skipped whenever the active list already resolves the tab. Port the behavior, not the old discord.js implementation details.
 
-### Late terminal titles
-
-`format_thread_name` currently errors every time a numeric tab label has no terminal title. Preserve the outcome of [historical issue #28](https://github.com/atreya2011/herdr-connect/issues/28): wait quietly while a cold-start title is absent, create the thread when it arrives, and surface a permanently unusable name once rather than once per snapshot.
-
 ## Unported product backlog
 
 These behaviors existed as TypeScript product decisions or reviewed branches but are absent from the current Rust implementation. They are not part of the immediate handoff unless the owner prioritizes them.
@@ -58,3 +54,4 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 - Owner-only semantic prompts inside qualifying mapped threads; all unrelated Discord surfaces remain silent.
 - Permission decisions are correlated, expiring, exactly once, and invalid when the requesting hook disconnects.
 - A closed Herdr tab's thread is deleted; a closed Herdr workspace's channel is deleted (Discord removes its threads with it). Startup deletes every workspace channel and tab thread Herdr no longer lists. Deletion is the rule; nothing is archived.
+- A tab with a numeric label and no terminal title yet is not an error: it is skipped quietly until a title arrives, at which point its thread is created; a tab whose Discord name can never be produced is logged once, not once per snapshot ([historical issue #28](https://github.com/atreya2011/herdr-connect/issues/28)).

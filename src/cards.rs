@@ -225,34 +225,53 @@ fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
     out
 }
 
+/// Why [`format_thread_name`] could not produce a name.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThreadNameError {
+    /// A numeric tab label has no terminal title yet. Not a failure: a cold-start tab is titled
+    /// by Herdr shortly after the pane starts, so the caller waits for a later snapshot.
+    TitlePending,
+    /// The name can never be produced from this tab's identity (empty label, or a tab id too
+    /// long for a Discord thread name).
+    Unusable(String),
+}
+
 /// Formats a bounded Discord thread name.
 ///
 /// # Errors
 ///
-/// Returns an error when the label has no usable base or the suffix cannot fit.
-pub fn format_thread_name(label: &str, title: &str, tab_id: &str) -> Result<String, String> {
+/// Returns [`ThreadNameError::TitlePending`] when a numeric label has no terminal title yet, or
+/// [`ThreadNameError::Unusable`] when the label is empty or the suffix cannot fit.
+pub fn format_thread_name(
+    label: &str,
+    title: &str,
+    tab_id: &str,
+) -> Result<String, ThreadNameError> {
     let label = label.trim();
     let title = title.trim();
-    let base = if !label.is_empty() && !label.chars().all(|c| c.is_ascii_digit()) {
+    let numeric_label = !label.is_empty() && label.chars().all(|c| c.is_ascii_digit());
+    let base = if !label.is_empty() && !numeric_label {
         label
-    } else if !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()) && !title.is_empty() {
+    } else if numeric_label && !title.is_empty() {
         title
+    } else if numeric_label {
+        return Err(ThreadNameError::TitlePending);
     } else {
-        return Err(format!(
-            "herdr tab {tab_id} has numeric label {label} without a terminal title"
-        ));
+        return Err(ThreadNameError::Unusable(format!(
+            "herdr tab {tab_id} has no label"
+        )));
     };
     let suffix = format!(" [{tab_id}]");
     if suffix.chars().count() > MAX_THREAD_NAME_LENGTH {
-        return Err(format!(
+        return Err(ThreadNameError::Unusable(format!(
             "herdr tab id {tab_id} is too long for a Discord thread"
-        ));
+        )));
     }
     let capacity = MAX_THREAD_NAME_LENGTH - suffix.chars().count();
     if capacity == 0 {
-        return Err(format!(
+        return Err(ThreadNameError::Unusable(format!(
             "herdr tab id {tab_id} is too long for a Discord thread"
-        ));
+        )));
     }
     Ok(format!(
         "{}{}",

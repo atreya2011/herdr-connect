@@ -20,7 +20,7 @@ pub use broker::{
     PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
 };
 pub use cards::{
-    AgentLogCapture, TransitionMessage, create_transition_messages,
+    AgentLogCapture, ThreadNameError, TransitionMessage, create_transition_messages,
     create_unsupported_blocked_card, format_thread_name,
 };
 pub use config::{
@@ -49,7 +49,7 @@ pub use prompting::{
 };
 pub use readers::{AgentLog, format_detection_question, read_agent_log};
 pub use topology::{
-    TopologyCache, TopologyRoute, archived_threads, delete_tab_thread,
+    RouteError, TopologyCache, TopologyRoute, archived_threads, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
     reconcile_topology_cache, route_topology, sync_topology, workspace_channel_name,
 };

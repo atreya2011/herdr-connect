@@ -6,7 +6,7 @@ use twilight_model::channel::Channel;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker};
 
-use crate::{AgentSnapshot, HerdrTab, format_thread_name};
+use crate::{AgentSnapshot, HerdrTab, ThreadNameError, format_thread_name};
 
 /// Shared, per-process cache of one guild's channel list and active-thread list, reused across
 /// tabs so a startup sweep does not refetch both lists for every tab.
@@ -22,42 +22,77 @@ pub struct TopologyRoute {
     pub thread_name: String,
 }
 
+/// Why [`route_topology`] could not resolve a topology route.
+#[derive(Debug)]
+pub enum RouteError {
+    /// The named tab's numeric label has no terminal title yet. Not a failure: the caller
+    /// remembers the tab id and waits for a later snapshot to report one.
+    TitlePending { tab_id: String },
+    /// The tab's Discord thread name can never be produced from its current identity.
+    Unusable { tab_id: String, message: String },
+    /// Missing or ambiguous Herdr identity, missing workspace evidence, or a channel naming
+    /// failure.
+    Other(String),
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TitlePending { tab_id } => {
+                write!(formatter, "herdr tab {tab_id} terminal title pending")
+            }
+            Self::Unusable { message, .. } | Self::Other(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl From<RouteError> for String {
+    fn from(error: RouteError) -> Self {
+        error.to_string()
+    }
+}
+
 /// Resolves one agent transition to an unambiguous workspace, tab, and pane.
 ///
 /// # Errors
 ///
-/// Returns an error for missing or ambiguous Herdr identity, missing workspace evidence, or an
-/// unusable Discord name.
+/// Returns [`RouteError::Other`] for missing or ambiguous Herdr identity, missing workspace
+/// evidence, or a channel naming failure; [`RouteError::TitlePending`] when a numeric tab label
+/// has no terminal title yet; and [`RouteError::Unusable`] when the tab can never produce a
+/// Discord thread name.
 pub fn route_topology(
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
     terminal_id: &str,
-) -> Result<TopologyRoute, String> {
+) -> Result<TopologyRoute, RouteError> {
     let matching_agents: Vec<&AgentSnapshot> = agents
         .iter()
         .filter(|agent| agent.terminal_id == terminal_id)
         .collect();
     let [agent] = matching_agents.as_slice() else {
-        return Err(format!(
+        return Err(RouteError::Other(format!(
             "herdr topology has duplicate or missing terminal {terminal_id}"
-        ));
+        )));
     };
-    let tab_id = usable_agent_identity(agent.tab_id.as_deref(), "tab", terminal_id)?;
+    let tab_id = usable_agent_identity(agent.tab_id.as_deref(), "tab", terminal_id)
+        .map_err(RouteError::Other)?;
     let workspace_id =
-        usable_agent_identity(agent.workspace_id.as_deref(), "workspace", terminal_id)?;
-    let pane_id = usable_agent_identity(agent.pane_id.as_deref(), "pane", terminal_id)?;
+        usable_agent_identity(agent.workspace_id.as_deref(), "workspace", terminal_id)
+            .map_err(RouteError::Other)?;
+    let pane_id = usable_agent_identity(agent.pane_id.as_deref(), "pane", terminal_id)
+        .map_err(RouteError::Other)?;
     let matching_tabs: Vec<&HerdrTab> = tabs.iter().filter(|tab| tab.tab_id == tab_id).collect();
     let [tab] = matching_tabs.as_slice() else {
-        return Err(if matching_tabs.is_empty() {
+        return Err(RouteError::Other(if matching_tabs.is_empty() {
             format!("herdr topology error: tab {tab_id} disappeared")
         } else {
             format!("herdr topology error: duplicate tab identifier {tab_id}")
-        });
+        }));
     };
     if tab.workspace_id != workspace_id {
-        return Err(format!(
+        return Err(RouteError::Other(format!(
             "herdr topology error: tab {tab_id} workspace mismatch"
-        ));
+        )));
     }
     let workspace_tabs: HashSet<&str> = tabs
         .iter()
@@ -75,16 +110,31 @@ pub fn route_topology(
         })
         .filter_map(|candidate| candidate.cwd.clone())
         .collect();
+    let channel_name = workspace_channel_name(workspace_id, &cwds).map_err(RouteError::Other)?;
+    let thread_name = match format_thread_name(
+        &tab.label,
+        agent.terminal_title_stripped.as_deref().unwrap_or_default(),
+        tab_id,
+    ) {
+        Ok(name) => name,
+        Err(ThreadNameError::TitlePending) => {
+            return Err(RouteError::TitlePending {
+                tab_id: tab_id.to_owned(),
+            });
+        }
+        Err(ThreadNameError::Unusable(message)) => {
+            return Err(RouteError::Unusable {
+                tab_id: tab_id.to_owned(),
+                message,
+            });
+        }
+    };
     Ok(TopologyRoute {
         workspace_id: workspace_id.to_owned(),
         tab_id: tab_id.to_owned(),
         pane_id: pane_id.to_owned(),
-        channel_name: workspace_channel_name(workspace_id, &cwds)?,
-        thread_name: format_thread_name(
-            &tab.label,
-            agent.terminal_title_stripped.as_deref().unwrap_or_default(),
-            tab_id,
-        )?,
+        channel_name,
+        thread_name,
     })
 }
 

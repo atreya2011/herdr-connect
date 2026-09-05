@@ -285,12 +285,19 @@ pub fn workspace_list_result() -> Result<Vec<HerdrWorkspace>, String> {
 
 /// Session-wide pane-membership and tab/workspace-closure watches for the lifecycle subscribe
 /// socket.
+///
+/// `pane.updated` has no `pane_id` filter in Herdr's subscription schema, so it is subscribed
+/// once here rather than once per tracked pane: one unfiltered subscription per pane would
+/// multiply every pane's update events by the tracked-pane count. The event loop reads each
+/// pushed event's own `data.pane.tab_id` and `data.pane.terminal_title_stripped` to decide
+/// whether it is worth a snapshot, rather than relying on the subscription to filter anything.
 #[must_use]
 pub fn lifecycle_subscriptions() -> Vec<Value> {
     vec![
         json!({SUBSCRIPTION_TYPE_KEY: "pane.created"}),
         json!({SUBSCRIPTION_TYPE_KEY: "pane.closed"}),
         json!({SUBSCRIPTION_TYPE_KEY: "pane.agent_detected"}),
+        json!({SUBSCRIPTION_TYPE_KEY: "pane.updated"}),
         json!({SUBSCRIPTION_TYPE_KEY: "tab.closed"}),
         json!({SUBSCRIPTION_TYPE_KEY: "workspace.closed"}),
     ]

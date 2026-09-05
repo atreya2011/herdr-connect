@@ -208,7 +208,7 @@ impl PermissionResponder {
                     return Err("permission request has ambiguous pane mapping".to_owned());
                 }
             };
-            route_topology(&agents, &tabs, &agent.terminal_id)
+            route_topology(&agents, &tabs, &agent.terminal_id).map_err(String::from)
         });
         let route = tokio::select! {
             result = route_task => result.ok().and_then(|result| match result {
