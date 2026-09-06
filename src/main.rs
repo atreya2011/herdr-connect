@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use notify::Watcher;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twilight_http::Client;
 use twilight_model::id::{
@@ -15,13 +16,15 @@ use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
     RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache,
-    TopologyRoute, Transition, TransitionMessage, agent_read_detection, create_transition_messages,
-    create_unsupported_blocked_card, delete_tab_thread, delete_topology_absent_from_herdr,
-    delete_workspace_channel, deliver_transition_card, drive_gateway_with_components,
-    expire_informational_card, fetch_topology_lists, format_detection_question, hook_timeout,
-    is_postable_transition, lifecycle_subscriptions, list_agents, load_discord_config,
-    reconcile_topology_cache, route_topology, status_subscriptions, subscribe_herdr_events,
-    sync_topology, tab_list_result, transition_card_nonce, workspace_list_result,
+    TopologyRoute, Transition, TransitionMessage, agent_read_detection, claude_turn_start_position,
+    create_transition_messages, create_unsupported_blocked_card, delete_tab_thread,
+    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_live_message,
+    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
+    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
+    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
+    read_claude_incremental, reconcile_topology_cache, route_topology, split_live_message,
+    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
+    transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -46,6 +49,20 @@ struct InformationalCard {
     message: Id<MessageMarker>,
 }
 
+/// Where an incremental vendor-log reader resumes from: a byte offset into the vendor's JSONL log.
+enum LivePosition {
+    Bytes(u64),
+}
+
+/// Dropping this stops its `notify` watcher.
+struct LiveWatch {
+    _watcher: notify::RecommendedWatcher,
+    vendor: String,
+    path: PathBuf,
+    position: LivePosition,
+    channel: Id<ChannelMarker>,
+}
+
 #[derive(Default)]
 struct BridgeState {
     previous: HashMap<String, (String, String)>,
@@ -68,6 +85,14 @@ struct BridgeState {
     /// Tab ids already logged for an unusable Discord thread name, so a permanent
     /// [`RouteError::Unusable`] is surfaced once rather than on every later snapshot.
     unusable_reported: HashSet<String>,
+    live_watches: HashMap<String, LiveWatch>,
+    /// `None` in tests that never wire live capture up.
+    live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Terminals to stop retrying a watch for: a non-transient `live_log_path` error.
+    live_unfollowable: HashSet<String>,
+    /// Terminals whose live-capture read error was already logged once, so it is not repeated on
+    /// every later event.
+    live_read_errors_reported: HashSet<String>,
 }
 
 struct BlockedCardContext<'a> {
@@ -334,6 +359,19 @@ fn seq_backstop_collapsed_settled_turn(
         && previous_herdr_seq.is_some_and(|previous| current_herdr_seq > previous)
 }
 
+/// Split out of [`process_snapshot`] to keep it under the line-count lint.
+async fn maybe_start_live_watch(
+    discord: Option<&DiscordConnection>,
+    snapshot: &AgentSnapshot,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+    state: &mut BridgeState,
+) {
+    if snapshot.agent_status == STATUS_WORKING {
+        ensure_live_watch_started(discord, snapshot, agents, tabs, state).await;
+    }
+}
+
 async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -345,11 +383,13 @@ async fn process_snapshot(
     let terminal = snapshot.terminal_id.clone();
     let status = snapshot.agent_status.clone();
     println!("{agent} {terminal}: {status}");
+    maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
     let previous_herdr_seq = state
         .herdr_state_change_seq
         .insert(terminal.clone(), snapshot.state_change_seq);
     if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned() {
         if old != status {
+            let old_was_working = old == STATUS_WORKING;
             let state_change_seq =
                 next_state_change_sequence(&mut state.state_change_sequences, &terminal);
             let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
@@ -365,6 +405,9 @@ async fn process_snapshot(
                 snapshot.state_change_seq,
             ) {
                 STATUS_WORKING.clone_into(&mut transition.from);
+            }
+            if old_was_working {
+                settle_live_watch(discord, &terminal, state).await;
             }
             update_blocked_lifecycle(
                 discord,
@@ -531,15 +574,50 @@ async fn deliver_postable_transition(
     let Some(capture) = capture_for_or_report(snapshot) else {
         return Ok(());
     };
-    if state.last_posted.get(terminal) == Some(&capture.message) {
+    let last_posted = state.last_posted.get(terminal).map(String::as_str);
+    if capture.failure.is_none() && repeats_last_live_text(&capture, last_posted) {
         println!("{terminal}: skipped duplicate reply card");
         return Ok(());
     }
-    deliver_to_route(connection, &route, transition, &capture, state_change_seq).await?;
+    let card_capture = card_capture_for_delivery(&capture, last_posted);
+    deliver_to_route(
+        connection,
+        &route,
+        transition,
+        &card_capture,
+        state_change_seq,
+    )
+    .await?;
     state
         .last_posted
         .insert(terminal.to_owned(), capture.message);
     Ok(())
+}
+
+/// Whether a reply card would only repeat a text already shown live: the caller's dedup guard
+/// skips posting in that case unless the turn also failed and needs reporting.
+#[must_use]
+fn repeats_last_live_text(capture: &AgentLogCapture, last_posted: Option<&str>) -> bool {
+    last_posted == Some(capture.message.as_str())
+}
+
+/// The capture used to build a reply card's content. Unchanged, unless this turn's message
+/// already appeared live and the turn also failed: then the message portion is cleared so the
+/// card shows only the failure instead of repeating text already posted live.
+#[must_use]
+fn card_capture_for_delivery(
+    capture: &AgentLogCapture,
+    last_posted: Option<&str>,
+) -> AgentLogCapture {
+    if capture.failure.is_some() && repeats_last_live_text(capture, last_posted) {
+        AgentLogCapture {
+            message: String::new(),
+            failure: capture.failure.clone(),
+            question: capture.question.clone(),
+        }
+    } else {
+        capture.clone()
+    }
 }
 
 async fn update_blocked_lifecycle(
@@ -620,6 +698,28 @@ fn capture_for(snapshot: &AgentSnapshot) -> Result<AgentLogCapture, String> {
     capture_for_with_search_root(snapshot, Path::new(&home))
 }
 
+/// Why a Claude/Codex/Cursor session's on-disk log could not be resolved, classified by KIND
+/// rather than by matching the rendered message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionPathError {
+    /// The log itself does not exist yet (zero candidates matched). Not a real problem: the vendor
+    /// may still write it once its first turn starts, so the caller retries on every later
+    /// snapshot.
+    NotFoundYet(String),
+    /// A real, non-transient problem — an ambiguous session (multiple candidate logs), an
+    /// unsupported vendor, or a search directory that cannot be read at all — that a caller should
+    /// stop retrying and mark unfollowable instead.
+    Permanent(String),
+}
+
+impl std::fmt::Display for SessionPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFoundYet(message) | Self::Permanent(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
 fn capture_for_with_search_root(
     snapshot: &AgentSnapshot,
     search_root: &Path,
@@ -630,7 +730,8 @@ fn capture_for_with_search_root(
             snapshot.terminal_id
         )
     })?;
-    let path = resolve_session_path(search_root, snapshot, session)?;
+    let path =
+        resolve_session_path(search_root, snapshot, session).map_err(|error| error.to_string())?;
     let log = herdr_connect_rs::read_agent_log(Some(session), &path)?;
     Ok(AgentLogCapture {
         message: log.message,
@@ -643,14 +744,18 @@ fn resolve_session_path(
     search_root: &Path,
     snapshot: &AgentSnapshot,
     session: &AgentSession,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, SessionPathError> {
     match session.agent.as_str() {
         VENDOR_CLAUDE => {
             let cwd = snapshot
                 .cwd
                 .as_deref()
                 .filter(|cwd| !cwd.trim().is_empty())
-                .ok_or_else(|| "claude session has no cwd for log resolution".to_owned())?;
+                .ok_or_else(|| {
+                    SessionPathError::Permanent(
+                        "claude session has no cwd for log resolution".to_owned(),
+                    )
+                })?;
             let cwd_slug = cwd
                 .chars()
                 .map(|character| {
@@ -704,15 +809,24 @@ fn resolve_session_path(
             }
             unique_existing_path(&candidates, "Cursor session store")
         }
-        agent => Err(format!("unsupported vendor session agent: {agent}")),
+        agent => Err(SessionPathError::Permanent(format!(
+            "unsupported vendor session agent: {agent}"
+        ))),
     }
 }
 
-fn unique_existing_path(candidates: &[PathBuf], description: &str) -> Result<PathBuf, String> {
+fn unique_existing_path(
+    candidates: &[PathBuf],
+    description: &str,
+) -> Result<PathBuf, SessionPathError> {
     match candidates {
         [path] => Ok(path.clone()),
-        [] => Err(format!("{description} was not found")),
-        _ => Err(format!("multiple {description}s were found")),
+        [] => Err(SessionPathError::NotFoundYet(format!(
+            "{description} was not found"
+        ))),
+        _ => Err(SessionPathError::Permanent(format!(
+            "multiple {description}s were found"
+        ))),
     }
 }
 
@@ -721,7 +835,7 @@ fn find_unique_session_path(
     session_id: &str,
     matches: fn(&Path) -> bool,
     description: &str,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, SessionPathError> {
     let mut candidates = Vec::new();
     collect_matching_paths(root, session_id, matches, &mut candidates)?;
     unique_existing_path(&candidates, description)
@@ -732,7 +846,7 @@ fn collect_matching_paths(
     session_id: &str,
     matches: fn(&Path) -> bool,
     candidates: &mut Vec<PathBuf>,
-) -> Result<(), String> {
+) -> Result<(), SessionPathError> {
     for entry in read_entries(directory, "session search directory")? {
         let path = entry.path();
         if path.is_dir() {
@@ -749,7 +863,7 @@ fn collect_matching_paths(
     Ok(())
 }
 
-fn read_directories(root: &Path, description: &str) -> Result<Vec<PathBuf>, String> {
+fn read_directories(root: &Path, description: &str) -> Result<Vec<PathBuf>, SessionPathError> {
     Ok(read_entries(root, description)?
         .into_iter()
         .map(|entry| entry.path())
@@ -757,21 +871,226 @@ fn read_directories(root: &Path, description: &str) -> Result<Vec<PathBuf>, Stri
         .collect())
 }
 
-fn read_entries(directory: &Path, description: &str) -> Result<Vec<fs::DirEntry>, String> {
+fn read_entries(
+    directory: &Path,
+    description: &str,
+) -> Result<Vec<fs::DirEntry>, SessionPathError> {
+    let classify = |error: std::io::Error| {
+        SessionPathError::Permanent(format!(
+            "failed to read {description} {}: {error}",
+            directory.display()
+        ))
+    };
     fs::read_dir(directory)
-        .map_err(|error| {
-            format!(
-                "failed to read {description} {}: {error}",
-                directory.display()
-            )
-        })?
+        .map_err(classify)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            format!(
-                "failed to read {description} {}: {error}",
-                directory.display()
+        .map_err(classify)
+}
+
+/// `Ok(None)` means the log does not exist yet ([`SessionPathError::NotFoundYet`]): the caller
+/// retries later rather than treating it as an error.
+///
+/// # Errors
+///
+/// Returns any [`SessionPathError::Permanent`] error, or a misconfigured `HOME`.
+fn live_log_path(
+    snapshot: &AgentSnapshot,
+    session: &AgentSession,
+) -> Result<Option<PathBuf>, String> {
+    let home = std::env::var_os(ENV_HOME).ok_or_else(|| "HOME is not configured".to_owned())?;
+    match resolve_session_path(Path::new(&home), snapshot, session) {
+        Ok(path) => Ok(Some(path)),
+        Err(SessionPathError::NotFoundYet(_)) => Ok(None),
+        Err(SessionPathError::Permanent(message)) => Err(message),
+    }
+}
+
+/// Registers a `notify` watch on a vendor log file, forwarding the terminal id on every modify
+/// event.
+fn start_notify_watcher(
+    path: &Path,
+    terminal: String,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<notify::RecommendedWatcher, String> {
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        if let Ok(event) = result
+            && matches!(
+                event.kind,
+                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
             )
-        })
+        {
+            let _ = tx.send(terminal.clone());
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    watcher
+        .watch(path, notify::RecursiveMode::NonRecursive)
+        .map_err(|error| error.to_string())?;
+    Ok(watcher)
+}
+
+/// The position a freshly started live-capture follower resumes from: the start of the current
+/// turn. A watch that attaches mid-turn still posts every assistant text the turn already wrote,
+/// since `ensure_live_watch_started` performs one immediate read from this position before
+/// returning.
+fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
+    match vendor {
+        VENDOR_CLAUDE => claude_turn_start_position(path).map(LivePosition::Bytes),
+        other => Err(format!(
+            "live capture: unsupported vendor for initial position: {other}"
+        )),
+    }
+}
+
+/// Starts a live-capture follower for a terminal newly observed as `working`, unless one is
+/// already running or the terminal was already marked unfollowable. Retried on every later
+/// snapshot while the pane stays `working`, except that a non-transient `live_log_path` error
+/// marks the terminal unfollowable so no further attempt is made for it.
+///
+/// A bridge restart re-follows an already-in-progress turn from its start. Discord's nonce dedupe
+/// lasts only a few minutes, so this reposts only the turn's texts older than that window; a
+/// closely-timed restart has its nonce still recognized and the repost suppressed.
+async fn ensure_live_watch_started(
+    discord: Option<&DiscordConnection>,
+    snapshot: &AgentSnapshot,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+    state: &mut BridgeState,
+) {
+    let terminal = snapshot.terminal_id.clone();
+    if state.live_watches.contains_key(&terminal) || state.live_unfollowable.contains(&terminal) {
+        return;
+    }
+    let Some(session) = snapshot.session.clone() else {
+        return;
+    };
+    let path = match live_log_path(snapshot, &session) {
+        Ok(Some(path)) => path,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("live capture unfollowable for {terminal}: {error}");
+            state.live_unfollowable.insert(terminal);
+            return;
+        }
+    };
+    let Some(live_tx) = state.live_tx.clone() else {
+        return;
+    };
+    let position = match initial_live_position(&session.agent, &path) {
+        Ok(position) => position,
+        Err(error) => {
+            eprintln!("live capture watch error for {terminal}: {error}");
+            return;
+        }
+    };
+    let watcher = match start_notify_watcher(&path, terminal.clone(), live_tx) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            eprintln!("live capture watch error for {terminal}: {error}");
+            return;
+        }
+    };
+    let Some((client, guild, _owner_id, responder)) = discord else {
+        return;
+    };
+    let Ok(route) = route_topology(agents, tabs, &terminal) else {
+        return;
+    };
+    let Ok(channel) = sync_route(client.as_ref(), *guild, &route, responder.topology_cache()).await
+    else {
+        return;
+    };
+    state.live_watches.insert(
+        terminal.clone(),
+        LiveWatch {
+            _watcher: watcher,
+            vendor: session.agent,
+            path,
+            position,
+            channel,
+        },
+    );
+    // Read once immediately: the next `notify` tick may never come if the turn is already near
+    // done.
+    handle_live_event(discord, &terminal, state).await;
+}
+
+/// Never touches the stored position on error: the caller must not advance past data it failed to
+/// read.
+///
+/// # Errors
+///
+/// Returns the incremental reader's error for the follower's vendor.
+fn read_new_live_texts(watch: &mut LiveWatch) -> Result<Vec<(String, i64)>, String> {
+    let LivePosition::Bytes(offset) = &mut watch.position;
+    let (texts, new_offset) = match watch.vendor.as_str() {
+        VENDOR_CLAUDE => read_claude_incremental(&watch.path, *offset)?,
+        vendor => return Err(format!("live capture: unsupported vendor {vendor}")),
+    };
+    *offset = new_offset;
+    Ok(texts
+        .into_iter()
+        .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
+        .collect())
+}
+
+/// Updates `state.last_posted` per fully delivered text so a turn-end card repeating it is
+/// skipped. The nonce is derived from the terminal id and log position, not a counter, so it
+/// survives a watch restart that resumes at the same position. A read failure logs once per
+/// terminal and leaves the follower running at its unchanged position, to retry on the next event.
+async fn handle_live_event(
+    discord: Option<&DiscordConnection>,
+    terminal: &str,
+    state: &mut BridgeState,
+) {
+    let Some((client, ..)) = discord else {
+        return;
+    };
+    let Some(watch) = state.live_watches.get_mut(terminal) else {
+        return;
+    };
+    let channel = watch.channel;
+    let texts = match read_new_live_texts(watch) {
+        Ok(texts) => {
+            state.live_read_errors_reported.remove(terminal);
+            texts
+        }
+        Err(error) => {
+            if state.live_read_errors_reported.insert(terminal.to_owned()) {
+                eprintln!("live capture read error for {terminal}: {error}");
+            }
+            return;
+        }
+    };
+    for (text, position) in texts {
+        let mut posted_all = true;
+        for (part_index, part) in split_live_message(&text).into_iter().enumerate() {
+            let nonce = live_message_nonce(terminal, position, part_index);
+            if let Err(error) = deliver_live_message(client.as_ref(), channel, &part, &nonce).await
+            {
+                eprintln!("live capture delivery error for {terminal}: {error}");
+                posted_all = false;
+                break;
+            }
+        }
+        if posted_all {
+            state.last_posted.insert(terminal.to_owned(), text);
+        }
+    }
+}
+
+/// Reads once more first so nothing written just before the pane left `working` is lost.
+async fn settle_live_watch(
+    discord: Option<&DiscordConnection>,
+    terminal: &str,
+    state: &mut BridgeState,
+) {
+    if !state.live_watches.contains_key(terminal) {
+        return;
+    }
+    handle_live_event(discord, terminal, state).await;
+    state.live_watches.remove(terminal);
+    state.live_read_errors_reported.remove(terminal);
 }
 
 fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
@@ -1013,6 +1332,15 @@ fn prune_departed_state(
     state
         .last_posted
         .retain(|terminal, _| current_terminals.contains(terminal));
+    state
+        .live_watches
+        .retain(|terminal, _| current_terminals.contains(terminal));
+    state
+        .live_unfollowable
+        .retain(|terminal| current_terminals.contains(terminal));
+    state
+        .live_read_errors_reported
+        .retain(|terminal| current_terminals.contains(terminal));
     state
         .title_pending
         .retain(|tab_id| current_tabs.contains(tab_id));
@@ -1407,6 +1735,7 @@ struct BridgeRuntime {
     pane_ids: Vec<String>,
     status: Option<HerdrSubscription>,
     state: BridgeState,
+    live_events: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
 async fn doorbell_unless_shutdown(
@@ -1457,6 +1786,9 @@ async fn bridge_event_loop(
                 {
                     break;
                 }
+            }
+            Some(terminal) = runtime.live_events.recv() => {
+                handle_live_event(discord, &terminal, &mut runtime.state).await;
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = stop.recv() => break,
@@ -1781,7 +2113,11 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => (None, None, None),
     };
-    let state = BridgeState::default();
+    let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
+    let state = BridgeState {
+        live_tx: Some(live_tx),
+        ..BridgeState::default()
+    };
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let Some(lifecycle) = unwrap_or_shutdown(
         subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), &mut stop).await,
@@ -1801,6 +2137,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         pane_ids,
         status,
         state,
+        live_events,
     };
     if !doorbell_unless_shutdown(
         discord.as_ref(),
@@ -1863,17 +2200,20 @@ mod tests {
     use super::{
         BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
         Membership, PermissionResponder, TopologyClosure, TopologyRoute, agent_read_detection,
-        apply_membership, capture_for_with_search_root, create_transition_messages,
-        decide_blocked_response, discover_pending_and_unusable_tabs, fetch_topology_lists,
-        handle_blocked_card, handle_lifecycle_select_result, lifecycle_closure,
-        lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
-        resolve_session_path, route_topology, seq_backstop_collapsed_settled_turn,
-        seq_backstop_rewrites_working_from, subscribe_status, subscribe_status_with_backoff,
-        sync_pending_titles, sync_route, sync_startup_topology, tab_list_result,
+        apply_membership, capture_for_with_search_root, card_capture_for_delivery,
+        create_transition_messages, decide_blocked_response, discover_pending_and_unusable_tabs,
+        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
+        handle_live_event, lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        next_state_change_sequence, process_snapshot, repeats_last_live_text, resolve_session_path,
+        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
+        subscribe_status, subscribe_status_with_backoff, sync_pending_titles, sync_route,
+        sync_startup_topology, tab_list_result,
     };
     use herdr_connect_rs::{
-        AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, Transition, lifecycle_subscriptions,
-        status_subscriptions, subscribe_herdr_events, transition_card_nonce, workspace_list_result,
+        AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
+        Transition, lifecycle_subscriptions, read_claude_incremental, read_codex_incremental,
+        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
+        workspace_list_result,
     };
 
     #[test]
@@ -2180,6 +2520,42 @@ mod tests {
                 decide_blocked_response(vendor_supported, question, attempts_so_far),
                 expected,
                 "vendor_supported={vendor_supported} question={question:?} attempts_so_far={attempts_so_far}"
+            );
+        }
+    }
+
+    #[test]
+    fn reply_card_dedup_only_suppresses_the_message_never_a_failure() {
+        let capture = |message: &str, failure: Option<&str>| AgentLogCapture {
+            message: message.to_owned(),
+            failure: failure.map(str::to_owned),
+            question: None,
+        };
+        let cases = [
+            (
+                "repeats last live text, no failure: dedup skips the card entirely",
+                capture("gamma", None),
+                true,
+                "gamma",
+            ),
+            (
+                "repeats last live text, with failure: card must still post, message-only",
+                capture("gamma", Some("tool errored")),
+                false,
+                "",
+            ),
+        ];
+        for (name, capture, expect_skip, expect_card_message) in cases {
+            let last_posted = Some("gamma");
+            assert_eq!(
+                capture.failure.is_none() && repeats_last_live_text(&capture, last_posted),
+                expect_skip,
+                "{name}: skip decision"
+            );
+            assert_eq!(
+                card_capture_for_delivery(&capture, last_posted).message,
+                expect_card_message,
+                "{name}: card message"
             );
         }
     }
@@ -3430,6 +3806,333 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const LIVE_CAPTURE_LABEL: &str = "testrun-live-capture";
+
+    /// `sleep 12`: an instant tool step lets `haiku` finish before `working` is ever confirmed.
+    #[cfg(unix)]
+    const LIVE_CAPTURE_FORCE_PROMPT: &str = "Say the word alpha. Then run the shell command \
+                                              `sleep 12 && echo beta`. Then say the word gamma.";
+
+    #[cfg(unix)]
+    fn start_live_capture_agent(kind: &str, agent_name: &str, pane_id: &str) -> Result<(), String> {
+        let vendor_args: &[&str] = match kind {
+            "claude" => &["--model", "haiku"],
+            other => return Err(format!("unsupported live-capture test kind: {other}")),
+        };
+        let bound = Duration::from_secs(10);
+        let start = Instant::now();
+        loop {
+            let mut args: Vec<&str> = vec![
+                "agent",
+                "start",
+                agent_name,
+                "--kind",
+                kind,
+                "--pane",
+                pane_id,
+                "--timeout",
+                "60000",
+            ];
+            if !vendor_args.is_empty() {
+                args.push("--");
+                args.extend_from_slice(vendor_args);
+            }
+            match herdr_json(&args) {
+                Ok(_) => return Ok(()),
+                Err(error) if is_agent_pane_busy(&error) && start.elapsed() < bound => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Testrun tab cwd, never the repository directory (holds `.env`). Claude alone (so far)
+    /// uses the fixed, owner-trusted `.../herdr-connect-testrun/claude` — its trust prompt has
+    /// no recovery.
+    #[cfg(unix)]
+    fn live_capture_tab_fixture(kind: &str) -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
+        let cwd_dir = if kind == "claude" {
+            claude_testrun_dir(&home)
+        } else {
+            home.join(".cache/herdr-connect-testrun").join(format!(
+                "{kind}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ))
+        };
+        if kind == "claude" {
+            clear_directory_contents(&cwd_dir)?;
+        } else {
+            fs::create_dir_all(&cwd_dir).map_err(|error| error.to_string())?;
+        }
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        match create_tab(&label, &workspace_id, cwd) {
+            Ok(tab) => Ok((tab, cwd_dir)),
+            Err(error) => {
+                if kind != "claude" {
+                    let _ = fs::remove_dir_all(&cwd_dir);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The bool is whether the message carries an embed (a card, never live text).
+    #[cfg(unix)]
+    async fn thread_messages(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+    ) -> Result<Vec<(String, bool, Id<MessageMarker>)>, String> {
+        let messages = guild
+            .client
+            .channel_messages(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(messages
+            .into_iter()
+            .map(|message| (message.content, !message.embeds.is_empty(), message.id))
+            .collect())
+    }
+
+    /// Polls until `done` accepts a snapshot or `bound` elapses, tolerating a transient
+    /// `agent.list` deserialization failure within `bound` rather than propagating it at once.
+    #[cfg(unix)]
+    fn poll_snapshot(
+        pane_id: &str,
+        bound: Duration,
+        done: impl Fn(&AgentSnapshot) -> bool,
+    ) -> Result<AgentSnapshot, String> {
+        let start = Instant::now();
+        loop {
+            let past_bound = start.elapsed() > bound;
+            match snapshot_for_pane(pane_id) {
+                Ok(snapshot) if done(&snapshot) || past_bound => return Ok(snapshot),
+                Err(error) if past_bound => return Err(error),
+                Ok(_) | Err(_) => {}
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// `process_snapshot` with the two slice args always equal to a single snapshot.
+    #[cfg(unix)]
+    async fn own(
+        snapshot: &AgentSnapshot,
+        tabs: &[herdr_connect_rs::HerdrTab],
+        connection: &super::DiscordConnection,
+        state: &mut BridgeState,
+    ) {
+        process_snapshot(
+            snapshot,
+            std::slice::from_ref(snapshot),
+            tabs,
+            Some(connection),
+            state,
+        )
+        .await;
+    }
+
+    /// Drives one real agent idle -> working -> settled: asserts `working` was observed, `alpha`
+    /// was live before settle, live count matches the log, and the end card skips a repeat.
+    #[cfg(unix)]
+    async fn live_capture_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+        kind: &str,
+    ) -> Result<(), String> {
+        start_live_capture_agent(kind, agent_name, &tab.pane_id)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+
+        let matching = matching_tab(&tab.tab_id)?;
+        let (tabs, agents) = (std::slice::from_ref(&matching), std::slice::from_ref(&idle));
+        let mut state = BridgeState::default();
+        let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
+        state.live_tx = Some(live_tx);
+        let connection = discord_tuple(guild);
+
+        own(&idle, tabs, &connection, &mut state).await;
+        let route = route_topology(agents, tabs, &terminal)?;
+        let topology_cache = Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+        submit_owner_prompt(&tab.pane_id, LIVE_CAPTURE_FORCE_PROMPT)?;
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some("working"),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let working = poll_snapshot(&tab.pane_id, Duration::from_secs(10), |s| {
+            s.session.is_some()
+        })?;
+        if working.agent_status != STATUS_WORKING
+            || working.session.as_ref().is_none_or(|sn| sn.agent != kind)
+        {
+            return Err(format!("no confirmed {kind} working session: {working:?}"));
+        }
+        own(&working, tabs, &connection, &mut state).await;
+        let watch_deadline = Instant::now() + Duration::from_secs(5);
+        while !state.live_watches.contains_key(&terminal) && Instant::now() < watch_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            own(&working, tabs, &connection, &mut state).await;
+        }
+
+        let has_alpha = |messages: &[(String, bool, Id<MessageMarker>)]| {
+            messages
+                .iter()
+                .any(|(content, _, _)| content.to_lowercase().contains("alpha"))
+        };
+        let mut alpha_before_settle = has_alpha(&thread_messages(guild, thread).await?);
+        let settled = loop {
+            tokio::select! {
+                Some(terminal_id) = live_events.recv() => {
+                    handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+                    if !alpha_before_settle {
+                        alpha_before_settle = has_alpha(&thread_messages(guild, thread).await?);
+                    }
+                }
+                event = wait_for_event(
+                    &mut sub, "pane.agent_status_changed", &tab.pane_id, "/data/pane_id", None,
+                    Duration::from_secs(30),
+                ) => {
+                    let event = event?;
+                    if matches!(
+                        event.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some("done" | "idle")
+                    ) {
+                        break poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
+                    }
+                }
+            }
+        };
+        if !alpha_before_settle {
+            return Err("'alpha' did not appear live before the pane settled".to_owned());
+        }
+        own(&settled, tabs, &connection, &mut state).await;
+        while let Ok(terminal_id) = live_events.try_recv() {
+            handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+        }
+
+        let Some(session) = settled.session.clone() else {
+            return Err("settled snapshot lost its session".to_owned());
+        };
+        let log_path = live_log_path(&settled, &session)?.ok_or("no log path yet")?;
+        let expected_count = match kind {
+            "claude" => read_claude_incremental(&log_path, 0)?.0.len(),
+            "codex" => read_codex_incremental(&log_path, 0)?.0.len(),
+            other => return Err(format!("unsupported vendor for structural count: {other}")),
+        };
+        let messages = thread_messages(guild, thread).await?;
+        let mut live: Vec<_> = messages.iter().filter(|(_, embed, _)| !embed).collect();
+        if live.len() != expected_count {
+            return Err(format!("expected {expected_count} live, got {live:?}"));
+        }
+        live.sort_by_key(|(_, _, id)| *id);
+        let last_text = &live.last().expect("expected_count > 0 for a real turn").0;
+        let repeated = messages
+            .iter()
+            .any(|(content, embed, _)| *embed && content == last_text);
+        if repeated {
+            return Err(format!("end card repeated live text {last_text:?}"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn run_live_capture_test(kind: &str) {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let created = live_capture_tab_fixture(kind);
+        let (tab_id, cwd_dir, result) = match created {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "live-{kind}-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(180),
+                    live_capture_exercise(&guild, &tab, &agent_name, kind),
+                )
+                .await
+                .unwrap_or_else(|_| Err(format!("{kind} live-capture exercise timed out")));
+                if let Ok(snapshot) = snapshot_for_pane(&tab.pane_id)
+                    && let Some(session) = snapshot.session.as_ref()
+                    && let Ok(path) = resolve_session_path(&home, &snapshot, session)
+                    && let Some(parent) = path.parent()
+                {
+                    let _ = fs::remove_dir_all(parent);
+                }
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            if kind == "claude" {
+                let _ = clear_directory_contents(&cwd_dir);
+            } else {
+                let _ = fs::remove_dir_all(&cwd_dir);
+            }
+        }
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn live_capture_posts_first_live_text_before_settle_for_claude() {
+        run_live_capture_test("claude").await;
     }
 
     /// Drives one real `claude --model haiku` agent through a genuine settled round-trip and
@@ -4918,11 +5621,13 @@ mod tests {
         let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|error| error.to_string())?;
         let mut broker: Option<BrokerTask> = None;
+        let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
         let mut runtime = BridgeRuntime {
             lifecycle,
             pane_ids: Vec::new(),
             status: None,
             state: BridgeState::default(),
+            live_events,
         };
 
         close_tab(&second_tab.tab_id);

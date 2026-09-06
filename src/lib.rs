@@ -21,15 +21,15 @@ pub use broker::{
 };
 pub use cards::{
     AgentLogCapture, ThreadNameError, TransitionMessage, create_transition_messages,
-    create_unsupported_blocked_card, format_thread_name,
+    create_unsupported_blocked_card, format_thread_name, split_live_message,
 };
 pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,
     load_discord_config,
 };
 pub use delivery::{
-    deliver_permission_card, deliver_transition_card, expire_informational_card,
-    transition_card_nonce,
+    deliver_live_message, deliver_permission_card, deliver_transition_card,
+    expire_informational_card, live_message_nonce, transition_card_nonce,
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{

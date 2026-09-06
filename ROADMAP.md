@@ -34,7 +34,6 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 - [Dashboard and read commands](https://github.com/atreya2011/herdr-connect/issues/7): pinned cross-workspace status, ephemeral `/agents`, and on-demand `/read <tab_id>`.
 - [Operations](https://github.com/atreya2011/herdr-connect/issues/8): a systemd user service and a `doctor` preflight. The historical environment-file path is obsolete; this repository ignores `.env`.
 - [Rich result details](https://github.com/atreya2011/herdr-connect/issues/29): vendor-recorded model, effort, tool, token, plan, branch, changed-file, and bounded diff details, omitting fields the vendor does not record.
-- [Live activity capture](https://github.com/atreya2011/herdr-connect/issues/40): incremental, complete-record log following for working agents.
 - [Durable live status](https://github.com/atreya2011/herdr-connect/issues/36): one bounded status card per active turn with persisted lifecycle and orphan cleanup. Prior dead Rust live-status surfaces were deliberately removed; reintroduce this only as a newly approved feature with real-service tests.
 
 ## Do not port
@@ -55,3 +54,4 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 - Permission decisions are correlated, expiring, exactly once, and invalid when the requesting hook disconnects.
 - A closed Herdr tab's thread is deleted; a closed Herdr workspace's channel is deleted (Discord removes its threads with it). Startup deletes every workspace channel and tab thread Herdr no longer lists. Deletion is the rule; nothing is archived.
 - A tab with a numeric label and no terminal title yet is not an error: it is skipped quietly until a title arrives, at which point its thread is created; a tab whose Discord name can never be produced is logged once, not once per snapshot ([historical issue #28](https://github.com/atreya2011/herdr-connect/issues/28)).
+- While a session-carrying pane with a resolved tab thread is `working`, each new complete assistant text its vendor log records is posted live as a plain message; tool calls are never posted, a watch always starts at the turn's start (a restart mid-turn reposts that turn's text, suppressed as an exact repeat by Discord's position-derived nonce), a settle transition runs one final read before its card so nothing written just before settling is lost, and a turn-end card repeating the last live text is skipped rather than reposted.

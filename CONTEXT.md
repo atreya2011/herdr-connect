@@ -43,3 +43,7 @@ _Avoid_: Blocked card, approval message
 **Informational blocked card**:
 A non-interactive Discord card reporting that an unsupported pane is blocked and must be handled in Herdr.
 _Avoid_: Permission card, fallback approval
+
+**Live message**:
+A plain, content-only Discord message posted for one new complete assistant text a working pane's vendor log records, ahead of its turn's transition card.
+_Avoid_: Streaming message, partial reply, live card

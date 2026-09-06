@@ -30,6 +30,7 @@ twilight-http = "0.17.1"
 twilight-model = "0.17.1"
 twilight-gateway = { version = "0.17.1", default-features = false, features = ["rustls-platform-verifier"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
+notify = "=8.2.0"
 
 [dev-dependencies]
 serial_test = "3.2.0"

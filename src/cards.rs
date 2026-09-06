@@ -109,7 +109,9 @@ pub fn create_transition_messages(
         capture.message.clone()
     };
     if let Some(failure) = &capture.failure {
-        body.push_str("\n\n");
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
         body.push_str(failure);
     }
     let color = if capture.failure.is_some() {
@@ -136,6 +138,13 @@ pub fn create_transition_messages(
         })
         .collect()
 }
+/// Splits a live-captured assistant text at the same boundary transition cards use, with no part
+/// numbering: each part is posted as its own plain message.
+#[must_use]
+pub fn split_live_message(text: &str) -> Vec<String> {
+    split_body(text)
+}
+
 fn split_body(body: &str) -> Vec<String> {
     const PART_BUDGET: usize = MAX_PART_LENGTH - 10;
     let mut atoms = Vec::new();
@@ -284,7 +293,33 @@ pub fn format_thread_name(
 mod tests {
     use std::time::Duration;
 
-    use super::{MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH, create_unsupported_blocked_card};
+    use super::{
+        AgentLogCapture, MAX_UNSUPPORTED_BLOCKED_DESCRIPTION_LENGTH, create_transition_messages,
+        create_unsupported_blocked_card,
+    };
+    use crate::herdr::STATUS_DONE;
+    use crate::watcher::Transition;
+
+    #[test]
+    fn error_turn_card_with_an_empty_message_shows_only_the_failure() {
+        let transition = Transition {
+            from: "working".to_owned(),
+            to: STATUS_DONE.to_owned(),
+            terminal_id: "terminal".to_owned(),
+            agent: "claude".to_owned(),
+        };
+        let capture = AgentLogCapture {
+            message: String::new(),
+            failure: Some("tool errored".to_owned()),
+            question: None,
+        };
+
+        let messages = create_transition_messages(&transition, &capture, "42");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].description, "tool errored");
+        assert!(!messages[0].description.starts_with('\n'));
+    }
 
     #[test]
     fn unsupported_blocked_card_is_informational_and_bounded() {

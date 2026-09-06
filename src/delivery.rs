@@ -34,6 +34,54 @@ pub fn transition_card_nonce(
     )
 }
 
+/// Derived from the terminal id, log position, and part index, never from when the process
+/// started.
+///
+/// A watch that reattaches after a restart and resumes at the same position reproduces the same
+/// nonce. Discord's nonce dedupe lasts only a few minutes, so a restart within that window has its
+/// repost of that text suppressed by `enforce_nonce`; a restart after it does not, and the text is
+/// reposted. Distinct in shape (no dash) from [`transition_card_nonce`] so the two can never
+/// collide.
+#[must_use]
+pub fn live_message_nonce(terminal_id: &str, position: i64, part_index: usize) -> String {
+    let payload = format!("{terminal_id}-live-{position}-{part_index}");
+    let payload_component = payload.bytes().fold(0_u64, |value, byte| {
+        value.wrapping_mul(257).wrapping_add(u64::from(byte))
+    });
+    format!("{:013x}", payload_component & PAYLOAD_COMPONENT_MASK)
+}
+
+/// Delivers one plain, content-only message: no embed, no color, no mention, and mentions parsed
+/// from nothing.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn deliver_live_message(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    content: &str,
+    nonce: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let nonce = bounded_nonce(nonce);
+    let payload = serde_json::json!({
+        PAYLOAD_CONTENT_KEY: content,
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+        "nonce": nonce,
+        "enforce_nonce": true,
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .create_message(channel)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
 /// Delivers a complete transition card with its embed color and optional mention.
 ///
 /// # Errors
@@ -314,7 +362,8 @@ mod tests {
 
     use super::{
         MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
-        permission_card_description, permission_card_title, transition_card_nonce_for_start,
+        live_message_nonce, permission_card_description, permission_card_title,
+        transition_card_nonce_for_start,
     };
     use crate::cards::TransitionMessage;
     use crate::permission::PermissionVendor;
@@ -361,6 +410,35 @@ mod tests {
                 transition_card_nonce_for_start(first_start, terminal, sequence, card_index)
             );
         }
+    }
+
+    #[test]
+    fn live_message_nonce_is_stable_by_position_not_a_counter() {
+        let first = live_message_nonce("terminal", 100, 0);
+        // Same terminal and position: identical, whether this is the original read or a watch
+        // restart that resumed at the same log position — the point of keying on position rather
+        // than a resettable counter.
+        assert_eq!(first, live_message_nonce("terminal", 100, 0));
+        assert!(first.len() <= MAX_DISCORD_NONCE_LENGTH);
+        assert_ne!(
+            first,
+            live_message_nonce("terminal", 200, 0),
+            "position differs"
+        );
+        assert_ne!(
+            first,
+            live_message_nonce("other-terminal", 100, 0),
+            "terminal differs"
+        );
+        assert_ne!(
+            first,
+            live_message_nonce("terminal", 100, 1),
+            "part index differs"
+        );
+        assert!(
+            !first.contains('-'),
+            "a live nonce carries no process-start component, unlike a transition card nonce"
+        );
     }
 
     #[test]
