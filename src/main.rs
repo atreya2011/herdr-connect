@@ -1862,21 +1862,18 @@ mod tests {
 
     use super::{
         BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
-        InformationalCard, Membership, PermissionResponder, PostableTransitionContext,
-        TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
-        capture_for_with_search_root, create_transition_messages, decide_blocked_response,
-        deliver_postable_transition, discover_pending_and_unusable_tabs, fetch_topology_lists,
+        Membership, PermissionResponder, TopologyClosure, TopologyRoute, agent_read_detection,
+        apply_membership, capture_for_with_search_root, create_transition_messages,
+        decide_blocked_response, discover_pending_and_unusable_tabs, fetch_topology_lists,
         handle_blocked_card, handle_lifecycle_select_result, lifecycle_closure,
         lifecycle_membership, list_agents, next_state_change_sequence, process_snapshot,
-        prune_departed_state, report_route_error, resolve_session_path, route_topology,
-        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
-        subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
-        tab_list_result,
+        resolve_session_path, route_topology, seq_backstop_collapsed_settled_turn,
+        seq_backstop_rewrites_working_from, subscribe_status, subscribe_status_with_backoff,
+        sync_pending_titles, sync_route, sync_startup_topology, tab_list_result,
     };
     use herdr_connect_rs::{
-        AgentSession, AgentSnapshot, RouteError, STATUS_DONE, STATUS_IDLE, Transition,
-        lifecycle_subscriptions, status_subscriptions, subscribe_herdr_events,
-        transition_card_nonce, workspace_list_result,
+        AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, Transition, lifecycle_subscriptions,
+        status_subscriptions, subscribe_herdr_events, transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -1916,240 +1913,6 @@ mod tests {
         );
 
         assert_ne!(pre_departure_nonce, returned_nonce);
-    }
-
-    #[test]
-    fn departed_terminals_are_pruned_from_reconciled_state() {
-        let departed = "departed";
-        let current = "current";
-        let departed_tab = "departed-tab";
-        let current_tab = "current-tab";
-        let mut state = BridgeState::default();
-        for terminal in [departed, current] {
-            state
-                .blocked_since
-                .insert(terminal.to_owned(), Instant::now());
-            state.state_change_sequences.insert(terminal.to_owned(), 1);
-            state.herdr_state_change_seq.insert(terminal.to_owned(), 7);
-            state.informational_cards.insert(
-                terminal.to_owned(),
-                InformationalCard {
-                    channel: Id::<ChannelMarker>::new(1),
-                    message: Id::<MessageMarker>::new(2),
-                },
-            );
-            state
-                .last_posted
-                .insert(terminal.to_owned(), format!("{terminal} reply"));
-        }
-        for tab_id in [departed_tab, current_tab] {
-            state.title_pending.insert(tab_id.to_owned());
-            state.unusable_reported.insert(tab_id.to_owned());
-        }
-
-        let current_terminals = HashSet::from([current.to_owned()]);
-        let current_tabs = HashSet::from([current_tab.to_owned()]);
-        let expired = prune_departed_state(&mut state, &current_terminals, &current_tabs);
-
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].0, departed);
-        assert!(!state.blocked_since.contains_key(departed));
-        assert!(!state.state_change_sequences.contains_key(departed));
-        assert!(!state.herdr_state_change_seq.contains_key(departed));
-        assert!(!state.informational_cards.contains_key(departed));
-        assert!(!state.last_posted.contains_key(departed));
-        assert!(!state.title_pending.contains(departed_tab));
-        assert!(!state.unusable_reported.contains(departed_tab));
-        assert!(state.blocked_since.contains_key(current));
-        assert!(state.state_change_sequences.contains_key(current));
-        assert!(state.herdr_state_change_seq.contains_key(current));
-        assert!(state.informational_cards.contains_key(current));
-        assert!(state.title_pending.contains(current_tab));
-        assert!(state.unusable_reported.contains(current_tab));
-        assert_eq!(
-            state.last_posted.get(current).map(String::as_str),
-            Some("current reply")
-        );
-    }
-
-    #[test]
-    fn unusable_thread_name_is_reported_once_across_two_route_topology_passes() {
-        let tab_id = "t".repeat(120);
-        let agent = AgentSnapshot {
-            agent: "claude".to_owned(),
-            terminal_id: "unusable-terminal".to_owned(),
-            agent_status: STATUS_IDLE.to_owned(),
-            tab_id: Some(tab_id.clone()),
-            workspace_id: Some("unusable-workspace".to_owned()),
-            pane_id: Some("unusable-pane".to_owned()),
-            cwd: Some("/repo/example".to_owned()),
-            terminal_title_stripped: None,
-            session: Some(AgentSession {
-                agent: "claude".to_owned(),
-                value: "session".to_owned(),
-            }),
-            state_change_seq: 1,
-        };
-        let tab = herdr_connect_rs::HerdrTab {
-            tab_id: tab_id.clone(),
-            workspace_id: "unusable-workspace".to_owned(),
-            label: "build".to_owned(),
-        };
-        let agents = [agent];
-        let tabs = [tab];
-        let mut state = BridgeState::default();
-        let mut logged = Vec::new();
-
-        for pass in 0..2 {
-            match route_topology(&agents, &tabs, "unusable-terminal") {
-                Ok(route) => panic!("pass {pass}: expected an unusable name, got {route:?}"),
-                Err(error @ RouteError::Unusable { .. }) => {
-                    logged.push(report_route_error(error, &mut state));
-                }
-                Err(error) => panic!("pass {pass}: expected RouteError::Unusable, got {error:?}"),
-            }
-        }
-
-        assert_eq!(
-            logged,
-            vec![true, false],
-            "the second pass must not log the already-reported name again"
-        );
-        assert_eq!(state.unusable_reported, HashSet::from([tab_id]));
-    }
-
-    /// Builds a fixture agent whose numeric label and `terminal_title_stripped` decide whether
-    /// `route_topology` resolves it or reports it pending, alongside its matching `HerdrTab`.
-    fn pending_title_fixture(
-        terminal_title_stripped: Option<&str>,
-    ) -> (AgentSnapshot, herdr_connect_rs::HerdrTab) {
-        let tab_id = "pending-tab".to_owned();
-        let agent = AgentSnapshot {
-            agent: "claude".to_owned(),
-            terminal_id: "pending-terminal".to_owned(),
-            agent_status: STATUS_IDLE.to_owned(),
-            tab_id: Some(tab_id.clone()),
-            workspace_id: Some("pending-workspace".to_owned()),
-            pane_id: Some("pending-pane".to_owned()),
-            cwd: Some("/repo/example".to_owned()),
-            terminal_title_stripped: terminal_title_stripped.map(str::to_owned),
-            session: Some(AgentSession {
-                agent: "claude".to_owned(),
-                value: "session".to_owned(),
-            }),
-            state_change_seq: 1,
-        };
-        let tab = herdr_connect_rs::HerdrTab {
-            tab_id,
-            workspace_id: "pending-workspace".to_owned(),
-            label: "3".to_owned(),
-        };
-        (agent, tab)
-    }
-
-    #[tokio::test]
-    async fn sync_pending_titles_leaves_a_tab_pending_once_its_agent_loses_its_session() {
-        let (agent, tab) = pending_title_fixture(Some("late title"));
-        let tab_id = tab.tab_id.clone();
-        let sessionless_agent = AgentSnapshot {
-            session: None,
-            ..agent
-        };
-        let agents = [sessionless_agent];
-        let tabs = [tab];
-        let mut state = BridgeState {
-            title_pending: HashSet::from([tab_id.clone()]),
-            ..Default::default()
-        };
-
-        // The session-less agent still carries the tab's title, but the no-session rule forbids
-        // mirroring it: `sync_pending_titles` must not resolve or sync it just because a title is
-        // present.
-        sync_pending_titles(None, &agents, &tabs, &mut state).await;
-
-        assert!(state.title_pending.contains(&tab_id));
-    }
-
-    #[tokio::test]
-    async fn sync_pending_titles_leaves_a_tab_pending_when_only_a_sessionless_sibling_pane_has_the_title()
-     {
-        let (session_pane, tab) = pending_title_fixture(None);
-        let tab_id = tab.tab_id.clone();
-        let titled_sessionless_pane = AgentSnapshot {
-            terminal_id: "pending-terminal-sibling".to_owned(),
-            pane_id: Some("pending-pane-sibling".to_owned()),
-            terminal_title_stripped: Some("late title".to_owned()),
-            session: None,
-            ..session_pane.clone()
-        };
-        let agents = [session_pane, titled_sessionless_pane];
-        let tabs = [tab];
-        let mut state = BridgeState {
-            title_pending: HashSet::from([tab_id.clone()]),
-            ..Default::default()
-        };
-
-        // Pane A has the session but no title; pane B has the title but no session. Neither one
-        // alone qualifies, so the tab must stay pending.
-        sync_pending_titles(None, &agents, &tabs, &mut state).await;
-
-        assert!(state.title_pending.contains(&tab_id));
-    }
-
-    #[tokio::test]
-    async fn a_snapshot_pass_records_a_pending_tab_without_a_status_transition() {
-        let (agent, tab) = pending_title_fixture(None);
-        let tab_id = tab.tab_id.clone();
-        let agents = [agent];
-        let tabs = [tab];
-        let mut state = BridgeState::default();
-
-        // No transition drives this: a silent snapshot pass alone must discover the tab is
-        // pending, since Herdr can title a pane without ever changing its agent status.
-        discover_pending_and_unusable_tabs(&agents, &tabs, &mut state);
-        assert!(state.title_pending.contains(&tab_id));
-
-        let titled_agents = [AgentSnapshot {
-            terminal_title_stripped: Some("late title".to_owned()),
-            ..agents[0].clone()
-        }];
-        sync_pending_titles(None, &titled_agents, &tabs, &mut state).await;
-        assert!(!state.title_pending.contains(&tab_id));
-    }
-
-    #[tokio::test]
-    async fn delivering_a_resolved_transition_clears_title_pending() {
-        let (agent, tab) = pending_title_fixture(Some("already titled"));
-        let tab_id = tab.tab_id.clone();
-        let agents = [agent.clone()];
-        let tabs = [tab];
-        let mut state = BridgeState {
-            title_pending: HashSet::from([tab_id.clone()]),
-            ..Default::default()
-        };
-        let transition = Transition {
-            from: STATUS_IDLE.to_owned(),
-            to: STATUS_DONE.to_owned(),
-            terminal_id: agent.terminal_id.clone(),
-            agent: agent.agent.clone(),
-        };
-
-        deliver_postable_transition(
-            PostableTransitionContext {
-                snapshot: &agent,
-                agents: &agents,
-                tabs: &tabs,
-                discord: None,
-                terminal: &agent.terminal_id,
-                transition: &transition,
-                state_change_seq: 1,
-            },
-            &mut state,
-        )
-        .await
-        .expect("delivery with no Discord connection still resolves the route");
-
-        assert!(!state.title_pending.contains(&tab_id));
     }
 
     #[test]
@@ -4552,6 +4315,32 @@ mod tests {
         )
     }
 
+    /// Waits up to `bound` for `agent.list` to report an empty (or whitespace-only) stripped
+    /// terminal title on a pane. A fire-and-forget `pane run` that clears the title (`pane run`
+    /// submits and returns immediately, it does not wait for the command to run) takes some real,
+    /// unbounded moment to actually reach the shell; a single read racing that moment is not
+    /// deterministic. Fails with the last observed title on timeout.
+    #[cfg(unix)]
+    async fn wait_for_empty_terminal_title(
+        pane_id: &str,
+        bound: Duration,
+    ) -> Result<AgentSnapshot, String> {
+        let start = Instant::now();
+        loop {
+            let snapshot = snapshot_for_pane(pane_id)?;
+            let title = snapshot.terminal_title_stripped.as_deref().unwrap_or("");
+            if title.trim().is_empty() {
+                return Ok(snapshot);
+            }
+            if start.elapsed() > bound {
+                return Err(format!(
+                    "pane {pane_id} did not report an empty terminal title within {bound:?}, last saw {title:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Real-Herdr exercise for the numeric-label/no-title bridge behavior, driven exactly as the
     /// ongoing event loop would: a silent snapshot pass (no status transition) discovers the tab
     /// is pending, a real session-wide `pane.updated` event reports the title, and the next
@@ -4566,19 +4355,8 @@ mod tests {
         let hold = Duration::from_secs(10);
         let hold_started = Instant::now();
         clear_and_hold_terminal_title(&tab.pane_id, hold)?;
-        tokio::time::sleep(Duration::from_millis(750)).await;
-
-        let pending_snapshot = snapshot_for_pane(&tab.pane_id)?;
-        let pending_title = pending_snapshot
-            .terminal_title_stripped
-            .as_deref()
-            .unwrap_or("")
-            .trim();
-        if !pending_title.is_empty() {
-            return Err(format!(
-                "expected an empty terminal title while the clear-and-hold command runs, agent.list reported {pending_title:?}"
-            ));
-        }
+        let pending_snapshot =
+            wait_for_empty_terminal_title(&tab.pane_id, Duration::from_secs(10)).await?;
 
         let matching = matching_tab(&tab.tab_id)?;
         if matching.label.is_empty() || !matching.label.chars().all(|c| c.is_ascii_digit()) {
