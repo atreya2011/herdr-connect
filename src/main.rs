@@ -964,6 +964,10 @@ async fn ensure_live_watch_started(
     let Some(session) = snapshot.session.clone() else {
         return;
     };
+    // Live text exists only for Claude logs; other vendors still get end cards, just not live text.
+    if session.agent != VENDOR_CLAUDE {
+        return;
+    }
     let path = match live_log_path(snapshot, &session) {
         Ok(Some(path)) => path,
         Ok(None) => return,
@@ -3363,7 +3367,7 @@ mod tests {
         }
         .await;
         close_tab(&tab.tab_id);
-        let _ = fs::remove_dir_all(&cwd_dir);
+        let _ = clear_directory_contents(&cwd_dir);
         let tabs_left =
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
@@ -3524,7 +3528,7 @@ mod tests {
         }
         .await;
         close_tab(&tab.tab_id);
-        let _ = fs::remove_dir_all(&cwd_dir);
+        let _ = clear_directory_contents(&cwd_dir);
         let tabs_left =
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
@@ -3568,7 +3572,7 @@ mod tests {
                 .expect("register the live pane as a herdr agent");
             let (closed_tab, closed_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
             close_tab(&closed_tab.tab_id);
-            let _ = fs::remove_dir_all(&closed_cwd_dir);
+            let _ = clear_directory_contents(&closed_cwd_dir);
 
             let mut pane_ids = (case.initial_pane_ids)(&closed_tab.pane_id, &live_tab.pane_id);
 
@@ -3583,7 +3587,7 @@ mod tests {
             .await;
 
             close_tab(&live_tab.tab_id);
-            let _ = fs::remove_dir_all(&live_cwd_dir);
+            let _ = clear_directory_contents(&live_cwd_dir);
             let tabs_left = remaining_tabs(SUBSCRIBE_LABEL)
                 .expect("tab.list succeeds for the zero-leftover check");
 
@@ -4049,12 +4053,28 @@ mod tests {
             other => return Err(format!("unsupported vendor for structural count: {other}")),
         };
         let messages = thread_messages(guild, thread).await?;
+        end_card_matches_last_live_text(&messages, expected_count)
+    }
+
+    /// Asserts the thread carries exactly `expected_count` live (non-embed) messages and that the
+    /// end card never repeats the last one.
+    #[cfg(unix)]
+    fn end_card_matches_last_live_text(
+        messages: &[(String, bool, Id<MessageMarker>)],
+        expected_count: usize,
+    ) -> Result<(), String> {
         let mut live: Vec<_> = messages.iter().filter(|(_, embed, _)| !embed).collect();
         if live.len() != expected_count {
             return Err(format!("expected {expected_count} live, got {live:?}"));
         }
         live.sort_by_key(|(_, _, id)| *id);
-        let last_text = &live.last().expect("expected_count > 0 for a real turn").0;
+        // An aborted, refused, or tool-only turn writes no assistant text: fail instead of
+        // panicking, so the caller still runs cleanup and the zero-leftover checks.
+        let Some((last_text, ..)) = live.last() else {
+            return Err(
+                "real turn produced no live text to compare against the end card".to_owned(),
+            );
+        };
         let repeated = messages
             .iter()
             .any(|(content, embed, _)| *embed && content == last_text);
