@@ -23,6 +23,8 @@ Never print or commit `.env`. Real-guild tests create only `testrun-` channels, 
 - **Idiomatic Rust**: `Result` errors, no panics in library paths, no `block_on` in library code, references where callers keep using values.
 - **Reproduction or rejection**: a bug claim without a reproducing failing test or exact command evidence is rejected unread.
 - **Honest reporting**: no green claim without pasting the run that proves it. The orchestrator independently re-runs all gates; false green claims are treated as defects.
+- **Bounded change**: one commit changes at most 1,000 hand-written lines; generated files such as `Cargo.lock` are excluded from the count.
+- **No ghost cases**: code and tests exist only for behavior with evidence — a reproduced defect, a real log, or a stated requirement. Hypothetical situations get neither code nor tests.
 
 ## Repo conventions
 
