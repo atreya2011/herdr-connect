@@ -47,7 +47,10 @@ pub use permission::{
 pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
 };
-pub use readers::{AgentLog, format_detection_question, read_agent_log};
+pub use readers::{
+    AgentLog, claude_turn_start_position, codex_turn_start_position, format_detection_question,
+    read_agent_log, read_claude_incremental, read_codex_incremental,
+};
 pub use topology::{
     RouteError, TopologyCache, TopologyRoute, archived_threads, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,

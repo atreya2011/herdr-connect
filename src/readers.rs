@@ -10,19 +10,33 @@ use crate::permission::{VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR};
 const POINTER: &str = "agent stopped, no log available";
 /// Key for a vendor log record's own type field (Claude: `user`/`assistant`; Codex: `turn_context`/`event_msg`).
 const RECORD_TYPE_KEY: &str = "type";
-/// Key for a Claude message content part's type field (e.g. `text`, `tool_use`, `tool_result`).
+/// Key for a Claude/Cursor content part's type (`text`, `tool_use`, `tool_result`, `tool-call`, `reasoning`).
 const CONTENT_PART_TYPE_KEY: &str = "type";
 /// Key for a Codex payload's type field (e.g. `task_started`, `turn_aborted`).
 const PAYLOAD_TYPE_KEY: &str = "type";
 const CONTENT_KEY: &str = "content";
 /// Key holding a Claude/Codex/Cursor content part's own text payload.
 const TEXT_KEY: &str = "text";
-/// The `text` content part's type-discriminant value.
 const CONTENT_PART_TEXT_VALUE: &str = "text";
 const MESSAGE_KEY: &str = "message";
 const PAYLOAD_KEY: &str = "payload";
 /// Value of a Cursor row's `role` field marking it as user-authored.
 const USER_ROLE_VALUE: &str = "user";
+/// Value of a Cursor row's `role` field marking it as assistant-authored.
+const ASSISTANT_ROLE_VALUE: &str = "assistant";
+/// Value of a Claude/Codex record's own `type` field marking it as assistant-authored.
+const ASSISTANT_RECORD_TYPE_VALUE: &str = "assistant";
+/// Value of a Codex record's own `type` field marking it as an event message.
+const EVENT_MSG_RECORD_TYPE_VALUE: &str = "event_msg";
+/// Value of a Codex record's `type` marking it a response item (live-verified Codex 0.153.4 shape
+/// for both user and assistant turn content).
+const RESPONSE_ITEM_RECORD_TYPE_VALUE: &str = "response_item";
+/// Value marking a Codex response item payload as a chat message, not e.g. a `custom_tool_call`.
+const MESSAGE_PAYLOAD_TYPE_VALUE: &str = "message";
+/// Key for a Codex response item payload's or Cursor row's author-role field.
+const ROLE_KEY: &str = "role";
+/// Value marking a Codex content part as the model's own output text (vs. `input_text`).
+const OUTPUT_TEXT_PART_TYPE_VALUE: &str = "output_text";
 /// Value of a Claude record's own `type` field marking it as user-authored.
 const USER_RECORD_TYPE_VALUE: &str = "user";
 const ROW_DATA_KEY: &str = "data";
@@ -59,6 +73,217 @@ pub fn read_agent_log(session: Option<&AgentSession>, path: &Path) -> Result<Age
     .map_err(|_| POINTER.to_owned())
 }
 
+/// Reads bytes after `offset`, plus the byte length of the leading run of complete
+/// (newline-terminated) lines: bytes after the last `\n` are a still-being-written line, excluded.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened, seeked, or read.
+fn read_new_bytes(path: &Path, offset: u64) -> Result<(Vec<u8>, usize), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let complete_len = bytes
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1);
+    Ok((bytes, complete_len))
+}
+
+/// One newline-terminated, non-blank line read from a vendor log, paired with the byte offset
+/// immediately after it: where an incremental reader resumes from if this line is consumed.
+struct PositionedLine<'a> {
+    text: &'a str,
+    end_offset: u64,
+}
+
+fn positioned_complete_lines(text: &str, start_offset: u64) -> Vec<PositionedLine<'_>> {
+    let mut out = Vec::new();
+    let mut consumed: u64 = 0;
+    for raw_line in text.split_inclusive('\n') {
+        consumed += raw_line.len() as u64;
+        let trimmed = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if !trimmed.trim().is_empty() {
+            out.push(PositionedLine {
+                text: trimmed,
+                end_offset: start_offset + consumed,
+            });
+        }
+    }
+    out
+}
+
+/// Parses each positioned line as JSON and extracts zero or more texts (paired with that line's
+/// position) from records `extract` matches.
+///
+/// Tolerates a torn write like [`lines`] tolerates a truncated trailing line: a parse failure on
+/// only the LAST line defers it (offset stops before it, not past it), since its newline can flush
+/// ahead of the record it terminates. A failure on any earlier line is real corruption: an error.
+///
+/// # Errors
+///
+/// Returns the parse error for a non-final line that fails to parse as JSON.
+fn extract_tolerant(
+    lines: &[PositionedLine<'_>],
+    start_offset: u64,
+    extract: impl Fn(&Value) -> Vec<String>,
+) -> Result<(Vec<(String, u64)>, u64), String> {
+    let mut texts = Vec::new();
+    let mut new_offset = start_offset;
+    for (index, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<Value>(line.text) {
+            Ok(record) => {
+                for text in extract(&record) {
+                    texts.push((text, line.end_offset));
+                }
+                new_offset = line.end_offset;
+            }
+            Err(_) if index + 1 == lines.len() => break,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok((texts, new_offset))
+}
+
+/// Reads new complete Claude assistant text parts appended to a session JSONL log since `offset`,
+/// each paired with the byte offset immediately after its record.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
+/// non-final complete line fails to parse as JSON.
+pub fn read_claude_incremental(
+    path: &Path,
+    offset: u64,
+) -> Result<(Vec<(String, u64)>, u64), String> {
+    let (bytes, complete_len) = read_new_bytes(path, offset)?;
+    let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
+    let lines = positioned_complete_lines(text, offset);
+    extract_tolerant(&lines, offset, |record| {
+        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(ASSISTANT_RECORD_TYPE_VALUE)
+        {
+            return Vec::new();
+        }
+        record
+            .get(MESSAGE_KEY)
+            .and_then(|message| message.get(CONTENT_KEY))
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| {
+                        part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                            == Some(CONTENT_PART_TEXT_VALUE)
+                    })
+                    .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Reads new complete Codex assistant messages appended to a session JSONL log since `offset`,
+/// each paired with the byte offset immediately after its record.
+///
+/// Understands only the current `response_item` record shape; the older `event_msg` shape
+/// (still read by the whole-log reader, via its own fixture) never appears in a fresh session
+/// and is not matched here.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
+/// non-final complete line fails to parse as JSON.
+pub fn read_codex_incremental(
+    path: &Path,
+    offset: u64,
+) -> Result<(Vec<(String, u64)>, u64), String> {
+    let (bytes, complete_len) = read_new_bytes(path, offset)?;
+    let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
+    let lines = positioned_complete_lines(text, offset);
+    extract_tolerant(&lines, offset, |record| {
+        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str)
+            != Some(RESPONSE_ITEM_RECORD_TYPE_VALUE)
+        {
+            return Vec::new();
+        }
+        let payload = record.get(PAYLOAD_KEY);
+        if payload
+            .and_then(|payload| payload.get(PAYLOAD_TYPE_KEY))
+            .and_then(Value::as_str)
+            != Some(MESSAGE_PAYLOAD_TYPE_VALUE)
+            || payload
+                .and_then(|payload| payload.get(ROLE_KEY))
+                .and_then(Value::as_str)
+                != Some(ASSISTANT_ROLE_VALUE)
+        {
+            return Vec::new();
+        }
+        payload
+            .and_then(|payload| payload.get(CONTENT_KEY))
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| {
+                        part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                            == Some(OUTPUT_TEXT_PART_TYPE_VALUE)
+                    })
+                    .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// The byte offset immediately after the last qualifying user record in a Claude session JSONL
+/// log — where a live-capture watch starts.
+///
+/// Its first read surfaces any text the turn already wrote before the watch attached. Returns 0
+/// when no such record exists yet (an empty/new log).
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or its complete lines are not valid UTF-8.
+pub fn claude_turn_start_position(path: &Path) -> Result<u64, String> {
+    turn_start_byte_position(path, is_qualifying_claude_user_record)
+}
+
+/// The byte offset immediately after the last turn-boundary record in a Codex session JSONL log,
+/// for the same reason as [`claude_turn_start_position`].
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or its complete lines are not valid UTF-8.
+pub fn codex_turn_start_position(path: &Path) -> Result<u64, String> {
+    turn_start_byte_position(path, is_codex_turn_boundary_record)
+}
+
+fn turn_start_byte_position(
+    path: &Path,
+    is_boundary: impl Fn(&Value) -> bool,
+) -> Result<u64, String> {
+    let (bytes, complete_len) = read_new_bytes(path, 0)?;
+    let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
+    let lines = positioned_complete_lines(text, 0);
+    let mut offset = 0;
+    for line in &lines {
+        if let Ok(record) = serde_json::from_str::<Value>(line.text)
+            && is_boundary(&record)
+        {
+            offset = line.end_offset;
+        }
+    }
+    Ok(offset)
+}
+
 fn parse_cursor_path(path: &Path) -> Result<AgentLog, serde_json::Error> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| serde_json::Error::custom("invalid cursor log"))?;
@@ -92,27 +317,31 @@ fn lines(text: &str) -> Result<Vec<Value>, serde_json::Error> {
     }
     Ok(records)
 }
+/// Whether a Claude record is a real, non-meta user turn boundary — shared by the whole-log tail
+/// search and the live-capture turn-start position.
+fn is_qualifying_claude_user_record(record: &Value) -> bool {
+    if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(USER_RECORD_TYPE_VALUE)
+        || record.get("isMeta") == Some(&Value::Bool(true))
+    {
+        return false;
+    }
+    let content = record.get(MESSAGE_KEY).and_then(|m| m.get(CONTENT_KEY));
+    content.is_some_and(|c| {
+        c.is_string()
+            || c.as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                        == Some(CONTENT_PART_TEXT_VALUE)
+                })
+            })
+    })
+}
+
 fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
     let records = lines(text)?;
     let start = records
         .iter()
-        .rposition(|r| {
-            if r.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(USER_RECORD_TYPE_VALUE)
-                || r.get("isMeta") == Some(&Value::Bool(true))
-            {
-                return false;
-            }
-            let content = r.get(MESSAGE_KEY).and_then(|m| m.get(CONTENT_KEY));
-            content.is_some_and(|c| {
-                c.is_string()
-                    || c.as_array().is_some_and(|parts| {
-                        parts.iter().any(|p| {
-                            p.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
-                                == Some(CONTENT_PART_TEXT_VALUE)
-                        })
-                    })
-            })
-        })
+        .rposition(is_qualifying_claude_user_record)
         .map_or(0, |i| i + 1);
     let tail = &records[start..];
     let answered: std::collections::HashSet<&str> = tail
@@ -185,18 +414,24 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         failure,
     })
 }
+/// Whether a Codex record marks the start of a new turn (`turn_context` or `task_started`) —
+/// shared by the whole-log tail search and the live-capture turn-start position.
+fn is_codex_turn_boundary_record(record: &Value) -> bool {
+    record.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("turn_context")
+        || (record.get(RECORD_TYPE_KEY).and_then(Value::as_str)
+            == Some(EVENT_MSG_RECORD_TYPE_VALUE)
+            && record
+                .get(PAYLOAD_KEY)
+                .and_then(|p| p.get(PAYLOAD_TYPE_KEY))
+                .and_then(Value::as_str)
+                == Some("task_started"))
+}
+
 fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
     let records = lines(text)?;
     let start = records
         .iter()
-        .rposition(|r| {
-            r.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("turn_context")
-                || (r.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("event_msg")
-                    && r.get(PAYLOAD_KEY)
-                        .and_then(|p| p.get(PAYLOAD_TYPE_KEY))
-                        .and_then(Value::as_str)
-                        == Some("task_started"))
-        })
+        .rposition(is_codex_turn_boundary_record)
         .map_or(0, |i| i + 1);
     let tail = &records[start..];
     let message = tail
@@ -241,6 +476,7 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
         failure,
     })
 }
+
 fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
     let records: Vec<Value> = rows
         .iter()

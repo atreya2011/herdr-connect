@@ -23,6 +23,14 @@ fn read_captured_vendor_logs() {
         ),
         (
             AgentSession {
+                agent: "codex".into(),
+                value: "session".into(),
+            },
+            "tests/fixtures/codex-session-response-item.jsonl",
+            "gamma",
+        ),
+        (
+            AgentSession {
                 agent: "cursor".into(),
                 value: "session".into(),
             },
