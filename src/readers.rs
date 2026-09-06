@@ -20,8 +20,12 @@ const TEXT_KEY: &str = "text";
 const CONTENT_PART_TEXT_VALUE: &str = "text";
 const MESSAGE_KEY: &str = "message";
 const PAYLOAD_KEY: &str = "payload";
+/// Key for a Cursor row's author-role field.
+const ROLE_KEY: &str = "role";
 /// Value of a Cursor row's `role` field marking it as user-authored.
 const USER_ROLE_VALUE: &str = "user";
+/// Value of a Cursor row's `role` field marking it as assistant-authored.
+const ASSISTANT_ROLE_VALUE: &str = "assistant";
 /// Value of a Claude/Codex record's own `type` field marking it as assistant-authored.
 const ASSISTANT_RECORD_TYPE_VALUE: &str = "assistant";
 /// Value of a Codex record's own `type` field marking it as an event message.
@@ -177,6 +181,63 @@ pub fn read_claude_incremental(
     })
 }
 
+/// Reads new complete Cursor assistant text parts from rows with `rowid` > `last_rowid`, paired
+/// with each row's `rowid` (store opened read-only).
+///
+/// `SQLite` rows are atomic: no torn-write case, a row is either committed and complete or not
+/// yet visible.
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be opened or queried.
+pub fn read_cursor_incremental(
+    path: &Path,
+    last_rowid: i64,
+) -> Result<(Vec<(String, i64)>, i64), String> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT rowid, data FROM blobs WHERE rowid > ?1 ORDER BY rowid")
+        .map_err(|error| error.to_string())?;
+    let rows: Vec<(i64, Value)> = statement
+        .query_map([last_rowid], |row| {
+            let rowid: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((
+                rowid,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut new_last_rowid = last_rowid;
+    let mut texts = Vec::new();
+    for (rowid, record) in rows {
+        new_last_rowid = new_last_rowid.max(rowid);
+        let data = record
+            .get(ROW_DATA_KEY)
+            .cloned()
+            .unwrap_or_else(|| record.clone());
+        if data.get(ROLE_KEY).and_then(Value::as_str) != Some(ASSISTANT_ROLE_VALUE) {
+            continue;
+        }
+        let Some(parts) = data.get(CONTENT_KEY).and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                == Some(CONTENT_PART_TEXT_VALUE)
+                && let Some(part_text) = part.get(TEXT_KEY).and_then(Value::as_str)
+                && !part_text.is_empty()
+            {
+                texts.push((part_text.to_owned(), rowid));
+            }
+        }
+    }
+    Ok((texts, new_last_rowid))
+}
+
 /// The byte offset immediately after the last qualifying user record in a Claude session JSONL
 /// log — where a live-capture watch starts.
 ///
@@ -206,6 +267,50 @@ fn turn_start_byte_position(
         }
     }
     Ok(offset)
+}
+
+/// The `rowid` of the last qualifying user row in a Cursor store, or 0 if none — the watch-start
+/// position, see [`claude_turn_start_position`].
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be opened or queried.
+pub fn cursor_turn_start_rowid(path: &Path) -> Result<i64, String> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT rowid, data FROM blobs ORDER BY rowid")
+        .map_err(|error| error.to_string())?;
+    let rows: Vec<(i64, Value)> = statement
+        .query_map([], |row| {
+            let rowid: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((
+                rowid,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut start_rowid = 0;
+    for (rowid, record) in rows {
+        let data = record
+            .get(ROW_DATA_KEY)
+            .cloned()
+            .unwrap_or_else(|| record.clone());
+        if is_cursor_user_boundary_row(&data) {
+            start_rowid = rowid;
+        }
+    }
+    Ok(start_rowid)
+}
+
+/// Whether a Cursor row's data marks the start of a new turn (a user row with array content) — the
+/// watch-start boundary for [`cursor_turn_start_rowid`].
+fn is_cursor_user_boundary_row(data: &Value) -> bool {
+    data.get(ROLE_KEY).and_then(Value::as_str) == Some(USER_ROLE_VALUE)
+        && data.get(CONTENT_KEY).is_some_and(Value::is_array)
 }
 
 fn parse_cursor_path(path: &Path) -> Result<AgentLog, serde_json::Error> {

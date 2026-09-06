@@ -23,14 +23,14 @@ use herdr_connect_rs::{
     RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache,
     TopologyRoute, Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
     agent_read_detection, cached_route, claude_turn_start_position, create_transition_messages,
-    create_unsupported_blocked_card, delete_tab_thread, delete_topology_absent_from_herdr,
-    delete_workspace_channel, deliver_live_message, deliver_transition_card,
-    drive_gateway_with_components, expire_informational_card, fetch_topology_lists,
-    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, live_message_nonce, load_discord_config, read_claude_incremental,
-    reconcile_topology_cache, route_topology, split_live_message, status_subscriptions,
-    subscribe_herdr_events, sync_topology, tab_list_result, transition_card_nonce,
-    workspace_list_result,
+    create_unsupported_blocked_card, cursor_turn_start_rowid, delete_tab_thread,
+    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_live_message,
+    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
+    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
+    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
+    read_claude_incremental, read_cursor_incremental, reconcile_topology_cache, route_topology,
+    split_live_message, status_subscriptions, subscribe_herdr_events, sync_topology,
+    tab_list_result, transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -55,9 +55,12 @@ struct InformationalCard {
     message: Id<MessageMarker>,
 }
 
-/// Where an incremental vendor-log reader resumes from: a byte offset into the vendor's JSONL log.
+/// Where an incremental vendor-log reader resumes from: a byte offset for the Claude JSONL log, a
+/// `rowid` for the Cursor sqlite store.
+#[derive(Clone, Copy)]
 enum LivePosition {
     Bytes(u64),
+    RowId(i64),
 }
 
 /// Dropping this stops its `notify` watcher.
@@ -1042,9 +1045,18 @@ fn live_log_path(
     }
 }
 
-/// Registers a `notify` watch on a vendor log file, forwarding the terminal id on every modify
-/// event.
+/// The Cursor session's chat directory: the parent of `store.db`, watched instead of the file
+/// itself so both the creation of its `-wal` sibling and later writes to it wake the follower. A
+/// watch set up before the sibling exists (the common case for a freshly started pane) would
+/// otherwise never see it appear.
+fn cursor_watch_target(store_path: &Path) -> &Path {
+    store_path.parent().unwrap_or(store_path)
+}
+
+/// Registers a `notify` watch on a vendor log path, forwarding the terminal id on every modify
+/// event. Cursor watches its chat directory (see [`cursor_watch_target`]) instead of the file.
 fn start_notify_watcher(
+    vendor: &str,
     path: &Path,
     terminal: String,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -1060,8 +1072,13 @@ fn start_notify_watcher(
         }
     })
     .map_err(|error| error.to_string())?;
+    let target = if vendor == VENDOR_CURSOR {
+        cursor_watch_target(path)
+    } else {
+        path
+    };
     watcher
-        .watch(path, notify::RecursiveMode::NonRecursive)
+        .watch(target, notify::RecursiveMode::NonRecursive)
         .map_err(|error| error.to_string())?;
     Ok(watcher)
 }
@@ -1073,6 +1090,7 @@ fn start_notify_watcher(
 fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
     match vendor {
         VENDOR_CLAUDE => claude_turn_start_position(path).map(LivePosition::Bytes),
+        VENDOR_CURSOR => cursor_turn_start_rowid(path).map(LivePosition::RowId),
         other => Err(format!(
             "live capture: unsupported vendor for initial position: {other}"
         )),
@@ -1102,8 +1120,9 @@ async fn ensure_live_watch_started(
     let Some(session) = snapshot.session.clone() else {
         return;
     };
-    // Live text exists only for Claude logs; other vendors still get end cards, just not live text.
-    if session.agent != VENDOR_CLAUDE {
+    // Live text exists only for Claude and Cursor logs; other vendors still get end cards, just
+    // not live text.
+    if !matches!(session.agent.as_str(), VENDOR_CLAUDE | VENDOR_CURSOR) {
         return;
     }
     let path = match live_log_path(snapshot, &session) {
@@ -1125,7 +1144,7 @@ async fn ensure_live_watch_started(
             return;
         }
     };
-    let watcher = match start_notify_watcher(&path, terminal.clone(), live_tx) {
+    let watcher = match start_notify_watcher(&session.agent, &path, terminal.clone(), live_tx) {
         Ok(watcher) => watcher,
         Err(error) => {
             eprintln!("live capture watch error for {terminal}: {error}");
@@ -1165,11 +1184,23 @@ async fn ensure_live_watch_started(
 /// # Errors
 ///
 /// Returns the incremental reader's error for the follower's vendor.
-fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, u64)>, u64), String> {
-    let LivePosition::Bytes(offset) = watch.position;
-    match watch.vendor.as_str() {
-        VENDOR_CLAUDE => read_claude_incremental(&watch.path, offset),
-        vendor => Err(format!("live capture: unsupported vendor {vendor}")),
+fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, i64)>, i64), String> {
+    match (watch.vendor.as_str(), watch.position) {
+        (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
+            let (texts, new_offset) = read_claude_incremental(&watch.path, offset)?;
+            Ok((
+                texts
+                    .into_iter()
+                    .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
+                    .collect(),
+                i64::try_from(new_offset).unwrap_or(i64::MAX),
+            ))
+        }
+        (VENDOR_CURSOR, LivePosition::RowId(rowid)) => {
+            let (texts, new_rowid) = read_cursor_incremental(&watch.path, rowid)?;
+            Ok((texts, new_rowid))
+        }
+        (vendor, _) => Err(format!("live capture: unsupported vendor {vendor}")),
     }
 }
 
@@ -1203,10 +1234,13 @@ async fn handle_live_event(
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
-    let LivePosition::Bytes(start_offset) = watch.position;
+    let start_position = match watch.position {
+        LivePosition::Bytes(offset) => i64::try_from(offset).unwrap_or(i64::MAX),
+        LivePosition::RowId(rowid) => rowid,
+    };
     let mut channel = watch.channel;
     let route = watch.route.clone();
-    let (texts, read_offset) = match read_new_live_texts(watch) {
+    let (texts, read_position) = match read_new_live_texts(watch) {
         Ok(result) => {
             state.live_read_errors_reported.remove(terminal);
             result
@@ -1219,16 +1253,12 @@ async fn handle_live_event(
         }
     };
     let topology_cache = responder.topology_cache();
-    let mut delivered_offset = start_offset;
+    let mut delivered_position = start_position;
     let mut all_delivered = true;
     for (text, position) in texts {
         let mut posted_all = true;
         for (part_index, part) in split_live_message(&text).into_iter().enumerate() {
-            let nonce = live_message_nonce(
-                terminal,
-                i64::try_from(position).unwrap_or(i64::MAX),
-                part_index,
-            );
+            let nonce = live_message_nonce(terminal, position, part_index);
             let mut sent = deliver_live_message(client.as_ref(), channel, &part, &nonce).await;
             if let Err(error) = &sent
                 && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
@@ -1253,10 +1283,10 @@ async fn handle_live_event(
             break;
         }
         state.last_posted.insert(terminal.to_owned(), text);
-        delivered_offset = position;
+        delivered_position = position;
     }
     if all_delivered {
-        delivered_offset = read_offset;
+        delivered_position = read_position;
         state.live_delivery_attempts.remove(terminal);
     } else {
         let attempts_so_far = state
@@ -1279,7 +1309,10 @@ async fn handle_live_event(
     }
     if let Some(watch) = state.live_watches.get_mut(terminal) {
         watch.channel = channel;
-        watch.position = LivePosition::Bytes(delivered_offset);
+        watch.position = match watch.vendor.as_str() {
+            VENDOR_CURSOR => LivePosition::RowId(delivered_position),
+            _ => LivePosition::Bytes(u64::try_from(delivered_position).unwrap_or(u64::MAX)),
+        };
     }
 }
 
@@ -2778,8 +2811,8 @@ mod tests {
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
         Transition, VENDOR_CLAUDE, lifecycle_subscriptions, read_claude_incremental,
-        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
-        workspace_list_result,
+        read_cursor_incremental, status_subscriptions, submit_owner_prompt, subscribe_herdr_events,
+        transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -3820,6 +3853,14 @@ mod tests {
         home.join(".cache/herdr-connect-testrun/claude")
     }
 
+    /// Fixed, owner-pre-trusted cwd for every real-Cursor fixture, for the same reason as
+    /// [`claude_testrun_dir`]: the Cursor CLI's own one-time "Trust this workspace" prompt has no
+    /// recovery either.
+    #[cfg(unix)]
+    fn cursor_testrun_dir(home: &Path) -> PathBuf {
+        home.join(".cache/herdr-connect-testrun/cursor")
+    }
+
     /// Empties `directory` without removing it: a fixture's shared, owner-pre-trusted cwd must
     /// always exist at the same path.
     #[cfg(unix)]
@@ -4749,6 +4790,7 @@ mod tests {
     fn start_live_capture_agent(kind: &str, agent_name: &str, pane_id: &str) -> Result<(), String> {
         let vendor_args: &[&str] = match kind {
             "claude" => &["--model", "haiku"],
+            "cursor" => &["--yolo"],
             other => return Err(format!("unsupported live-capture test kind: {other}")),
         };
         let bound = Duration::from_secs(10);
@@ -4780,17 +4822,20 @@ mod tests {
     }
 
     /// Testrun tab cwd, never the repository directory (holds `.env`): the fixed, owner-trusted
-    /// `.../herdr-connect-testrun/claude` — its trust prompt has no recovery.
+    /// `.../herdr-connect-testrun/{claude,cursor}` — its trust prompt has no recovery.
     #[cfg(unix)]
-    fn live_capture_tab_fixture() -> Result<(Tab, PathBuf), String> {
+    fn live_capture_tab_fixture(kind: &str) -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
             "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
         })?;
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
-        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
-        let cwd_dir = claude_testrun_dir(&home);
+        let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
+        let cwd_dir = match kind {
+            "cursor" => cursor_testrun_dir(&home),
+            _ => claude_testrun_dir(&home),
+        };
         clear_directory_contents(&cwd_dir)?;
         let cwd = cwd_dir
             .to_str()
@@ -4864,8 +4909,9 @@ mod tests {
         guild: &BlockedCaptureGuild,
         tab: &Tab,
         agent_name: &str,
+        kind: &str,
     ) -> Result<(), String> {
-        start_live_capture_agent(VENDOR_CLAUDE, agent_name, &tab.pane_id)?;
+        start_live_capture_agent(kind, agent_name, &tab.pane_id)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
         let terminal = idle.terminal_id.clone();
 
@@ -4897,12 +4943,9 @@ mod tests {
             s.session.is_some()
         })?;
         if working.agent_status != STATUS_WORKING
-            || working
-                .session
-                .as_ref()
-                .is_none_or(|sn| sn.agent != VENDOR_CLAUDE)
+            || working.session.as_ref().is_none_or(|sn| sn.agent != kind)
         {
-            return Err(format!("no confirmed claude working session: {working:?}"));
+            return Err(format!("no confirmed {kind} working session: {working:?}"));
         }
         own(&working, tabs, &connection, &mut state).await;
         let watch_deadline = Instant::now() + Duration::from_secs(5);
@@ -4951,7 +4994,11 @@ mod tests {
             return Err("settled snapshot lost its session".to_owned());
         };
         let log_path = live_log_path(&settled, &session)?.ok_or("no log path yet")?;
-        let expected_count = read_claude_incremental(&log_path, 0)?.0.len();
+        let expected_count = match kind {
+            "claude" => read_claude_incremental(&log_path, 0)?.0.len(),
+            "cursor" => read_cursor_incremental(&log_path, 0)?.0.len(),
+            other => return Err(format!("unsupported vendor for structural count: {other}")),
+        };
         let messages = thread_messages(guild, thread).await?;
         end_card_matches_last_live_text(&messages, expected_count)
     }
@@ -4985,7 +5032,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn run_live_capture_test() {
+    async fn run_live_capture_test(kind: &str) {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -4995,7 +5042,7 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
+        let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
         assert_eq!(
             remaining_tabs(&label).expect("tab.list succeeds"),
             0,
@@ -5005,19 +5052,19 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let created = live_capture_tab_fixture();
+        let created = live_capture_tab_fixture(kind);
         let (tab_id, cwd_dir, result) = match created {
             Ok((tab, cwd_dir)) => {
                 let agent_name = format!(
-                    "live-claude-{}",
+                    "live-{kind}-{}",
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(180),
-                    live_capture_exercise(&guild, &tab, &agent_name),
+                    live_capture_exercise(&guild, &tab, &agent_name, kind),
                 )
                 .await
-                .unwrap_or_else(|_| Err("claude live-capture exercise timed out".to_owned()));
+                .unwrap_or_else(|_| Err(format!("{kind} live-capture exercise timed out")));
                 if let Ok(snapshot) = snapshot_for_pane(&tab.pane_id)
                     && let Some(session) = snapshot.session.as_ref()
                     && let Ok(path) = resolve_session_path(&home, &snapshot, session)
@@ -5047,8 +5094,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn live_capture_posts_first_live_text_before_settle_for_claude() {
-        run_live_capture_test().await;
+    async fn live_capture_posts_first_live_text_before_settle_for_each_vendor() {
+        for kind in ["claude", "cursor"] {
+            run_live_capture_test(kind).await;
+        }
     }
 
     #[cfg(unix)]
@@ -7265,7 +7314,8 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         let (live_tx, _live_rx) = tokio::sync::mpsc::unbounded_channel();
-        let watcher = start_notify_watcher(&live_path, terminal.to_owned(), live_tx)?;
+        let watcher =
+            start_notify_watcher(VENDOR_CLAUDE, &live_path, terminal.to_owned(), live_tx)?;
         let mut state = BridgeState::default();
         state.live_watches.insert(
             terminal.to_owned(),
@@ -7492,7 +7542,7 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         let (live_tx, _live_rx) = tokio::sync::mpsc::unbounded_channel();
-        let watcher = start_notify_watcher(&live_path, terminal.clone(), live_tx)?;
+        let watcher = start_notify_watcher(VENDOR_CLAUDE, &live_path, terminal.clone(), live_tx)?;
         let mut state = BridgeState::default();
         state.live_watches.insert(
             terminal.clone(),
