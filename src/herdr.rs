@@ -245,7 +245,8 @@ pub struct AgentSnapshot {
 ///
 /// # Errors
 ///
-/// Returns socket, envelope, or payload errors.
+/// Returns socket or envelope errors, or a payload error naming the exact `agent.list` entry that
+/// failed to deserialize (so a transient shape a caller could not otherwise diagnose is visible).
 pub fn list_agents() -> Result<Vec<AgentSnapshot>, String> {
     let value: Value =
         serde_json::from_str(&request_rpc_result("agent.list")?).map_err(|e| e.to_string())?;
@@ -255,7 +256,10 @@ pub fn list_agents() -> Result<Vec<AgentSnapshot>, String> {
         .ok_or_else(|| "agent.list response did not contain agents".into())
         .and_then(|a| {
             a.iter()
-                .map(|v| AgentSnapshot::deserialize(v).map_err(|error| error.to_string()))
+                .map(|v| {
+                    AgentSnapshot::deserialize(v)
+                        .map_err(|error| format!("{error} in agent.list entry: {v}"))
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
 }
@@ -317,6 +321,13 @@ pub fn status_subscriptions(pane_ids: &[String]) -> Vec<Value> {
 /// lines are pushed events.
 pub struct HerdrSubscription {
     reader: tokio::io::BufReader<tokio::net::UnixStream>,
+    /// Accumulates `next_event`'s in-progress line across calls. `read_until` is cancel-safe only
+    /// when its output buffer survives cancellation: `tokio::select!` racing `next_event` against
+    /// another branch (as the bridge event loop's live-capture arm now does, on every pane's
+    /// `notify` tick) can cancel a read after it has copied bytes out of the socket but before a
+    /// full line is available. A buffer owned by the future itself would lose those bytes with it;
+    /// this one lives in `self` and is still there on the next call.
+    line_buffer: Vec<u8>,
 }
 
 /// Error from [`subscribe_herdr_events`], distinguishing a Herdr-declared `pane_not_found` from
@@ -420,7 +431,10 @@ pub async fn subscribe_herdr_events(
                 "herdr events.subscribe ack was not subscription_started: {response}"
             )));
         }
-        Ok(HerdrSubscription { reader })
+        Ok(HerdrSubscription {
+            reader,
+            line_buffer: Vec::new(),
+        })
     })
     .await
     .map_err(|_| SubscribeError::Other("herdr subscribe connect timed out".to_owned()))?
@@ -429,19 +443,25 @@ pub async fn subscribe_herdr_events(
 impl HerdrSubscription {
     /// Reads the next pushed JSON event line.
     ///
+    /// Cancel-safe: reads with `read_until` into `self.line_buffer`, which persists across calls.
+    /// If this call is cancelled (for example by losing a `tokio::select!` race) before a full
+    /// line arrives, whatever bytes it already read stay in `self.line_buffer` for the next call
+    /// to continue from, rather than being read from the socket and then discarded.
+    ///
     /// # Errors
     ///
     /// Returns stream-closed, parse, or Herdr-declared errors.
     pub async fn next_event(&mut self) -> Result<Value, String> {
-        let mut line = String::new();
         let read = self
             .reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut self.line_buffer)
             .await
             .map_err(|error| error.to_string())?;
-        if read == 0 {
+        if read == 0 || !self.line_buffer.ends_with(b"\n") {
             return Err("herdr subscribe stream closed".to_owned());
         }
+        let line = String::from_utf8(std::mem::take(&mut self.line_buffer))
+            .map_err(|error| error.to_string())?;
         let value: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
         if let Some(error) = value.get(ERROR_KEY) {
             return Err(format!(
@@ -462,7 +482,61 @@ impl HerdrSubscription {
 
 #[cfg(test)]
 mod tests {
-    use super::acknowledge_prompt_result;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tokio::io::AsyncWriteExt;
+
+    use super::{HerdrSubscription, acknowledge_prompt_result};
+
+    /// A real Unix domain socket, not the live Herdr daemon: reproducing a byte-level split-write
+    /// race against the real daemon on demand is not practically controllable, but
+    /// `HerdrSubscription`'s cancel safety does not depend on what is on the other end of the
+    /// socket, only on real, unmocked `tokio::net::UnixStream` I/O.
+    #[tokio::test]
+    async fn next_event_survives_cancellation_across_a_split_write() {
+        let (mut server, client) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let mut subscription = HerdrSubscription {
+            reader: tokio::io::BufReader::new(client),
+            line_buffer: Vec::new(),
+        };
+        let line = format!(
+            "{}\n",
+            json!({"event": "pane.agent_status_changed", "data": {"pane_id": "p1"}})
+        );
+        let split_at = line.len() / 2;
+        let (first_half, second_half) = line.split_at(split_at);
+        server.write_all(first_half.as_bytes()).await.unwrap();
+        server.flush().await.unwrap();
+
+        let second_half = second_half.to_owned();
+        let writer = tokio::spawn(async move {
+            // Gives several competing-branch ticks below a real chance to cancel `next_event`'s
+            // in-flight read before the line completes.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            server.write_all(second_half.as_bytes()).await.unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let mut competing_branch_ticks = 0;
+        let event = loop {
+            tokio::select! {
+                result = subscription.next_event() => break result,
+                () = tokio::time::sleep(Duration::from_millis(50)) => { competing_branch_ticks += 1; }
+            }
+        };
+        writer.await.unwrap();
+
+        assert!(
+            competing_branch_ticks > 0,
+            "the competing branch must actually have fired to exercise cancellation"
+        );
+        let event = event.expect("the event parses intact despite repeated cancellation");
+        assert_eq!(
+            event.get("event").and_then(Value::as_str),
+            Some("pane.agent_status_changed")
+        );
+    }
 
     #[test]
     fn prompt_stalls_are_acknowledged_but_real_errors_are_preserved() {
