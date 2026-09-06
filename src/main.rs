@@ -2660,9 +2660,12 @@ mod tests {
     #[cfg(unix)]
     const SEQ_BACKSTOP_LABEL: &str = "testrun-seq-backstop";
 
+    /// Creates a testrun tab, passing the caller's own `CLAUDE_CONFIG_DIR` through to it when set,
+    /// so a real Claude agent started in it authenticates with the same account as the test
+    /// process rather than falling back to `claude`'s default config directory.
     #[cfg(unix)]
     fn create_tab(label: &str, workspace_id: &str, cwd: &str) -> Result<Tab, String> {
-        let created = herdr_json(&[
+        let mut args = vec![
             "tab",
             "create",
             "--workspace",
@@ -2672,7 +2675,16 @@ mod tests {
             "--label",
             label,
             "--no-focus",
-        ])?;
+        ];
+        let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let env_arg = claude_config_dir
+            .as_deref()
+            .map(|dir| format!("CLAUDE_CONFIG_DIR={dir}"));
+        if let Some(env_arg) = &env_arg {
+            args.push("--env");
+            args.push(env_arg);
+        }
+        let created = herdr_json(&args)?;
         let tab_id = created["result"]["tab"]["tab_id"]
             .as_str()
             .ok_or("herdr tab create result missing tab_id")?
@@ -2689,6 +2701,30 @@ mod tests {
         let _ = Command::new("herdr")
             .args(["tab", "close", tab_id])
             .output();
+    }
+
+    /// Fixed, owner-pre-trusted cwd for every real-Claude fixture: a fresh directory would trip
+    /// Claude Code's own first-run "trust this folder?" prompt under a personal `CLAUDE_CONFIG_DIR`,
+    /// which blocks the pane from ever reaching ready.
+    #[cfg(unix)]
+    fn claude_testrun_dir(home: &Path) -> PathBuf {
+        home.join(".cache/herdr-connect-testrun/claude")
+    }
+
+    /// Empties `directory` without removing it: a fixture's shared, owner-pre-trusted cwd must
+    /// always exist at the same path.
+    #[cfg(unix)]
+    fn clear_directory_contents(directory: &Path) -> Result<(), String> {
+        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+            } else {
+                fs::remove_file(&path).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2750,10 +2786,11 @@ mod tests {
     }
 
     /// Creates a workspace and renames its root tab to the same label, so both the workspace and
-    /// its root tab are visible to a zero-leftover check by that one label.
+    /// its root tab are visible to a zero-leftover check by that one label. Passes the caller's
+    /// own `CLAUDE_CONFIG_DIR` through when set, for the same reason as [`create_tab`].
     #[cfg(unix)]
     fn create_workspace(label: &str, cwd: &str) -> Result<Workspace, String> {
-        let created = herdr_json(&[
+        let mut args = vec![
             "workspace",
             "create",
             "--cwd",
@@ -2761,7 +2798,16 @@ mod tests {
             "--label",
             label,
             "--no-focus",
-        ])?;
+        ];
+        let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let env_arg = claude_config_dir
+            .as_deref()
+            .map(|dir| format!("CLAUDE_CONFIG_DIR={dir}"));
+        if let Some(env_arg) = &env_arg {
+            args.push("--env");
+            args.push(env_arg);
+        }
+        let created = herdr_json(&args)?;
         let workspace_id = created["result"]["workspace"]["workspace_id"]
             .as_str()
             .ok_or("herdr workspace create result missing workspace_id")?
@@ -2892,25 +2938,15 @@ mod tests {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
             "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
         })?;
-        let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-subscribe-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&cwd_dir).map_err(|error| error.to_string())?;
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir)?;
         let cwd = cwd_dir
             .to_str()
             .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
-        match create_tab(SUBSCRIBE_LABEL, &workspace_id, cwd) {
-            Ok(tab) => Ok((tab, cwd_dir)),
-            Err(error) => {
-                let _ = fs::remove_dir_all(&cwd_dir);
-                Err(error)
-            }
-        }
+        create_tab(SUBSCRIBE_LABEL, &workspace_id, cwd).map(|tab| (tab, cwd_dir))
     }
 
     #[cfg(unix)]
@@ -3385,7 +3421,7 @@ mod tests {
             close_tab(tab_id);
         }
         if let Some(cwd_dir) = cwd_dir {
-            let _ = fs::remove_dir_all(&cwd_dir);
+            let _ = clear_directory_contents(&cwd_dir);
         }
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
@@ -3522,15 +3558,8 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-seq-backstop-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&cwd_dir).expect("create seq-backstop test cwd");
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir).expect("clear seq-backstop test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
         let created = create_tab(SEQ_BACKSTOP_LABEL, &workspace_id, cwd);
@@ -3556,7 +3585,7 @@ mod tests {
         if let Some(tab_id) = &tab_id {
             close_tab(tab_id);
         }
-        let _ = fs::remove_dir_all(&cwd_dir);
+        let _ = clear_directory_contents(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(SEQ_BACKSTOP_LABEL)
@@ -3590,15 +3619,8 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-seq-same-status-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&cwd_dir).expect("create seq-same-status test cwd");
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir).expect("clear seq-same-status test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
         let created = create_tab(SEQ_BACKSTOP_LABEL, &workspace_id, cwd);
@@ -3624,7 +3646,7 @@ mod tests {
         if let Some(tab_id) = &tab_id {
             close_tab(tab_id);
         }
-        let _ = fs::remove_dir_all(&cwd_dir);
+        let _ = clear_directory_contents(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(SEQ_BACKSTOP_LABEL)
@@ -5629,11 +5651,8 @@ mod tests {
         ));
         fs::create_dir_all(&silent_cwd_dir).expect("create session-reported-later silent cwd");
         let silent_cwd = silent_cwd_dir.to_str().expect("temp cwd is valid UTF-8");
-        let claude_cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-session-reported-later-claude-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&claude_cwd_dir).expect("create session-reported-later claude cwd");
+        let claude_cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&claude_cwd_dir).expect("clear session-reported-later claude cwd");
         let claude_cwd = claude_cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
         let (workspace_ids, result) =
@@ -5667,7 +5686,7 @@ mod tests {
             close_workspace(workspace_id);
         }
         let _ = fs::remove_dir_all(&silent_cwd_dir);
-        let _ = fs::remove_dir_all(&claude_cwd_dir);
+        let _ = clear_directory_contents(&claude_cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(SESSION_REPORTED_LATER_LABEL)
