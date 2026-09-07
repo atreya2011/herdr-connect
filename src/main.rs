@@ -1282,28 +1282,47 @@ async fn deliver_to_route(
 /// already holds both the route's workspace channel and its tab thread. Refetches -- one Discord
 /// round trip instead of one per lifecycle event -- only when the cache is empty, does not yet
 /// hold the route, or (via a caller invalidating it first) held a channel a send just rejected as
-/// unknown.
+/// unknown. One guard is held for the whole call, across the refetch too, so a concurrent miss on
+/// the same route blocks on the lock instead of racing its own fetch-and-create.
 async fn sync_route(
     client: &Client,
     guild: Id<GuildMarker>,
     route: &TopologyRoute,
     topology_cache: &TopologyCache,
 ) -> Result<Id<ChannelMarker>, String> {
-    {
-        let guard = topology_cache.lock().await;
-        if let Some((channels, active_threads)) = guard.as_ref() {
-            match cached_route(channels, active_threads, route) {
-                Ok(Some(channel)) => return Ok(channel),
-                Ok(None) => {}
-                Err(error) => return Err(format!("discord topology error: {error}")),
-            }
-        }
+    let mut guard = topology_cache.lock().await;
+    sync_route_locked(client, guild, route, &mut guard).await
+}
+
+/// [`sync_route`]'s body, run under a guard the caller acquired and holds for this whole call
+/// (including the refetch): a second concurrent miss on the same route blocks on that same guard
+/// instead of racing its own fetch-and-create. Split into its own function, taking the guard by
+/// reference rather than owning it, purely so `sync_route` itself has one single, unbroken use of
+/// its guard for lint purposes; the locking behavior is identical either way.
+async fn sync_route_locked(
+    client: &Client,
+    guild: Id<GuildMarker>,
+    route: &TopologyRoute,
+    guard: &mut tokio::sync::MutexGuard<
+        '_,
+        Option<(
+            Vec<twilight_model::channel::Channel>,
+            Vec<twilight_model::channel::Channel>,
+        )>,
+    >,
+) -> Result<Id<ChannelMarker>, String> {
+    let cached = match guard.as_ref() {
+        Some((channels, active_threads)) => cached_route(channels, active_threads, route)
+            .map_err(|error| format!("discord topology error: {error}"))?,
+        None => None,
+    };
+    if let Some(channel) = cached {
+        return Ok(channel);
     }
     let fetched = fetch_topology_lists(client, guild)
         .await
         .map_err(|error| format!("discord topology error: {error}"))?;
-    let mut guard = topology_cache.lock().await;
-    let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
+    let (channels, active_threads) = reconcile_topology_cache(guard, fetched);
     sync_topology(client, guild, channels, active_threads, route)
         .await
         .map_err(|error| format!("discord topology error: {error}"))
