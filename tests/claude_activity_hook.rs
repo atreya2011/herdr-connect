@@ -110,6 +110,41 @@ async fn activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
     }
 }
 
+fn invoke_activity_with_args(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
+        .arg("activity")
+        .args(args)
+        .env_remove("HERDR_CLAUDE_BROKER_SOCKET")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run activity subcommand")
+}
+
+/// An argument error is as much a no-op as a malformed payload or a missing socket: the hook's
+/// fire-and-forget contract promises "always exits 0 with no output" for every input, not just the
+/// ones the subcommand itself considers well-formed.
+#[test]
+fn activity_subcommand_exits_zero_with_no_output_for_every_argument_error() {
+    let cases: [(&str, &[&str]); 5] = [
+        ("unsupported vendor", &["--vendor", "codex"]),
+        ("unknown flag", &["--vendor", "claude", "--oops"]),
+        ("no arguments", &[]),
+        ("--vendor with no value", &["--vendor"]),
+        (
+            "--socket with no value",
+            &["--vendor", "claude", "--socket"],
+        ),
+    ];
+    for (name, args) in cases {
+        let output = invoke_activity_with_args(args);
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert!(output.stdout.is_empty(), "{name}: unexpected stdout");
+        assert!(output.stderr.is_empty(), "{name}: unexpected stderr");
+    }
+}
+
 #[tokio::test]
 async fn activity_subcommand_writes_nothing_for_malformed_input() {
     let path = socket_path("malformed");

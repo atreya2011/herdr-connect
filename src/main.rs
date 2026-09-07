@@ -1305,6 +1305,22 @@ async fn cached_route_channel(
     channel
 }
 
+/// Re-resolves `route`'s tab thread from a fresh topology fetch, without creating anything: an
+/// activity frame's empty `channel_name`/`thread_name` (it has no agent/tab snapshot to derive a
+/// real name from) would corrupt a genuine create, so unlike [`sync_route`] a route the fresh
+/// fetch still does not resolve returns `None` rather than falling through to `sync_topology`.
+async fn refresh_activity_route_channel(
+    client: &Client,
+    guild: Id<GuildMarker>,
+    route: &TopologyRoute,
+    topology_cache: &TopologyCache,
+) -> Option<Id<ChannelMarker>> {
+    let fetched = fetch_topology_lists(client, guild).await.ok()?;
+    let mut guard = topology_cache.lock().await;
+    let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
+    cached_route(channels, active_threads, route).ok().flatten()
+}
+
 /// Applies one activity frame: routes it to its tab's thread purely from the cached topology, then
 /// posts or edits this turn's one activity message for the pane.
 ///
@@ -1316,7 +1332,7 @@ async fn handle_activity_event(
     frame: ActivityFrame,
     state: &mut BridgeState,
 ) {
-    let Some((client, _guild, _owner_id, responder)) = discord else {
+    let Some((client, guild, _owner_id, responder)) = discord else {
         return;
     };
     let route = TopologyRoute {
@@ -1326,16 +1342,32 @@ async fn handle_activity_event(
         channel_name: String::new(),
         thread_name: String::new(),
     };
-    let Some(channel) = cached_route_channel(responder.topology_cache(), &route).await else {
+    let topology_cache = responder.topology_cache();
+    let Some(mut channel) = cached_route_channel(topology_cache, &route).await else {
         return;
     };
     if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
         let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
-        if update_activity_message(client.as_ref(), channel, existing.message, &text)
-            .await
-            .is_ok()
+        let mut result =
+            update_activity_message(client.as_ref(), channel, existing.message, &text).await;
+        if let Err(error) = &result
+            && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
+            && let Some(resolved) =
+                refresh_activity_route_channel(client.as_ref(), *guild, &route, topology_cache)
+                    .await
         {
-            existing.count += 1;
+            channel = resolved;
+            result =
+                update_activity_message(client.as_ref(), channel, existing.message, &text).await;
+        }
+        match result {
+            Ok(()) => existing.count += 1,
+            Err(error) => {
+                eprintln!(
+                    "activity edit delivery error for pane {}: {error}",
+                    frame.pane_id
+                );
+            }
         }
         return;
     }
@@ -1343,10 +1375,27 @@ async fn handle_activity_event(
         return;
     }
     let text = activity_message_text(1, &frame.tool, &frame.summary);
-    if let Ok(message) = deliver_activity_message(client.as_ref(), channel, &text).await {
-        state
-            .activity_messages
-            .insert(frame.pane_id, ActivityMessage { message, count: 1 });
+    let mut result = deliver_activity_message(client.as_ref(), channel, &text).await;
+    if let Err(error) = &result
+        && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
+        && let Some(resolved) =
+            refresh_activity_route_channel(client.as_ref(), *guild, &route, topology_cache).await
+    {
+        channel = resolved;
+        result = deliver_activity_message(client.as_ref(), channel, &text).await;
+    }
+    match result {
+        Ok(message) => {
+            state
+                .activity_messages
+                .insert(frame.pane_id, ActivityMessage { message, count: 1 });
+        }
+        Err(error) => {
+            eprintln!(
+                "activity create delivery error for pane {}: {error}",
+                frame.pane_id
+            );
+        }
     }
 }
 
@@ -1886,8 +1935,9 @@ fn parse_hook_args(
 /// activity frame, always exiting 0 with no output: activity display is best-effort and must
 /// never fail the tool call it rides on.
 async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let requested_socket = parse_activity_args(args)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let Ok(requested_socket) = parse_activity_args(args) else {
+        return Ok(());
+    };
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
     let Ok(request) = decode_claude_activity_request(&input) else {

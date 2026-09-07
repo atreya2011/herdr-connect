@@ -146,7 +146,7 @@ pub async fn update_activity_message(
         .update_message(channel, message)
         .payload_json(&payload)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| map_send_error(&error))?;
     Ok(())
 }
 
