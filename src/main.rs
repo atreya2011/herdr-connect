@@ -100,11 +100,16 @@ struct BridgeState {
     live_watches: HashMap<String, LiveWatch>,
     /// `None` in tests that never wire live capture up.
     live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Terminals to stop retrying a watch for: a non-transient `live_log_path` error.
+    /// Terminals to stop retrying a watch for: a non-transient `live_log_path` error, or a live
+    /// delivery that kept failing for [`LIVE_DELIVERY_ATTEMPTS`] ticks in a row.
     live_unfollowable: HashSet<String>,
     /// Terminals whose live-capture read error was already logged once, so it is not repeated on
     /// every later event.
     live_read_errors_reported: HashSet<String>,
+    /// Consecutive failed delivery ticks per terminal for the text currently stuck at the front of
+    /// its live watch. Reset once that text is finally delivered; cleared once the terminal is
+    /// marked unfollowable, since there is no longer a watch to retry.
+    live_delivery_attempts: HashMap<String, u32>,
     /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
     /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
     /// Forgotten -- not deleted -- at the same point a live watch settles, so the next turn starts
@@ -141,6 +146,13 @@ struct BlockedCardContext<'a> {
 /// file is flushed with the pending question, so a single capture miss is not
 /// treated as "no question" — it is retried on the next few snapshots instead.
 const MAX_BLOCKED_CAPTURE_ATTEMPTS: u32 = 3;
+
+/// Bounded number of consecutive failed delivery ticks for the same stuck live-capture text
+/// before its terminal is marked [`BridgeState::live_unfollowable`] and its watch dropped. A
+/// persistent failure (the bot loses `SEND_MESSAGES` in that thread; a thread archived rather
+/// than deleted, which the unknown-channel recovery does not cover) would otherwise retry and log
+/// once per `notify` tick for the rest of the turn.
+const LIVE_DELIVERY_ATTEMPTS: u32 = 3;
 
 /// Retries blocked-capture while a pane stays blocked without another status event.
 const BLOCKED_CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(1_500);
@@ -1032,8 +1044,9 @@ fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, Stri
 
 /// Starts a live-capture follower for a terminal newly observed as `working`, unless one is
 /// already running or the terminal was already marked unfollowable. Retried on every later
-/// snapshot while the pane stays `working`, except that a non-transient `live_log_path` error
-/// marks the terminal unfollowable so no further attempt is made for it.
+/// snapshot while the pane stays `working`, except that a non-transient `live_log_path` error, or
+/// [`LIVE_DELIVERY_ATTEMPTS`] consecutive delivery failures inside [`handle_live_event`], marks
+/// the terminal unfollowable so no further attempt is made for it.
 ///
 /// A bridge restart re-follows an already-in-progress turn from its start. Discord's nonce dedupe
 /// lasts only a few minutes, so this reposts only the turn's texts older than that window; a
@@ -1135,6 +1148,13 @@ fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, u64)>, u64), S
 /// do not repeat the round trip. The stored log position only advances past text that was
 /// actually delivered: a text that still fails after the retry stops the batch there, so it and
 /// everything read after it are re-read and re-sent on the next event instead of being lost.
+///
+/// That retry-on-the-next-tick behavior is only safe because it is bounded:
+/// [`BridgeState::live_delivery_attempts`] counts consecutive failed ticks for whatever text is
+/// currently stuck at the front, and once that reaches [`LIVE_DELIVERY_ATTEMPTS`] (a persistent
+/// failure the one unknown-channel recovery does not fix -- lost `SEND_MESSAGES`, or a thread
+/// archived rather than deleted) the terminal is logged once, added to
+/// [`BridgeState::live_unfollowable`], and its watch is dropped, rather than retrying forever.
 async fn handle_live_event(
     discord: Option<&DiscordConnection>,
     terminal: &str,
@@ -1200,6 +1220,25 @@ async fn handle_live_event(
     }
     if all_delivered {
         delivered_offset = read_offset;
+        state.live_delivery_attempts.remove(terminal);
+    } else {
+        let attempts_so_far = state
+            .live_delivery_attempts
+            .get(terminal)
+            .copied()
+            .unwrap_or(0);
+        if attempts_so_far + 1 >= LIVE_DELIVERY_ATTEMPTS {
+            eprintln!(
+                "live capture unfollowable for {terminal}: delivery failed {LIVE_DELIVERY_ATTEMPTS} times in a row"
+            );
+            state.live_delivery_attempts.remove(terminal);
+            state.live_watches.remove(terminal);
+            state.live_unfollowable.insert(terminal.to_owned());
+            return;
+        }
+        state
+            .live_delivery_attempts
+            .insert(terminal.to_owned(), attempts_so_far + 1);
     }
     if let Some(watch) = state.live_watches.get_mut(terminal) {
         watch.channel = channel;
@@ -2620,15 +2659,16 @@ mod tests {
 
     use super::{
         BlockedCardContext, BlockedDeliveryRoute, BlockedResponse, BridgeRuntime, BridgeState,
-        BrokerTask, Client, LivePosition, LiveWatch, Membership, PermissionResponder,
-        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
-        capture_for_with_search_root, card_capture_for_delivery, create_transition_messages,
-        decide_blocked_response, delete_closed_topology_batch, deliver_blocked_messages,
-        deliver_to_route, discover_pending_and_unusable_tabs, drain_lifecycle_batch,
-        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
-        handle_live_event, lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        next_state_change_sequence, process_snapshot, repeats_last_live_text, resolve_session_path,
-        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
+        BrokerTask, Client, LIVE_DELIVERY_ATTEMPTS, LivePosition, LiveWatch, Membership,
+        PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
+        agent_read_detection, apply_membership, capture_for_with_search_root,
+        card_capture_for_delivery, create_transition_messages, decide_blocked_response,
+        delete_closed_topology_batch, deliver_blocked_messages, deliver_to_route,
+        discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_topology_lists,
+        handle_blocked_card, handle_lifecycle_select_result, handle_live_event, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, next_state_change_sequence,
+        process_snapshot, repeats_last_live_text, resolve_session_path, route_topology,
+        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
         start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
         sync_route, sync_startup_topology, tab_list_result, unique_existing_path,
     };
@@ -6999,6 +7039,238 @@ mod tests {
 
             let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
             let tabs_left = remaining_tabs(CACHE_RECOVERY_LABEL)
+                .expect("tab.list succeeds for the zero-leftover check");
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
+            assert_eq!(channels_left, 0, "named zero-leftover check: {}", case.name);
+            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
+        }
+    }
+
+    #[cfg(unix)]
+    const LIVE_ATTEMPTS_LABEL: &str = "testrun-live-attempts";
+
+    /// One row of [`live_delivery_gives_up_after_bounded_attempts`]: how the stuck text's delivery
+    /// fails.
+    #[cfg(unix)]
+    enum LiveDeliveryFailureMode {
+        /// The watch is pointed at a real category channel: `create_message` against it always
+        /// fails with a non-"unknown channel" error (categories can never hold messages), so the
+        /// one recovery branch is never even triggered and every tick fails identically.
+        Persistent,
+        /// Only the tab thread is deleted; the workspace channel survives, so the one
+        /// unknown-channel recovery attempt inside `handle_live_event` re-resolves and recreates
+        /// the thread within the same tick.
+        Transient,
+    }
+
+    #[cfg(unix)]
+    struct LiveDeliveryAttemptsCase {
+        name: &'static str,
+        mode: LiveDeliveryFailureMode,
+    }
+
+    /// The [`LiveDeliveryFailureMode::Persistent`] arm of [`live_delivery_attempts_exercise`],
+    /// split out to keep that function under the line-count lint: drives [`handle_live_event`]
+    /// [`LIVE_DELIVERY_ATTEMPTS`] times and asserts the terminal is marked
+    /// [`BridgeState::live_unfollowable`] and its watch dropped only on the final attempt, never
+    /// before.
+    #[cfg(unix)]
+    async fn assert_persistent_delivery_gives_up(
+        connection: &super::DiscordConnection,
+        terminal: &str,
+        state: &mut BridgeState,
+    ) -> Result<(), String> {
+        for attempt in 1..=LIVE_DELIVERY_ATTEMPTS {
+            handle_live_event(Some(connection), terminal, state).await;
+            let gave_up = attempt == LIVE_DELIVERY_ATTEMPTS;
+            let is_unfollowable = state.live_unfollowable.contains(terminal);
+            let has_watch = state.live_watches.contains_key(terminal);
+            if gave_up != is_unfollowable || gave_up == has_watch {
+                return Err(format!(
+                    "attempt {attempt}: expected gave_up={gave_up}, got \
+                     unfollowable={is_unfollowable} has_watch={has_watch}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The [`LiveDeliveryFailureMode::Transient`] arm of [`live_delivery_attempts_exercise`],
+    /// split out to keep that function under the line-count lint: drives one
+    /// [`handle_live_event`] and asserts the stuck text was redelivered, the terminal was never
+    /// marked unfollowable, and its attempt counter was reset.
+    #[cfg(unix)]
+    async fn assert_transient_delivery_redelivers(
+        connection: &super::DiscordConnection,
+        terminal: &str,
+        state: &mut BridgeState,
+    ) -> Result<(), String> {
+        handle_live_event(Some(connection), terminal, state).await;
+        if !state.last_posted.contains_key(terminal) {
+            Err("transient delivery failure did not redeliver once it cleared".to_owned())
+        } else if state.live_unfollowable.contains(terminal) {
+            Err("a single transient failure must not mark the terminal unfollowable".to_owned())
+        } else if state.live_delivery_attempts.contains_key(terminal) {
+            Err("a fully recovered delivery must reset the attempt counter".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Binds a live watch with one pending text to a channel that fails delivery in the shape
+    /// `mode` describes, then dispatches to [`assert_persistent_delivery_gives_up`] or
+    /// [`assert_transient_delivery_redelivers`].
+    #[cfg(unix)]
+    async fn live_delivery_attempts_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        mode: &LiveDeliveryFailureMode,
+    ) -> Result<(), String> {
+        report_idle_with_session(&tab.pane_id)?;
+        let listed = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+        let terminal = listed.terminal_id.clone();
+
+        let topology_cache: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let created_thread =
+            sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        let stuck_channel = match mode {
+            LiveDeliveryFailureMode::Persistent => {
+                guild
+                    .client
+                    .create_guild_channel(guild.id, &format!("testrun-category-{nonce}"))
+                    .kind(twilight_model::channel::ChannelType::GuildCategory)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .model()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .id
+            }
+            LiveDeliveryFailureMode::Transient => {
+                guild
+                    .client
+                    .delete_channel(created_thread)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                created_thread
+            }
+        };
+
+        let live_path = std::env::temp_dir().join(format!("testrun-live-attempts-{nonce}.jsonl"));
+        fs::write(
+            &live_path,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\
+             [{\"type\":\"text\",\"text\":\"live-attempts stuck text\"}]}}\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let (live_tx, _live_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = start_notify_watcher(&live_path, terminal.clone(), live_tx)?;
+        let mut state = BridgeState::default();
+        state.live_watches.insert(
+            terminal.clone(),
+            LiveWatch {
+                _watcher: watcher,
+                vendor: VENDOR_CLAUDE.to_owned(),
+                path: live_path.clone(),
+                position: LivePosition::Bytes(0),
+                channel: stuck_channel,
+                route: route.clone(),
+            },
+        );
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&topology_cache));
+
+        let result = match mode {
+            LiveDeliveryFailureMode::Persistent => {
+                assert_persistent_delivery_gives_up(&connection, &terminal, &mut state).await
+            }
+            LiveDeliveryFailureMode::Transient => {
+                assert_transient_delivery_redelivers(&connection, &terminal, &mut state).await
+            }
+        };
+
+        let _ = fs::remove_file(&live_path);
+        if matches!(mode, LiveDeliveryFailureMode::Persistent) {
+            let _ = guild.client.delete_channel(stuck_channel).await;
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn live_delivery_gives_up_after_bounded_attempts() {
+        let cases = [
+            LiveDeliveryAttemptsCase {
+                name: "persistent failure gives up",
+                mode: LiveDeliveryFailureMode::Persistent,
+            },
+            LiveDeliveryAttemptsCase {
+                name: "transient failure redelivers",
+                mode: LiveDeliveryFailureMode::Transient,
+            },
+        ];
+
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+
+        for case in cases {
+            assert_eq!(
+                blocked_capture_cleanup(&guild).await.unwrap(),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
+            assert_eq!(
+                remaining_tabs(LIVE_ATTEMPTS_LABEL).expect("tab.list succeeds"),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
+
+            let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+                .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+            let cwd_dir = std::env::temp_dir().join(format!(
+                "testrun-live-attempts-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&cwd_dir).expect("create live-attempts test cwd");
+            let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+            let created = create_tab(LIVE_ATTEMPTS_LABEL, &workspace_id, cwd);
+            let (tab_id, result) = match created {
+                Ok(tab) => {
+                    let outcome = live_delivery_attempts_exercise(&guild, &tab, &case.mode).await;
+                    (Some(tab.tab_id), outcome)
+                }
+                Err(error) => (None, Err(error)),
+            };
+            if let Some(tab_id) = &tab_id {
+                close_tab(tab_id);
+            }
+            let _ = fs::remove_dir_all(&cwd_dir);
+
+            let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+            let tabs_left = remaining_tabs(LIVE_ATTEMPTS_LABEL)
                 .expect("tab.list succeeds for the zero-leftover check");
             assert!(result.is_ok(), "{}: {result:?}", case.name);
             assert_eq!(channels_left, 0, "named zero-leftover check: {}", case.name);
