@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use twilight_http::Client;
 use twilight_model::application::interaction::{
     Interaction as DiscordInteraction, InteractionData,
@@ -20,6 +20,7 @@ use twilight_model::http::interaction::{
 };
 use twilight_model::id::{Id, marker::GuildMarker};
 
+use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::delivery::expire_permission_card;
 use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
 use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
@@ -451,6 +452,22 @@ pub async fn request_decision(
     .and_then(Result::ok)
 }
 
+/// Sends one activity frame to the broker socket and returns without waiting for a reply.
+///
+/// A connect failure, write failure, or timeout is silently discarded, matching the activity
+/// hook's fire-and-forget contract.
+pub async fn send_activity_frame(
+    frame: &ActivityFrame,
+    socket_path: &Path,
+    connect_timeout: Duration,
+) {
+    let _ = tokio::time::timeout(connect_timeout, async {
+        let mut stream = UnixStream::connect(socket_path).await.map_err(|_| ())?;
+        write_json_line(&mut stream, frame).await.map_err(|_| ())
+    })
+    .await;
+}
+
 #[derive(Default)]
 struct PendingRequests {
     state: Mutex<PendingState>,
@@ -521,6 +538,7 @@ async fn serve_broker(
     listener: UnixListener,
     mut shutdown: oneshot::Receiver<()>,
     responder: Arc<PermissionResponder>,
+    activity_tx: mpsc::UnboundedSender<ActivityFrame>,
 ) -> io::Result<()> {
     let pending = Arc::new(PendingRequests::default());
     let next_connection_id = AtomicU64::new(0);
@@ -530,9 +548,10 @@ async fn serve_broker(
                 let (stream, _) = accepted?;
                 let pending = Arc::clone(&pending);
                 let responder = Arc::clone(&responder);
+                let activity_tx = activity_tx.clone();
                 let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    handle_connection(stream, pending, responder, connection_id).await;
+                    handle_connection(stream, pending, responder, activity_tx, connection_id).await;
                 });
             }
             _ = &mut shutdown => break,
@@ -543,10 +562,17 @@ async fn serve_broker(
 
 /// Binds and runs the Discord-backed permission broker until Ctrl-C or SIGTERM.
 ///
+/// Every accepted activity frame is forwarded on `activity_tx`; a caller with no bridge to
+/// forward to may pass a sender whose receiver it has already dropped.
+///
 /// # Errors
 ///
 /// Returns an I/O error when the socket cannot be bound or the listener fails.
-pub async fn run_broker(socket_path: &Path, responder: Arc<PermissionResponder>) -> io::Result<()> {
+pub async fn run_broker(
+    socket_path: &Path,
+    responder: Arc<PermissionResponder>,
+    activity_tx: mpsc::UnboundedSender<ActivityFrame>,
+) -> io::Result<()> {
     remove_stale_socket(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -558,7 +584,7 @@ pub async fn run_broker(socket_path: &Path, responder: Arc<PermissionResponder>)
         }
         let _ = shutdown_tx.send(());
     });
-    let result = serve_broker(listener, shutdown_rx, responder).await;
+    let result = serve_broker(listener, shutdown_rx, responder, activity_tx).await;
     shutdown_task.abort();
     let _ = std::fs::remove_file(socket_path);
     result
@@ -592,21 +618,36 @@ async fn handle_connection(
     mut stream: UnixStream,
     pending: Arc<PendingRequests>,
     responder: Arc<PermissionResponder>,
+    activity_tx: mpsc::UnboundedSender<ActivityFrame>,
     connection_id: u64,
 ) {
-    let interaction =
-        match tokio::time::timeout(INITIAL_FRAME_TIMEOUT, read_json_line(&mut stream)).await {
-            Ok(Ok(interaction)) if is_valid_interaction(&interaction) => interaction,
-            Ok(Ok(_)) => return,
-            Ok(Err(error)) => {
-                eprintln!("broker rejected initial frame: {error}");
-                return;
-            }
-            Err(_) => {
-                eprintln!("broker rejected initial frame: initial frame read timed out");
-                return;
-            }
-        };
+    let bytes = match tokio::time::timeout(INITIAL_FRAME_TIMEOUT, read_json_line_bytes(&mut stream))
+        .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            eprintln!("broker rejected initial frame: {error}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("broker rejected initial frame: initial frame read timed out");
+            return;
+        }
+    };
+    if is_activity_frame(&bytes) {
+        if let Ok(frame) = serde_json::from_slice::<ActivityFrame>(&bytes) {
+            let _ = activity_tx.send(frame);
+        }
+        return;
+    }
+    let interaction = match serde_json::from_slice::<Interaction>(&bytes) {
+        Ok(interaction) if is_valid_interaction(&interaction) => interaction,
+        Ok(_) => return,
+        Err(error) => {
+            eprintln!("broker rejected initial frame: malformed broker frame: {error}");
+            return;
+        }
+    };
     let (read_half, mut write_half) = stream.into_split();
     let liveness = HookLiveness::new();
     let monitor = spawn_hook_monitor(read_half, liveness.clone());
@@ -636,10 +677,24 @@ const fn is_valid_interaction(interaction: &Interaction) -> bool {
         && !interaction.tool_input.command.is_empty()
 }
 
-async fn read_json_line<T>(stream: &mut UnixStream) -> Result<T, String>
-where
-    T: for<'de> Deserialize<'de>,
-{
+/// Whether a raw initial frame names itself an activity frame, ahead of a typed decode: the
+/// broker socket carries both permission [`Interaction`] frames (untagged) and [`ActivityFrame`]
+/// frames (tagged `"kind":"activity"`), and this is the only way to tell them apart before
+/// choosing which type to deserialize into.
+fn is_activity_frame(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(ACTIVITY_KIND)
+}
+
+async fn read_json_line_bytes(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
     let mut reader = BufReader::new(stream).take((MAX_FRAME_BYTES + 1) as u64);
     let mut bytes = Vec::new();
     let length = reader
@@ -655,11 +710,19 @@ where
     if bytes.last() != Some(&b'\n') {
         return Err("incomplete broker frame".to_owned());
     }
-    let payload = &bytes[..bytes.len() - 1];
-    if payload.is_empty() {
+    bytes.pop();
+    if bytes.is_empty() {
         return Err("empty broker frame".to_owned());
     }
-    serde_json::from_slice(payload).map_err(|error| format!("malformed broker frame: {error}"))
+    Ok(bytes)
+}
+
+async fn read_json_line<T>(stream: &mut UnixStream) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = read_json_line_bytes(stream).await?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("malformed broker frame: {error}"))
 }
 
 async fn write_json_line<T, W>(stream: &mut W, value: &T) -> Result<(), String>

@@ -1,0 +1,10 @@
+{
+  "session_id": "77777777-7777-4777-8777-777777777777",
+  "transcript_path": "<home>/.claude/projects/-tmp-herdr-connect-rs-gauntlet-20260815-102236-t4-activity/77777777-7777-4777-8777-777777777777.jsonl",
+  "cwd": "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t4-activity",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "TodoWrite",
+  "tool_input": {},
+  "tool_use_id": "toolu_018activityfixtureempty"
+}

@@ -3,6 +3,7 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+mod activity;
 mod broker;
 mod cards;
 mod config;
@@ -16,8 +17,12 @@ mod registry;
 mod topology;
 mod watcher;
 
+pub use activity::{
+    ACTIVITY_KIND, ActivityFrame, ClaudeActivityRequest, decode_claude_activity_request,
+};
 pub use broker::{
     PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
+    send_activity_frame,
 };
 pub use cards::{
     AgentLogCapture, ThreadNameError, TransitionMessage, create_transition_messages,

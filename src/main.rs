@@ -14,6 +14,9 @@ use twilight_model::id::{
 };
 
 use herdr_connect_rs::{
+    ACTIVITY_KIND, ActivityFrame, decode_claude_activity_request, send_activity_frame,
+};
+use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
     RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache,
@@ -1583,6 +1586,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args: Vec<String> = args.collect();
             return run_hook(&args).await;
         }
+        Some("activity") => {
+            let args: Vec<String> = args.collect();
+            return run_activity(&args).await;
+        }
         Some("broker") => {
             let args: Vec<String> = args.collect();
             return run_broker(&args).await;
@@ -1704,6 +1711,68 @@ fn parse_hook_args(
     Ok((vendor, socket))
 }
 
+/// Reads one harness `PreToolUse` hook payload from stdin and forwards it to the broker as an
+/// activity frame, always exiting 0 with no output: activity display is best-effort and must
+/// never fail the tool call it rides on.
+async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let requested_socket = parse_activity_args(args)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let mut input = Vec::new();
+    tokio::io::stdin().read_to_end(&mut input).await?;
+    let Ok(request) = decode_claude_activity_request(&input) else {
+        return Ok(());
+    };
+    let Some(socket_path) = requested_socket
+        .or_else(|| std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET").map(std::path::PathBuf::from))
+    else {
+        return Ok(());
+    };
+    let frame = ActivityFrame {
+        kind: ACTIVITY_KIND.to_owned(),
+        vendor: VENDOR_CLAUDE.to_owned(),
+        workspace_id: std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default(),
+        tab_id: std::env::var("HERDR_TAB_ID").unwrap_or_default(),
+        pane_id: std::env::var("HERDR_PANE_ID").unwrap_or_default(),
+        session_id: request.session_id,
+        tool: request.tool,
+        summary: request.summary,
+    };
+    send_activity_frame(&frame, &socket_path, Duration::from_secs(1)).await;
+    Ok(())
+}
+
+fn parse_activity_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
+    let mut vendor_seen = false;
+    let mut socket = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--vendor" => {
+                index += 1;
+                let value = args.get(index).ok_or("--vendor requires claude")?;
+                if value != VENDOR_CLAUDE {
+                    return Err("--vendor requires claude".to_owned());
+                }
+                vendor_seen = true;
+            }
+            "--socket" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("--socket requires a path")?;
+                socket = Some(std::path::PathBuf::from(value));
+            }
+            argument => return Err(format!("unknown activity argument: {argument}")),
+        }
+        index += 1;
+    }
+    if !vendor_seen {
+        return Err("activity requires --vendor claude".to_owned());
+    }
+    Ok(socket)
+}
+
 async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path =
         socket_path(args).ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
@@ -1724,7 +1793,11 @@ async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         config.owner_id.clone(),
         topology_cache,
     ));
-    run_permission_broker(&socket_path, responder)
+    // The standalone `broker` subcommand has no bridge event loop to forward activity frames to:
+    // dropping the receiver immediately makes every subsequent send a no-op.
+    let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(activity_rx);
+    run_permission_broker(&socket_path, responder, activity_tx)
         .await
         .map_err(Into::into)
 }
@@ -1743,7 +1816,12 @@ fn start_broker(connection: &DiscordConnection) -> Option<BrokerTask> {
     socket_path(&[]).map(|socket| {
         let responder = Arc::clone(&connection.3);
         tokio::spawn(async move {
-            run_permission_broker(&socket, responder)
+            // Nothing in the bridge event loop consumes activity frames yet: dropping the
+            // receiver immediately makes every send a no-op, exactly like the standalone `broker`
+            // subcommand.
+            let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
+            drop(activity_rx);
+            run_permission_broker(&socket, responder, activity_tx)
                 .await
                 .map_err(|error| error.to_string())
         })

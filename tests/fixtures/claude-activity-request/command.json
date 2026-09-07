@@ -1,0 +1,15 @@
+{
+  "session_id": "55555555-5555-4555-8555-555555555555",
+  "transcript_path": "<home>/.claude/projects/-tmp-herdr-connect-rs-gauntlet-20260815-102236-t4-activity/55555555-5555-4555-8555-555555555555.jsonl",
+  "cwd": "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t4-activity",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "find . -maxdepth 3 -name '*.rs' -newer Cargo.toml -print | xargs wc -l | tail -n 30",
+    "description": "Count lines changed since Cargo.toml",
+    "timeout": 120000,
+    "run_in_background": false
+  },
+  "tool_use_id": "toolu_016activityfixturecommand"
+}

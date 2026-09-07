@@ -1,0 +1,12 @@
+{
+  "session_id": "66666666-6666-4666-8666-666666666666",
+  "transcript_path": "<home>/.claude/projects/-tmp-herdr-connect-rs-gauntlet-20260815-102236-t4-activity/66666666-6666-4666-8666-666666666666.jsonl",
+  "cwd": "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t4-activity",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t4-activity/src/main.rs"
+  },
+  "tool_use_id": "toolu_017activityfixturefilepath"
+}
