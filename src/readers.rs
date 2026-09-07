@@ -22,21 +22,10 @@ const MESSAGE_KEY: &str = "message";
 const PAYLOAD_KEY: &str = "payload";
 /// Value of a Cursor row's `role` field marking it as user-authored.
 const USER_ROLE_VALUE: &str = "user";
-/// Value of a Cursor row's `role` field marking it as assistant-authored.
-const ASSISTANT_ROLE_VALUE: &str = "assistant";
 /// Value of a Claude/Codex record's own `type` field marking it as assistant-authored.
 const ASSISTANT_RECORD_TYPE_VALUE: &str = "assistant";
 /// Value of a Codex record's own `type` field marking it as an event message.
 const EVENT_MSG_RECORD_TYPE_VALUE: &str = "event_msg";
-/// Value of a Codex record's `type` marking it a response item (live-verified Codex 0.153.4 shape
-/// for both user and assistant turn content).
-const RESPONSE_ITEM_RECORD_TYPE_VALUE: &str = "response_item";
-/// Value marking a Codex response item payload as a chat message, not e.g. a `custom_tool_call`.
-const MESSAGE_PAYLOAD_TYPE_VALUE: &str = "message";
-/// Key for a Codex response item payload's or Cursor row's author-role field.
-const ROLE_KEY: &str = "role";
-/// Value marking a Codex content part as the model's own output text (vs. `input_text`).
-const OUTPUT_TEXT_PART_TYPE_VALUE: &str = "output_text";
 /// Value of a Claude record's own `type` field marking it as user-authored.
 const USER_RECORD_TYPE_VALUE: &str = "user";
 const ROW_DATA_KEY: &str = "data";
@@ -188,61 +177,6 @@ pub fn read_claude_incremental(
     })
 }
 
-/// Reads new complete Codex assistant messages appended to a session JSONL log since `offset`,
-/// each paired with the byte offset immediately after its record.
-///
-/// Understands only the current `response_item` record shape; the older `event_msg` shape
-/// (still read by the whole-log reader, via its own fixture) never appears in a fresh session
-/// and is not matched here.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
-/// non-final complete line fails to parse as JSON.
-pub fn read_codex_incremental(
-    path: &Path,
-    offset: u64,
-) -> Result<(Vec<(String, u64)>, u64), String> {
-    let (bytes, complete_len) = read_new_bytes(path, offset)?;
-    let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
-    let lines = positioned_complete_lines(text, offset);
-    extract_tolerant(&lines, offset, |record| {
-        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str)
-            != Some(RESPONSE_ITEM_RECORD_TYPE_VALUE)
-        {
-            return Vec::new();
-        }
-        let payload = record.get(PAYLOAD_KEY);
-        if payload
-            .and_then(|payload| payload.get(PAYLOAD_TYPE_KEY))
-            .and_then(Value::as_str)
-            != Some(MESSAGE_PAYLOAD_TYPE_VALUE)
-            || payload
-                .and_then(|payload| payload.get(ROLE_KEY))
-                .and_then(Value::as_str)
-                != Some(ASSISTANT_ROLE_VALUE)
-        {
-            return Vec::new();
-        }
-        payload
-            .and_then(|payload| payload.get(CONTENT_KEY))
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter(|part| {
-                        part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
-                            == Some(OUTPUT_TEXT_PART_TYPE_VALUE)
-                    })
-                    .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
 /// The byte offset immediately after the last qualifying user record in a Claude session JSONL
 /// log — where a live-capture watch starts.
 ///
@@ -254,16 +188,6 @@ pub fn read_codex_incremental(
 /// Returns an error when the file cannot be read or its complete lines are not valid UTF-8.
 pub fn claude_turn_start_position(path: &Path) -> Result<u64, String> {
     turn_start_byte_position(path, is_qualifying_claude_user_record)
-}
-
-/// The byte offset immediately after the last turn-boundary record in a Codex session JSONL log,
-/// for the same reason as [`claude_turn_start_position`].
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read or its complete lines are not valid UTF-8.
-pub fn codex_turn_start_position(path: &Path) -> Result<u64, String> {
-    turn_start_byte_position(path, is_codex_turn_boundary_record)
 }
 
 fn turn_start_byte_position(

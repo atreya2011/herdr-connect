@@ -2215,7 +2215,7 @@ mod tests {
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-        Transition, lifecycle_subscriptions, read_claude_incremental, read_codex_incremental,
+        Transition, VENDOR_CLAUDE, lifecycle_subscriptions, read_claude_incremental,
         status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
         workspace_list_result,
     };
@@ -3854,47 +3854,24 @@ mod tests {
         }
     }
 
-    /// Testrun tab cwd, never the repository directory (holds `.env`). Claude alone (so far)
-    /// uses the fixed, owner-trusted `.../herdr-connect-testrun/claude` — its trust prompt has
-    /// no recovery.
+    /// Testrun tab cwd, never the repository directory (holds `.env`): the fixed, owner-trusted
+    /// `.../herdr-connect-testrun/claude` — its trust prompt has no recovery.
     #[cfg(unix)]
-    fn live_capture_tab_fixture(kind: &str) -> Result<(Tab, PathBuf), String> {
+    fn live_capture_tab_fixture() -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
             "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
         })?;
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
-        let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
-        let cwd_dir = if kind == "claude" {
-            claude_testrun_dir(&home)
-        } else {
-            home.join(".cache/herdr-connect-testrun").join(format!(
-                "{kind}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system clock is after unix epoch")
-                    .as_nanos()
-            ))
-        };
-        if kind == "claude" {
-            clear_directory_contents(&cwd_dir)?;
-        } else {
-            fs::create_dir_all(&cwd_dir).map_err(|error| error.to_string())?;
-        }
+        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir)?;
         let cwd = cwd_dir
             .to_str()
             .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
-        match create_tab(&label, &workspace_id, cwd) {
-            Ok(tab) => Ok((tab, cwd_dir)),
-            Err(error) => {
-                if kind != "claude" {
-                    let _ = fs::remove_dir_all(&cwd_dir);
-                }
-                Err(error)
-            }
-        }
+        let tab = create_tab(&label, &workspace_id, cwd)?;
+        Ok((tab, cwd_dir))
     }
 
     /// The bool is whether the message carries an embed (a card, never live text).
@@ -3962,9 +3939,8 @@ mod tests {
         guild: &BlockedCaptureGuild,
         tab: &Tab,
         agent_name: &str,
-        kind: &str,
     ) -> Result<(), String> {
-        start_live_capture_agent(kind, agent_name, &tab.pane_id)?;
+        start_live_capture_agent(VENDOR_CLAUDE, agent_name, &tab.pane_id)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
         let terminal = idle.terminal_id.clone();
 
@@ -3996,9 +3972,12 @@ mod tests {
             s.session.is_some()
         })?;
         if working.agent_status != STATUS_WORKING
-            || working.session.as_ref().is_none_or(|sn| sn.agent != kind)
+            || working
+                .session
+                .as_ref()
+                .is_none_or(|sn| sn.agent != VENDOR_CLAUDE)
         {
-            return Err(format!("no confirmed {kind} working session: {working:?}"));
+            return Err(format!("no confirmed claude working session: {working:?}"));
         }
         own(&working, tabs, &connection, &mut state).await;
         let watch_deadline = Instant::now() + Duration::from_secs(5);
@@ -4047,11 +4026,7 @@ mod tests {
             return Err("settled snapshot lost its session".to_owned());
         };
         let log_path = live_log_path(&settled, &session)?.ok_or("no log path yet")?;
-        let expected_count = match kind {
-            "claude" => read_claude_incremental(&log_path, 0)?.0.len(),
-            "codex" => read_codex_incremental(&log_path, 0)?.0.len(),
-            other => return Err(format!("unsupported vendor for structural count: {other}")),
-        };
+        let expected_count = read_claude_incremental(&log_path, 0)?.0.len();
         let messages = thread_messages(guild, thread).await?;
         end_card_matches_last_live_text(&messages, expected_count)
     }
@@ -4085,7 +4060,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn run_live_capture_test(kind: &str) {
+    async fn run_live_capture_test() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -4095,7 +4070,7 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-        let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
+        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
         assert_eq!(
             remaining_tabs(&label).expect("tab.list succeeds"),
             0,
@@ -4105,19 +4080,19 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let created = live_capture_tab_fixture(kind);
+        let created = live_capture_tab_fixture();
         let (tab_id, cwd_dir, result) = match created {
             Ok((tab, cwd_dir)) => {
                 let agent_name = format!(
-                    "live-{kind}-{}",
+                    "live-claude-{}",
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(180),
-                    live_capture_exercise(&guild, &tab, &agent_name, kind),
+                    live_capture_exercise(&guild, &tab, &agent_name),
                 )
                 .await
-                .unwrap_or_else(|_| Err(format!("{kind} live-capture exercise timed out")));
+                .unwrap_or_else(|_| Err("claude live-capture exercise timed out".to_owned()));
                 if let Ok(snapshot) = snapshot_for_pane(&tab.pane_id)
                     && let Some(session) = snapshot.session.as_ref()
                     && let Ok(path) = resolve_session_path(&home, &snapshot, session)
@@ -4133,11 +4108,7 @@ mod tests {
             close_tab(tab_id);
         }
         if let Some(cwd_dir) = cwd_dir {
-            if kind == "claude" {
-                let _ = clear_directory_contents(&cwd_dir);
-            } else {
-                let _ = fs::remove_dir_all(&cwd_dir);
-            }
+            let _ = clear_directory_contents(&cwd_dir);
         }
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
@@ -4152,7 +4123,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn live_capture_posts_first_live_text_before_settle_for_claude() {
-        run_live_capture_test("claude").await;
+        run_live_capture_test().await;
     }
 
     /// Drives one real `claude --model haiku` agent through a genuine settled round-trip and

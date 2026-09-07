@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use herdr_connect_rs::{
-    claude_turn_start_position, read_claude_incremental, read_codex_incremental,
-};
+use herdr_connect_rs::{claude_turn_start_position, read_claude_incremental};
 
 fn temp_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -84,19 +82,5 @@ fn claude_turn_start_position_resumes_at_the_reply_on_a_log_that_already_holds_o
     assert_eq!(
         texts.into_iter().map(|(text, _)| text).collect::<Vec<_>>(),
         vec!["narration".to_owned(), "final answer".to_owned()]
-    );
-}
-
-#[test]
-fn read_codex_incremental_reads_the_committed_response_item_capture() {
-    let path = "tests/fixtures/codex-session-response-item.jsonl";
-    let (texts, _) = read_codex_incremental(path.as_ref(), 0).expect("read succeeds");
-    assert_eq!(
-        texts.into_iter().map(|(text, _)| text).collect::<Vec<_>>(),
-        vec![
-            "priorreply".to_owned(),
-            "alpha".to_owned(),
-            "gamma".to_owned()
-        ]
     );
 }
