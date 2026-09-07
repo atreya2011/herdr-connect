@@ -18,7 +18,8 @@ mod topology;
 mod watcher;
 
 pub use activity::{
-    ACTIVITY_KIND, ActivityFrame, ClaudeActivityRequest, decode_claude_activity_request,
+    ACTIVITY_KIND, ActivityFrame, ClaudeActivityRequest, activity_message_text,
+    decode_claude_activity_request,
 };
 pub use broker::{
     PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
@@ -33,8 +34,9 @@ pub use config::{
     load_discord_config,
 };
 pub use delivery::{
-    UNKNOWN_CHANNEL_DELIVERY_ERROR, deliver_live_message, deliver_permission_card,
-    deliver_transition_card, expire_informational_card, live_message_nonce, transition_card_nonce,
+    UNKNOWN_CHANNEL_DELIVERY_ERROR, deliver_activity_message, deliver_live_message,
+    deliver_permission_card, deliver_transition_card, expire_informational_card,
+    live_message_nonce, transition_card_nonce, update_activity_message,
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{

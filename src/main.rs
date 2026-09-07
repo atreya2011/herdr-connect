@@ -14,7 +14,8 @@ use twilight_model::id::{
 };
 
 use herdr_connect_rs::{
-    ACTIVITY_KIND, ActivityFrame, decode_claude_activity_request, send_activity_frame,
+    ACTIVITY_KIND, ActivityFrame, activity_message_text, decode_claude_activity_request,
+    deliver_activity_message, send_activity_frame, update_activity_message,
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
@@ -104,6 +105,18 @@ struct BridgeState {
     /// Terminals whose live-capture read error was already logged once, so it is not repeated on
     /// every later event.
     live_read_errors_reported: HashSet<String>,
+    /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
+    /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
+    /// Forgotten -- not deleted -- at the same point a live watch settles, so the next turn starts
+    /// a fresh message instead of editing the last one.
+    activity_messages: HashMap<String, ActivityMessage>,
+}
+
+/// The Discord message tracking one pane's current turn of tool activity: `count` tool calls
+/// edited into it so far.
+struct ActivityMessage {
+    message: Id<MessageMarker>,
+    count: u32,
 }
 
 struct BlockedCardContext<'a> {
@@ -466,6 +479,7 @@ async fn process_snapshot(
             }
             if old_was_working {
                 settle_live_watch(discord, &terminal, state).await;
+                forget_activity_message(state, snapshot.pane_id.as_deref());
             }
             update_blocked_lifecycle(
                 discord,
@@ -1207,6 +1221,67 @@ async fn settle_live_watch(
     state.live_read_errors_reported.remove(terminal);
 }
 
+/// Forgets a pane's tracked activity message, if any, so the next turn's first activity frame
+/// creates a fresh one instead of editing the settled turn's message.
+fn forget_activity_message(state: &mut BridgeState, pane_id: Option<&str>) {
+    if let Some(pane_id) = pane_id {
+        state.activity_messages.remove(pane_id);
+    }
+}
+
+/// The route's tab thread from the cached topology only, issuing no Discord request. `None` when
+/// the cache is not yet populated or does not resolve the route.
+async fn cached_route_channel(
+    topology_cache: &TopologyCache,
+    route: &TopologyRoute,
+) -> Option<Id<ChannelMarker>> {
+    let guard = topology_cache.lock().await;
+    let (channels, active_threads) = guard.as_ref()?;
+    let channel = cached_route(channels, active_threads, route).ok().flatten();
+    drop(guard);
+    channel
+}
+
+/// Applies one activity frame: routes it to its tab's thread purely from the cached topology, then
+/// posts or edits this turn's one activity message for the pane.
+///
+/// A cache not yet populated, or a route the cache does not resolve, drops the frame silently.
+async fn handle_activity_event(
+    discord: Option<&DiscordConnection>,
+    frame: ActivityFrame,
+    state: &mut BridgeState,
+) {
+    let Some((client, _guild, _owner_id, responder)) = discord else {
+        return;
+    };
+    let route = TopologyRoute {
+        workspace_id: frame.workspace_id,
+        tab_id: frame.tab_id,
+        pane_id: frame.pane_id.clone(),
+        channel_name: String::new(),
+        thread_name: String::new(),
+    };
+    let Some(channel) = cached_route_channel(responder.topology_cache(), &route).await else {
+        return;
+    };
+    if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
+        let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
+        if update_activity_message(client.as_ref(), channel, existing.message, &text)
+            .await
+            .is_ok()
+        {
+            existing.count += 1;
+        }
+        return;
+    }
+    let text = activity_message_text(1, &frame.tool, &frame.summary);
+    if let Ok(message) = deliver_activity_message(client.as_ref(), channel, &text).await {
+        state
+            .activity_messages
+            .insert(frame.pane_id, ActivityMessage { message, count: 1 });
+    }
+}
+
 fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
     match capture_for(snapshot) {
         Ok(capture) => Some(capture),
@@ -1812,15 +1887,13 @@ fn socket_path(args: &[String]) -> Option<std::path::PathBuf> {
     }
 }
 
-fn start_broker(connection: &DiscordConnection) -> Option<BrokerTask> {
+fn start_broker(
+    connection: &DiscordConnection,
+    activity_tx: tokio::sync::mpsc::UnboundedSender<ActivityFrame>,
+) -> Option<BrokerTask> {
     socket_path(&[]).map(|socket| {
         let responder = Arc::clone(&connection.3);
         tokio::spawn(async move {
-            // Nothing in the bridge event loop consumes activity frames yet: dropping the
-            // receiver immediately makes every send a no-op, exactly like the standalone `broker`
-            // subcommand.
-            let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
-            drop(activity_rx);
             run_permission_broker(&socket, responder, activity_tx)
                 .await
                 .map_err(|error| error.to_string())
@@ -1985,6 +2058,7 @@ struct BridgeRuntime {
     status: Option<HerdrSubscription>,
     state: BridgeState,
     live_events: tokio::sync::mpsc::UnboundedReceiver<String>,
+    activity_events: tokio::sync::mpsc::UnboundedReceiver<ActivityFrame>,
 }
 
 async fn doorbell_unless_shutdown(
@@ -2038,6 +2112,9 @@ async fn bridge_event_loop(
             }
             Some(terminal) = runtime.live_events.recv() => {
                 handle_live_event(discord, &terminal, &mut runtime.state).await;
+            }
+            Some(frame) = runtime.activity_events.recv() => {
+                handle_activity_event(discord, frame, &mut runtime.state).await;
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = stop.recv() => break,
@@ -2442,10 +2519,11 @@ async fn next_status_event(
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+    let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
     let (discord, mut gateway, mut broker) = match discord_connection(Arc::clone(&topology_cache))?
     {
         Some((connection, gateway)) => {
-            let broker = start_broker(&connection);
+            let broker = start_broker(&connection, activity_tx);
             (Some(connection), Some(gateway), broker)
         }
         None => (None, None, None),
@@ -2475,6 +2553,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         status,
         state,
         live_events,
+        activity_events,
     };
     if !doorbell_unless_shutdown(
         discord.as_ref(),
@@ -4729,6 +4808,330 @@ mod tests {
         run_live_capture_test().await;
     }
 
+    #[cfg(unix)]
+    const ACTIVITY_LABEL: &str = "testrun-activity";
+
+    /// `echo`: an instant tool step, so the turn settles almost immediately after the one activity
+    /// frame it produces.
+    #[cfg(unix)]
+    const ACTIVITY_FORCE_PROMPT: &str =
+        "Run the shell command `echo activity-check`. Then say the word done.";
+
+    /// Testrun tab cwd fixture for the activity hook exercise, mirroring `live_capture_tab_fixture`
+    /// under its own label so the two tests' zero-leftover checks never collide.
+    #[cfg(unix)]
+    fn activity_tab_fixture() -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let label = format!("{ACTIVITY_LABEL}-claude");
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir)?;
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        let tab = create_tab(&label, &workspace_id, cwd)?;
+        Ok((tab, cwd_dir))
+    }
+
+    /// The freshly built `herdr-connect-rs` binary, resolved at runtime: `CARGO_BIN_EXE_*` is not
+    /// defined at compile time for a bin target's own test harness (only for a separate target
+    /// that depends on it, such as an integration test under `tests/`), so this walks up from the
+    /// running test binary's own path (`target/<profile>/deps/<test-binary>`) to its sibling bin
+    /// artifact (`target/<profile>/herdr-connect-rs`) instead.
+    #[cfg(unix)]
+    fn activity_binary_path() -> Result<PathBuf, String> {
+        let current = std::env::current_exe().map_err(|error| error.to_string())?;
+        let deps_dir = current
+            .parent()
+            .ok_or("test binary has no parent directory")?;
+        let target_dir = deps_dir
+            .parent()
+            .ok_or("deps directory has no parent directory")?;
+        let candidate = target_dir.join("herdr-connect-rs");
+        if candidate.is_file() {
+            Ok(candidate)
+        } else {
+            Err(format!(
+                "built herdr-connect-rs binary not found at {}",
+                candidate.display()
+            ))
+        }
+    }
+
+    /// Writes a Claude `--settings` file registering the `PreToolUse` activity hook against
+    /// `broker_socket`, per [examples/claude-hooks.json](../examples/claude-hooks.json)'s shape.
+    #[cfg(unix)]
+    fn write_activity_settings(broker_socket: &Path) -> Result<PathBuf, String> {
+        let binary = activity_binary_path()?;
+        let binary = binary
+            .to_str()
+            .ok_or_else(|| "built binary path is valid UTF-8".to_owned())?;
+        let socket_arg = broker_socket
+            .to_str()
+            .ok_or_else(|| "broker socket path is valid UTF-8".to_owned())?;
+        let command = format!("{binary} activity --vendor claude --socket {socket_arg}");
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {"type": "command", "command": command, "async": true}
+                        ]
+                    }
+                ]
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-activity-settings-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec(&settings).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(path)
+    }
+
+    /// Mirrors `start_claude_haiku_agent`, additionally passing `--settings <settings_path>` so
+    /// the spawned Claude process registers the activity hook under test.
+    #[cfg(unix)]
+    fn start_claude_haiku_agent_with_settings(
+        name: &str,
+        pane_id: &str,
+        settings_path: &Path,
+    ) -> Result<(), String> {
+        herdr_json(&[
+            "pane",
+            "wait-output",
+            pane_id,
+            "--match",
+            "╰─",
+            "--timeout",
+            "15000",
+        ])?;
+        let settings_arg = settings_path
+            .to_str()
+            .ok_or_else(|| "settings path is valid UTF-8".to_owned())?;
+        let bound = Duration::from_secs(10);
+        let start = Instant::now();
+        loop {
+            let args = [
+                "agent",
+                "start",
+                name,
+                "--kind",
+                "claude",
+                "--pane",
+                pane_id,
+                "--timeout",
+                "60000",
+                "--",
+                "--model",
+                "haiku",
+                "--settings",
+                settings_arg,
+            ];
+            match herdr_json(&args) {
+                Ok(_) => return Ok(()),
+                Err(error) if is_agent_pane_busy(&error) && start.elapsed() < bound => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Drives one real `claude --model haiku` agent with the activity hook registered against a
+    /// real bridge broker (bound at `broker_socket`), prompts it to run one shell command, and
+    /// asserts the thread holds exactly one plain activity message naming `Bash`, posted before
+    /// the end card.
+    #[cfg(unix)]
+    async fn activity_hook_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+        broker_socket: &Path,
+        settings_path: &Path,
+    ) -> Result<(), String> {
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+        let mut state = BridgeState::default();
+
+        let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
+        let responder = Arc::clone(&connection.3);
+        let broker_socket_owned = broker_socket.to_path_buf();
+        let broker_task = tokio::spawn(async move {
+            super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
+        });
+        let broker_deadline = Instant::now() + Duration::from_secs(2);
+        while !broker_socket.exists() && Instant::now() < broker_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !broker_socket.exists() {
+            broker_task.abort();
+            return Err("test broker did not create its socket".to_owned());
+        }
+
+        // The activity hook only connects once Claude registers it at agent start, so the
+        // snapshot -- and everything routed from it -- is only meaningful once the agent exists.
+        start_claude_haiku_agent_with_settings(agent_name, &tab.pane_id, settings_path)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let (tabs, agents) = (std::slice::from_ref(&matching), std::slice::from_ref(&idle));
+
+        own(&idle, tabs, &connection, &mut state).await;
+        let route = route_topology(agents, tabs, &terminal)?;
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+        submit_owner_prompt(&tab.pane_id, ACTIVITY_FORCE_PROMPT)?;
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some("working"),
+            Duration::from_secs(15),
+        )
+        .await?;
+
+        let settled = loop {
+            tokio::select! {
+                Some(frame) = activity_rx.recv() => {
+                    super::handle_activity_event(Some(&connection), frame, &mut state).await;
+                }
+                event = wait_for_event(
+                    &mut sub, "pane.agent_status_changed", &tab.pane_id, "/data/pane_id", None,
+                    Duration::from_secs(30),
+                ) => {
+                    let event = event?;
+                    if matches!(
+                        event.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some("done" | "idle")
+                    ) {
+                        break poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
+                    }
+                }
+            }
+        };
+        own(&settled, tabs, &connection, &mut state).await;
+        broker_task.abort();
+        let _ = std::fs::remove_file(broker_socket);
+
+        let messages = thread_messages(guild, thread).await?;
+        let activity_messages: Vec<_> = messages
+            .iter()
+            .filter(|(content, embed, _)| !embed && content.starts_with('⚙'))
+            .collect();
+        let [(activity_text, _, activity_id)] = activity_messages.as_slice() else {
+            return Err(format!(
+                "expected exactly one activity message, thread has {messages:?}"
+            ));
+        };
+        if !activity_text.contains("Bash") {
+            return Err(format!(
+                "activity message did not name Bash: {activity_text}"
+            ));
+        }
+        let Some((_, _, end_card_id)) = messages.iter().find(|(_, embed, _)| *embed) else {
+            return Err("no end card was posted".to_owned());
+        };
+        if activity_id >= end_card_id {
+            return Err("activity message was not posted before the end card".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn run_activity_hook_test() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{ACTIVITY_LABEL}-claude");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let broker_socket = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-activity-broker-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        let settings_path = write_activity_settings(&broker_socket)
+            .expect("write activity settings for the exercise");
+        let created = activity_tab_fixture();
+        let (tab_id, cwd_dir, result) = match created {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "activity-claude-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(180),
+                    activity_hook_exercise(
+                        &guild,
+                        &tab,
+                        &agent_name,
+                        &broker_socket,
+                        &settings_path,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err("activity hook exercise timed out".to_owned()));
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = clear_directory_contents(&cwd_dir);
+        }
+        let _ = std::fs::remove_file(&broker_socket);
+        let _ = std::fs::remove_file(&settings_path);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn activity_hook_posts_one_message_naming_the_tool_before_the_end_card() {
+        run_activity_hook_test().await;
+    }
     /// Drives one real `claude --model haiku` agent through a genuine settled round-trip and
     /// asserts the seq backstop still posts a card carrying the real captured reply. Status and
     /// the seq counter come only from live `agent.list` snapshots; nothing is set by hand (the
@@ -6628,12 +7031,14 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let mut broker: Option<BrokerTask> = None;
         let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
+        let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
         let mut runtime = BridgeRuntime {
             lifecycle,
             pane_ids: Vec::new(),
             status: None,
             state: BridgeState::default(),
             live_events,
+            activity_events,
         };
 
         close_tab(&second_tab.tab_id);
@@ -6835,12 +7240,14 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let mut broker: Option<BrokerTask> = None;
         let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
+        let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
         let mut runtime = BridgeRuntime {
             lifecycle,
             pane_ids: Vec::new(),
             status: None,
             state: BridgeState::default(),
             live_events,
+            activity_events,
         };
 
         let alive = handle_lifecycle_select_result(

@@ -87,9 +87,20 @@ fn truncate_chars(value: &str) -> String {
     value.chars().take(MAX_SUMMARY_CHARS).collect()
 }
 
+/// The Discord text for one pane's turn-scoped activity message: `⚙️ {count} · {tool}`, with the
+/// summary appended after a colon when non-empty.
+#[must_use]
+pub fn activity_message_text(count: u32, tool: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        format!("⚙️ {count} · {tool}")
+    } else {
+        format!("⚙️ {count} · {tool}: {summary}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::decode_claude_activity_request;
+    use super::{activity_message_text, decode_claude_activity_request};
 
     #[test]
     fn decodes_the_fallback_chain_in_priority_order() {
@@ -141,5 +152,14 @@ mod tests {
     #[test]
     fn rejects_malformed_json() {
         assert!(decode_claude_activity_request(b"{ malformed").is_err());
+    }
+
+    #[test]
+    fn activity_text_omits_the_colon_for_an_empty_summary() {
+        assert_eq!(activity_message_text(1, "Bash", ""), "⚙️ 1 · Bash");
+        assert_eq!(
+            activity_message_text(3, "Bash", "ls -la"),
+            "⚙️ 3 · Bash: ls -la"
+        );
     }
 }

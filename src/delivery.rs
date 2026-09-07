@@ -99,6 +99,57 @@ pub async fn deliver_live_message(
         .map_err(|error| error.to_string())
 }
 
+/// Delivers one plain, content-only activity message: no embed, no nonce -- a turn's activity
+/// message is edited in place rather than deduplicated by nonce.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn deliver_activity_message(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    content: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let payload = serde_json::json!({
+        PAYLOAD_CONTENT_KEY: content,
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .create_message(channel)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| map_send_error(&error))?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+/// Edits an existing activity message's content in place.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
+pub async fn update_activity_message(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+    content: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        PAYLOAD_CONTENT_KEY: content,
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .update_message(channel, message)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Delivers a complete transition card with its embed color and optional mention.
 ///
 /// # Errors
