@@ -294,6 +294,35 @@ fn single_matching_thread(
     Ok(resolved.cloned())
 }
 
+/// Whether the cached channel/thread lists already resolve `route`'s tab thread, without any
+/// Discord request.
+///
+/// `None` means the cache does not (yet) resolve the route: the caller must fetch fresh and let
+/// [`sync_topology`] create whatever is missing. Only the active-thread list is consulted,
+/// matching the existing miss-path contract: archived-thread listing stays a
+/// Discord-request-issuing fallback that only [`sync_topology`] performs, on a miss.
+///
+/// # Errors
+///
+/// Returns an error when the cached active-thread list has duplicate threads for the tab.
+pub fn cached_route(
+    channels: &[Channel],
+    active_threads: &[Channel],
+    route: &TopologyRoute,
+) -> Result<Option<Id<ChannelMarker>>, String> {
+    let Some(workspace_channel) = workspace_channel_id(channels, &route.workspace_id) else {
+        return Ok(None);
+    };
+    let thread_suffix = format!(" [{}]", route.tab_id);
+    let resolved = single_matching_thread(
+        active_threads,
+        workspace_channel,
+        &thread_suffix,
+        &route.tab_id,
+    )?;
+    Ok(resolved.map(|thread| thread.id))
+}
+
 /// Synchronizes the Discord workspace topology against caller-supplied channel and
 /// active-thread lists, extending them in place when a channel or thread is created.
 ///
@@ -445,7 +474,7 @@ pub async fn archived_threads(
 }
 
 /// True when a Discord API error means the target channel or thread is already gone.
-fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
+pub fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
     matches!(
         error.kind(),
         twilight_http::error::ErrorType::Response {

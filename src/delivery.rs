@@ -6,6 +6,13 @@ use twilight_model::channel::message::Embed;
 
 use crate::cards::TransitionMessage;
 use crate::permission::PermissionVendor;
+use crate::topology::is_unknown_channel_error;
+
+/// Prefixes a delivery error whose target channel or thread no longer exists on Discord.
+///
+/// Lets a caller holding a cached route tell "the send failed" from "the cached route is stale"
+/// and refetch instead of retrying the same, permanently-invalid target.
+pub const UNKNOWN_CHANNEL_DELIVERY_ERROR: &str = "discord unknown channel";
 
 const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
@@ -51,6 +58,16 @@ pub fn live_message_nonce(terminal_id: &str, position: i64, part_index: usize) -
     format!("{:013x}", payload_component & PAYLOAD_COMPONENT_MASK)
 }
 
+/// Maps a failed Discord send to a plain string, distinguishing "the target channel or thread no
+/// longer exists" ([`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed) from every other request failure.
+fn map_send_error(error: &twilight_http::Error) -> String {
+    if is_unknown_channel_error(error) {
+        format!("{UNKNOWN_CHANNEL_DELIVERY_ERROR}: {error}")
+    } else {
+        error.to_string()
+    }
+}
+
 /// Delivers one plain, content-only message: no embed, no color, no mention, and mentions parsed
 /// from nothing.
 ///
@@ -75,7 +92,7 @@ pub async fn deliver_live_message(
         .create_message(channel)
         .payload_json(&payload)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| map_send_error(&error))?
         .model()
         .await
         .map(|message| message.id)
@@ -284,7 +301,7 @@ async fn deliver_payload(
         .create_message(channel)
         .payload_json(&payload)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| map_send_error(&error))?
         .model()
         .await
         .map(|message| message.id)

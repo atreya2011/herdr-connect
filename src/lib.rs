@@ -28,8 +28,8 @@ pub use config::{
     load_discord_config,
 };
 pub use delivery::{
-    deliver_live_message, deliver_permission_card, deliver_transition_card,
-    expire_informational_card, live_message_nonce, transition_card_nonce,
+    UNKNOWN_CHANNEL_DELIVERY_ERROR, deliver_live_message, deliver_permission_card,
+    deliver_transition_card, expire_informational_card, live_message_nonce, transition_card_nonce,
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{
@@ -52,7 +52,7 @@ pub use readers::{
     read_claude_incremental,
 };
 pub use topology::{
-    RouteError, TopologyCache, TopologyRoute, archived_threads, delete_tab_thread,
+    RouteError, TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
     reconcile_topology_cache, route_topology, sync_topology, workspace_channel_name,
 };

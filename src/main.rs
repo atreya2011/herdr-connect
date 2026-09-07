@@ -16,15 +16,16 @@ use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
     RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache,
-    TopologyRoute, Transition, TransitionMessage, agent_read_detection, claude_turn_start_position,
-    create_transition_messages, create_unsupported_blocked_card, delete_tab_thread,
-    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_live_message,
-    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
-    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
-    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
-    read_claude_incremental, reconcile_topology_cache, route_topology, split_live_message,
-    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
-    transition_card_nonce, workspace_list_result,
+    TopologyRoute, Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
+    agent_read_detection, cached_route, claude_turn_start_position, create_transition_messages,
+    create_unsupported_blocked_card, delete_tab_thread, delete_topology_absent_from_herdr,
+    delete_workspace_channel, deliver_live_message, deliver_transition_card,
+    drive_gateway_with_components, expire_informational_card, fetch_topology_lists,
+    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, live_message_nonce, load_discord_config, read_claude_incremental,
+    reconcile_topology_cache, route_topology, split_live_message, status_subscriptions,
+    subscribe_herdr_events, sync_topology, tab_list_result, transition_card_nonce,
+    workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1157,26 +1158,50 @@ async fn deliver_to_route(
     state_change_seq: u64,
 ) -> Result<Id<MessageMarker>, String> {
     let (client, guild, owner_id, responder) = discord;
+    let topology_cache = responder.topology_cache();
     let messages = create_transition_messages(transition, capture, owner_id);
-    let target = sync_route(client.as_ref(), *guild, route, responder.topology_cache()).await?;
+    let mut target = sync_route(client.as_ref(), *guild, route, topology_cache).await?;
     let mut last_message_id = None;
     for (index, message) in messages.iter().enumerate() {
         let nonce = transition_card_nonce(&transition.terminal_id, state_change_seq, index);
-        last_message_id = Some(
-            deliver_transition_card(client.as_ref(), target, message, &nonce)
-                .await
-                .map_err(|error| format!("discord delivery error: {error}"))?,
-        );
+        let mut sent = deliver_transition_card(client.as_ref(), target, message, &nonce).await;
+        if let Err(error) = &sent
+            && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
+        {
+            // The cached route no longer exists on Discord (deleted outside the bridge's own
+            // tracking, since every deletion the bridge itself performs already keeps this same
+            // cache in sync): drop it and resolve fresh before retrying once, rather than
+            // repeating a send that can only fail again against the same stale id.
+            *topology_cache.lock().await = None;
+            target = sync_route(client.as_ref(), *guild, route, topology_cache).await?;
+            sent = deliver_transition_card(client.as_ref(), target, message, &nonce).await;
+        }
+        last_message_id = Some(sent.map_err(|error| format!("discord delivery error: {error}"))?);
     }
     last_message_id.ok_or_else(|| "discord delivery produced no messages".to_owned())
 }
 
+/// Resolves `route`'s tab thread, serving it straight from `topology_cache` when the cache
+/// already holds both the route's workspace channel and its tab thread. Refetches -- one Discord
+/// round trip instead of one per lifecycle event -- only when the cache is empty, does not yet
+/// hold the route, or (via a caller invalidating it first) held a channel a send just rejected as
+/// unknown.
 async fn sync_route(
     client: &Client,
     guild: Id<GuildMarker>,
     route: &TopologyRoute,
     topology_cache: &TopologyCache,
 ) -> Result<Id<ChannelMarker>, String> {
+    {
+        let guard = topology_cache.lock().await;
+        if let Some((channels, active_threads)) = guard.as_ref() {
+            match cached_route(channels, active_threads, route) {
+                Ok(Some(channel)) => return Ok(channel),
+                Ok(None) => {}
+                Err(error) => return Err(format!("discord topology error: {error}")),
+            }
+        }
+    }
     let fetched = fetch_topology_lists(client, guild)
         .await
         .map_err(|error| format!("discord topology error: {error}"))?;
@@ -2300,11 +2325,11 @@ mod tests {
         BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
         Membership, PermissionResponder, TopologyClosure, TopologyRoute, agent_read_detection,
         apply_membership, capture_for_with_search_root, card_capture_for_delivery,
-        create_transition_messages, decide_blocked_response, discover_pending_and_unusable_tabs,
-        drain_lifecycle_batch, fetch_topology_lists, handle_blocked_card,
-        handle_lifecycle_select_result, handle_live_event, lifecycle_closure, lifecycle_membership,
-        list_agents, live_log_path, next_state_change_sequence, process_snapshot,
-        repeats_last_live_text, resolve_session_path, route_topology,
+        create_transition_messages, decide_blocked_response, deliver_to_route,
+        discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_topology_lists,
+        handle_blocked_card, handle_lifecycle_select_result, handle_live_event, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, next_state_change_sequence,
+        process_snapshot, repeats_last_live_text, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
         subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
         tab_list_result,
@@ -5859,6 +5884,131 @@ mod tests {
         let archived =
             herdr_connect_rs::archived_threads(guild.client.as_ref(), channel_id).await?;
         Ok(archived.iter().any(has_suffix))
+    }
+
+    #[cfg(unix)]
+    const CACHE_RECOVERY_LABEL: &str = "testrun-cache-recovery";
+
+    /// Drives `sync_route`'s three refetch triggers against a real guild: a cache hit is served
+    /// without any Discord request (so deleting the channel directly, out from under the cache,
+    /// does not get noticed), and a subsequent card delivery recovers by treating the resulting
+    /// unknown-channel send failure as a signal to invalidate the cache, resolve the route fresh,
+    /// and retry once.
+    #[cfg(unix)]
+    async fn sync_route_cache_recovery_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+    ) -> Result<(), String> {
+        report_idle_with_session(&tab.pane_id)?;
+        let listed = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let agents = std::slice::from_ref(&listed);
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let suffix = format!(" [{}]", route.tab_id);
+
+        let topology_cache: herdr_connect_rs::TopologyCache =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let created_thread =
+            sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+        let workspace_channel = guild_channel_with_topic(guild, &topic).await?.id;
+
+        // Delete the real thread directly, bypassing the bridge entirely: the in-memory cache
+        // still references it, standing in for an owner deleting a tab thread out from under the
+        // bridge's own tracking. The workspace channel is untouched.
+        guild
+            .client
+            .delete_channel(created_thread)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // A cache hit is served without a Discord request: sync_route returns the same, now-gone
+        // thread id rather than refetching and discovering it is missing.
+        let cached_thread =
+            sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+        if cached_thread != created_thread {
+            return Err(format!(
+                "expected the cache hit to return the original thread {created_thread}, got {cached_thread}"
+            ));
+        }
+        if thread_with_suffix_survives(guild, workspace_channel, &suffix).await? {
+            return Err("the cache hit must not have recreated the deleted thread".to_owned());
+        }
+
+        // A real send against the stale cached thread fails as unknown channel; deliver_to_route
+        // must recover by invalidating the cache, resolving the route fresh, and retrying once.
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&topology_cache));
+        let transition = Transition {
+            from: STATUS_IDLE.to_owned(),
+            to: STATUS_DONE.to_owned(),
+            terminal_id: listed.terminal_id.clone(),
+            agent: VENDOR_CLAUDE.to_owned(),
+        };
+        let capture = AgentLogCapture {
+            message: "cache-recovery test reply".to_owned(),
+            question: None,
+            failure: None,
+        };
+        deliver_to_route(&connection, &route, &transition, &capture, 1).await?;
+
+        if !thread_with_suffix_survives(guild, workspace_channel, &suffix).await? {
+            return Err("recovery must have created a fresh thread for the route".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn sync_route_serves_cache_hits_and_recovers_from_a_stale_send() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(CACHE_RECOVERY_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-cache-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create cache-recovery test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_tab(CACHE_RECOVERY_LABEL, &workspace_id, cwd);
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let outcome = sync_route_cache_recovery_exercise(&guild, &tab).await;
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(CACHE_RECOVERY_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
