@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -523,16 +523,19 @@ fn thread_tab_suffix(name: &str) -> Option<&str> {
 
 /// Deletes the Discord thread identifying one closed Herdr tab.
 ///
-/// Searches active threads first and the workspace channel's archived threads on a miss. A
+/// Searches active threads first and the workspace channel's archived threads on a miss, caching
+/// the archived listing per workspace channel in `archived_cache` so repeated misses against the
+/// same channel within one call site (for example, a batch of closures) list it at most once. A
 /// missing workspace channel or thread is not an error: the tab is already gone from Discord.
 ///
 /// # Errors
 ///
 /// Returns Discord request or response errors, or a duplicate-thread topology error.
-pub async fn delete_tab_thread(
+pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
     client: &twilight_http::Client,
     channels: &[Channel],
     active_threads: &mut Vec<Channel>,
+    archived_cache: &mut HashMap<Id<ChannelMarker>, Vec<Channel>, S>,
     workspace_id: &str,
     tab_id: &str,
 ) -> Result<(), String> {
@@ -543,8 +546,13 @@ pub async fn delete_tab_thread(
     let mut resolved =
         single_matching_thread(active_threads, workspace_channel, &thread_suffix, tab_id)?;
     if resolved.is_none() {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            archived_cache.entry(workspace_channel)
+        {
+            entry.insert(archived_threads(client, workspace_channel).await?);
+        }
         resolved = single_matching_thread(
-            &archived_threads(client, workspace_channel).await?,
+            &archived_cache[&workspace_channel],
             workspace_channel,
             &thread_suffix,
             tab_id,

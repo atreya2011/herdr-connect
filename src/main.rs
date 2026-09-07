@@ -1323,9 +1323,11 @@ async fn sync_startup_topology(
 
 /// Applies every `tab.closed`/`workspace.closed` Herdr event in a batch to Discord with ONE
 /// topology fetch shared across the whole batch, deleting only the tabs and workspaces the
-/// fetched lists actually contain. A closure with no match makes no Discord request. A per-closure
-/// delete error is logged and does not stop the remaining closures in the batch; only a failure of
-/// the shared fetch itself aborts the batch.
+/// fetched lists actually contain. A closure with no match in the active list and no match in that
+/// closure's workspace channel's archived listing makes no further Discord request: the archived
+/// listing itself is fetched at most once per distinct workspace channel in the batch and reused
+/// by every closure that channel contains. A per-closure delete error is logged and does not stop
+/// the remaining closures in the batch; only a failure of the shared fetch itself aborts the batch.
 async fn delete_closed_topology_batch(
     discord: Option<&DiscordConnection>,
     closures: &[TopologyClosure],
@@ -1340,6 +1342,8 @@ async fn delete_closed_topology_batch(
     let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
     let mut guard = topology_cache.lock().await;
     let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
+    let mut archived_cache: HashMap<Id<ChannelMarker>, Vec<twilight_model::channel::Channel>> =
+        HashMap::new();
     for closure in closures {
         let result = match closure {
             TopologyClosure::Tab {
@@ -1350,6 +1354,7 @@ async fn delete_closed_topology_batch(
                     client.as_ref(),
                     channels,
                     active_threads,
+                    &mut archived_cache,
                     workspace_id,
                     tab_id,
                 )
@@ -2343,13 +2348,14 @@ mod tests {
         Membership, PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
         agent_read_detection, apply_membership, capture_for_with_search_root,
         card_capture_for_delivery, create_transition_messages, decide_blocked_response,
-        deliver_to_route, discover_pending_and_unusable_tabs, drain_lifecycle_batch,
-        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
-        handle_live_event, lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        next_state_change_sequence, process_snapshot, repeats_last_live_text, resolve_session_path,
-        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
-        subscribe_status, subscribe_status_with_backoff, sync_pending_titles, sync_route,
-        sync_startup_topology, tab_list_result, unique_existing_path,
+        delete_closed_topology_batch, deliver_to_route, discover_pending_and_unusable_tabs,
+        drain_lifecycle_batch, fetch_topology_lists, handle_blocked_card,
+        handle_lifecycle_select_result, handle_live_event, lifecycle_closure, lifecycle_membership,
+        list_agents, live_log_path, next_state_change_sequence, process_snapshot,
+        repeats_last_live_text, resolve_session_path, route_topology,
+        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
+        subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
+        tab_list_result, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
@@ -5987,6 +5993,146 @@ mod tests {
         let archived =
             herdr_connect_rs::archived_threads(guild.client.as_ref(), channel_id).await?;
         Ok(archived.iter().any(has_suffix))
+    }
+
+    #[cfg(unix)]
+    const CLOSURE_BATCH_LABEL: &str = "testrun-closure-batch";
+
+    /// Whether a tab's thread exists, and where, before [`closure_batch_exercise`] runs its batch.
+    #[cfg(unix)]
+    enum ClosureBatchPresence {
+        Active,
+        Archived,
+        Absent,
+    }
+
+    /// One row in [`closure_batch_exercise`]'s table: a tab's thread presence going in, whether its
+    /// closure is included in the batch, and whether the thread is expected to survive the batch.
+    #[cfg(unix)]
+    struct ClosureBatchCase {
+        name: &'static str,
+        presence: ClosureBatchPresence,
+        closed: bool,
+        expect_survives: bool,
+    }
+
+    /// Table-driven, against a real Discord guild: a batch of several `tab.closed` closures for
+    /// tabs in the same workspace channel deletes only the closed tabs whose threads the fetched
+    /// active list or that channel's one archived listing actually contains, and a live tab's
+    /// thread outside the batch survives untouched.
+    #[cfg(unix)]
+    async fn closure_batch_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        let workspace_id = format!("{CLOSURE_BATCH_LABEL}-{nonce}");
+        let channel = guild
+            .client
+            .create_guild_channel(guild.id, &format!("{CLOSURE_BATCH_LABEL}-{nonce}"))
+            .topic(&format!("herdr workspace [{workspace_id}]"))
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let cases = [
+            ClosureBatchCase {
+                name: "an active thread whose closure is in the batch is deleted",
+                presence: ClosureBatchPresence::Active,
+                closed: true,
+                expect_survives: false,
+            },
+            ClosureBatchCase {
+                name: "an archived thread whose closure is in the batch is deleted",
+                presence: ClosureBatchPresence::Archived,
+                closed: true,
+                expect_survives: false,
+            },
+            ClosureBatchCase {
+                name: "a closure with no matching thread is a harmless no-op",
+                presence: ClosureBatchPresence::Absent,
+                closed: true,
+                expect_survives: false,
+            },
+            ClosureBatchCase {
+                name: "a live tab outside the batch survives",
+                presence: ClosureBatchPresence::Active,
+                closed: false,
+                expect_survives: true,
+            },
+        ];
+
+        let mut closures = Vec::new();
+        let mut suffixes = Vec::new();
+        for (index, case) in cases.iter().enumerate() {
+            let tab_id = format!("{workspace_id}:t{index}");
+            let suffix = format!(" [{tab_id}]");
+            match case.presence {
+                ClosureBatchPresence::Active => {
+                    create_guild_thread(guild, channel.id, &format!("tab-{index}{suffix}")).await?;
+                }
+                ClosureBatchPresence::Archived => {
+                    let thread =
+                        create_guild_thread(guild, channel.id, &format!("tab-{index}{suffix}"))
+                            .await?;
+                    guild
+                        .client
+                        .update_thread(thread.id)
+                        .archived(true)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                ClosureBatchPresence::Absent => {}
+            }
+            if case.closed {
+                closures.push(TopologyClosure::Tab {
+                    workspace_id: workspace_id.clone(),
+                    tab_id,
+                });
+            }
+            suffixes.push(suffix);
+        }
+
+        let connection = discord_tuple(guild);
+        delete_closed_topology_batch(Some(&connection), &closures).await?;
+
+        for (case, suffix) in cases.iter().zip(suffixes.iter()) {
+            let survives = thread_with_suffix_survives(guild, channel.id, suffix).await?;
+            if survives != case.expect_survives {
+                return Err(format!(
+                    "{}: expected survives={}, got {survives}",
+                    case.name, case.expect_survives
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn closure_batch_deletes_matching_threads_and_spares_live_ones() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+
+        let result = closure_batch_exercise(&guild).await;
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
