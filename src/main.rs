@@ -1420,7 +1420,10 @@ async fn sync_route_locked(
 /// follows reuses this same cache rather than refetching per tab; an Ok but empty Herdr
 /// workspace or tab list is authoritative and deletes accordingly, while an Err from either
 /// Herdr call skips the whole delete pass with one logged error line. The delete pass is
-/// unaffected by session: a live tab keeps any thread that already exists.
+/// unaffected by session: a live tab keeps any thread that already exists. Both passes tolerate
+/// the shared cache going empty mid-sweep -- a concurrent stale-route recovery elsewhere clears
+/// it for microseconds while it re-resolves -- by refetching in place rather than aborting: the
+/// create pass skips just that one agent and continues, and the delete pass still runs.
 async fn sync_startup_topology(
     discord: &DiscordConnection,
     agents: &[AgentSnapshot],
@@ -1457,9 +1460,17 @@ async fn sync_startup_topology(
             }
         };
         let mut guard = topology_cache.lock().await;
-        let Some((channels, active_threads)) = guard.as_mut() else {
-            eprintln!("herdr startup topology error: topology cache was cleared");
-            return;
+        let (channels, active_threads) = if let Some((channels, active_threads)) = guard.as_mut() {
+            (channels, active_threads)
+        } else {
+            let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    eprintln!("herdr startup topology error: {error}");
+                    continue;
+                }
+            };
+            reconcile_topology_cache(&mut guard, fetched)
         };
         let result = sync_topology(client.as_ref(), *guild, channels, active_threads, &route).await;
         drop(guard);
@@ -1480,9 +1491,17 @@ async fn sync_startup_topology(
         .collect();
     let live_tab_ids: HashSet<&str> = live_tabs.iter().map(|tab| tab.tab_id.as_str()).collect();
     let mut guard = topology_cache.lock().await;
-    let Some((channels, active_threads)) = guard.as_mut() else {
-        eprintln!("herdr startup topology error: topology cache was cleared");
-        return;
+    let (channels, active_threads) = if let Some((channels, active_threads)) = guard.as_mut() {
+        (channels, active_threads)
+    } else {
+        let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                eprintln!("herdr startup topology error: {error}");
+                return;
+            }
+        };
+        reconcile_topology_cache(&mut guard, fetched)
     };
     let result = delete_topology_absent_from_herdr(
         client.as_ref(),
@@ -7529,6 +7548,126 @@ mod tests {
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
         assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    struct ConcurrentClearCase {
+        name: &'static str,
+        race_the_clear: bool,
+    }
+
+    /// Creates an orphan channel/thread pair Herdr does not list, then runs the startup sweep's
+    /// delete pass against a `topology_cache` starting at `None`. When `race_the_clear` is set, a
+    /// second task hammers that same cache back to `None` on a separate worker thread for the
+    /// sweep's whole run -- mimicking a concurrent stale-route recovery (`deliver_to_route`,
+    /// `deliver_blocked_messages`, `handle_live_event`) clearing it mid-sweep. Either way the
+    /// orphan must still be deleted: the reconciliation pass must not abort just because it
+    /// observed an empty cache.
+    #[cfg(unix)]
+    async fn startup_sweep_survives_concurrent_clear_exercise(
+        guild: &BlockedCaptureGuild,
+        race_the_clear: bool,
+    ) -> Result<(), String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        let orphan_channel = guild
+            .client
+            .create_guild_channel(guild.id, &format!("testrun-orphan-{nonce}"))
+            .topic("herdr workspace [wCC9]")
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let orphan_thread =
+            create_guild_thread(guild, orphan_channel.id, "testrun-orphan [wCC9:tCC]").await?;
+
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+
+        let racer = if race_the_clear {
+            let done = Arc::new(AtomicBool::new(false));
+            let handle = tokio::spawn({
+                let cache = Arc::clone(&shared_cache);
+                let done = Arc::clone(&done);
+                async move {
+                    while !done.load(Ordering::Relaxed) {
+                        *cache.lock().await = None;
+                    }
+                }
+            });
+            Some((handle, done))
+        } else {
+            None
+        };
+
+        sync_startup_topology(&connection, &[], &[]).await;
+
+        if let Some((handle, done)) = racer {
+            done.store(true, Ordering::Relaxed);
+            handle.await.map_err(|error| error.to_string())?;
+        }
+
+        let channels_after = guild_channels_for_guild(guild).await?;
+        if channels_after
+            .iter()
+            .any(|channel| channel.id == orphan_channel.id)
+        {
+            return Err("startup sweep did not delete the orphan workspace channel".to_owned());
+        }
+        let active_after = active_threads_for_guild(guild).await?;
+        if active_after
+            .iter()
+            .any(|thread| thread.id == orphan_thread.id)
+        {
+            return Err("startup sweep did not delete the orphan channel's thread".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn startup_sweep_survives_a_concurrent_cache_clear() {
+        let cases = [
+            ConcurrentClearCase {
+                name: "cache cleared between the create and delete pass",
+                race_the_clear: true,
+            },
+            ConcurrentClearCase {
+                name: "cache left untouched",
+                race_the_clear: false,
+            },
+        ];
+
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+
+        for case in cases {
+            assert_eq!(
+                blocked_capture_cleanup(&guild).await.unwrap(),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
+
+            let result =
+                startup_sweep_survives_concurrent_clear_exercise(&guild, case.race_the_clear).await;
+
+            let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
+            assert_eq!(channels_left, 0, "named zero-leftover check: {}", case.name);
+        }
     }
 
     #[cfg(unix)]
