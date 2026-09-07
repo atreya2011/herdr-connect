@@ -124,6 +124,15 @@ const BLOCKED_CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(1_500);
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// How long a lifecycle batch keeps draining after its most recent event before it is acted on. A
+/// resubscribe replay burst pushes events back-to-back well inside this window, so the whole
+/// burst is drained into one batch instead of triggering one doorbell and one topology fetch per
+/// event.
+const LIFECYCLE_BATCH_WINDOW: Duration = Duration::from_millis(100);
+/// Upper bound on events drained into one lifecycle batch, so a pathological event storm still
+/// yields control back to the rest of the event loop.
+const LIFECYCLE_BATCH_CAP: usize = 1_000;
+
 #[derive(Debug, PartialEq, Eq)]
 enum BlockedResponse {
     Question,
@@ -1270,37 +1279,49 @@ async fn sync_startup_topology(
     }
 }
 
-/// Applies one `tab.closed`/`workspace.closed` Herdr event to Discord: deletes the closed tab's
-/// thread or the closed workspace's channel. A missing target is not an error.
-async fn delete_closed_topology(
+/// Applies every `tab.closed`/`workspace.closed` Herdr event in a batch to Discord with ONE
+/// topology fetch shared across the whole batch, deleting only the tabs and workspaces the
+/// fetched lists actually contain. A closure with no match makes no Discord request. A per-closure
+/// delete error is logged and does not stop the remaining closures in the batch; only a failure of
+/// the shared fetch itself aborts the batch.
+async fn delete_closed_topology_batch(
     discord: Option<&DiscordConnection>,
-    closure: &TopologyClosure,
+    closures: &[TopologyClosure],
 ) -> Result<(), String> {
     let Some((client, guild, _, responder)) = discord else {
         return Ok(());
     };
+    if closures.is_empty() {
+        return Ok(());
+    }
     let topology_cache = responder.topology_cache();
     let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
     let mut guard = topology_cache.lock().await;
     let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
-    match closure {
-        TopologyClosure::Tab {
-            workspace_id,
-            tab_id,
-        } => {
-            delete_tab_thread(
-                client.as_ref(),
-                channels,
-                active_threads,
+    for closure in closures {
+        let result = match closure {
+            TopologyClosure::Tab {
                 workspace_id,
                 tab_id,
-            )
-            .await
-        }
-        TopologyClosure::Workspace { workspace_id } => {
-            delete_workspace_channel(client.as_ref(), channels, workspace_id).await
+            } => {
+                delete_tab_thread(
+                    client.as_ref(),
+                    channels,
+                    active_threads,
+                    workspace_id,
+                    tab_id,
+                )
+                .await
+            }
+            TopologyClosure::Workspace { workspace_id } => {
+                delete_workspace_channel(client.as_ref(), channels, workspace_id).await
+            }
+        };
+        if let Err(error) = result {
+            eprintln!("herdr topology closure error: {error}");
         }
     }
+    Ok(())
 }
 
 fn next_state_change_sequence(
@@ -1807,6 +1828,112 @@ async fn bridge_event_loop(
     Ok(())
 }
 
+/// Keeps draining further lifecycle events into `batch` as long as each new one arrives within
+/// [`LIFECYCLE_BATCH_WINDOW`] of the previous one, up to [`LIFECYCLE_BATCH_CAP`] events total
+/// (including the seed event already in `batch`). Returns the terminating subscribe error when
+/// draining stopped because the stream closed, rather than because the window elapsed or the cap
+/// was reached.
+async fn drain_lifecycle_batch(
+    lifecycle: &mut HerdrSubscription,
+    batch: &mut Vec<serde_json::Value>,
+) -> Option<String> {
+    while batch.len() < LIFECYCLE_BATCH_CAP {
+        tokio::select! {
+            result = lifecycle.next_event() => {
+                match result {
+                    Ok(event) => batch.push(event),
+                    Err(error) => return Some(error),
+                }
+            }
+            () = tokio::time::sleep(LIFECYCLE_BATCH_WINDOW) => return None,
+        }
+    }
+    None
+}
+
+/// Applies one drained batch of lifecycle events: every membership change first (one status
+/// resubscribe if any pane joined or left), then every closure with one shared topology fetch,
+/// then one doorbell. A batch made only of `pane.updated` events that report no pending title
+/// keeps the existing early-return rule and skips the doorbell.
+async fn apply_lifecycle_batch(
+    batch: &[serde_json::Value],
+    discord: Option<&DiscordConnection>,
+    stop: &mut tokio::signal::unix::Signal,
+    broker: &mut Option<BrokerTask>,
+    runtime: &mut BridgeRuntime,
+) -> bool {
+    let mut membership_changed = false;
+    for event in batch {
+        if let Some(change) = lifecycle_membership(event)
+            && apply_membership(&mut runtime.pane_ids, change)
+        {
+            membership_changed = true;
+        }
+    }
+    if membership_changed {
+        let Some(next_status) = unwrap_or_shutdown(
+            subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
+            broker,
+        ) else {
+            return false;
+        };
+        runtime.status = next_status;
+    }
+
+    let closures: Vec<TopologyClosure> = batch.iter().filter_map(lifecycle_closure).collect();
+    if let Err(error) = delete_closed_topology_batch(discord, &closures).await {
+        eprintln!("herdr topology closure error: {error}");
+    }
+
+    let worth_doorbell = batch.iter().any(|event| {
+        let is_pane_updated = canonical_event_name(
+            event
+                .get(EVENT_KEY)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        ) == "pane_updated";
+        !is_pane_updated || pane_update_reports_a_pending_title(event, &runtime.state.title_pending)
+    });
+    if !worth_doorbell {
+        return true;
+    }
+    doorbell_unless_shutdown(
+        discord,
+        &mut runtime.state,
+        &mut runtime.pane_ids,
+        &mut runtime.status,
+        stop,
+        broker,
+    )
+    .await
+}
+
+async fn handle_lifecycle_subscribe_error(
+    error: String,
+    discord: Option<&DiscordConnection>,
+    stop: &mut tokio::signal::unix::Signal,
+    broker: &mut Option<BrokerTask>,
+    runtime: &mut BridgeRuntime,
+) -> bool {
+    eprintln!("herdr lifecycle subscribe error: {error}");
+    let Some(next_lifecycle) = unwrap_or_shutdown(
+        subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), stop).await,
+        broker,
+    ) else {
+        return false;
+    };
+    runtime.lifecycle = next_lifecycle;
+    doorbell_unless_shutdown(
+        discord,
+        &mut runtime.state,
+        &mut runtime.pane_ids,
+        &mut runtime.status,
+        stop,
+        broker,
+    )
+    .await
+}
+
 async fn handle_lifecycle_select_result(
     result: Result<serde_json::Value, String>,
     discord: Option<&DiscordConnection>,
@@ -1816,62 +1943,19 @@ async fn handle_lifecycle_select_result(
 ) -> bool {
     match result {
         Ok(event) => {
-            if let Some(change) = lifecycle_membership(&event)
-                && apply_membership(&mut runtime.pane_ids, change)
-            {
-                let Some(next_status) = unwrap_or_shutdown(
-                    subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
-                    broker,
-                ) else {
-                    return false;
-                };
-                runtime.status = next_status;
-            }
-            if let Some(closure) = lifecycle_closure(&event)
-                && let Err(error) = delete_closed_topology(discord, &closure).await
-            {
-                eprintln!("herdr topology closure error: {error}");
-            }
-            let is_pane_updated = canonical_event_name(
-                event
-                    .get(EVENT_KEY)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            ) == "pane_updated";
-            if is_pane_updated
-                && !pane_update_reports_a_pending_title(&event, &runtime.state.title_pending)
-            {
-                return true;
-            }
-            doorbell_unless_shutdown(
-                discord,
-                &mut runtime.state,
-                &mut runtime.pane_ids,
-                &mut runtime.status,
-                stop,
-                broker,
-            )
-            .await
-        }
-        Err(error) => {
-            eprintln!("herdr lifecycle subscribe error: {error}");
-            let Some(next_lifecycle) = unwrap_or_shutdown(
-                subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), stop).await,
-                broker,
-            ) else {
+            let mut batch = vec![event];
+            let drain_error = drain_lifecycle_batch(&mut runtime.lifecycle, &mut batch).await;
+            if !apply_lifecycle_batch(&batch, discord, stop, broker, runtime).await {
                 return false;
-            };
-            runtime.lifecycle = next_lifecycle;
-            doorbell_unless_shutdown(
-                discord,
-                &mut runtime.state,
-                &mut runtime.pane_ids,
-                &mut runtime.status,
-                stop,
-                broker,
-            )
-            .await
+            }
+            match drain_error {
+                Some(error) => {
+                    handle_lifecycle_subscribe_error(error, discord, stop, broker, runtime).await
+                }
+                None => true,
+            }
         }
+        Err(error) => handle_lifecycle_subscribe_error(error, discord, stop, broker, runtime).await,
     }
 }
 
@@ -2206,12 +2290,13 @@ mod tests {
         Membership, PermissionResponder, TopologyClosure, TopologyRoute, agent_read_detection,
         apply_membership, capture_for_with_search_root, card_capture_for_delivery,
         create_transition_messages, decide_blocked_response, discover_pending_and_unusable_tabs,
-        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
-        handle_live_event, lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        next_state_change_sequence, process_snapshot, repeats_last_live_text, resolve_session_path,
-        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
-        subscribe_status, subscribe_status_with_backoff, sync_pending_titles, sync_route,
-        sync_startup_topology, tab_list_result,
+        drain_lifecycle_batch, fetch_topology_lists, handle_blocked_card,
+        handle_lifecycle_select_result, handle_live_event, lifecycle_closure, lifecycle_membership,
+        list_agents, live_log_path, next_state_change_sequence, process_snapshot,
+        repeats_last_live_text, resolve_session_path, route_topology,
+        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
+        subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
+        tab_list_result,
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
@@ -3616,6 +3701,202 @@ mod tests {
                 "{}: live pane id must be present in the recovered membership",
                 case.name
             );
+            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
+        }
+    }
+
+    #[cfg(unix)]
+    const LIFECYCLE_BATCH_LABEL: &str = "testrun-lifecycle-batch";
+
+    /// A gap in `next_event` results longer than this means the real backlog replay has caught up
+    /// to live: longer than `LIFECYCLE_BATCH_WINDOW` so an ordinary batch-ending gap inside a
+    /// ragged real backlog does not read as "caught up".
+    #[cfg(unix)]
+    const LIFECYCLE_BATCH_CATCH_UP_IDLE: Duration = Duration::from_millis(600);
+
+    /// One case in [`lifecycle_batch_drains_replay_burst_then_isolates_a_later_closure`]:
+    /// `seeded_closures` tab.closed events are generated before the subscribe, so the replayed
+    /// backlog is guaranteed non-empty even against an otherwise-quiet Herdr instance. A batch
+    /// with more than one event is only required when more than one closure was seeded together:
+    /// a lone seeded closure may or may not land next to unrelated ambient history.
+    #[cfg(unix)]
+    struct LifecycleBatchCase {
+        name: &'static str,
+        seeded_closures: usize,
+    }
+
+    /// Extracts the tab ids that `lifecycle_closure` reports as tab closures within a batch.
+    #[cfg(unix)]
+    fn batch_tab_closures(batch: &[Value]) -> HashSet<String> {
+        batch
+            .iter()
+            .filter_map(lifecycle_closure)
+            .filter_map(|closure| match closure {
+                TopologyClosure::Tab { tab_id, .. } => Some(tab_id),
+                TopologyClosure::Workspace { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Pulls one more drained batch from `lifecycle`, seeded by the next available event.
+    /// `Ok(None)` means the subscription has caught up to live: no event arrived within
+    /// `LIFECYCLE_BATCH_CATCH_UP_IDLE`.
+    #[cfg(unix)]
+    async fn next_lifecycle_batch(
+        lifecycle: &mut herdr_connect_rs::HerdrSubscription,
+    ) -> Result<Option<Vec<Value>>, String> {
+        let seed = match tokio::time::timeout(LIFECYCLE_BATCH_CATCH_UP_IDLE, lifecycle.next_event())
+            .await
+        {
+            Ok(Ok(event)) => event,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Ok(None),
+        };
+        let mut batch = vec![seed];
+        if let Some(error) = drain_lifecycle_batch(lifecycle, &mut batch).await {
+            return Err(error);
+        }
+        Ok(Some(batch))
+    }
+
+    /// Table-driven, against the real Herdr socket: draining a fresh lifecycle subscription
+    /// coalesces the replayed backlog into batches of more than one event rather than one event at
+    /// a time, and once the backlog has caught up to live, a tab closed only now arrives promptly
+    /// in its own later batch, isolated from every closure seeded into the backlog.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_batch_drains_replay_burst_then_isolates_a_later_closure() {
+        let cases = [
+            LifecycleBatchCase {
+                name: "single seeded closure",
+                seeded_closures: 1,
+            },
+            LifecycleBatchCase {
+                name: "two seeded closures",
+                seeded_closures: 2,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                remaining_tabs(LIFECYCLE_BATCH_LABEL).expect("tab.list succeeds"),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
+
+            let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+                .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+            let mut seeded_tab_ids = Vec::new();
+            let mut seeded_cwd_dirs = Vec::new();
+            for _ in 0..case.seeded_closures {
+                let cwd_dir = std::env::temp_dir().join(format!(
+                    "testrun-lifecycle-batch-{}-{}-{}",
+                    std::process::id(),
+                    seeded_tab_ids.len(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("system clock is after unix epoch")
+                        .as_nanos()
+                ));
+                fs::create_dir_all(&cwd_dir).expect("create lifecycle-batch seed cwd");
+                let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+                let tab =
+                    create_tab(LIFECYCLE_BATCH_LABEL, &workspace_id, cwd).expect("create seed tab");
+                close_tab(&tab.tab_id);
+                seeded_tab_ids.push(tab.tab_id);
+                seeded_cwd_dirs.push(cwd_dir);
+            }
+
+            let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+                .await
+                .expect("lifecycle subscribe");
+
+            let result: Result<(), String> = async {
+                // Drain the replayed backlog, batch by batch, until the subscription catches up
+                // to live, tracking whether every seeded closure surfaced and whether any batch
+                // along the way coalesced more than one event.
+                let mut remaining_seeds: HashSet<String> = seeded_tab_ids.iter().cloned().collect();
+                let mut multi_event_batch_seen = false;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "backlog never surfaced seeded closures {remaining_seeds:?} within the deadline"
+                        ));
+                    }
+                    let Some(batch) = next_lifecycle_batch(&mut lifecycle).await? else {
+                        break;
+                    };
+                    if batch.len() > 1 {
+                        multi_event_batch_seen = true;
+                    }
+                    for tab_id in batch_tab_closures(&batch) {
+                        remaining_seeds.remove(&tab_id);
+                    }
+                }
+                if !remaining_seeds.is_empty() {
+                    return Err(format!(
+                        "backlog replay caught up without ever surfacing seeded closures {remaining_seeds:?}"
+                    ));
+                }
+                if case.seeded_closures > 1 && !multi_event_batch_seen {
+                    return Err(
+                        "expected at least one drained batch with more than one event while \
+                         seeding more than one closure together"
+                            .to_owned(),
+                    );
+                }
+
+                // The backlog has caught up to live (the last `next_lifecycle_batch` call idled
+                // for `LIFECYCLE_BATCH_CATCH_UP_IDLE` with nothing pending). A tab closed only now
+                // must arrive promptly, as its own batch, isolated from every seeded closure.
+                let later_cwd_dir = std::env::temp_dir().join(format!(
+                    "testrun-lifecycle-batch-later-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("system clock is after unix epoch")
+                        .as_nanos()
+                ));
+                fs::create_dir_all(&later_cwd_dir).map_err(|error| error.to_string())?;
+                let later_cwd = later_cwd_dir
+                    .to_str()
+                    .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+                let later_tab = create_tab(LIFECYCLE_BATCH_LABEL, &workspace_id, later_cwd)
+                    .map_err(|error| format!("later tab: {error}"))?;
+                close_tab(&later_tab.tab_id);
+                let _ = fs::remove_dir_all(&later_cwd_dir);
+
+                let later_batch = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    next_lifecycle_batch(&mut lifecycle),
+                )
+                .await
+                .map_err(|_| "timed out waiting for the later closure".to_owned())??
+                .ok_or_else(|| "expected a batch for the later closure, got none".to_owned())?;
+                let later_closures = batch_tab_closures(&later_batch);
+                if !later_closures.contains(&later_tab.tab_id) {
+                    return Err(format!(
+                        "later batch must contain the tab closed after the burst, got {later_closures:?}"
+                    ));
+                }
+                if seeded_tab_ids.iter().any(|tab_id| later_closures.contains(tab_id)) {
+                    return Err(format!(
+                        "later batch must be its own closure, isolated from the burst: {later_closures:?}"
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+
+            for cwd_dir in &seeded_cwd_dirs {
+                let _ = fs::remove_dir_all(cwd_dir);
+            }
+            let tabs_left = remaining_tabs(LIFECYCLE_BATCH_LABEL)
+                .expect("tab.list succeeds for the zero-leftover check");
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
             assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
         }
     }
