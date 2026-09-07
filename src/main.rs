@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -825,11 +826,27 @@ fn resolve_session_path(
     }
 }
 
+/// Collapses candidates that are hard links to the same file (same device and inode) into one
+/// path, so a session log hard-linked under both `~/.claude` and `~/.claude-one` is not
+/// mistaken for two distinct session logs.
+fn dedupe_hard_links(candidates: &[PathBuf]) -> Result<Vec<PathBuf>, SessionPathError> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for path in candidates {
+        let metadata = fs::metadata(path)
+            .map_err(|error| SessionPathError::Permanent(format!("{}: {error}", path.display())))?;
+        if seen.insert((metadata.dev(), metadata.ino())) {
+            unique.push(path.clone());
+        }
+    }
+    Ok(unique)
+}
+
 fn unique_existing_path(
     candidates: &[PathBuf],
     description: &str,
 ) -> Result<PathBuf, SessionPathError> {
-    match candidates {
+    match dedupe_hard_links(candidates)?.as_slice() {
         [path] => Ok(path.clone()),
         [] => Err(SessionPathError::NotFoundYet(format!(
             "{description} was not found"
@@ -2323,16 +2340,16 @@ mod tests {
 
     use super::{
         BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
-        Membership, PermissionResponder, TopologyClosure, TopologyRoute, agent_read_detection,
-        apply_membership, capture_for_with_search_root, card_capture_for_delivery,
-        create_transition_messages, decide_blocked_response, deliver_to_route,
-        discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_topology_lists,
-        handle_blocked_card, handle_lifecycle_select_result, handle_live_event, lifecycle_closure,
-        lifecycle_membership, list_agents, live_log_path, next_state_change_sequence,
-        process_snapshot, repeats_last_live_text, resolve_session_path, route_topology,
-        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
-        subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
-        tab_list_result,
+        Membership, PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
+        agent_read_detection, apply_membership, capture_for_with_search_root,
+        card_capture_for_delivery, create_transition_messages, decide_blocked_response,
+        deliver_to_route, discover_pending_and_unusable_tabs, drain_lifecycle_batch,
+        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
+        handle_live_event, lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        next_state_change_sequence, process_snapshot, repeats_last_live_text, resolve_session_path,
+        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
+        subscribe_status, subscribe_status_with_backoff, sync_pending_titles, sync_route,
+        sync_startup_topology, tab_list_result, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
@@ -2586,6 +2603,92 @@ mod tests {
             );
         }
         fs::remove_dir_all(&root).expect("remove Claude slug test directory");
+    }
+
+    /// One case in [`unique_existing_path_collapses_hard_linked_candidates`].
+    enum UniqueExistingPathExpectation {
+        /// Resolves to the candidate at this index.
+        Ok(usize),
+        /// A real, non-transient ambiguity: candidates that are not the same file.
+        Permanent,
+    }
+
+    struct UniqueExistingPathCase {
+        name: &'static str,
+        build: fn(&Path) -> Vec<PathBuf>,
+        expected: UniqueExistingPathExpectation,
+    }
+
+    /// Session logs hard-linked under both `~/.claude` and `~/.claude-one` (real, observed
+    /// on-disk shape) must resolve as the one file they are, not as two ambiguous candidates.
+    #[test]
+    fn unique_existing_path_collapses_hard_linked_candidates() {
+        let cases = [
+            UniqueExistingPathCase {
+                name: "one file",
+                build: |dir| {
+                    let path = dir.join("a.jsonl");
+                    fs::write(&path, "{}").expect("write test session file");
+                    vec![path]
+                },
+                expected: UniqueExistingPathExpectation::Ok(0),
+            },
+            UniqueExistingPathCase {
+                name: "a hard-linked pair",
+                build: |dir| {
+                    let original = dir.join("a.jsonl");
+                    fs::write(&original, "{}").expect("write test session file");
+                    let linked = dir.join("b.jsonl");
+                    fs::hard_link(&original, &linked).expect("create hard link");
+                    vec![original, linked]
+                },
+                expected: UniqueExistingPathExpectation::Ok(0),
+            },
+            UniqueExistingPathCase {
+                name: "two distinct files",
+                build: |dir| {
+                    let a = dir.join("a.jsonl");
+                    fs::write(&a, "{}").expect("write test session file");
+                    let b = dir.join("b.jsonl");
+                    fs::write(&b, "{}").expect("write test session file");
+                    vec![a, b]
+                },
+                expected: UniqueExistingPathExpectation::Permanent,
+            },
+        ];
+
+        for (index, case) in cases.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "testrun-unique-existing-path-{}-{index}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).expect("create unique_existing_path test dir");
+            let candidates = (case.build)(&dir);
+
+            let result = unique_existing_path(&candidates, "test session log");
+            match case.expected {
+                UniqueExistingPathExpectation::Ok(expected_index) => {
+                    assert_eq!(
+                        result,
+                        Ok(candidates[expected_index].clone()),
+                        "{}",
+                        case.name
+                    );
+                }
+                UniqueExistingPathExpectation::Permanent => {
+                    assert!(
+                        matches!(result, Err(SessionPathError::Permanent(_))),
+                        "{}: expected Permanent, got {result:?}",
+                        case.name
+                    );
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
