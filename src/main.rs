@@ -112,9 +112,15 @@ struct BridgeState {
     live_delivery_attempts: HashMap<String, u32>,
     /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
     /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
-    /// Forgotten -- not deleted -- at the same point a live watch settles, so the next turn starts
-    /// a fresh message instead of editing the last one.
+    /// Forgotten -- not deleted -- at the point the pane's transition card for that turn is
+    /// posted, so the next turn starts a fresh message instead of editing the last one.
     activity_messages: HashMap<String, ActivityMessage>,
+    /// Pane ids the latest Herdr snapshot reports as `working` with a session, kept fresh by
+    /// every [`process_snapshot`] call (whether from the doorbell's `agent.list` sweep or a
+    /// single-pane update). `handle_activity_event` checks this before creating a message: an
+    /// activity frame that outlives its turn, or that names a pane with no reported session, has
+    /// nothing to gate its creation without it.
+    activity_eligible_panes: HashSet<String>,
 }
 
 /// The Discord message tracking one pane's current turn of tool activity: `count` tool calls
@@ -455,6 +461,20 @@ async fn maybe_start_live_watch(
     }
 }
 
+/// Split out of [`process_snapshot`] to keep it under the line-count lint. Keeps
+/// `state.activity_eligible_panes` in step with this snapshot's pane: eligible while it reports
+/// `working` with a session, not otherwise.
+fn update_activity_eligibility(state: &mut BridgeState, snapshot: &AgentSnapshot, status: &str) {
+    let Some(pane_id) = snapshot.pane_id.as_deref() else {
+        return;
+    };
+    if status == STATUS_WORKING && snapshot.session.is_some() {
+        state.activity_eligible_panes.insert(pane_id.to_owned());
+    } else {
+        state.activity_eligible_panes.remove(pane_id);
+    }
+}
+
 async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -466,6 +486,7 @@ async fn process_snapshot(
     let terminal = snapshot.terminal_id.clone();
     let status = snapshot.agent_status.clone();
     println!("{agent} {terminal}: {status}");
+    update_activity_eligibility(state, snapshot, &status);
     maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
     let previous_herdr_seq = state
         .herdr_state_change_seq
@@ -491,7 +512,6 @@ async fn process_snapshot(
             }
             if old_was_working {
                 settle_live_watch(discord, &terminal, state).await;
-                forget_activity_message(state, snapshot.pane_id.as_deref());
             }
             update_blocked_lifecycle(
                 discord,
@@ -517,6 +537,9 @@ async fn process_snapshot(
                 .await
             {
                 eprintln!("{error}");
+            }
+            if old_was_working {
+                forget_activity_message(state, snapshot.pane_id.as_deref());
             }
         } else if seq_backstop_collapsed_settled_turn(
             &status,
@@ -548,6 +571,7 @@ async fn process_snapshot(
             {
                 eprintln!("{error}");
             }
+            forget_activity_message(state, snapshot.pane_id.as_deref());
         }
     } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
         retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
@@ -1284,7 +1308,9 @@ async fn cached_route_channel(
 /// Applies one activity frame: routes it to its tab's thread purely from the cached topology, then
 /// posts or edits this turn's one activity message for the pane.
 ///
-/// A cache not yet populated, or a route the cache does not resolve, drops the frame silently.
+/// A cache not yet populated, or a route the cache does not resolve, drops the frame silently, and
+/// so does a pane the latest snapshot does not report as `working` with a session -- the same
+/// no-session rule every other card follows.
 async fn handle_activity_event(
     discord: Option<&DiscordConnection>,
     frame: ActivityFrame,
@@ -1311,6 +1337,9 @@ async fn handle_activity_event(
         {
             existing.count += 1;
         }
+        return;
+    }
+    if !state.activity_eligible_panes.contains(&frame.pane_id) {
         return;
     }
     let text = activity_message_text(1, &frame.tool, &frame.summary);
@@ -1616,13 +1645,16 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
-/// Removes every terminal-keyed entry for a terminal absent from `current_terminals`, and every
+/// Removes every terminal-keyed entry for a terminal absent from `current_terminals`, every
 /// tab-keyed entry (`title_pending`, `unusable_reported`) for a tab absent from `current_tabs`,
-/// returning the informational cards that departed so callers can expire them.
+/// and every pane-keyed entry (`activity_messages`, `activity_eligible_panes`) for a pane absent
+/// from `current_panes`, returning the informational cards that departed so callers can expire
+/// them.
 fn prune_departed_state(
     state: &mut BridgeState,
     current_terminals: &HashSet<String>,
     current_tabs: &HashSet<String>,
+    current_panes: &HashSet<String>,
 ) -> Vec<(String, InformationalCard)> {
     state
         .blocked_since
@@ -1654,6 +1686,12 @@ fn prune_departed_state(
     state
         .unusable_reported
         .retain(|tab_id| current_tabs.contains(tab_id));
+    state
+        .activity_messages
+        .retain(|pane_id, _| current_panes.contains(pane_id));
+    state
+        .activity_eligible_panes
+        .retain(|pane_id| current_panes.contains(pane_id));
     let departed_cards = state
         .informational_cards
         .iter()
@@ -2459,10 +2497,12 @@ async fn apply_herdr_snapshot(
     let tabs = tab_list_result()?;
     let current_terminals: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
     let current_tabs: HashSet<String> = tabs.iter().map(|tab| tab.tab_id.clone()).collect();
+    let current_panes: HashSet<String> = agents.iter().filter_map(|s| s.pane_id.clone()).collect();
     state
         .previous
         .retain(|terminal, _| current_terminals.contains(terminal));
-    let departed_cards = prune_departed_state(state, &current_terminals, &current_tabs);
+    let departed_cards =
+        prune_departed_state(state, &current_terminals, &current_tabs, &current_panes);
     for (terminal, card) in departed_cards {
         expire_departed_card(discord, &terminal, card).await;
     }
@@ -5010,10 +5050,139 @@ mod tests {
         }
     }
 
+    /// Submits `prompt`, drives the pane through `working` (marking it activity-eligible via
+    /// `own`, the same as a real doorbell would), drains activity frames into `state` until the
+    /// pane settles, then marks it settled via `own` (forgetting the turn's activity message and
+    /// revoking eligibility, exactly as `process_snapshot` does in production). Returns the
+    /// settled snapshot.
+    #[cfg(unix)]
+    async fn drive_one_activity_turn(
+        pane_id: &str,
+        tabs: &[herdr_connect_rs::HerdrTab],
+        sub: &mut herdr_connect_rs::HerdrSubscription,
+        connection: &super::DiscordConnection,
+        state: &mut BridgeState,
+        activity_rx: &mut tokio::sync::mpsc::UnboundedReceiver<herdr_connect_rs::ActivityFrame>,
+        prompt: &str,
+    ) -> Result<AgentSnapshot, String> {
+        submit_owner_prompt(pane_id, prompt)?;
+        wait_for_event(
+            sub,
+            "pane.agent_status_changed",
+            pane_id,
+            "/data/pane_id",
+            Some("working"),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let working = poll_snapshot(pane_id, Duration::from_secs(10), |s| s.session.is_some())?;
+        own(&working, tabs, connection, state).await;
+
+        let settled = loop {
+            tokio::select! {
+                Some(frame) = activity_rx.recv() => {
+                    super::handle_activity_event(Some(connection), frame, state).await;
+                }
+                event = wait_for_event(
+                    sub, "pane.agent_status_changed", pane_id, "/data/pane_id", None,
+                    Duration::from_secs(30),
+                ) => {
+                    let event = event?;
+                    if matches!(
+                        event.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some("done" | "idle")
+                    ) {
+                        break poll_snapshot(pane_id, Duration::from_secs(2), |_| true)?;
+                    }
+                }
+            }
+        };
+        own(&settled, tabs, connection, state).await;
+        Ok(settled)
+    }
+
+    /// The thread's plain `⚙️`-prefixed messages, in post order.
+    #[cfg(unix)]
+    fn activity_message_rows(
+        messages: &[(String, bool, Id<MessageMarker>)],
+    ) -> Vec<&(String, bool, Id<MessageMarker>)> {
+        let mut rows: Vec<_> = messages
+            .iter()
+            .filter(|(content, embed, _)| !embed && content.starts_with('⚙'))
+            .collect();
+        rows.sort_by_key(|(_, _, id)| *id);
+        rows
+    }
+
+    /// Row 1: asserts `messages` (the thread right after turn one settles) holds exactly one
+    /// activity message naming `Bash`, posted before the end card. Returns that message's id.
+    #[cfg(unix)]
+    fn assert_first_turn_activity(
+        messages: &[(String, bool, Id<MessageMarker>)],
+    ) -> Result<Id<MessageMarker>, String> {
+        let rows = activity_message_rows(messages);
+        let [(text, _, activity_id)] = rows.as_slice() else {
+            return Err(format!(
+                "expected exactly one activity message after turn one, thread has {messages:?}"
+            ));
+        };
+        if !text.contains("Bash") {
+            return Err(format!("activity message did not name Bash: {text}"));
+        }
+        let Some((_, _, end_card_id)) = messages.iter().find(|(_, embed, _)| *embed) else {
+            return Err("no end card was posted for turn one".to_owned());
+        };
+        if activity_id >= end_card_id {
+            return Err("activity message was not posted before the end card".to_owned());
+        }
+        Ok(*activity_id)
+    }
+
+    /// Row 2 continued: asserts `messages` (the thread after turn two settles) holds turn one's
+    /// unchanged activity message plus a second, distinct one that starts its own count at 1 and
+    /// names `Bash` -- not an edit continuing turn one's count, and not the dropped late frame.
+    #[cfg(unix)]
+    fn assert_second_turn_activity(
+        messages: &[(String, bool, Id<MessageMarker>)],
+        first_activity_id: Id<MessageMarker>,
+    ) -> Result<(), String> {
+        let rows = activity_message_rows(messages);
+        let [first_row, second_row] = rows.as_slice() else {
+            return Err(format!(
+                "expected exactly two activity messages after turn two, thread has {messages:?}"
+            ));
+        };
+        if first_row.2 != first_activity_id {
+            return Err(format!(
+                "turn one's activity message changed identity: {first_row:?}"
+            ));
+        }
+        if second_row.2 == first_activity_id {
+            return Err(
+                "turn two edited turn one's activity message instead of posting its own".to_owned(),
+            );
+        }
+        if !second_row.0.starts_with("⚙️ 1 ·") {
+            return Err(format!(
+                "turn two's activity message did not start a fresh count: {}",
+                second_row.0
+            ));
+        }
+        if !second_row.0.contains("Bash") {
+            return Err(format!(
+                "turn two's activity message did not name Bash: {}",
+                second_row.0
+            ));
+        }
+        Ok(())
+    }
+
     /// Drives one real `claude --model haiku` agent with the activity hook registered against a
-    /// real bridge broker (bound at `broker_socket`), prompts it to run one shell command, and
-    /// asserts the thread holds exactly one plain activity message naming `Bash`, posted before
-    /// the end card.
+    /// real bridge broker (bound at `broker_socket`) through two turns, exercising every row of
+    /// the turn-boundary table in one continuous scenario: turn one's activity frame posts before
+    /// its end card; a frame injected on the broker socket after the turn settles is dropped (no
+    /// new message, no edit of the settled one); turn two's first frame starts its own fresh
+    /// message rather than continuing turn one's count.
     #[cfg(unix)]
     async fn activity_hook_exercise(
         guild: &BlockedCaptureGuild,
@@ -5055,62 +5224,63 @@ mod tests {
 
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
-        submit_owner_prompt(&tab.pane_id, ACTIVITY_FORCE_PROMPT)?;
-        wait_for_event(
-            &mut sub,
-            "pane.agent_status_changed",
+
+        // Row 1: a frame during the turn posts before the end card.
+        drive_one_activity_turn(
             &tab.pane_id,
-            "/data/pane_id",
-            Some("working"),
-            Duration::from_secs(15),
+            tabs,
+            &mut sub,
+            &connection,
+            &mut state,
+            &mut activity_rx,
+            ACTIVITY_FORCE_PROMPT,
         )
         .await?;
+        let after_first_turn = thread_messages(guild, thread).await?;
+        let first_activity_id = assert_first_turn_activity(&after_first_turn)?;
 
-        let settled = loop {
-            tokio::select! {
-                Some(frame) = activity_rx.recv() => {
-                    super::handle_activity_event(Some(&connection), frame, &mut state).await;
-                }
-                event = wait_for_event(
-                    &mut sub, "pane.agent_status_changed", &tab.pane_id, "/data/pane_id", None,
-                    Duration::from_secs(30),
-                ) => {
-                    let event = event?;
-                    if matches!(
-                        event.pointer("/data/agent_status").and_then(Value::as_str),
-                        Some("done" | "idle")
-                    ) {
-                        break poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
-                    }
-                }
-            }
+        // Row 2: a frame injected after the turn settled is dropped, not edited or recreated.
+        let late_frame = herdr_connect_rs::ActivityFrame {
+            kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
+            vendor: VENDOR_CLAUDE.to_owned(),
+            workspace_id: route.workspace_id.clone(),
+            tab_id: route.tab_id.clone(),
+            pane_id: route.pane_id.clone(),
+            session_id: "late-frame-synthetic".to_owned(),
+            tool: "LateGhost".to_owned(),
+            summary: "late-frame-should-be-dropped".to_owned(),
         };
-        own(&settled, tabs, &connection, &mut state).await;
+        herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
+            .await;
+        let received = tokio::time::timeout(Duration::from_secs(2), activity_rx.recv())
+            .await
+            .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
+            .ok_or_else(|| "activity channel closed before the late frame arrived".to_owned())?;
+        super::handle_activity_event(Some(&connection), received, &mut state).await;
+        let after_late_frame = thread_messages(guild, thread).await?;
+        if after_late_frame != after_first_turn {
+            return Err(format!(
+                "late frame changed the thread: before {after_first_turn:?}, after {after_late_frame:?}"
+            ));
+        }
+
+        // Row 2 continued: the next turn starts its own message with count 1, not a continuation
+        // of the dropped late frame or turn one's count.
+        drive_one_activity_turn(
+            &tab.pane_id,
+            tabs,
+            &mut sub,
+            &connection,
+            &mut state,
+            &mut activity_rx,
+            ACTIVITY_FORCE_PROMPT,
+        )
+        .await?;
         broker_task.abort();
         let _ = std::fs::remove_file(broker_socket);
 
-        let messages = thread_messages(guild, thread).await?;
-        let activity_messages: Vec<_> = messages
-            .iter()
-            .filter(|(content, embed, _)| !embed && content.starts_with('⚙'))
-            .collect();
-        let [(activity_text, _, activity_id)] = activity_messages.as_slice() else {
-            return Err(format!(
-                "expected exactly one activity message, thread has {messages:?}"
-            ));
-        };
-        if !activity_text.contains("Bash") {
-            return Err(format!(
-                "activity message did not name Bash: {activity_text}"
-            ));
-        }
-        let Some((_, _, end_card_id)) = messages.iter().find(|(_, embed, _)| *embed) else {
-            return Err("no end card was posted".to_owned());
-        };
-        if activity_id >= end_card_id {
-            return Err("activity message was not posted before the end card".to_owned());
-        }
-        Ok(())
+        let after_second_turn = thread_messages(guild, thread).await?;
+        assert_second_turn_activity(&after_second_turn, first_activity_id)
     }
 
     #[cfg(unix)]
@@ -5152,7 +5322,7 @@ mod tests {
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
                 let outcome = tokio::time::timeout(
-                    Duration::from_secs(180),
+                    Duration::from_secs(300),
                     activity_hook_exercise(
                         &guild,
                         &tab,
@@ -5188,7 +5358,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn activity_hook_posts_one_message_naming_the_tool_before_the_end_card() {
+    async fn activity_hook_keeps_messages_inside_their_turn() {
         run_activity_hook_test().await;
     }
     /// Drives one real `claude --model haiku` agent through a genuine settled round-trip and
