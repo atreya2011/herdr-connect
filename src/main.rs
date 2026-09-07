@@ -1908,6 +1908,27 @@ async fn apply_lifecycle_batch(
     .await
 }
 
+/// Spawns the startup-style topology sweep (one `list_agents`/`tab_list_result` snapshot, then
+/// `sync_startup_topology`) beside the caller rather than blocking it, exactly as `run_bridge`
+/// does at process start. Run again after every successful lifecycle resubscribe: a replay gap
+/// while the subscribe stream was down can otherwise leave a closed tab's thread or a closed
+/// workspace's channel undeleted until some later, unrelated event happens to touch it.
+fn spawn_startup_topology_sweep(discord: &DiscordConnection) {
+    match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
+        Ok((agents, tabs)) => {
+            let discord = discord.clone();
+            let startup_task =
+                tokio::spawn(async move { sync_startup_topology(&discord, &agents, &tabs).await });
+            tokio::spawn(async move {
+                if let Err(error) = startup_task.await {
+                    eprintln!("herdr startup topology task error: {error}");
+                }
+            });
+        }
+        Err(error) => eprintln!("herdr startup topology snapshot error: {error}"),
+    }
+}
+
 async fn handle_lifecycle_subscribe_error(
     error: String,
     discord: Option<&DiscordConnection>,
@@ -1923,7 +1944,7 @@ async fn handle_lifecycle_subscribe_error(
         return false;
     };
     runtime.lifecycle = next_lifecycle;
-    doorbell_unless_shutdown(
+    let alive = doorbell_unless_shutdown(
         discord,
         &mut runtime.state,
         &mut runtime.pane_ids,
@@ -1931,7 +1952,11 @@ async fn handle_lifecycle_subscribe_error(
         stop,
         broker,
     )
-    .await
+    .await;
+    if alive && let Some(discord) = discord {
+        spawn_startup_topology_sweep(discord);
+    }
+    alive
 }
 
 async fn handle_lifecycle_select_result(
@@ -2240,21 +2265,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(discord) = discord.as_ref() {
-        match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
-            Ok((agents, tabs)) => {
-                let discord = discord.clone();
-                let startup_task =
-                    tokio::spawn(
-                        async move { sync_startup_topology(&discord, &agents, &tabs).await },
-                    );
-                tokio::spawn(async move {
-                    if let Err(error) = startup_task.await {
-                        eprintln!("herdr startup topology task error: {error}");
-                    }
-                });
-            }
-            Err(error) => eprintln!("herdr startup topology snapshot error: {error}"),
-        }
+        spawn_startup_topology_sweep(discord);
     }
     bridge_event_loop(
         discord.as_ref(),
@@ -6012,6 +6023,209 @@ mod tests {
         let tabs_left = remaining_tabs(LIVE_CLOSE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
         let workspaces_left = remaining_workspaces(LIVE_CLOSE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const RESUBSCRIBE_RECONCILE_LABEL: &str = "testrun-resubscribe-reconcile";
+
+    /// Polls until a tab's thread is gone or `bound` elapses: the resubscribe reconciliation
+    /// sweep runs on a spawned task rather than being awaited inline (exactly like the startup
+    /// sweep it reuses), so its effect on Discord is only eventually observable.
+    #[cfg(unix)]
+    async fn wait_until_thread_absent(
+        guild: &BlockedCaptureGuild,
+        channel_id: Id<ChannelMarker>,
+        suffix: &str,
+        bound: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + bound;
+        loop {
+            if !thread_with_suffix_survives(guild, channel_id, suffix).await? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "thread with suffix {suffix} was not deleted within {bound:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    /// One row in the table [`resubscribe_reconciliation_exercise`] checks after a forced
+    /// resubscribe: whether the named tab's thread is expected to survive the reconciliation
+    /// sweep.
+    #[cfg(unix)]
+    struct ResubscribeReconcileExpectation {
+        name: &'static str,
+        suffix: String,
+        survives: bool,
+    }
+
+    /// Drives a real forced lifecycle-subscribe error through `handle_lifecycle_select_result` and
+    /// asserts that the resubscribe's own reconciliation sweep -- not a live `tab.closed` event --
+    /// deletes a thread whose tab was closed while the subscribe stream was down, while a live
+    /// tab's thread survives.
+    #[cfg(unix)]
+    async fn resubscribe_reconciliation_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+        second_tab: &Tab,
+    ) -> Result<(), String> {
+        report_idle_with_session(&workspace.pane_id)?;
+        report_idle_with_session(&second_tab.pane_id)?;
+        let root_agent = snapshot_for_pane(&workspace.pane_id)?;
+        let second_agent = snapshot_for_pane(&second_tab.pane_id)?;
+        let root_tab = matching_tab(&workspace.tab_id)?;
+        let second_matching_tab = matching_tab(&second_tab.tab_id)?;
+        let tabs = [root_tab, second_matching_tab];
+        let agents = [root_agent.clone(), second_agent.clone()];
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
+        let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
+        let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
+
+        let topic = format!("herdr workspace [{}]", root_route.workspace_id);
+        let channel = guild_channel_with_topic(guild, &topic).await?;
+        let root_suffix = format!(" [{}]", root_route.tab_id);
+        let second_suffix = format!(" [{}]", second_route.tab_id);
+        if !thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
+            return Err("sync did not create the second tab's thread".to_owned());
+        }
+
+        // Close the second tab without ever running its tab.closed event through the lifecycle
+        // event loop: this stands in for a closure that happened while the subscribe stream was
+        // down, so only the resubscribe's own reconciliation sweep -- not a live event -- can
+        // catch it.
+        close_tab(&second_tab.tab_id);
+
+        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| error.to_string())?;
+        let mut broker: Option<BrokerTask> = None;
+        let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = BridgeRuntime {
+            lifecycle,
+            pane_ids: Vec::new(),
+            status: None,
+            state: BridgeState::default(),
+            live_events,
+        };
+
+        let alive = handle_lifecycle_select_result(
+            Err("test-forced subscribe error".to_owned()),
+            Some(&connection),
+            &mut stop,
+            &mut broker,
+            &mut runtime,
+        )
+        .await;
+        if !alive {
+            return Err(
+                "handle_lifecycle_select_result reported shutdown on a forced resubscribe error"
+                    .to_owned(),
+            );
+        }
+
+        let expectations = [
+            ResubscribeReconcileExpectation {
+                name: "a thread whose tab was closed before the resubscribe is deleted after it",
+                suffix: second_suffix,
+                survives: false,
+            },
+            ResubscribeReconcileExpectation {
+                name: "a live tab keeps its thread",
+                suffix: root_suffix,
+                survives: true,
+            },
+        ];
+        for expectation in expectations {
+            if expectation.survives {
+                if !thread_with_suffix_survives(guild, channel.id, &expectation.suffix).await? {
+                    return Err(format!("{}: thread did not survive", expectation.name));
+                }
+            } else {
+                wait_until_thread_absent(
+                    guild,
+                    channel.id,
+                    &expectation.suffix,
+                    Duration::from_secs(20),
+                )
+                .await
+                .map_err(|error| format!("{}: {error}", expectation.name))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn resubscribe_reconciles_topology_against_closures_missed_while_down() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(RESUBSCRIBE_RECONCILE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(RESUBSCRIBE_RECONCILE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-resubscribe-reconcile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create resubscribe-reconcile test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = match create_workspace(RESUBSCRIBE_RECONCILE_LABEL, cwd) {
+            Ok(workspace) => match create_tab(RESUBSCRIBE_RECONCILE_LABEL, &workspace.id, cwd) {
+                Ok(second_tab) => Ok((workspace, second_tab)),
+                Err(error) => Err((Some(workspace.id), error)),
+            },
+            Err(error) => Err((None, error)),
+        };
+        let (workspace_id, result) = match created {
+            Ok((workspace, second_tab)) => {
+                let workspace_id = workspace.id.clone();
+                let outcome =
+                    resubscribe_reconciliation_exercise(&guild, &workspace, &second_tab).await;
+                (Some(workspace_id), outcome)
+            }
+            Err((workspace_id, error)) => (workspace_id, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(RESUBSCRIBE_RECONCILE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(RESUBSCRIBE_RECONCILE_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
