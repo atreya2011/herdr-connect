@@ -13,7 +13,7 @@ use crate::{AgentSnapshot, HerdrTab, ThreadNameError, format_thread_name};
 pub type TopologyCache = Arc<Mutex<Option<(Vec<Channel>, Vec<Channel>)>>>;
 
 /// The Discord topology and sole pane that owns it for one agent transition.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyRoute {
     pub workspace_id: String,
     pub tab_id: String,

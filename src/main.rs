@@ -62,7 +62,13 @@ struct LiveWatch {
     vendor: String,
     path: PathBuf,
     position: LivePosition,
+    /// The tab thread this watch currently posts to. Re-resolved from `route` and updated in
+    /// place when a delivery finds it gone (deleted outside the bridge's own tracking), so later
+    /// events do not repeat that recovery.
     channel: Id<ChannelMarker>,
+    /// Kept so a dead `channel` can be re-resolved without the caller having to supply fresh
+    /// agent/tab snapshots (the live event loop that drives most deliveries has none in scope).
+    route: TopologyRoute,
 }
 
 #[derive(Default)]
@@ -263,7 +269,12 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         }
     };
     deliver_blocked_messages(
-        client,
+        &BlockedDeliveryRoute {
+            client,
+            guild,
+            route,
+            topology_cache,
+        },
         target,
         terminal,
         state_change_seq,
@@ -273,18 +284,51 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     .await;
 }
 
+/// What [`deliver_blocked_messages`] needs to re-resolve its route on a stale-thread retry,
+/// bundled to keep the function under the argument-count lint.
+#[derive(Clone, Copy)]
+struct BlockedDeliveryRoute<'a> {
+    client: &'a Client,
+    guild: Id<GuildMarker>,
+    route: &'a TopologyRoute,
+    topology_cache: &'a TopologyCache,
+}
+
+/// Delivers each blocked-card message to `target`, applying the same invalidate-and-retry as
+/// [`deliver_to_route`] when a send finds the cached thread gone: the shared topology cache is
+/// cleared, the route is re-resolved once, and that message is retried at the recreated thread
+/// before later messages reuse it too.
 async fn deliver_blocked_messages(
-    client: &Client,
-    target: Id<ChannelMarker>,
+    delivery: &BlockedDeliveryRoute<'_>,
+    mut target: Id<ChannelMarker>,
     terminal: &str,
     state_change_seq: u64,
     messages: &[TransitionMessage],
     informational_cards: &mut HashMap<String, InformationalCard>,
 ) {
+    let BlockedDeliveryRoute {
+        client,
+        guild,
+        route,
+        topology_cache,
+    } = *delivery;
     let mut last = None;
     for (index, message) in messages.iter().enumerate() {
         let nonce = transition_card_nonce(terminal, state_change_seq, index);
-        match deliver_transition_card(client, target, message, &nonce).await {
+        let mut sent = deliver_transition_card(client, target, message, &nonce).await;
+        if let Err(error) = &sent
+            && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
+        {
+            *topology_cache.lock().await = None;
+            sent = match sync_route(client, guild, route, topology_cache).await {
+                Ok(resolved) => {
+                    target = resolved;
+                    deliver_transition_card(client, target, message, &nonce).await
+                }
+                Err(error) => Err(error),
+            };
+        }
+        match sent {
             Ok(id) => last = Some(id),
             Err(error) => {
                 eprintln!("discord delivery error: {error}");
@@ -1039,6 +1083,7 @@ async fn ensure_live_watch_started(
             path,
             position,
             channel,
+            route,
         },
     );
     // Read once immediately: the next `notify` tick may never come if the turn is already near
@@ -1046,45 +1091,51 @@ async fn ensure_live_watch_started(
     handle_live_event(discord, &terminal, state).await;
 }
 
-/// Never touches the stored position on error: the caller must not advance past data it failed to
-/// read.
+/// Does not touch the watch's stored position: the caller advances it only past text it actually
+/// delivers, so a text this read returns but a later delivery attempt drops is re-read and
+/// re-sent rather than skipped.
 ///
 /// # Errors
 ///
 /// Returns the incremental reader's error for the follower's vendor.
-fn read_new_live_texts(watch: &mut LiveWatch) -> Result<Vec<(String, i64)>, String> {
-    let LivePosition::Bytes(offset) = &mut watch.position;
-    let (texts, new_offset) = match watch.vendor.as_str() {
-        VENDOR_CLAUDE => read_claude_incremental(&watch.path, *offset)?,
-        vendor => return Err(format!("live capture: unsupported vendor {vendor}")),
-    };
-    *offset = new_offset;
-    Ok(texts
-        .into_iter()
-        .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
-        .collect())
+fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, u64)>, u64), String> {
+    let LivePosition::Bytes(offset) = watch.position;
+    match watch.vendor.as_str() {
+        VENDOR_CLAUDE => read_claude_incremental(&watch.path, offset),
+        vendor => Err(format!("live capture: unsupported vendor {vendor}")),
+    }
 }
 
 /// Updates `state.last_posted` per fully delivered text so a turn-end card repeating it is
 /// skipped. The nonce is derived from the terminal id and log position, not a counter, so it
 /// survives a watch restart that resumes at the same position. A read failure logs once per
 /// terminal and leaves the follower running at its unchanged position, to retry on the next event.
+///
+/// A delivery that fails against the watch's cached channel because the thread is gone (deleted
+/// outside the bridge's own tracking) invalidates the shared topology cache, re-resolves the
+/// route once, and retries that same text at the recreated thread, exactly like
+/// [`deliver_to_route`]; the watch's `channel` is updated on a successful recovery so later events
+/// do not repeat the round trip. The stored log position only advances past text that was
+/// actually delivered: a text that still fails after the retry stops the batch there, so it and
+/// everything read after it are re-read and re-sent on the next event instead of being lost.
 async fn handle_live_event(
     discord: Option<&DiscordConnection>,
     terminal: &str,
     state: &mut BridgeState,
 ) {
-    let Some((client, ..)) = discord else {
+    let Some((client, guild, _owner_id, responder)) = discord else {
         return;
     };
-    let Some(watch) = state.live_watches.get_mut(terminal) else {
+    let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
-    let channel = watch.channel;
-    let texts = match read_new_live_texts(watch) {
-        Ok(texts) => {
+    let LivePosition::Bytes(start_offset) = watch.position;
+    let mut channel = watch.channel;
+    let route = watch.route.clone();
+    let (texts, read_offset) = match read_new_live_texts(watch) {
+        Ok(result) => {
             state.live_read_errors_reported.remove(terminal);
-            texts
+            result
         }
         Err(error) => {
             if state.live_read_errors_reported.insert(terminal.to_owned()) {
@@ -1093,20 +1144,49 @@ async fn handle_live_event(
             return;
         }
     };
+    let topology_cache = responder.topology_cache();
+    let mut delivered_offset = start_offset;
+    let mut all_delivered = true;
     for (text, position) in texts {
         let mut posted_all = true;
         for (part_index, part) in split_live_message(&text).into_iter().enumerate() {
-            let nonce = live_message_nonce(terminal, position, part_index);
-            if let Err(error) = deliver_live_message(client.as_ref(), channel, &part, &nonce).await
+            let nonce = live_message_nonce(
+                terminal,
+                i64::try_from(position).unwrap_or(i64::MAX),
+                part_index,
+            );
+            let mut sent = deliver_live_message(client.as_ref(), channel, &part, &nonce).await;
+            if let Err(error) = &sent
+                && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
             {
+                *topology_cache.lock().await = None;
+                sent = match sync_route(client.as_ref(), *guild, &route, topology_cache).await {
+                    Ok(resolved) => {
+                        channel = resolved;
+                        deliver_live_message(client.as_ref(), channel, &part, &nonce).await
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+            if let Err(error) = sent {
                 eprintln!("live capture delivery error for {terminal}: {error}");
                 posted_all = false;
                 break;
             }
         }
-        if posted_all {
-            state.last_posted.insert(terminal.to_owned(), text);
+        if !posted_all {
+            all_delivered = false;
+            break;
         }
+        state.last_posted.insert(terminal.to_owned(), text);
+        delivered_offset = position;
+    }
+    if all_delivered {
+        delivered_offset = read_offset;
+    }
+    if let Some(watch) = state.live_watches.get_mut(terminal) {
+        watch.channel = channel;
+        watch.position = LivePosition::Bytes(delivered_offset);
     }
 }
 
@@ -2344,18 +2424,18 @@ mod tests {
     };
 
     use super::{
-        BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
-        Membership, PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
-        agent_read_detection, apply_membership, capture_for_with_search_root,
-        card_capture_for_delivery, create_transition_messages, decide_blocked_response,
-        delete_closed_topology_batch, deliver_to_route, discover_pending_and_unusable_tabs,
-        drain_lifecycle_batch, fetch_topology_lists, handle_blocked_card,
-        handle_lifecycle_select_result, handle_live_event, lifecycle_closure, lifecycle_membership,
-        list_agents, live_log_path, next_state_change_sequence, process_snapshot,
-        repeats_last_live_text, resolve_session_path, route_topology,
-        seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from, subscribe_status,
-        subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
-        tab_list_result, unique_existing_path,
+        BlockedCardContext, BlockedDeliveryRoute, BlockedResponse, BridgeRuntime, BridgeState,
+        BrokerTask, Client, LivePosition, LiveWatch, Membership, PermissionResponder,
+        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
+        capture_for_with_search_root, card_capture_for_delivery, create_transition_messages,
+        decide_blocked_response, delete_closed_topology_batch, deliver_blocked_messages,
+        deliver_to_route, discover_pending_and_unusable_tabs, drain_lifecycle_batch,
+        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
+        handle_live_event, lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        next_state_change_sequence, process_snapshot, repeats_last_live_text, resolve_session_path,
+        route_topology, seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
+        start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
+        sync_route, sync_startup_topology, tab_list_result, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
@@ -6138,15 +6218,31 @@ mod tests {
     #[cfg(unix)]
     const CACHE_RECOVERY_LABEL: &str = "testrun-cache-recovery";
 
+    /// One row of [`sync_route_serves_cache_hits_and_recovers_from_a_stale_send`]: which of the
+    /// three `sync_route` callers delivers past a cache hit gone stale.
+    #[cfg(unix)]
+    enum CacheRecoveryCaller {
+        TransitionCard,
+        BlockedCard,
+        LiveMessage,
+    }
+
+    #[cfg(unix)]
+    struct CacheRecoveryCase {
+        name: &'static str,
+        caller: CacheRecoveryCaller,
+    }
+
     /// Drives `sync_route`'s three refetch triggers against a real guild: a cache hit is served
     /// without any Discord request (so deleting the channel directly, out from under the cache,
-    /// does not get noticed), and a subsequent card delivery recovers by treating the resulting
+    /// does not get noticed), and `caller`'s delivery then recovers by treating the resulting
     /// unknown-channel send failure as a signal to invalidate the cache, resolve the route fresh,
     /// and retry once.
     #[cfg(unix)]
     async fn sync_route_cache_recovery_exercise(
         guild: &BlockedCaptureGuild,
         tab: &Tab,
+        caller: &CacheRecoveryCaller,
     ) -> Result<(), String> {
         report_idle_with_session(&tab.pane_id)?;
         let listed = snapshot_for_pane(&tab.pane_id)?;
@@ -6185,8 +6281,9 @@ mod tests {
             return Err("the cache hit must not have recreated the deleted thread".to_owned());
         }
 
-        // A real send against the stale cached thread fails as unknown channel; deliver_to_route
-        // must recover by invalidating the cache, resolving the route fresh, and retrying once.
+        // A real send against the stale cached thread fails as unknown channel; the caller under
+        // test must recover by invalidating the cache, resolving the route fresh, and retrying
+        // once.
         let connection = discord_tuple_with_cache(guild, Arc::clone(&topology_cache));
         let transition = Transition {
             from: STATUS_IDLE.to_owned(),
@@ -6199,10 +6296,119 @@ mod tests {
             question: None,
             failure: None,
         };
-        deliver_to_route(&connection, &route, &transition, &capture, 1).await?;
+        match caller {
+            CacheRecoveryCaller::TransitionCard => {
+                deliver_to_route(&connection, &route, &transition, &capture, 1).await?;
+            }
+            CacheRecoveryCaller::BlockedCard => {
+                recover_blocked_card_delivery(
+                    &connection,
+                    &route,
+                    &topology_cache,
+                    &transition,
+                    &capture,
+                    cached_thread,
+                    &listed.terminal_id,
+                )
+                .await?;
+            }
+            CacheRecoveryCaller::LiveMessage => {
+                recover_live_message_delivery(
+                    &connection,
+                    &route,
+                    cached_thread,
+                    &listed.terminal_id,
+                )
+                .await?;
+            }
+        }
 
         if !thread_with_suffix_survives(guild, workspace_channel, &suffix).await? {
             return Err("recovery must have created a fresh thread for the route".to_owned());
+        }
+        Ok(())
+    }
+
+    /// The [`CacheRecoveryCaller::BlockedCard`] arm of
+    /// [`sync_route_cache_recovery_exercise`], split out to keep that function under the
+    /// line-count lint: delivers a blocked-card message set to the stale `target` and asserts
+    /// [`deliver_blocked_messages`]'s invalidate-and-retry recorded an informational card.
+    #[cfg(unix)]
+    async fn recover_blocked_card_delivery(
+        connection: &super::DiscordConnection,
+        route: &TopologyRoute,
+        topology_cache: &herdr_connect_rs::TopologyCache,
+        transition: &Transition,
+        capture: &AgentLogCapture,
+        target: Id<ChannelMarker>,
+        terminal: &str,
+    ) -> Result<(), String> {
+        let (client, guild_id, owner_id, _responder) = connection;
+        let messages = create_transition_messages(transition, capture, owner_id);
+        let mut informational_cards = HashMap::new();
+        deliver_blocked_messages(
+            &BlockedDeliveryRoute {
+                client: client.as_ref(),
+                guild: *guild_id,
+                route,
+                topology_cache,
+            },
+            target,
+            terminal,
+            1,
+            &messages,
+            &mut informational_cards,
+        )
+        .await;
+        if informational_cards.is_empty() {
+            return Err("blocked card delivery did not record an informational card".to_owned());
+        }
+        Ok(())
+    }
+
+    /// The [`CacheRecoveryCaller::LiveMessage`] arm of [`sync_route_cache_recovery_exercise`],
+    /// split out to keep that function under the line-count lint: binds a live watch to a
+    /// synthetic one-record Claude log and the stale `target`, drives one [`handle_live_event`],
+    /// and asserts the recovered delivery landed.
+    #[cfg(unix)]
+    async fn recover_live_message_delivery(
+        connection: &super::DiscordConnection,
+        route: &TopologyRoute,
+        target: Id<ChannelMarker>,
+        terminal: &str,
+    ) -> Result<(), String> {
+        let live_path = std::env::temp_dir().join(format!(
+            "testrun-cache-recovery-live-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::write(
+            &live_path,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\
+             [{\"type\":\"text\",\"text\":\"cache-recovery live text\"}]}}\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let (live_tx, _live_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = start_notify_watcher(&live_path, terminal.to_owned(), live_tx)?;
+        let mut state = BridgeState::default();
+        state.live_watches.insert(
+            terminal.to_owned(),
+            LiveWatch {
+                _watcher: watcher,
+                vendor: VENDOR_CLAUDE.to_owned(),
+                path: live_path.clone(),
+                position: LivePosition::Bytes(0),
+                channel: target,
+                route: route.clone(),
+            },
+        );
+        handle_live_event(Some(connection), terminal, &mut state).await;
+        let _ = fs::remove_file(&live_path);
+        if !state.last_posted.contains_key(terminal) {
+            return Err("live message recovery did not deliver the pending text".to_owned());
         }
         Ok(())
     }
@@ -6211,53 +6417,74 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn sync_route_serves_cache_hits_and_recovers_from_a_stale_send() {
+        let cases = [
+            CacheRecoveryCase {
+                name: "transition card",
+                caller: CacheRecoveryCaller::TransitionCard,
+            },
+            CacheRecoveryCase {
+                name: "blocked card",
+                caller: CacheRecoveryCaller::BlockedCard,
+            },
+            CacheRecoveryCase {
+                name: "live message",
+                caller: CacheRecoveryCaller::LiveMessage,
+            },
+        ];
+
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
         };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        assert_eq!(
-            remaining_tabs(CACHE_RECOVERY_LABEL).expect("tab.list succeeds"),
-            0,
-            "named zero-leftover check"
-        );
 
-        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
-        let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-cache-recovery-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&cwd_dir).expect("create cache-recovery test cwd");
-        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+        for case in cases {
+            assert_eq!(
+                blocked_capture_cleanup(&guild).await.unwrap(),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
+            assert_eq!(
+                remaining_tabs(CACHE_RECOVERY_LABEL).expect("tab.list succeeds"),
+                0,
+                "named zero-leftover check: {}",
+                case.name
+            );
 
-        let created = create_tab(CACHE_RECOVERY_LABEL, &workspace_id, cwd);
-        let (tab_id, result) = match created {
-            Ok(tab) => {
-                let outcome = sync_route_cache_recovery_exercise(&guild, &tab).await;
-                (Some(tab.tab_id), outcome)
+            let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+                .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+            let cwd_dir = std::env::temp_dir().join(format!(
+                "testrun-cache-recovery-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&cwd_dir).expect("create cache-recovery test cwd");
+            let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+            let created = create_tab(CACHE_RECOVERY_LABEL, &workspace_id, cwd);
+            let (tab_id, result) = match created {
+                Ok(tab) => {
+                    let outcome =
+                        sync_route_cache_recovery_exercise(&guild, &tab, &case.caller).await;
+                    (Some(tab.tab_id), outcome)
+                }
+                Err(error) => (None, Err(error)),
+            };
+            if let Some(tab_id) = &tab_id {
+                close_tab(tab_id);
             }
-            Err(error) => (None, Err(error)),
-        };
-        if let Some(tab_id) = &tab_id {
-            close_tab(tab_id);
-        }
-        let _ = fs::remove_dir_all(&cwd_dir);
+            let _ = fs::remove_dir_all(&cwd_dir);
 
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left = remaining_tabs(CACHE_RECOVERY_LABEL)
-            .expect("tab.list succeeds for the zero-leftover check");
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-        assert_eq!(tabs_left, 0, "named zero-leftover check");
+            let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+            let tabs_left = remaining_tabs(CACHE_RECOVERY_LABEL)
+                .expect("tab.list succeeds for the zero-leftover check");
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
+            assert_eq!(channels_left, 0, "named zero-leftover check: {}", case.name);
+            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
+        }
     }
 
     #[cfg(unix)]
