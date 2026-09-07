@@ -874,21 +874,13 @@ fn resolve_session_path(
                     }
                 })
                 .collect::<String>();
-            let candidates = [
-                search_root
-                    .join(".claude/projects")
-                    .join(&cwd_slug)
-                    .join(format!("{}.jsonl", session.value)),
-                search_root
-                    .join(".claude-one/projects")
-                    .join(&cwd_slug)
-                    .join(format!("{}.jsonl", session.value)),
-            ];
-            let existing = candidates
+            let session_file = format!("{}.jsonl", session.value);
+            let candidates = claude_config_roots(search_root)?
                 .into_iter()
+                .map(|root| root.join("projects").join(&cwd_slug).join(&session_file))
                 .filter(|path| path.is_file())
                 .collect::<Vec<_>>();
-            unique_existing_path(&existing, "claude session log")
+            unique_existing_path(&candidates, "claude session log")
         }
         VENDOR_CODEX => find_unique_session_path(
             &search_root.join(".codex/sessions"),
@@ -923,9 +915,30 @@ fn resolve_session_path(
     }
 }
 
+/// Every Claude config directory directly under `search_root`: named `.claude` or starting with
+/// `.claude-`, and containing a `projects` directory. Covers `CLAUDE_CONFIG_DIR` overrides such
+/// as `~/.claude-two` alongside the default `~/.claude` and `~/.claude-one`. Sorted so the
+/// search order is deterministic.
+fn claude_config_roots(search_root: &Path) -> Result<Vec<PathBuf>, SessionPathError> {
+    let mut roots = read_entries(search_root, "Claude config directory")?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == ".claude" || name.starts_with(".claude-"))
+                && path.join("projects").is_dir()
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+    Ok(roots)
+}
+
 /// Collapses candidates that are hard links to the same file (same device and inode) into one
-/// path, so a session log hard-linked under both `~/.claude` and `~/.claude-one` is not
-/// mistaken for two distinct session logs.
+/// path, so a session log hard-linked across Claude config directories (for example `~/.claude`
+/// and `~/.claude-one`) is not mistaken for two distinct session logs.
 fn dedupe_hard_links(candidates: &[PathBuf]) -> Result<Vec<PathBuf>, SessionPathError> {
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
@@ -2959,61 +2972,142 @@ mod tests {
         );
     }
 
+    /// Builds an `AgentSnapshot`/`AgentSession` pair for a Claude session at `cwd`, for use in
+    /// [`ClaudeSearchRootCase::build`] closures.
+    fn claude_session_snapshot(cwd: &str, session_id: &str) -> (AgentSnapshot, AgentSession) {
+        let session = AgentSession {
+            agent: "claude".to_owned(),
+            value: session_id.to_owned(),
+        };
+        let snapshot = AgentSnapshot {
+            agent: "claude".to_owned(),
+            terminal_id: "claude-search-root-terminal".to_owned(),
+            agent_status: "done".to_owned(),
+            tab_id: None,
+            workspace_id: None,
+            pane_id: None,
+            cwd: Some(cwd.to_owned()),
+            terminal_title_stripped: None,
+            session: Some(session.clone()),
+            state_change_seq: 0,
+        };
+        (snapshot, session)
+    }
+
+    /// The project directory a session log for `cwd` resolves under beneath `root/vendor_root`,
+    /// mirroring `resolve_session_path`'s slug so a case can place a fixture where production
+    /// code will read it.
+    fn claude_project_dir(root: &Path, vendor_root: &str, cwd: &str) -> PathBuf {
+        let cwd_slug: String = cwd
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        root.join(vendor_root).join("projects").join(cwd_slug)
+    }
+
+    /// One synthetic `$HOME` layout in
+    /// [`claude_search_roots_cover_every_claude_config_directory_under_home`].
+    struct ClaudeSearchRootCase {
+        name: &'static str,
+        /// Builds the layout under a fresh temp `$HOME` and returns the session to resolve and,
+        /// when a log should be found there, the path it must resolve to.
+        build: fn(&Path) -> (AgentSnapshot, AgentSession, Option<PathBuf>),
+    }
+
     #[test]
-    fn claude_project_slugs_match_dot_and_underscore_directory_names_in_both_roots() {
-        let root = std::env::temp_dir().join(format!(
-            "herdr-connect-rs-claude-slug-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
+    fn claude_search_roots_cover_every_claude_config_directory_under_home() {
         let cases = [
-            (
-                ".claude",
-                "/home/user/src/herdr-connect-rs",
-                "-home-user-src-herdr-connect-rs",
-            ),
-            (
-                ".claude-one",
-                "/tmp/agent_workspace_v2",
-                "-tmp-agent-workspace-v2",
-            ),
+            ClaudeSearchRootCase {
+                name: "two roots: the log lives under the second, .claude-one",
+                build: |root| {
+                    let cwd = "/tmp/agent_workspace_v2";
+                    fs::create_dir_all(claude_project_dir(root, ".claude", cwd))
+                        .expect("create empty .claude project directory");
+                    let directory = claude_project_dir(root, ".claude-one", cwd);
+                    fs::create_dir_all(&directory).expect("create Claude project directory");
+                    let expected_path = directory.join("two-roots-session.jsonl");
+                    fs::write(&expected_path, "").expect("create Claude session file");
+                    let (snapshot, session) = claude_session_snapshot(cwd, "two-roots-session");
+                    (snapshot, session, Some(expected_path))
+                },
+            },
+            ClaudeSearchRootCase {
+                name: "three roots: the log lives under the third, .claude-two",
+                build: |root| {
+                    let cwd = "/home/user/src/herdr-connect-rs";
+                    for vendor_root in [".claude", ".claude-one"] {
+                        fs::create_dir_all(claude_project_dir(root, vendor_root, cwd))
+                            .expect("create empty Claude project directory");
+                    }
+                    let directory = claude_project_dir(root, ".claude-two", cwd);
+                    fs::create_dir_all(&directory).expect("create Claude project directory");
+                    let expected_path = directory.join("three-roots-session.jsonl");
+                    fs::write(&expected_path, "").expect("create Claude session file");
+                    let (snapshot, session) = claude_session_snapshot(cwd, "three-roots-session");
+                    (snapshot, session, Some(expected_path))
+                },
+            },
+            ClaudeSearchRootCase {
+                name: "a .claude-foo directory without a projects directory is not a root",
+                build: |root| {
+                    fs::create_dir_all(root.join(".claude-foo"))
+                        .expect("create non-root .claude-foo directory");
+                    let (snapshot, session) =
+                        claude_session_snapshot("/tmp/ignored-workspace", "ignored-session");
+                    (snapshot, session, None)
+                },
+            },
+            ClaudeSearchRootCase {
+                name: "the same log hard-linked across two roots resolves as one file",
+                build: |root| {
+                    let cwd = "/tmp/linked-workspace";
+                    let primary_dir = claude_project_dir(root, ".claude", cwd);
+                    fs::create_dir_all(&primary_dir).expect("create primary project directory");
+                    let primary_path = primary_dir.join("linked-session.jsonl");
+                    fs::write(&primary_path, "").expect("create Claude session file");
+                    let secondary_dir = claude_project_dir(root, ".claude-one", cwd);
+                    fs::create_dir_all(&secondary_dir).expect("create secondary project directory");
+                    let secondary_path = secondary_dir.join("linked-session.jsonl");
+                    fs::hard_link(&primary_path, &secondary_path)
+                        .expect("hard-link session log across roots");
+                    let (snapshot, session) = claude_session_snapshot(cwd, "linked-session");
+                    (snapshot, session, Some(primary_path))
+                },
+            },
         ];
-        for (vendor_root, cwd, expected_directory) in cases {
-            let directory = root
-                .join(vendor_root)
-                .join("projects")
-                .join(expected_directory);
-            fs::create_dir_all(&directory).expect("create Claude project directory");
-            let expected_path = directory.join("slug-session.jsonl");
-            fs::write(&expected_path, "").expect("create Claude session file");
-            let snapshot = AgentSnapshot {
-                agent: "claude".to_owned(),
-                terminal_id: "slug-terminal".to_owned(),
-                agent_status: "done".to_owned(),
-                tab_id: None,
-                workspace_id: None,
-                pane_id: None,
-                cwd: Some(cwd.to_owned()),
-                terminal_title_stripped: None,
-                session: Some(AgentSession {
-                    agent: "claude".to_owned(),
-                    value: "slug-session".to_owned(),
-                }),
-                state_change_seq: 0,
-            };
-            assert_eq!(
-                resolve_session_path(
-                    &root,
-                    &snapshot,
-                    snapshot.session.as_ref().expect("session is present"),
-                ),
-                Ok(expected_path)
-            );
+
+        for (index, case) in cases.iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-connect-rs-claude-search-roots-{}-{index}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).expect("create synthetic HOME directory");
+            let (snapshot, session, expected) = (case.build)(&root);
+            let result = resolve_session_path(&root, &snapshot, &session);
+            match expected {
+                Some(expected_path) => {
+                    assert_eq!(result, Ok(expected_path), "{}", case.name);
+                }
+                None => {
+                    assert!(
+                        matches!(result, Err(SessionPathError::NotFoundYet(_))),
+                        "{}: expected NotFoundYet, got {result:?}",
+                        case.name
+                    );
+                }
+            }
+            fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
         }
-        fs::remove_dir_all(&root).expect("remove Claude slug test directory");
     }
 
     /// One case in [`unique_existing_path_collapses_hard_linked_candidates`].
