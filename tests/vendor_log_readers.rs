@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use herdr_connect_rs::{AgentSession, read_agent_log};
+use herdr_connect_rs::{AgentSession, read_agent_log, read_claude_prompts_incremental};
 
 #[test]
 fn read_captured_vendor_logs() {
@@ -45,6 +45,25 @@ fn read_captured_vendor_logs() {
                 .message,
             expected
         );
+    }
+}
+
+#[test]
+fn read_captured_claude_terminal_prompt_with_position() {
+    let cases = [(
+        "tests/fixtures/claude-session.jsonl",
+        273_u64,
+        "current",
+        335_u64,
+    )];
+    for (path, start_offset, expected_prompt, expected_position) in cases {
+        let (records, new_offset) =
+            read_claude_prompts_incremental(Path::new(path), start_offset).unwrap();
+        assert_eq!(
+            records,
+            vec![(expected_prompt.to_owned(), expected_position)]
+        );
+        assert_eq!(new_offset, expected_position);
     }
 }
 

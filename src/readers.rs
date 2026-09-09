@@ -181,6 +181,49 @@ pub fn read_claude_incremental(
     })
 }
 
+/// Reads new complete Claude user text records appended to a session JSONL log since `offset`,
+/// each paired with the byte offset immediately after its record.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
+/// non-final complete line fails to parse as JSON.
+pub fn read_claude_prompts_incremental(
+    path: &Path,
+    offset: u64,
+) -> Result<(Vec<(String, u64)>, u64), String> {
+    let (bytes, complete_len) = read_new_bytes(path, offset)?;
+    let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
+    let lines = positioned_complete_lines(text, offset);
+    let (prompts, _) = extract_tolerant(&lines, offset, |record| {
+        let Some(content) = record
+            .get(MESSAGE_KEY)
+            .and_then(|message| message.get(CONTENT_KEY))
+        else {
+            return Vec::new();
+        };
+        if !is_qualifying_claude_user_record(record) {
+            return Vec::new();
+        }
+        match content {
+            Value::String(text) if !text.is_empty() => vec![text.clone()],
+            Value::Array(parts) => parts
+                .iter()
+                .filter(|part| {
+                    part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                        == Some(CONTENT_PART_TEXT_VALUE)
+                })
+                .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    })?;
+    let new_offset = prompts.last().map_or(offset, |(_, end_offset)| *end_offset);
+    Ok((prompts, new_offset))
+}
+
 /// Reads new complete Cursor assistant text parts from rows with `rowid` > `last_rowid`, paired
 /// with each row's `rowid` (store opened read-only).
 ///

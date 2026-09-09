@@ -56,7 +56,8 @@ pub use prompting::{
 };
 pub use readers::{
     AgentLog, claude_turn_start_position, cursor_turn_start_rowid, format_detection_question,
-    read_agent_log, read_claude_incremental, read_cursor_incremental,
+    read_agent_log, read_claude_incremental, read_claude_prompts_incremental,
+    read_cursor_incremental,
 };
 pub use topology::{
     RouteError, TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
