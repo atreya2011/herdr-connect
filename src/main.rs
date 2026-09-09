@@ -487,7 +487,14 @@ async fn maybe_sync_fresh_session_topology(
     discord: Option<&DiscordConnection>,
     state: &mut BridgeState,
 ) {
-    if snapshot.session.is_none() {
+    let previous_status = state
+        .previous
+        .get(&snapshot.terminal_id)
+        .map(|(previous, _)| previous.as_str());
+    if snapshot.session.is_none()
+        || previous_status
+            .is_some_and(|previous| previous != "unknown" || snapshot.agent_status != STATUS_IDLE)
+    {
         return;
     }
     let Ok(route) = route_topology(agents, tabs, &snapshot.terminal_id) else {
@@ -515,6 +522,7 @@ async fn process_snapshot(
     println!("{} {terminal}: {status}", snapshot.agent);
     update_activity_eligibility(state, snapshot, &status);
     maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
+    maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
     let previous_herdr_seq = state
         .herdr_state_change_seq
         .insert(terminal.clone(), snapshot.state_change_seq);
@@ -599,11 +607,8 @@ async fn process_snapshot(
             }
             forget_activity_message(state, snapshot.pane_id.as_deref());
         }
-    } else {
-        maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
-        if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
-            retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
-        }
+    } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
+        retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
     }
     state
         .previous
@@ -8850,6 +8855,190 @@ mod tests {
         let tabs_left = remaining_tabs(STARTUP_SESSION_SKIP_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
         let workspaces_left = remaining_workspaces(STARTUP_SESSION_SKIP_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const LATE_SESSION_TOPOLOGY_LABEL: &str = "testrun-late-session-topology";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn late_session_idle_retry_syncs_topology_once_after_unknown_observation() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(LATE_SESSION_TOPOLOGY_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(LATE_SESSION_TOPOLOGY_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after unix epoch")
+            .as_nanos();
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-late-session-topology-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create late-session-topology test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = create_workspace(LATE_SESSION_TOPOLOGY_LABEL, cwd);
+        let (workspace_id, result) = match created {
+            Ok(workspace) => {
+                let workspace_id = workspace.id.clone();
+                let outcome = async {
+                    let mut state = BridgeState::default();
+                    let connection = discord_tuple(&guild);
+                    let unknown = wait_for_status(
+                        &workspace.pane_id,
+                        &["unknown"],
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                    if unknown.session.is_some() {
+                        return Err("unknown snapshot unexpectedly carried a session".to_owned());
+                    }
+                    let matching = matching_tab(&workspace.tab_id)?;
+                    let tabs = std::slice::from_ref(&matching);
+                    process_snapshot(
+                        &unknown,
+                        std::slice::from_ref(&unknown),
+                        tabs,
+                        Some(&connection),
+                        &mut state,
+                    )
+                    .await;
+
+                    let agent_name = format!(
+                        "testrun-late-{}",
+                        agent_name_nonce().expect("system clock is after unix epoch")
+                    );
+                    start_claude_haiku_agent(&agent_name, &workspace.pane_id)?;
+                    let idle = wait_for_status(
+                        &workspace.pane_id,
+                        &[STATUS_IDLE],
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                    if idle.session.as_ref().map(|session| session.agent.as_str())
+                        != Some(VENDOR_CLAUDE)
+                    {
+                        return Err(format!(
+                            "idle snapshot did not carry a real Claude session: {:?}",
+                            idle.session
+                        ));
+                    }
+
+                    let route = route_topology(std::slice::from_ref(&idle), tabs, &idle.terminal_id)?;
+                    let topic = format!("herdr workspace [{}]", route.workspace_id);
+                    if !channel_with_topic_is_absent(&guild, &topic).await? {
+                        return Err(
+                            "unknown session-less observation created the workspace channel".to_owned(),
+                        );
+                    }
+                    process_snapshot(
+                        &idle,
+                        std::slice::from_ref(&idle),
+                        tabs,
+                        Some(&connection),
+                        &mut state,
+                    )
+                    .await;
+
+                    let channel = guild_channel_with_topic(&guild, &topic).await?;
+                    let thread_suffix = format!(" [{}]", route.tab_id);
+                    let threads = active_threads_for_guild(&guild).await?;
+                    let matching_threads: Vec<_> = threads
+                        .into_iter()
+                        .filter(|thread| {
+                            thread.parent_id == Some(channel.id)
+                                && thread
+                                    .name
+                                    .as_deref()
+                                    .is_some_and(|name| name.ends_with(&thread_suffix))
+                        })
+                        .collect();
+                    if matching_threads.len() != 1 {
+                        return Err(format!(
+                            "expected one late-session topology thread, found {}",
+                            matching_threads.len()
+                        ));
+                    }
+                    let messages = thread_messages(&guild, matching_threads[0].id).await?;
+                    if !messages.is_empty() {
+                        return Err(format!(
+                            "late-session topology created unexpected messages: {messages:?}"
+                        ));
+                    }
+
+                    process_snapshot(
+                        &idle,
+                        std::slice::from_ref(&idle),
+                        tabs,
+                        Some(&connection),
+                        &mut state,
+                    )
+                    .await;
+                    let repeated_threads = active_threads_for_guild(&guild)
+                        .await?
+                        .into_iter()
+                        .filter(|thread| {
+                            thread.parent_id == Some(channel.id)
+                                && thread
+                                    .name
+                                    .as_deref()
+                                    .is_some_and(|name| name.ends_with(&thread_suffix))
+                        })
+                        .count();
+                    if repeated_threads != 1 {
+                        return Err(format!(
+                            "repeated idle snapshot changed late-session topology thread count to {repeated_threads}"
+                        ));
+                    }
+                    let repeated_messages = thread_messages(&guild, matching_threads[0].id).await?;
+                    if repeated_messages != messages {
+                        return Err(format!(
+                            "repeated idle snapshot changed topology messages from {messages:?} to {repeated_messages:?}"
+                        ));
+                    }
+                    Ok::<(), String>(())
+                }
+                .await;
+                cleanup_real_claude_session_dir(&home, &workspace.pane_id);
+                (Some(workspace_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(LATE_SESSION_TOPOLOGY_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(LATE_SESSION_TOPOLOGY_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
