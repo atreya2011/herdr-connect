@@ -478,6 +478,30 @@ fn update_activity_eligibility(state: &mut BridgeState, snapshot: &AgentSnapshot
     }
 }
 
+async fn maybe_sync_fresh_session_topology(
+    snapshot: &AgentSnapshot,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+    discord: Option<&DiscordConnection>,
+    state: &mut BridgeState,
+) {
+    if snapshot.session.is_none() {
+        return;
+    }
+    let Ok(route) = route_topology(agents, tabs, &snapshot.terminal_id) else {
+        return;
+    };
+    state.title_pending.remove(&route.tab_id);
+    let Some((client, guild, _, responder)) = discord else {
+        return;
+    };
+    if let Err(error) =
+        sync_route(client.as_ref(), *guild, &route, responder.topology_cache()).await
+    {
+        eprintln!("{error}");
+    }
+}
+
 async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -485,10 +509,8 @@ async fn process_snapshot(
     discord: Option<&DiscordConnection>,
     state: &mut BridgeState,
 ) {
-    let agent = snapshot.agent.clone();
-    let terminal = snapshot.terminal_id.clone();
-    let status = snapshot.agent_status.clone();
-    println!("{agent} {terminal}: {status}");
+    let (terminal, status) = (snapshot.terminal_id.clone(), snapshot.agent_status.clone());
+    println!("{} {terminal}: {status}", snapshot.agent);
     update_activity_eligibility(state, snapshot, &status);
     maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
     let previous_herdr_seq = state
@@ -497,8 +519,7 @@ async fn process_snapshot(
     if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned() {
         if old != status {
             let old_was_working = old == STATUS_WORKING;
-            let state_change_seq =
-                next_state_change_sequence(&mut state.state_change_sequences, &terminal);
+            let seq = next_state_change_sequence(&mut state.state_change_sequences, &terminal);
             let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
             let mut transition = Transition {
                 from: old,
@@ -533,7 +554,7 @@ async fn process_snapshot(
                         discord,
                         terminal: &terminal,
                         transition: &transition,
-                        state_change_seq,
+                        state_change_seq: seq,
                     },
                     state,
                 )
@@ -576,12 +597,15 @@ async fn process_snapshot(
             }
             forget_activity_message(state, snapshot.pane_id.as_deref());
         }
-    } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
-        retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
+    } else {
+        maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
+        if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
+            retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
+        }
     }
     state
         .previous
-        .insert(terminal.clone(), (status.clone(), agent));
+        .insert(terminal.clone(), (status.clone(), snapshot.agent.clone()));
 }
 
 struct PostableTransitionContext<'a> {
@@ -6278,6 +6302,94 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const FRESH_IDLE_SESSION_LABEL: &str = "testrun-fresh-idle-session";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn fresh_idle_session_discovery_is_mirrored_on_first_snapshot() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cases = [
+            (
+                "claude",
+                "testrun-fresh-idle-claude",
+                "testrun-fresh-idle-claude:t1",
+            ),
+            (
+                "codex",
+                "testrun-fresh-idle-codex",
+                "testrun-fresh-idle-codex:t1",
+            ),
+        ];
+        let result = async {
+            for (agent, workspace_id, tab_id) in cases {
+                let terminal_id = format!("{workspace_id}:terminal");
+                let pane_id = format!("{workspace_id}:pane");
+                let snapshot = AgentSnapshot {
+                    agent: agent.to_owned(),
+                    terminal_id: terminal_id.clone(),
+                    agent_status: STATUS_IDLE.to_owned(),
+                    tab_id: Some(tab_id.to_owned()),
+                    workspace_id: Some(workspace_id.to_owned()),
+                    pane_id: Some(pane_id),
+                    cwd: Some(format!("/tmp/{FRESH_IDLE_SESSION_LABEL}")),
+                    terminal_title_stripped: Some("fresh".to_owned()),
+                    session: Some(AgentSession {
+                        agent: agent.to_owned(),
+                        value: format!("{agent}-fresh-session"),
+                    }),
+                    state_change_seq: 0,
+                };
+                let tabs = [herdr_connect_rs::HerdrTab {
+                    tab_id: tab_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    label: "fresh".to_owned(),
+                }];
+                let agents = [snapshot.clone()];
+                let connection = discord_tuple(&guild);
+                let mut state = BridgeState::default();
+
+                process_snapshot(&snapshot, &agents, &tabs, Some(&connection), &mut state).await;
+
+                let route = route_topology(&agents, &tabs, &terminal_id)?;
+                let topic = format!("herdr workspace [{}]", route.workspace_id);
+                let channel = guild_channel_with_topic(&guild, &topic).await?;
+                let suffix = format!(" [{}]", route.tab_id);
+                let has_thread = active_threads_for_guild(&guild)
+                    .await?
+                    .iter()
+                    .any(|thread| {
+                        thread.parent_id == Some(channel.id)
+                            && thread
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| name.ends_with(&suffix))
+                    });
+                if !has_thread {
+                    return Err(format!(
+                        "{agent} fresh idle session did not create its tab thread"
+                    ));
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
