@@ -909,22 +909,43 @@ fn resolve_session_path(
                 .collect::<Vec<_>>();
             unique_existing_path(&candidates, "claude session log")
         }
-        VENDOR_CODEX => find_unique_session_path(
-            &search_root.join(".codex/sessions"),
-            &session.value,
-            |path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("rollout-")
-                            && Path::new(name)
-                                .extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-                    })
-            },
-            "codex session log",
-        ),
+        VENDOR_CODEX => {
+            let roots = read_directories(search_root, "Codex home directory")?
+                .into_iter()
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name == ".codex" || name.starts_with(".codex-"))
+                })
+                .collect::<Vec<_>>();
+            let roots = if roots.is_empty() {
+                vec![search_root.join(".codex")]
+            } else {
+                roots
+            };
+            let mut candidates = Vec::new();
+            for root in roots {
+                collect_matching_paths(
+                    &root.join("sessions"),
+                    &session.value,
+                    |path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("rollout-")
+                                    && Path::new(name)
+                                        .extension()
+                                        .and_then(|extension| extension.to_str())
+                                        .is_some_and(|extension| {
+                                            extension.eq_ignore_ascii_case("jsonl")
+                                        })
+                            })
+                    },
+                    &mut candidates,
+                )?;
+            }
+            unique_existing_path(&candidates, "codex session log")
+        }
         VENDOR_CURSOR => {
             let chats = search_root.join(".cursor/chats");
             let mut candidates = Vec::new();
@@ -992,17 +1013,6 @@ fn unique_existing_path(
             "multiple {description}s were found"
         ))),
     }
-}
-
-fn find_unique_session_path(
-    root: &Path,
-    session_id: &str,
-    matches: fn(&Path) -> bool,
-    description: &str,
-) -> Result<PathBuf, SessionPathError> {
-    let mut candidates = Vec::new();
-    collect_matching_paths(root, session_id, matches, &mut candidates)?;
-    unique_existing_path(&candidates, description)
 }
 
 fn collect_matching_paths(
@@ -2834,7 +2844,7 @@ mod tests {
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-        Transition, VENDOR_CLAUDE, lifecycle_subscriptions, read_claude_incremental,
+        Transition, VENDOR_CLAUDE, VENDOR_CODEX, lifecycle_subscriptions, read_claude_incremental,
         read_cursor_incremental, status_subscriptions, submit_owner_prompt, subscribe_herdr_events,
         transition_card_nonce, workspace_list_result,
     };
@@ -3164,6 +3174,80 @@ mod tests {
                 }
             }
             fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
+        }
+    }
+
+    struct CodexSearchRootCase {
+        name: &'static str,
+        vendor_root: &'static str,
+        expected_message: &'static str,
+    }
+
+    #[test]
+    fn codex_session_log_is_discovered_under_custom_home_root() {
+        let cases = [CodexSearchRootCase {
+            name: "the log lives under .codex-one",
+            vendor_root: ".codex-one",
+            expected_message: "gamma",
+        }];
+
+        for (index, case) in cases.iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-connect-rs-codex-search-roots-{}-{index}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(root.join(".codex/sessions"))
+                .expect("create default Codex sessions directory");
+            let log_path = root
+                .join(case.vendor_root)
+                .join("sessions/2026/09/09")
+                .join("rollout-2026-09-09T00-00-00-capture-session.jsonl");
+            fs::create_dir_all(log_path.parent().expect("Codex log has a parent directory"))
+                .expect("create custom Codex sessions directory");
+            fs::write(
+                &log_path,
+                include_str!("../tests/fixtures/codex-session-response-item.jsonl"),
+            )
+            .expect("write committed Codex session fixture");
+
+            let session = AgentSession {
+                agent: VENDOR_CODEX.to_owned(),
+                value: "capture-session".to_owned(),
+            };
+            let snapshot = AgentSnapshot {
+                agent: VENDOR_CODEX.to_owned(),
+                terminal_id: "codex-custom-home-terminal".to_owned(),
+                agent_status: STATUS_DONE.to_owned(),
+                tab_id: None,
+                workspace_id: None,
+                pane_id: None,
+                cwd: Some("/srv/bridge".to_owned()),
+                terminal_title_stripped: None,
+                session: Some(session.clone()),
+                state_change_seq: 0,
+            };
+
+            let resolved_path = resolve_session_path(&root, &snapshot, &session);
+            let capture = capture_for_with_search_root(&snapshot, &root);
+
+            fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
+
+            assert_eq!(
+                resolved_path,
+                Ok(log_path.clone()),
+                "{}: resolve custom Codex session path",
+                case.name
+            );
+            let capture = capture.expect("custom Codex session fixture resolves");
+            assert_eq!(
+                capture.message, case.expected_message,
+                "{}: assistant text",
+                case.name
+            );
         }
     }
 
