@@ -23,15 +23,16 @@ use herdr_connect_rs::{
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
     RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache,
     TopologyRoute, Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
-    agent_read_detection, cached_route, claude_turn_start_position, create_transition_messages,
-    create_unsupported_blocked_card, cursor_turn_start_rowid, delete_tab_thread,
-    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_live_message,
-    deliver_transition_card, drive_gateway_with_components, expire_informational_card,
-    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
-    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
-    read_claude_incremental, read_cursor_incremental, reconcile_topology_cache, route_topology,
-    split_live_message, status_subscriptions, subscribe_herdr_events, sync_topology,
-    tab_list_result, transition_card_nonce, workspace_list_result,
+    agent_read_detection, cached_route, claude_turn_start_position, codex_turn_start_position,
+    create_transition_messages, create_unsupported_blocked_card, cursor_turn_start_rowid,
+    delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
+    deliver_live_message, deliver_transition_card, drive_gateway_with_components,
+    expire_informational_card, fetch_topology_lists, format_detection_question, hook_timeout,
+    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
+    load_discord_config, read_claude_incremental, read_codex_incremental, read_cursor_incremental,
+    reconcile_topology_cache, route_topology, split_live_message, status_subscriptions,
+    subscribe_herdr_events, sync_topology, tab_list_result, transition_card_nonce,
+    workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1125,6 +1126,7 @@ fn start_notify_watcher(
 fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
     match vendor {
         VENDOR_CLAUDE => claude_turn_start_position(path).map(LivePosition::Bytes),
+        VENDOR_CODEX => codex_turn_start_position(path).map(LivePosition::Bytes),
         VENDOR_CURSOR => cursor_turn_start_rowid(path).map(LivePosition::RowId),
         other => Err(format!(
             "live capture: unsupported vendor for initial position: {other}"
@@ -1155,9 +1157,12 @@ async fn ensure_live_watch_started(
     let Some(session) = snapshot.session.clone() else {
         return;
     };
-    // Live text exists only for Claude and Cursor logs; other vendors still get end cards, just
-    // not live text.
-    if !matches!(session.agent.as_str(), VENDOR_CLAUDE | VENDOR_CURSOR) {
+    // Live text exists only for Claude, Codex, and Cursor logs; other vendors still get end cards,
+    // just not live text.
+    if !matches!(
+        session.agent.as_str(),
+        VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR
+    ) {
         return;
     }
     let path = match live_log_path(snapshot, &session) {
@@ -1223,6 +1228,16 @@ fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, i64)>, i64), S
     match (watch.vendor.as_str(), watch.position) {
         (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
             let (texts, new_offset) = read_claude_incremental(&watch.path, offset)?;
+            Ok((
+                texts
+                    .into_iter()
+                    .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
+                    .collect(),
+                i64::try_from(new_offset).unwrap_or(i64::MAX),
+            ))
+        }
+        (VENDOR_CODEX, LivePosition::Bytes(offset)) => {
+            let (texts, new_offset) = read_codex_incremental(&watch.path, offset)?;
             Ok((
                 texts
                     .into_iter()
@@ -2855,8 +2870,8 @@ mod tests {
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
         Transition, VENDOR_CLAUDE, VENDOR_CODEX, lifecycle_subscriptions, read_claude_incremental,
-        read_cursor_incremental, status_subscriptions, submit_owner_prompt, subscribe_herdr_events,
-        transition_card_nonce, workspace_list_result,
+        read_codex_incremental, read_cursor_incremental, status_subscriptions, submit_owner_prompt,
+        subscribe_herdr_events, transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -3979,6 +3994,13 @@ mod tests {
         home.join(".cache/herdr-connect-testrun/cursor")
     }
 
+    /// Fixed, owner-pre-trusted cwd for every real-Codex fixture, for the same reason as
+    /// [`claude_testrun_dir`]: the Codex CLI's own one-time trust prompt has no recovery either.
+    #[cfg(unix)]
+    fn codex_testrun_dir(home: &Path) -> PathBuf {
+        home.join(".cache/herdr-connect-testrun/codex")
+    }
+
     /// Empties `directory` without removing it: a fixture's shared, owner-pre-trusted cwd must
     /// always exist at the same path.
     #[cfg(unix)]
@@ -4908,6 +4930,7 @@ mod tests {
     fn start_live_capture_agent(kind: &str, agent_name: &str, pane_id: &str) -> Result<(), String> {
         let vendor_args: &[&str] = match kind {
             "claude" => &["--model", "haiku"],
+            "codex" => &["--model", "gpt-5.6-luna"],
             "cursor" => &["--yolo"],
             other => return Err(format!("unsupported live-capture test kind: {other}")),
         };
@@ -4940,7 +4963,7 @@ mod tests {
     }
 
     /// Testrun tab cwd, never the repository directory (holds `.env`): the fixed, owner-trusted
-    /// `.../herdr-connect-testrun/{claude,cursor}` — its trust prompt has no recovery.
+    /// `.../herdr-connect-testrun/{claude,cursor,codex}` — its trust prompt has no recovery.
     #[cfg(unix)]
     fn live_capture_tab_fixture(kind: &str) -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
@@ -4951,6 +4974,7 @@ mod tests {
             .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
         let label = format!("{LIVE_CAPTURE_LABEL}-{kind}");
         let cwd_dir = match kind {
+            "codex" => codex_testrun_dir(&home),
             "cursor" => cursor_testrun_dir(&home),
             _ => claude_testrun_dir(&home),
         };
@@ -5114,6 +5138,7 @@ mod tests {
         let log_path = live_log_path(&settled, &session)?.ok_or("no log path yet")?;
         let expected_count = match kind {
             "claude" => read_claude_incremental(&log_path, 0)?.0.len(),
+            "codex" => read_codex_incremental(&log_path, 0)?.0.len(),
             "cursor" => read_cursor_incremental(&log_path, 0)?.0.len(),
             other => return Err(format!("unsupported vendor for structural count: {other}")),
         };
@@ -5171,7 +5196,7 @@ mod tests {
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
         let created = live_capture_tab_fixture(kind);
-        let (tab_id, cwd_dir, result) = match created {
+        let (tab_id, cwd_dir, result, session_cleanup) = match created {
             Ok((tab, cwd_dir)) => {
                 let agent_name = format!(
                     "live-{kind}-{}",
@@ -5183,16 +5208,39 @@ mod tests {
                 )
                 .await
                 .unwrap_or_else(|_| Err(format!("{kind} live-capture exercise timed out")));
-                if let Ok(snapshot) = snapshot_for_pane(&tab.pane_id)
-                    && let Some(session) = snapshot.session.as_ref()
-                    && let Ok(path) = resolve_session_path(&home, &snapshot, session)
-                    && let Some(parent) = path.parent()
-                {
-                    let _ = fs::remove_dir_all(parent);
-                }
-                (Some(tab.tab_id), Some(cwd_dir), outcome)
+                let session_cleanup = if kind == "codex" {
+                    snapshot_for_pane(&tab.pane_id)
+                        .map_err(|error| {
+                            format!("Codex log path cannot be resolved during cleanup: {error}")
+                        })
+                        .and_then(|snapshot| {
+                            let session = snapshot.session.as_ref().ok_or_else(|| {
+                                "Codex log path cannot be resolved during cleanup: no session"
+                                    .to_owned()
+                            })?;
+                            let path = resolve_session_path(&home, &snapshot, session).map_err(
+                                |error| {
+                                    format!(
+                                        "Codex log path cannot be resolved during cleanup: {error}"
+                                    )
+                                },
+                            )?;
+                            fs::remove_file(path)
+                                .map_err(|error| format!("remove Codex session file: {error}"))
+                        })
+                } else {
+                    if let Ok(snapshot) = snapshot_for_pane(&tab.pane_id)
+                        && let Some(session) = snapshot.session.as_ref()
+                        && let Ok(path) = resolve_session_path(&home, &snapshot, session)
+                        && let Some(parent) = path.parent()
+                    {
+                        let _ = fs::remove_dir_all(parent);
+                    }
+                    Ok(())
+                };
+                (Some(tab.tab_id), Some(cwd_dir), outcome, session_cleanup)
             }
-            Err(error) => (None, None, Err(error)),
+            Err(error) => (None, None, Err(error), Ok(())),
         };
         if let Some(tab_id) = &tab_id {
             close_tab(tab_id);
@@ -5204,9 +5252,10 @@ mod tests {
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left =
             remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
-        assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert!(session_cleanup.is_ok(), "{session_cleanup:?}");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[cfg(unix)]
@@ -5216,6 +5265,13 @@ mod tests {
         for kind in ["claude", "cursor"] {
             run_live_capture_test(kind).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn live_capture_posts_first_live_text_before_settle_for_codex() {
+        run_live_capture_test("codex").await;
     }
 
     #[cfg(unix)]
