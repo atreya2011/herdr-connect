@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use herdr_connect_rs::{
     claude_turn_start_position, read_claude_incremental, read_cursor_incremental,
+    read_cursor_prompts_incremental,
 };
 use rusqlite::Connection;
 
@@ -115,4 +116,52 @@ fn read_cursor_incremental_returns_only_new_rows_since_a_rowid() {
 
     drop(connection);
     fs::remove_file(&path).expect("remove cursor store");
+}
+
+#[test]
+fn read_cursor_prompts_incremental_returns_new_user_rows_once() {
+    let cases = [(
+        "tests/fixtures/cursor-session.json",
+        0_i64,
+        "current",
+        1_i64,
+    )];
+    for (fixture_path, start_rowid, expected_prompt, expected_rowid) in cases {
+        let path = temp_path("prompt-rowid", "db");
+        let connection = Connection::open(&path).expect("create cursor store");
+        connection
+            .execute("CREATE TABLE blobs (data BLOB)", [])
+            .expect("create blobs table");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(fixture_path).expect("read Cursor fixture"))
+                .expect("parse Cursor fixture");
+        for row in rows {
+            let bytes = serde_json::to_vec(&row).expect("encode Cursor row");
+            connection
+                .execute("INSERT INTO blobs (data) VALUES (?1)", [bytes])
+                .expect("insert Cursor row");
+        }
+        drop(connection);
+
+        let first_observation = read_cursor_prompts_incremental(&path, start_rowid).and_then(
+            |(first_pass, checkpoint)| {
+                read_cursor_prompts_incremental(&path, checkpoint).map(
+                    |(second_pass, repeated_checkpoint)| {
+                        (first_pass, checkpoint, second_pass, repeated_checkpoint)
+                    },
+                )
+            },
+        );
+        fs::remove_file(&path).expect("remove cursor store");
+        let (first_pass, checkpoint, second_pass, repeated_checkpoint) =
+            first_observation.expect("read Cursor prompts");
+
+        assert_eq!(
+            first_pass,
+            vec![(expected_prompt.to_owned(), expected_rowid)]
+        );
+        assert_eq!(checkpoint, expected_rowid);
+        assert!(second_pass.is_empty());
+        assert_eq!(repeated_checkpoint, checkpoint);
+    }
 }

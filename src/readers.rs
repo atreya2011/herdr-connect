@@ -281,6 +281,63 @@ pub fn read_cursor_incremental(
     Ok((texts, new_last_rowid))
 }
 
+/// Reads new complete Cursor user text parts from rows with `rowid` > `last_rowid`, paired with
+/// each row's `rowid` (store opened read-only).
+///
+/// `SQLite` rows are atomic: no torn-write case, a row is either committed and complete or not
+/// yet visible.
+///
+/// # Errors
+///
+/// Returns an error when the store cannot be opened or queried.
+pub fn read_cursor_prompts_incremental(
+    path: &Path,
+    last_rowid: i64,
+) -> Result<(Vec<(String, i64)>, i64), String> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT rowid, data FROM blobs WHERE rowid > ?1 ORDER BY rowid")
+        .map_err(|error| error.to_string())?;
+    let rows: Vec<(i64, Value)> = statement
+        .query_map([last_rowid], |row| {
+            let rowid: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((
+                rowid,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut new_last_rowid = last_rowid;
+    let mut prompts = Vec::new();
+    for (rowid, record) in rows {
+        let data = record
+            .get(ROW_DATA_KEY)
+            .cloned()
+            .unwrap_or_else(|| record.clone());
+        if data.get(ROLE_KEY).and_then(Value::as_str) != Some(USER_ROLE_VALUE) {
+            continue;
+        }
+        let Some(parts) = data.get(CONTENT_KEY).and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                == Some(CONTENT_PART_TEXT_VALUE)
+                && let Some(part_text) = part.get(TEXT_KEY).and_then(Value::as_str)
+                && !part_text.is_empty()
+            {
+                prompts.push((part_text.to_owned(), rowid));
+                new_last_rowid = rowid;
+            }
+        }
+    }
+    Ok((prompts, new_last_rowid))
+}
+
 /// The byte offset immediately after the last qualifying user record in a Claude session JSONL
 /// log — where a live-capture watch starts.
 ///
