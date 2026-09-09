@@ -78,6 +78,60 @@ fn cursor_hook_denies_when_broker_is_unavailable() {
 }
 
 #[test]
+fn cursor_hook_denies_and_reports_broker_connect_failure() {
+    let cases = [(
+        "missing broker socket",
+        std::path::PathBuf::from(format!(
+            "hc-cursor-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        )),
+    )];
+    for (name, socket) in cases {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
+            .args(["hook", "--vendor", "cursor", "--socket"])
+            .arg(&socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hook subcommand");
+        child
+            .stdin
+            .take()
+            .expect("hook stdin is piped")
+            .write_all(include_bytes!(
+                "fixtures/cursor-permission-request/default.json"
+            ))
+            .expect("write Cursor hook payload");
+        let output = child.wait_with_output().expect("wait for hook subcommand");
+
+        assert!(output.status.success(), "{name}: {output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).expect("denial is JSON");
+        assert_eq!(value["permission"], "deny", "{name}");
+        assert_eq!(
+            value["agent_message"],
+            "permission broker did not return a decision; denying by default",
+            "{name}"
+        );
+        assert!(value.get("hookSpecificOutput").is_none(), "{name}");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let socket = socket.to_string_lossy();
+        assert!(stderr.contains("broker request"), "{name}: {stderr}");
+        assert!(stderr.contains("connect"), "{name}: {stderr}");
+        assert!(stderr.contains(socket.as_ref()), "{name}: {stderr}");
+        assert!(
+            stderr.contains("No such file or directory"),
+            "{name}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn explicit_cursor_vendor_denies_when_payload_is_undecodable() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
         .args(["hook", "--vendor", "cursor"])

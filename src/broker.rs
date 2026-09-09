@@ -440,7 +440,16 @@ pub async fn request_decision(
         PermissionVendor::Claude | PermissionVendor::Codex => timeout_duration,
     };
     tokio::time::timeout(timeout_duration, async {
-        let mut stream = UnixStream::connect(socket_path).await.map_err(|_| ())?;
+        let mut stream = match UnixStream::connect(socket_path).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!(
+                    "broker request failed: connect to {}: {error}",
+                    socket_path.display()
+                );
+                return Err(());
+            }
+        };
         write_json_line(&mut stream, interaction)
             .await
             .map_err(|_| ())?;
