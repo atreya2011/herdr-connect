@@ -181,6 +181,49 @@ pub fn read_claude_incremental(
     })
 }
 
+/// Reads new complete Codex assistant text parts appended to a session JSONL log since `offset`,
+/// each paired with the byte offset immediately after its record.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
+/// non-final complete line fails to parse as JSON.
+pub fn read_codex_incremental(
+    path: &Path,
+    offset: u64,
+) -> Result<(Vec<(String, u64)>, u64), String> {
+    let (bytes, complete_len) = read_new_bytes(path, offset)?;
+    let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
+    let lines = positioned_complete_lines(text, offset);
+    extract_tolerant(&lines, offset, |record| {
+        let Some(payload) = record.get(PAYLOAD_KEY) else {
+            return Vec::new();
+        };
+        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some("response_item")
+            || payload.get(PAYLOAD_TYPE_KEY).and_then(Value::as_str) != Some("message")
+            || payload.get(ROLE_KEY).and_then(Value::as_str) != Some(ASSISTANT_ROLE_VALUE)
+        {
+            return Vec::new();
+        }
+        payload
+            .get(CONTENT_KEY)
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| {
+                        part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                            == Some("output_text")
+                    })
+                    .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// Reads new complete Claude user text records appended to a session JSONL log since `offset`,
 /// each paired with the byte offset immediately after its record.
 ///
@@ -405,6 +448,16 @@ pub fn read_cursor_prompts_incremental(
 /// Returns an error when the file cannot be read or its complete lines are not valid UTF-8.
 pub fn claude_turn_start_position(path: &Path) -> Result<u64, String> {
     turn_start_byte_position(path, is_qualifying_claude_user_record)
+}
+
+/// The byte offset immediately after the last Codex turn boundary in a session JSONL log — where
+/// a live-capture watch starts.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or its complete lines are not valid UTF-8.
+pub fn codex_turn_start_position(path: &Path) -> Result<u64, String> {
+    turn_start_byte_position(path, is_codex_turn_boundary_record)
 }
 
 fn turn_start_byte_position(

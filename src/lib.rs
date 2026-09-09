@@ -55,9 +55,10 @@ pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
 };
 pub use readers::{
-    AgentLog, claude_turn_start_position, cursor_turn_start_rowid, format_detection_question,
-    read_agent_log, read_claude_incremental, read_claude_prompts_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
+    AgentLog, claude_turn_start_position, codex_turn_start_position, cursor_turn_start_rowid,
+    format_detection_question, read_agent_log, read_claude_incremental,
+    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
+    read_cursor_incremental, read_cursor_prompts_incremental,
 };
 pub use topology::{
     RouteError, TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
