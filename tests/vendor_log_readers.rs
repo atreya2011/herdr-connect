@@ -1,6 +1,8 @@
 use std::{fs, path::Path};
 
-use herdr_connect_rs::{AgentSession, read_agent_log, read_claude_prompts_incremental};
+use herdr_connect_rs::{
+    AgentSession, read_agent_log, read_claude_prompts_incremental, read_codex_prompts_incremental,
+};
 
 #[test]
 fn read_captured_vendor_logs() {
@@ -64,6 +66,38 @@ fn read_captured_claude_terminal_prompt_with_position() {
             vec![(expected_prompt.to_owned(), expected_position)]
         );
         assert_eq!(new_offset, expected_position);
+    }
+}
+
+#[test]
+fn read_captured_codex_terminal_prompts_once_with_position() {
+    let cases = [
+        (
+            "tests/fixtures/codex-session.jsonl",
+            236_u64,
+            "current",
+            311_u64,
+        ),
+        (
+            "tests/fixtures/codex-session-response-item.jsonl",
+            695_u64,
+            "current",
+            814_u64,
+        ),
+    ];
+    for (path, start_offset, expected_prompt, expected_position) in cases {
+        let (records, new_offset) =
+            read_codex_prompts_incremental(Path::new(path), start_offset).unwrap();
+        assert_eq!(
+            records,
+            vec![(expected_prompt.to_owned(), expected_position)]
+        );
+        assert_eq!(new_offset, expected_position);
+
+        let (repeated_records, repeated_offset) =
+            read_codex_prompts_incremental(Path::new(path), new_offset).unwrap();
+        assert!(repeated_records.is_empty());
+        assert_eq!(repeated_offset, new_offset);
     }
 }
 
