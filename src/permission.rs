@@ -1,3 +1,4 @@
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 /// The Claude hook event name for a synchronous permission request.
@@ -7,7 +8,7 @@ pub const VENDOR_CLAUDE: &str = "claude";
 pub const VENDOR_CODEX: &str = "codex";
 pub const VENDOR_CURSOR: &str = "cursor";
 
-#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ClaudePermissionRequest {
     pub session_id: String,
     pub prompt_id: String,
@@ -20,6 +21,70 @@ pub struct ClaudePermissionRequest {
 pub struct ClaudePermissionToolInput {
     pub command: String,
     pub description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudePermissionRequestPayload {
+    session_id: String,
+    prompt_id: String,
+    hook_event_name: String,
+    tool_name: String,
+    tool_input: ClaudePermissionToolInputPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudePermissionToolInputPayload {
+    command: Option<String>,
+    description: Option<String>,
+    file_path: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ClaudePermissionRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let payload = ClaudePermissionRequestPayload::deserialize(deserializer)?;
+        let ClaudePermissionRequestPayload {
+            session_id,
+            prompt_id,
+            hook_event_name,
+            tool_name,
+            tool_input,
+        } = payload;
+        let ClaudePermissionToolInputPayload {
+            command,
+            description,
+            file_path,
+        } = tool_input;
+        let tool_input = match (tool_name.as_str(), command, description, file_path) {
+            (_, Some(command), Some(description), _) => ClaudePermissionToolInput {
+                command,
+                description,
+            },
+            ("Read", _, _, Some(file_path)) if !file_path.is_empty() => ClaudePermissionToolInput {
+                command: file_path.clone(),
+                description: file_path,
+            },
+            ("Read", _, _, _) => {
+                return Err(D::Error::custom(
+                    "Claude Read permission request has no usable file_path",
+                ));
+            }
+            (_, _, _, _) => {
+                return Err(D::Error::custom(
+                    "Claude permission request requires command and description",
+                ));
+            }
+        };
+        Ok(Self {
+            session_id,
+            prompt_id,
+            hook_event_name,
+            tool_name,
+            tool_input,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
