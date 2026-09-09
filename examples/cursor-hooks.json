@@ -1,6 +1,11 @@
 {
   "version": 1,
   "hooks": {
+    "preToolUse": [
+      {
+        "command": "herdr-connect-rs activity --vendor cursor"
+      }
+    ],
     "beforeShellExecution": [
       {
         "command": "herdr-connect-rs hook --vendor cursor",

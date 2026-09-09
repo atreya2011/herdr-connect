@@ -15,7 +15,8 @@ use twilight_model::id::{
 
 use herdr_connect_rs::{
     ACTIVITY_KIND, ActivityFrame, activity_message_text, decode_claude_activity_request,
-    deliver_activity_message, send_activity_frame, update_activity_message,
+    decode_cursor_activity_request, deliver_activity_message, send_activity_frame,
+    update_activity_message,
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
@@ -2015,12 +2016,16 @@ fn parse_hook_args(
 /// activity frame, always exiting 0 with no output: activity display is best-effort and must
 /// never fail the tool call it rides on.
 async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let Ok(requested_socket) = parse_activity_args(args) else {
+    let Ok((vendor, requested_socket)) = parse_activity_args(args) else {
         return Ok(());
     };
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
-    let Ok(request) = decode_claude_activity_request(&input) else {
+    let Ok(request) = (match vendor {
+        VENDOR_CLAUDE => decode_claude_activity_request(&input),
+        VENDOR_CURSOR => decode_cursor_activity_request(&input),
+        _ => return Ok(()),
+    }) else {
         return Ok(());
     };
     let Some(socket_path) = requested_socket
@@ -2030,7 +2035,7 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     };
     let frame = ActivityFrame {
         kind: ACTIVITY_KIND.to_owned(),
-        vendor: VENDOR_CLAUDE.to_owned(),
+        vendor: vendor.to_owned(),
         workspace_id: std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default(),
         tab_id: std::env::var("HERDR_TAB_ID").unwrap_or_default(),
         pane_id: std::env::var("HERDR_PANE_ID").unwrap_or_default(),
@@ -2042,19 +2047,24 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn parse_activity_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
-    let mut vendor_seen = false;
+fn parse_activity_args(
+    args: &[String],
+) -> Result<(&'static str, Option<std::path::PathBuf>), String> {
+    let mut vendor = None;
     let mut socket = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--vendor" => {
                 index += 1;
-                let value = args.get(index).ok_or("--vendor requires claude")?;
-                if value != VENDOR_CLAUDE {
-                    return Err("--vendor requires claude".to_owned());
-                }
-                vendor_seen = true;
+                let value = args
+                    .get(index)
+                    .ok_or("--vendor requires claude or cursor")?;
+                vendor = Some(match value.as_str() {
+                    VENDOR_CLAUDE => VENDOR_CLAUDE,
+                    VENDOR_CURSOR => VENDOR_CURSOR,
+                    _ => return Err("--vendor requires claude or cursor".to_owned()),
+                });
             }
             "--socket" => {
                 index += 1;
@@ -2068,10 +2078,10 @@ fn parse_activity_args(args: &[String]) -> Result<Option<std::path::PathBuf>, St
         }
         index += 1;
     }
-    if !vendor_seen {
-        return Err("activity requires --vendor claude".to_owned());
-    }
-    Ok(socket)
+    Ok((
+        vendor.ok_or("activity requires --vendor claude or cursor")?,
+        socket,
+    ))
 }
 
 async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

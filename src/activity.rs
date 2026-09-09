@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// The Claude hook event a tool-activity frame is derived from.
 const ACTIVITY_HOOK_EVENT: &str = "PreToolUse";
+const CURSOR_ACTIVITY_HOOK_EVENT: &str = "preToolUse";
 
 /// Discriminates an activity frame from a permission
 /// [`Interaction`](crate::permission::Interaction) on the shared broker socket.
@@ -30,6 +31,14 @@ struct ClaudePreToolUseRequest {
     tool_name: String,
     #[serde(default)]
     tool_input: ClaudeToolUseInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorPreToolUseRequest {
+    conversation_id: String,
+    hook_event_name: String,
+    tool_name: String,
+    agent_message: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +89,25 @@ pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
         session_id: request.session_id,
         tool: request.tool_name,
         summary,
+    })
+}
+
+/// Decodes one Cursor `preToolUse` hook payload into the shared activity essentials.
+///
+/// # Errors
+///
+/// Returns an error when the payload is not JSON, is missing a required field, or names a
+/// different hook event.
+pub fn decode_cursor_activity_request(input: &[u8]) -> Result<ClaudeActivityRequest, String> {
+    let request: CursorPreToolUseRequest =
+        serde_json::from_slice(input).map_err(|error| error.to_string())?;
+    if request.hook_event_name != CURSOR_ACTIVITY_HOOK_EVENT {
+        return Err("unexpected Cursor hook event".to_owned());
+    }
+    Ok(ClaudeActivityRequest {
+        session_id: request.conversation_id,
+        tool: request.tool_name,
+        summary: truncate_chars(&request.agent_message),
     })
 }
 

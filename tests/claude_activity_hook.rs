@@ -24,8 +24,12 @@ fn socket_path(label: &str) -> PathBuf {
 }
 
 fn invoke_activity(payload: &str, socket: &Path) -> std::process::Output {
+    invoke_activity_for_vendor(payload, "claude", socket)
+}
+
+fn invoke_activity_for_vendor(payload: &str, vendor: &str, socket: &Path) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
-        .args(["activity", "--vendor", "claude", "--socket"])
+        .args(["activity", "--vendor", vendor, "--socket"])
         .arg(socket)
         .env("HERDR_WORKSPACE_ID", "w1")
         .env("HERDR_TAB_ID", "w1:t1")
@@ -107,6 +111,72 @@ async fn activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
         assert_eq!(frame["tool"], expected_tool, "{name}");
         assert_eq!(frame["summary"], expected_summary, "{name}");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[tokio::test]
+async fn cursor_activity_subcommand_writes_the_documented_frame() {
+    let cases = [(
+        "documented Cursor preToolUse event",
+        r#"{
+            "conversation_id": "cursor-conversation",
+            "generation_id": "cursor-generation",
+            "hook_event_name": "preToolUse",
+            "workspace_roots": ["/tmp/cursor-workspace"],
+            "tool_name": "Shell",
+            "tool_input": {"command": "git status --short"},
+            "tool_use_id": "cursor-tool-use",
+            "cwd": "/tmp/cursor-workspace",
+            "agent_message": "Inspect the repository state"
+        }"#,
+        "cursor-conversation",
+        "Shell",
+        "Inspect the repository state",
+    )];
+    for (name, payload, expected_session, expected_tool, expected_summary) in cases {
+        let path = socket_path("cursor");
+        let listener = UnixListener::bind(&path).expect("bind test listener");
+        let output = tokio::task::spawn_blocking({
+            let path = path.clone();
+            let payload = payload.to_owned();
+            move || invoke_activity_for_vendor(&payload, "cursor", &path)
+        })
+        .await
+        .expect("activity process task completes");
+        let frame = recv_frame(&listener).await;
+        let _ = std::fs::remove_file(&path);
+
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert!(output.stdout.is_empty(), "{name}: unexpected stdout");
+        let frame = frame.unwrap_or_else(|| panic!("{name}: no frame received"));
+        assert_eq!(frame["kind"], "activity", "{name}");
+        assert_eq!(frame["vendor"], "cursor", "{name}");
+        assert_eq!(frame["session_id"], expected_session, "{name}");
+        assert_eq!(frame["tool"], expected_tool, "{name}");
+        assert_eq!(frame["summary"], expected_summary, "{name}");
+    }
+}
+
+#[test]
+fn cursor_hooks_register_activity_and_permission_commands() {
+    let config: Value = serde_json::from_str(include_str!("../examples/cursor-hooks.json"))
+        .expect("parse Cursor hook config");
+    let cases = [
+        ("preToolUse", "herdr-connect-rs activity --vendor cursor"),
+        (
+            "beforeShellExecution",
+            "herdr-connect-rs hook --vendor cursor",
+        ),
+    ];
+    for (event, expected_command) in cases {
+        let hooks = config["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("{event}: missing hook key"));
+        assert_eq!(hooks.len(), 1, "{event}: expected one hook");
+        assert_eq!(
+            hooks[0]["command"], expected_command,
+            "{event}: unexpected command"
+        );
     }
 }
 
