@@ -4557,17 +4557,17 @@ mod tests {
     #[cfg(unix)]
     const LIFECYCLE_BATCH_LABEL: &str = "testrun-lifecycle-batch";
 
-    /// A gap in `next_event` results longer than this means the real backlog replay has caught up
-    /// to live: longer than `LIFECYCLE_BATCH_WINDOW` so an ordinary batch-ending gap inside a
-    /// ragged real backlog does not read as "caught up".
+    /// A gap in `next_event` results longer than this means no event is currently pending: longer
+    /// than `LIFECYCLE_BATCH_WINDOW` so an ordinary batch-ending gap between live events does not
+    /// read as "nothing pending".
     #[cfg(unix)]
     const LIFECYCLE_BATCH_CATCH_UP_IDLE: Duration = Duration::from_millis(600);
 
-    /// One case in [`lifecycle_batch_drains_replay_burst_then_isolates_a_later_closure`]:
-    /// `seeded_closures` tab.closed events are generated before the subscribe, so the replayed
-    /// backlog is guaranteed non-empty even against an otherwise-quiet Herdr instance. A batch
-    /// with more than one event is only required when more than one closure was seeded together:
-    /// a lone seeded closure may or may not land next to unrelated ambient history.
+    /// One case in [`lifecycle_batch_coalesces_a_live_closure_burst_then_isolates_a_later_closure`]:
+    /// `seeded_closures` tabs are closed back-to-back, after the subscribe, well inside
+    /// `LIFECYCLE_BATCH_WINDOW`, so the whole burst is expected in one drained batch. A batch with
+    /// more than one event is only required when more than one closure was seeded together: a lone
+    /// seeded closure is still expected as its own single-event batch.
     #[cfg(unix)]
     struct LifecycleBatchCase {
         name: &'static str,
@@ -4588,8 +4588,7 @@ mod tests {
     }
 
     /// Pulls one more drained batch from `lifecycle`, seeded by the next available event.
-    /// `Ok(None)` means the subscription has caught up to live: no event arrived within
-    /// `LIFECYCLE_BATCH_CATCH_UP_IDLE`.
+    /// `Ok(None)` means no event arrived within `LIFECYCLE_BATCH_CATCH_UP_IDLE`.
     #[cfg(unix)]
     async fn next_lifecycle_batch(
         lifecycle: &mut herdr_connect_rs::HerdrSubscription,
@@ -4608,14 +4607,14 @@ mod tests {
         Ok(Some(batch))
     }
 
-    /// Table-driven, against the real Herdr socket: draining a fresh lifecycle subscription
-    /// coalesces the replayed backlog into batches of more than one event rather than one event at
-    /// a time, and once the backlog has caught up to live, a tab closed only now arrives promptly
-    /// in its own later batch, isolated from every closure seeded into the backlog.
+    /// Table-driven, against the real Herdr socket: closing several tabs back-to-back right after
+    /// subscribing coalesces the whole live burst into one drained batch rather than one event at
+    /// a time, and a tab closed only afterward arrives promptly in its own later batch, isolated
+    /// from the burst.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn lifecycle_batch_drains_replay_burst_then_isolates_a_later_closure() {
+    async fn lifecycle_batch_coalesces_a_live_closure_burst_then_isolates_a_later_closure() {
         let cases = [
             LifecycleBatchCase {
                 name: "single seeded closure",
@@ -4653,7 +4652,6 @@ mod tests {
                 let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
                 let tab =
                     create_tab(LIFECYCLE_BATCH_LABEL, &workspace_id, cwd).expect("create seed tab");
-                close_tab(&tab.tab_id);
                 seeded_tab_ids.push(tab.tab_id);
                 seeded_cwd_dirs.push(cwd_dir);
             }
@@ -4663,44 +4661,36 @@ mod tests {
                 .expect("lifecycle subscribe");
 
             let result: Result<(), String> = async {
-                // Drain the replayed backlog, batch by batch, until the subscription catches up
-                // to live, tracking whether every seeded closure surfaced and whether any batch
-                // along the way coalesced more than one event.
-                let mut remaining_seeds: HashSet<String> = seeded_tab_ids.iter().cloned().collect();
-                let mut multi_event_batch_seen = false;
-                let deadline = Instant::now() + Duration::from_secs(30);
-                loop {
-                    if Instant::now() >= deadline {
-                        return Err(format!(
-                            "backlog never surfaced seeded closures {remaining_seeds:?} within the deadline"
-                        ));
-                    }
-                    let Some(batch) = next_lifecycle_batch(&mut lifecycle).await? else {
-                        break;
-                    };
-                    if batch.len() > 1 {
-                        multi_event_batch_seen = true;
-                    }
-                    for tab_id in batch_tab_closures(&batch) {
-                        remaining_seeds.remove(&tab_id);
-                    }
-                }
-                if !remaining_seeds.is_empty() {
-                    return Err(format!(
-                        "backlog replay caught up without ever surfacing seeded closures {remaining_seeds:?}"
-                    ));
-                }
-                if case.seeded_closures > 1 && !multi_event_batch_seen {
-                    return Err(
-                        "expected at least one drained batch with more than one event while \
-                         seeding more than one closure together"
-                            .to_owned(),
-                    );
+                // Close every seeded tab back-to-back, well inside `LIFECYCLE_BATCH_WINDOW`: a
+                // live burst that the batching code must coalesce into one drained batch.
+                for tab_id in &seeded_tab_ids {
+                    close_tab(tab_id);
                 }
 
-                // The backlog has caught up to live (the last `next_lifecycle_batch` call idled
-                // for `LIFECYCLE_BATCH_CATCH_UP_IDLE` with nothing pending). A tab closed only now
-                // must arrive promptly, as its own batch, isolated from every seeded closure.
+                let burst_batch = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    next_lifecycle_batch(&mut lifecycle),
+                )
+                .await
+                .map_err(|_| "timed out waiting for the closure burst".to_owned())??
+                .ok_or_else(|| "expected a batch for the closure burst, got none".to_owned())?;
+
+                let burst_closures = batch_tab_closures(&burst_batch);
+                let expected_closures: HashSet<String> = seeded_tab_ids.iter().cloned().collect();
+                if burst_closures != expected_closures {
+                    return Err(format!(
+                        "expected the whole burst {expected_closures:?} in one batch, got {burst_closures:?} from {burst_batch:?}"
+                    ));
+                }
+                if case.seeded_closures > 1 && burst_batch.len() <= 1 {
+                    return Err(format!(
+                        "expected one batch with more than one event while closing {} tabs together, got {burst_batch:?}",
+                        case.seeded_closures
+                    ));
+                }
+
+                // A tab closed only now must arrive promptly, as its own batch, isolated from the
+                // burst.
                 let later_cwd_dir = std::env::temp_dir().join(format!(
                     "testrun-lifecycle-batch-later-{}-{}",
                     std::process::id(),
