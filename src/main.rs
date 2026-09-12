@@ -1472,77 +1472,97 @@ fn is_retriable_terminal_prompt_error(error: &str) -> bool {
         || error.starts_with(UNKNOWN_WEBHOOK_DELIVERY_ERROR)
 }
 
+/// Clears the shared topology cache and the cached webhook for `target`'s stale workspace channel,
+/// re-resolves both the route and the webhook, and returns the refreshed target.
+///
+/// # Errors
+///
+/// Returns [`sync_route_channels`]'s error.
+async fn refresh_terminal_prompt_target<'a>(
+    target: TerminalPromptTarget<'a>,
+    state: &mut BridgeState,
+) -> Result<TerminalPromptTarget<'a>, String> {
+    *target.topology_cache.lock().await = None;
+    state
+        .terminal_prompt_webhooks
+        .remove(&target.workspace_channel);
+    let (workspace_channel, thread) = sync_route_channels(
+        target.client,
+        target.guild,
+        target.route,
+        target.topology_cache,
+    )
+    .await?;
+    Ok(TerminalPromptTarget {
+        workspace_channel,
+        thread,
+        ..target
+    })
+}
+
+/// Resolves (from cache or fresh) the webhook for `target.workspace_channel` and executes one
+/// message into `target.thread`, returning `target` unchanged on success so the caller can chain
+/// further parts or prompts against the same resolved pair.
+///
+/// # Errors
+///
+/// Returns [`cached_terminal_prompt_webhook`]'s or [`execute_terminal_prompt_webhook`]'s error --
+/// covering both webhook resolution and execution, so [`mirror_one_terminal_prompt`]'s retry runs
+/// the same [`is_retriable_terminal_prompt_error`] check against either failure.
+async fn deliver_terminal_prompt_part<'a>(
+    target: TerminalPromptTarget<'a>,
+    identity: &OwnerIdentity,
+    part: &str,
+    state: &mut BridgeState,
+) -> Result<TerminalPromptTarget<'a>, String> {
+    let (webhook_id, webhook_token) =
+        cached_terminal_prompt_webhook(target.client, target.workspace_channel, state).await?;
+    execute_terminal_prompt_webhook(
+        target.client,
+        webhook_id,
+        &webhook_token,
+        target.thread,
+        &identity.display_name,
+        identity.avatar_url.as_deref(),
+        part,
+    )
+    .await?;
+    Ok(target)
+}
+
 /// Delivers one mirrored terminal prompt through the bridge-owned webhook, split into parts the
 /// same way live text is so Discord's 2000-character message limit never silently drops it, one
 /// webhook message per part, in order.
 ///
-/// A retriable failure ([`is_retriable_terminal_prompt_error`]) on any part invalidates the shared
-/// topology cache and the cached webhook for the stale pair, re-resolves both the route and the
-/// webhook, and retries that one part once against the fresh pair, which later parts then reuse
-/// too; any other failure, or a repeat failure after the retry, stops the batch there rather than
-/// sending later parts out of order.
+/// A retriable failure ([`is_retriable_terminal_prompt_error`]) resolving or executing any part --
+/// the cached thread or the cached webhook is stale -- invalidates the shared topology cache and
+/// the cached webhook, re-resolves both the route and the webhook, and retries that one part once
+/// against the fresh pair; any other failure, or a repeat failure after the retry, stops the batch
+/// there rather than sending later parts out of order. Returns the resolved target reached by the
+/// last part actually sent, so the caller carries a refreshed target forward to later prompts in
+/// the same batch instead of retrying each one from the stale pair independently.
 ///
 /// # Errors
 ///
 /// Returns a Discord request or response error.
-async fn mirror_one_terminal_prompt(
-    target: TerminalPromptTarget<'_>,
+async fn mirror_one_terminal_prompt<'a>(
+    target: TerminalPromptTarget<'a>,
     identity: &OwnerIdentity,
     content: &str,
     state: &mut BridgeState,
-) -> Result<(), String> {
+) -> Result<TerminalPromptTarget<'a>, String> {
     let mut current = target;
     for part in split_live_message(content) {
-        let (webhook_id, webhook_token) =
-            cached_terminal_prompt_webhook(current.client, current.workspace_channel, state)
-                .await?;
-        let sent = execute_terminal_prompt_webhook(
-            current.client,
-            webhook_id,
-            &webhook_token,
-            current.thread,
-            &identity.display_name,
-            identity.avatar_url.as_deref(),
-            &part,
-        )
-        .await;
-        let Err(error) = &sent else {
-            continue;
+        current = match deliver_terminal_prompt_part(current, identity, &part, state).await {
+            Ok(delivered) => delivered,
+            Err(error) if is_retriable_terminal_prompt_error(&error) => {
+                let refreshed = refresh_terminal_prompt_target(current, state).await?;
+                deliver_terminal_prompt_part(refreshed, identity, &part, state).await?
+            }
+            Err(error) => return Err(error),
         };
-        if !is_retriable_terminal_prompt_error(error) {
-            return sent.map(|_| ());
-        }
-        *current.topology_cache.lock().await = None;
-        state
-            .terminal_prompt_webhooks
-            .remove(&current.workspace_channel);
-        let (workspace_channel, thread) = sync_route_channels(
-            current.client,
-            current.guild,
-            current.route,
-            current.topology_cache,
-        )
-        .await?;
-        current = TerminalPromptTarget {
-            workspace_channel,
-            thread,
-            ..current
-        };
-        let (webhook_id, webhook_token) =
-            cached_terminal_prompt_webhook(current.client, current.workspace_channel, state)
-                .await?;
-        execute_terminal_prompt_webhook(
-            current.client,
-            webhook_id,
-            &webhook_token,
-            current.thread,
-            &identity.display_name,
-            identity.avatar_url.as_deref(),
-            &part,
-        )
-        .await?;
     }
-    Ok(())
+    Ok(current)
 }
 
 /// Establishes (or re-establishes, on a session change) the terminal-prompt read baseline for
@@ -1682,7 +1702,7 @@ async fn mirror_terminal_prompts(
     else {
         return;
     };
-    let target = TerminalPromptTarget {
+    let mut target = TerminalPromptTarget {
         client: client.as_ref(),
         guild: *guild,
         route,
@@ -1694,8 +1714,9 @@ async fn mirror_terminal_prompts(
         if take_owner_prompt_suppression(&route.pane_id, &text) {
             continue;
         }
-        if let Err(error) = mirror_one_terminal_prompt(target, &identity, &text, state).await {
-            eprintln!("terminal prompt delivery error for {terminal}: {error}");
+        match mirror_one_terminal_prompt(target, &identity, &text, state).await {
+            Ok(delivered) => target = delivered,
+            Err(error) => eprintln!("terminal prompt delivery error for {terminal}: {error}"),
         }
     }
 }
