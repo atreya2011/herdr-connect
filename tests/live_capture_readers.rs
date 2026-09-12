@@ -149,6 +149,12 @@ fn read_cursor_incremental_returns_only_new_rows_since_a_rowid() {
     fs::remove_file(&path).expect("remove cursor store");
 }
 
+/// The checkpoint this test expects is the highest rowid [`read_cursor_prompts_incremental`]
+/// itself scans through, not the rowid of the last prompt found in range: round-1 finding 6
+/// measured checkpoint-at-last-prompt as a defect (a 21.9 MB turn re-read on every tick, 20 ticks
+/// costing 3.26 s instead of scanning through once), and the frozen expectation of rowid `1`
+/// encoded exactly that defect. The orchestrator ruled it a genuinely wrong test under the
+/// AGENTS.md red-green law and authorized updating this expected checkpoint value alone.
 #[test]
 fn read_cursor_prompts_incremental_returns_new_user_rows_once() {
     let cases = [(
@@ -156,8 +162,11 @@ fn read_cursor_prompts_incremental_returns_new_user_rows_once() {
         0_i64,
         "current",
         1_i64,
+        6_i64,
     )];
-    for (fixture_path, start_rowid, expected_prompt, expected_rowid) in cases {
+    for (fixture_path, start_rowid, expected_prompt, expected_prompt_rowid, expected_checkpoint) in
+        cases
+    {
         let path = temp_path("prompt-rowid", "db");
         let connection = Connection::open(&path).expect("create cursor store");
         connection
@@ -189,9 +198,9 @@ fn read_cursor_prompts_incremental_returns_new_user_rows_once() {
 
         assert_eq!(
             first_pass,
-            vec![(expected_prompt.to_owned(), expected_rowid)]
+            vec![(expected_prompt.to_owned(), expected_prompt_rowid)]
         );
-        assert_eq!(checkpoint, expected_rowid);
+        assert_eq!(checkpoint, expected_checkpoint);
         assert!(second_pass.is_empty());
         assert_eq!(repeated_checkpoint, checkpoint);
     }

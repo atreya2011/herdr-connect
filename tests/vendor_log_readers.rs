@@ -50,6 +50,12 @@ fn read_captured_vendor_logs() {
     }
 }
 
+/// The checkpoint this test expects is the position [`read_claude_prompts_incremental`] itself
+/// scans through, not the position of the last prompt found in range: round-1 finding 6 measured
+/// checkpoint-at-last-prompt as a defect (a 21.9 MB turn re-read on every tick, 20 ticks costing
+/// 3.26 s instead of scanning through once), and the frozen expectation of `335` encoded exactly
+/// that defect. The orchestrator ruled it a genuinely wrong test under the AGENTS.md red-green law
+/// and authorized updating this expected checkpoint value alone.
 #[test]
 fn read_captured_claude_terminal_prompt_with_position() {
     let cases = [(
@@ -57,42 +63,50 @@ fn read_captured_claude_terminal_prompt_with_position() {
         273_u64,
         "current",
         335_u64,
+        1_177_u64,
     )];
-    for (path, start_offset, expected_prompt, expected_position) in cases {
+    for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
+        cases
+    {
         let (records, new_offset) =
             read_claude_prompts_incremental(Path::new(path), start_offset).unwrap();
         assert_eq!(
             records,
-            vec![(expected_prompt.to_owned(), expected_position)]
+            vec![(expected_prompt.to_owned(), expected_prompt_position)]
         );
-        assert_eq!(new_offset, expected_position);
+        assert_eq!(new_offset, expected_checkpoint);
     }
 }
 
+/// See [`read_captured_claude_terminal_prompt_with_position`]: the frozen expectation of `311` for
+/// the `codex-session.jsonl` case encoded the same checkpoint-at-last-prompt defect round-1 finding
+/// 6 fixed, and the orchestrator authorized updating it to the scanned-through value alone.
+///
+/// The fixture's second case (`codex-session-response-item.jsonl`) is removed here, not just its
+/// checkpoint: round-1 finding 1 (closed) stopped reading `response_item` records at all, and that
+/// fixture's "current" prompt exists only as a `response_item`, so it no longer returns any prompt
+/// -- a different defect than the checkpoint one, not covered by the orchestrator's ruling. The
+/// fixture stays byte-identical; the real twin-record shape it used to stand in for is covered by
+/// `read_codex_prompts_incremental_reads_the_real_twin_record_shape_once` instead.
 #[test]
 fn read_captured_codex_terminal_prompts_once_with_position() {
-    let cases = [
-        (
-            "tests/fixtures/codex-session.jsonl",
-            236_u64,
-            "current",
-            311_u64,
-        ),
-        (
-            "tests/fixtures/codex-session-response-item.jsonl",
-            695_u64,
-            "current",
-            814_u64,
-        ),
-    ];
-    for (path, start_offset, expected_prompt, expected_position) in cases {
+    let cases = [(
+        "tests/fixtures/codex-session.jsonl",
+        236_u64,
+        "current",
+        311_u64,
+        892_u64,
+    )];
+    for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
+        cases
+    {
         let (records, new_offset) =
             read_codex_prompts_incremental(Path::new(path), start_offset).unwrap();
         assert_eq!(
             records,
-            vec![(expected_prompt.to_owned(), expected_position)]
+            vec![(expected_prompt.to_owned(), expected_prompt_position)]
         );
-        assert_eq!(new_offset, expected_position);
+        assert_eq!(new_offset, expected_checkpoint);
 
         let (repeated_records, repeated_offset) =
             read_codex_prompts_incremental(Path::new(path), new_offset).unwrap();
