@@ -99,6 +99,169 @@ pub async fn deliver_live_message(
         .map_err(|error| error.to_string())
 }
 
+/// The owner's identity as it should appear on a mirrored terminal prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerIdentity {
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+}
+
+/// Fetches the owner's identity once from Discord (`GET /users/{owner_id}`), independent of any
+/// guild.
+///
+/// Display name falls back from `global_name` to the account username, and the avatar URL is the
+/// account's own CDN avatar, `None` when it has none.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn fetch_owner_identity(
+    client: &twilight_http::Client,
+    owner_id: twilight_model::id::Id<twilight_model::id::marker::UserMarker>,
+) -> Result<OwnerIdentity, String> {
+    let user = client
+        .user(owner_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(OwnerIdentity {
+        display_name: owner_display_name(user.global_name.as_deref(), &user.name),
+        avatar_url: owner_avatar_url(user.id, user.avatar),
+    })
+}
+
+fn owner_display_name(global_name: Option<&str>, username: &str) -> String {
+    global_name.unwrap_or(username).to_owned()
+}
+
+fn owner_avatar_url(
+    user_id: twilight_model::id::Id<twilight_model::id::marker::UserMarker>,
+    avatar: Option<twilight_model::util::ImageHash>,
+) -> Option<String> {
+    let avatar = avatar?;
+    let extension = if avatar.is_animated() { "gif" } else { "png" };
+    Some(format!(
+        "https://cdn.discordapp.com/avatars/{user_id}/{avatar}.{extension}"
+    ))
+}
+
+/// Resolves the bridge-owned webhook for one workspace channel: the webhook named `webhook_name`
+/// on that channel, creating it when none exists yet.
+///
+/// # Errors
+///
+/// Returns an error when the workspace channel has duplicate named webhooks, the resolved webhook
+/// has no token, or Discord rejects the request.
+pub async fn resolve_terminal_prompt_webhook(
+    client: &twilight_http::Client,
+    workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    webhook_name: &str,
+) -> Result<
+    (
+        twilight_model::id::Id<twilight_model::id::marker::WebhookMarker>,
+        String,
+    ),
+    String,
+> {
+    let webhooks = client
+        .channel_webhooks(workspace_channel)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map_err(|error| error.to_string())?;
+    let matching: Vec<_> = webhooks
+        .into_iter()
+        .filter(|webhook| webhook.name.as_deref() == Some(webhook_name))
+        .collect();
+    if matching.len() > 1 {
+        return Err(format!(
+            "Discord has multiple bridge-owned webhooks named {webhook_name}"
+        ));
+    }
+    let webhook = if let Some(webhook) = matching.into_iter().next() {
+        webhook
+    } else {
+        client
+            .create_webhook(workspace_channel, webhook_name)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+    };
+    let token = webhook
+        .token
+        .ok_or_else(|| "bridge-owned webhook has no token".to_owned())?;
+    Ok((webhook.id, token))
+}
+
+/// Executes one message through an already-resolved bridge-owned webhook, into a workspace
+/// channel's thread, under the owner's mirrored display name and avatar.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn execute_terminal_prompt_webhook(
+    client: &twilight_http::Client,
+    webhook_id: twilight_model::id::Id<twilight_model::id::marker::WebhookMarker>,
+    webhook_token: &str,
+    thread: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    username: &str,
+    avatar_url: Option<&str>,
+    content: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let request = client
+        .execute_webhook(webhook_id, webhook_token)
+        .thread_id(thread)
+        .username(username)
+        .content(content);
+    let request = if let Some(avatar_url) = avatar_url {
+        request.avatar_url(avatar_url)
+    } else {
+        request
+    };
+    request
+        .wait()
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+/// Delivers one terminal-origin prompt through the bridge-owned workspace webhook, resolving (or
+/// creating) it fresh on every call.
+///
+/// # Errors
+///
+/// Returns [`resolve_terminal_prompt_webhook`] or [`execute_terminal_prompt_webhook`] errors.
+pub async fn deliver_terminal_prompt(
+    client: &twilight_http::Client,
+    workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    thread: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    webhook_name: &str,
+    username: &str,
+    avatar_url: Option<&str>,
+    content: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let (webhook_id, webhook_token) =
+        resolve_terminal_prompt_webhook(client, workspace_channel, webhook_name).await?;
+    execute_terminal_prompt_webhook(
+        client,
+        webhook_id,
+        &webhook_token,
+        thread,
+        username,
+        avatar_url,
+        content,
+    )
+    .await
+}
+
 /// Delivers one plain, content-only activity message: no embed, no nonce -- a turn's activity
 /// message is edited in place rather than deduplicated by nonce.
 ///
@@ -430,11 +593,13 @@ mod tests {
 
     use super::{
         MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
-        live_message_nonce, permission_card_description, permission_card_title,
-        transition_card_nonce_for_start,
+        live_message_nonce, owner_avatar_url, owner_display_name, permission_card_description,
+        permission_card_title, transition_card_nonce_for_start,
     };
     use crate::cards::TransitionMessage;
     use crate::permission::PermissionVendor;
+    use twilight_model::id::Id;
+    use twilight_model::util::ImageHash;
 
     #[test]
     fn allowed_mentions_only_allows_the_blocked_card_owner() {
@@ -579,6 +744,45 @@ mod tests {
 
         assert!(description.contains("rm -rf /tmp/x"));
         assert!(description.chars().count() <= MAX_PERMISSION_DESCRIPTION_LENGTH);
+    }
+
+    #[test]
+    fn owner_display_name_prefers_global_name_over_username() {
+        let cases = [
+            (Some("Global Name"), "handle", "Global Name"),
+            (None, "handle", "handle"),
+        ];
+        for (global_name, username, expected) in cases {
+            assert_eq!(owner_display_name(global_name, username), expected);
+        }
+    }
+
+    #[test]
+    fn owner_avatar_url_is_none_without_an_avatar_hash() {
+        assert_eq!(owner_avatar_url(Id::new(1), None), None);
+    }
+
+    #[test]
+    fn owner_avatar_url_picks_extension_from_animation() {
+        let user_id = Id::new(42);
+        let static_hash = ImageHash::parse(b"06c16474723fe537c283b8efa61a30c8")
+            .expect("parse static image hash fixture");
+        let animated_hash = ImageHash::parse(b"a_06c16474723fe537c283b8efa61a30c8")
+            .expect("parse animated image hash fixture");
+        assert_eq!(
+            owner_avatar_url(user_id, Some(static_hash)),
+            Some(
+                "https://cdn.discordapp.com/avatars/42/06c16474723fe537c283b8efa61a30c8.png"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            owner_avatar_url(user_id, Some(animated_hash)),
+            Some(
+                "https://cdn.discordapp.com/avatars/42/a_06c16474723fe537c283b8efa61a30c8.gif"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
