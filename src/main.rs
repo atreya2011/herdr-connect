@@ -132,11 +132,16 @@ struct BridgeState {
     /// The owner's mirrored display name and avatar, fetched once at startup. `None` when Discord
     /// is not configured or the fetch failed; terminal-prompt mirroring drops silently without it.
     owner_identity: Option<OwnerIdentity>,
-    /// Per-terminal read position for terminal-prompt mirroring, established once the first time a
-    /// terminal is ever seen and never reset by a later turn's fresh [`LiveWatch`] (unlike that
-    /// watch's own turn-scoped `position`): existing prompts already in the log at that first sight
-    /// are never replayed, but every prompt recorded afterward, across every later turn, is.
-    terminal_prompt_positions: HashMap<String, LivePosition>,
+    /// Per-terminal read path and position for terminal-prompt mirroring, established the first
+    /// time [`process_snapshot`] sees a session-carrying pane in any status -- not only `working`,
+    /// and never reset by a later turn's fresh [`LiveWatch`] (unlike that watch's own turn-scoped
+    /// `position`): existing prompts already in the log at that first sight are never replayed, but
+    /// every prompt recorded afterward, across every later turn, is. Keyed by terminal id but
+    /// valued by the resolved log path alongside the position, because a later session on the same
+    /// terminal (`/clear`, resume, a relaunch, or a vendor starting a fresh file or store) resolves
+    /// a different path; [`process_snapshot`] re-baselines against it rather than reusing a stale
+    /// position from the old file.
+    terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition)>,
     /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
     /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
     /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
@@ -537,6 +542,34 @@ async fn maybe_sync_fresh_session_topology(
     }
 }
 
+/// Runs the terminal-prompt mirror for a turn the bridge never observed as `working` (either seq
+/// backstop branch of [`process_snapshot`]): no [`LiveWatch`] ever existed for it, so
+/// [`handle_live_event`] never ran, and its prompt would otherwise wait for the next turn's first
+/// tick and land after this turn's own reply card. Does nothing without a session or a resolvable
+/// route; the transition-card delivery that follows reports a route failure on its own.
+async fn mirror_missed_turn_prompt(
+    snapshot: &AgentSnapshot,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+    discord: Option<&DiscordConnection>,
+    state: &mut BridgeState,
+) {
+    let Some(session) = snapshot.session.as_ref() else {
+        return;
+    };
+    let Ok(route) = route_topology(agents, tabs, &snapshot.terminal_id) else {
+        return;
+    };
+    mirror_terminal_prompts(
+        discord,
+        &snapshot.terminal_id,
+        &session.agent,
+        &route,
+        state,
+    )
+    .await;
+}
+
 async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -550,6 +583,7 @@ async fn process_snapshot(
         snapshot.agent.as_deref().unwrap_or("none")
     );
     update_activity_eligibility(state, snapshot, &status);
+    maybe_establish_terminal_prompt_baseline(snapshot, state);
     maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
     maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
     let previous_herdr_seq = state
@@ -572,6 +606,7 @@ async fn process_snapshot(
                 snapshot.state_change_seq,
             ) {
                 STATUS_WORKING.clone_into(&mut transition.from);
+                mirror_missed_turn_prompt(snapshot, agents, tabs, discord, state).await;
             }
             if old_was_working {
                 settle_live_watch(discord, &terminal, state).await;
@@ -609,6 +644,7 @@ async fn process_snapshot(
             previous_herdr_seq,
             snapshot.state_change_seq,
         ) {
+            mirror_missed_turn_prompt(snapshot, agents, tabs, discord, state).await;
             let state_change_seq =
                 next_state_change_sequence(&mut state.state_change_sequences, &terminal);
             let transition = Transition {
@@ -1483,17 +1519,72 @@ async fn mirror_one_terminal_prompt(
     .map(|_| ())
 }
 
+/// Establishes (or re-establishes, on a session change) the terminal-prompt read baseline for
+/// `snapshot`'s pane, the first time the bridge ever sees it with a session, in any status -- not
+/// only `working`. A prompt typed while the pane is idle, before its turn even starts, is
+/// therefore captured here rather than excluded by a baseline set too late (once the pane finally
+/// reaches `working` and its own initiating prompt is already in the log).
+///
+/// Keyed by terminal id in [`BridgeState::terminal_prompt_positions`], but re-baselined whenever
+/// the freshly resolved log path differs from the one already stored there: a later session on the
+/// same terminal (`/clear`, resume, a relaunch, or a vendor starting a fresh file or store) must
+/// never have the old file's position applied to the new one. [`live_log_path`] returning `Ok(None)`
+/// (not created on disk yet) is retried on the next snapshot; a permanent resolution error is
+/// logged and retried too, since resolving it costs only a directory read.
+fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
+    let terminal = &snapshot.terminal_id;
+    let Some(session) = snapshot.session.as_ref() else {
+        return;
+    };
+    let vendor = session.agent.as_str();
+    if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR) {
+        return;
+    }
+    let path = match live_log_path(snapshot, session) {
+        Ok(Some(path)) => path,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("terminal prompt baseline error for {terminal}: {error}");
+            return;
+        }
+    };
+    if terminal_prompt_baseline_is_current(&state.terminal_prompt_positions, terminal, &path) {
+        return;
+    }
+    match initial_terminal_prompt_position(vendor, &path) {
+        Ok(position) => {
+            state
+                .terminal_prompt_positions
+                .insert(terminal.clone(), (path, position));
+        }
+        Err(error) => eprintln!("terminal prompt baseline error for {terminal}: {error}"),
+    }
+}
+
+/// Whether `terminal` already has a terminal-prompt baseline for exactly `path`: `false` both when
+/// there is no baseline yet and when there is one for a different path (a session change -- a
+/// `/clear`, resume, relaunch, or a vendor starting a fresh file or store -- must re-baseline
+/// against the new path rather than reuse the old file's position, which the new file may not even
+/// be as long as).
+fn terminal_prompt_baseline_is_current(
+    positions: &HashMap<String, (PathBuf, LivePosition)>,
+    terminal: &str,
+    path: &Path,
+) -> bool {
+    positions
+        .get(terminal)
+        .is_some_and(|(existing_path, _)| existing_path == path)
+}
+
 /// Mirrors newly recorded owner prompts from one terminal's vendor log into its tab thread through
 /// the bridge-owned webhook, in log order, ahead of any assistant text the same `notify` tick
 /// delivers -- the caller runs this before reading live text.
 ///
-/// The read baseline is established once per terminal, the first time this function ever runs for
-/// it (normally the immediate read [`ensure_live_watch_started`] performs right after creating a
-/// terminal's first-ever [`LiveWatch`]): whatever the log already holds at that instant is
-/// discarded, never mirrored. Every later tick reads forward from the position the previous tick
-/// left at, in [`BridgeState::terminal_prompt_positions`] -- independent of the live-text watch's
-/// own turn-scoped position, so a later turn's own initiating prompt is mirrored rather than
-/// treated as pre-existing.
+/// Reads forward from the path and position [`maybe_establish_terminal_prompt_baseline`] last left
+/// in [`BridgeState::terminal_prompt_positions`] -- independent of the live-text watch's own
+/// turn-scoped position, so a later turn's own initiating prompt is mirrored rather than treated as
+/// pre-existing. Does nothing if that baseline is not established yet: `process_snapshot` always
+/// runs it first, for every status, before this function ever has a `LiveWatch` to be called from.
 ///
 /// A prompt equal to a pending [`take_owner_prompt_suppression`] marker is dropped once instead of
 /// mirrored: it is the bridge's own Discord-originated prompt, already posted by the owner in the
@@ -1504,25 +1595,16 @@ async fn mirror_terminal_prompts(
     discord: Option<&DiscordConnection>,
     terminal: &str,
     vendor: &str,
-    path: &Path,
     route: &TopologyRoute,
     state: &mut BridgeState,
 ) {
     if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR) {
         return;
     }
-    let Some(position) = state.terminal_prompt_positions.get(terminal).copied() else {
-        match initial_terminal_prompt_position(vendor, path) {
-            Ok(baseline) => {
-                state
-                    .terminal_prompt_positions
-                    .insert(terminal.to_owned(), baseline);
-            }
-            Err(error) => eprintln!("terminal prompt baseline error for {terminal}: {error}"),
-        }
+    let Some((path, position)) = state.terminal_prompt_positions.get(terminal).cloned() else {
         return;
     };
-    let (prompts, new_position) = match read_new_terminal_prompts(vendor, path, position) {
+    let (prompts, new_position) = match read_new_terminal_prompts(vendor, &path, position) {
         Ok(result) => result,
         Err(error) => {
             eprintln!("terminal prompt read error for {terminal}: {error}");
@@ -1531,7 +1613,7 @@ async fn mirror_terminal_prompts(
     };
     state
         .terminal_prompt_positions
-        .insert(terminal.to_owned(), new_position);
+        .insert(terminal.to_owned(), (path, new_position));
     if prompts.is_empty() {
         return;
     }
@@ -1606,10 +1688,9 @@ async fn handle_live_event(
     let mut channel = watch.channel;
     let route = watch.route.clone();
     let vendor = watch.vendor.clone();
-    let path = watch.path.clone();
     // `watch`'s borrow of `state.live_watches` ends here (its last use above); mirroring needs
     // `&mut state`, so it runs before `state.live_watches` is borrowed again below for live text.
-    mirror_terminal_prompts(discord, terminal, &vendor, &path, &route, state).await;
+    mirror_terminal_prompts(discord, terminal, &vendor, &route, state).await;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
@@ -3217,7 +3298,8 @@ mod tests {
         repeats_last_live_text, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
         start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
-        sync_route, sync_startup_topology, tab_list_result, unique_existing_path,
+        sync_route, sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
+        unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
@@ -3383,6 +3465,36 @@ mod tests {
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn terminal_prompt_baseline_is_current_only_for_the_exact_stored_path() {
+        let mut positions = HashMap::new();
+        let terminal = "terminal-1";
+        let first_path = PathBuf::from("/tmp/session-a.jsonl");
+        let second_path = PathBuf::from("/tmp/session-b.jsonl");
+
+        assert!(
+            !terminal_prompt_baseline_is_current(&positions, terminal, &first_path),
+            "no baseline yet must never read as current"
+        );
+
+        positions.insert(
+            terminal.to_owned(),
+            (first_path.clone(), LivePosition::Bytes(42)),
+        );
+        assert!(
+            terminal_prompt_baseline_is_current(&positions, terminal, &first_path),
+            "the exact path a baseline was stored for must read as current"
+        );
+        assert!(
+            !terminal_prompt_baseline_is_current(&positions, terminal, &second_path),
+            "a session change (a different resolved path) must not reuse the old baseline"
+        );
+        assert!(
+            !terminal_prompt_baseline_is_current(&positions, "terminal-2", &first_path),
+            "a different terminal's baseline must not be reused either"
+        );
     }
 
     #[test]
@@ -5988,12 +6100,13 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real pane through three turns for `vendor`: a first turn whose own initiating
-    /// prompt predates the bridge's terminal-prompt watch (never mirrored, by design -- the
-    /// baseline is established the moment the watch first attaches), a second terminal-origin turn
-    /// whose prompt is mirrored ahead of its assistant reply, and a third turn submitted through
-    /// the bridge's own Discord path (`submit_owner_prompt`) whose prompt must not be mirrored
-    /// back.
+    /// Drives one real pane through three turns for `vendor`: a first turn that establishes the
+    /// pane's terminal-prompt baseline (`process_snapshot` sets it the moment it first sees the
+    /// pane's session, in any status, so this turn's own prompt may or may not already be mirrored
+    /// depending on exactly when that first sight lands relative to the prompt landing in the log --
+    /// its mirror status is deliberately not asserted here), a second terminal-origin turn whose
+    /// prompt is mirrored ahead of its assistant reply, and a third turn submitted through the
+    /// bridge's own Discord path (`submit_owner_prompt`) whose prompt must not be mirrored back.
     #[cfg(unix)]
     async fn terminal_origin_prompt_exercise(
         guild: &BlockedCaptureGuild,
