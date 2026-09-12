@@ -5,4 +5,6 @@
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<bash-stdout>ok</bash-stdout>"}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/compact</command-name>"}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<bash-input>ls -la</bash-input>"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-message>compact</command-message>\n<command-name>/compact</command-name>"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<bash-stderr>cargo: command not found</bash-stderr>"}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the build"}]}}

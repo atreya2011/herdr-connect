@@ -233,9 +233,11 @@ const COMPACT_SUMMARY_KEY: &str = "isCompactSummary";
 /// task-notification wrappers. None of these are text the owner typed to the assistant.
 const INJECTED_CLAUDE_TEXT_PREFIXES: &[&str] = &[
     "<command-name>",
+    "<command-message>",
     "<bash-input>",
     "<local-command-stdout>",
     "<bash-stdout>",
+    "<bash-stderr>",
     "<task-notification>",
     "[Request interrupted",
 ];
