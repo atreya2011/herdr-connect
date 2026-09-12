@@ -3458,16 +3458,17 @@ mod tests {
                 .expect("initial Codex terminal prompt position resolves");
             assert!(matches!(initial_position, LivePosition::Bytes(1_215)));
 
-            // Codex writes every typed prompt twice: an `event_msg`/`user_message` record and a
-            // `response_item` user-message twin. Appending both and finding exactly one prompt
-            // proves the reader counts the twin once, sourced from the `event_msg` copy alone.
+            // Codex writes every typed prompt twice: a `response_item` user-message record and an
+            // `event_msg`/`user_message` twin that follows it. Appending both and finding exactly
+            // one prompt proves the reader counts it once, sourced from the `response_item` copy
+            // alone, and ignores its later `event_msg` twin entirely.
             fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .and_then(|mut file| {
                     file.write_all(
-                        b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"terminal-direct\"}}\n\
-                          {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"terminal-direct\"}]}}\n",
+                        b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"terminal-direct\"}]}}\n\
+                          {\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"terminal-direct\"}}\n",
                     )
                 })
                 .expect("append real-schema Codex twin user record");
@@ -3475,7 +3476,7 @@ mod tests {
             let (prompts, checkpoint) =
                 read_new_terminal_prompts(VENDOR_CODEX, &path, initial_position)
                     .expect("read appended Codex terminal prompt");
-            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_298_i64)]);
+            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_342_i64)]);
             assert!(matches!(checkpoint, LivePosition::Bytes(1_425)));
 
             let (repeated_prompts, repeated_checkpoint) =

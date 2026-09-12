@@ -301,13 +301,35 @@ pub fn read_claude_prompts_incremental(
     })
 }
 
+/// Leading markers of Codex harness-injected text that share a real prompt's `response_item` user
+/// record shape: environment/context injections, the repository's agent instructions, resumed-run
+/// user instructions, subagent notifications, and aborted-turn notices. None of these are text the
+/// owner typed to the assistant.
+const INJECTED_CODEX_TEXT_PREFIXES: &[&str] = &[
+    "<environment_context>",
+    "# AGENTS.md",
+    "<user_instructions>",
+    "<subagent_notification>",
+    "<turn_aborted>",
+];
+
+/// Whether a Codex `response_item` user record's text is one the owner actually typed to the
+/// assistant, as opposed to harness-injected content that happens to share a real prompt's record
+/// shape.
+fn is_owner_typed_codex_text(text: &str) -> bool {
+    !INJECTED_CODEX_TEXT_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
 /// Reads new complete Codex user text records appended to a session JSONL log since `offset`,
 /// each paired with the byte offset immediately after its record.
 ///
-/// Reads only `event_msg`/`user_message` records: Codex also writes every typed prompt a second
-/// time as a `response_item` user message (and writes injected records, such as
-/// `<environment_context>`, in that same `response_item` shape), so counting both would post each
-/// real prompt twice and mirror injected content under the owner's name.
+/// Reads `response_item` user `input_text` records: interactive Codex (`session_meta.source`
+/// `cli`, the TUI Herdr panes run) writes every typed prompt only in that shape and never as an
+/// `event_msg`/`user_message` record, so this is the sole prompt source. Excludes harness-injected
+/// text (environment/context injections, `AGENTS.md`, resumed-run user instructions, subagent
+/// notifications, aborted-turn notices) that shares the same record shape.
 ///
 /// # Errors
 ///
@@ -324,18 +346,29 @@ pub fn read_codex_prompts_incremental(
         let Some(payload) = record.get(PAYLOAD_KEY) else {
             return Vec::new();
         };
-        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(EVENT_MSG_RECORD_TYPE_VALUE)
-            || payload.get(PAYLOAD_TYPE_KEY).and_then(Value::as_str) != Some("user_message")
+        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some("response_item")
+            || payload.get(PAYLOAD_TYPE_KEY).and_then(Value::as_str) != Some("message")
+            || payload.get(ROLE_KEY).and_then(Value::as_str) != Some(USER_ROLE_VALUE)
         {
             return Vec::new();
         }
         payload
-            .get(MESSAGE_KEY)
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned)
-            .into_iter()
-            .collect()
+            .get(CONTENT_KEY)
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| {
+                        part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
+                            == Some("input_text")
+                    })
+                    .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                    .filter(|text| is_owner_typed_codex_text(text))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
     })
 }
 

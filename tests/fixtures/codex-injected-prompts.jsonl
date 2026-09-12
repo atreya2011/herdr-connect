@@ -1,2 +1,3 @@
 {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\ncwd: /srv/bridge\n</environment_context>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the build"}]}}
 {"type":"event_msg","payload":{"type":"user_message","message":"fix the build"}}

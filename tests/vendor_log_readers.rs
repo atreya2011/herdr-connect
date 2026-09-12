@@ -78,24 +78,27 @@ fn read_captured_claude_terminal_prompt_with_position() {
     }
 }
 
-/// See [`read_captured_claude_terminal_prompt_with_position`]: the frozen expectation of `311` for
-/// the `codex-session.jsonl` case encoded the same checkpoint-at-last-prompt defect round-1 finding
-/// 6 fixed, and the orchestrator authorized updating it to the scanned-through value alone.
+/// `codex-session.jsonl`'s "current" prompt exists only as an `event_msg`/`user_message` record,
+/// with no `response_item` twin: the shape written by the 2 old (`cli` 0.144) and vscode sessions in
+/// the round-1-finding-1 scan, not by the interactive `cli` 0.147-0.154 sessions Herdr panes
+/// actually run. Now that the reader reads only `response_item` user `input_text` and ignores
+/// `event_msg`/`user_message` entirely, that case can never return a prompt from this fixture, so it
+/// is removed rather than pinned to an empty expectation; the fixture itself is untouched (still
+/// byte-identical to main).
 ///
-/// The fixture's second case (`codex-session-response-item.jsonl`) is removed here, not just its
-/// checkpoint: round-1 finding 1 (closed) stopped reading `response_item` records at all, and that
-/// fixture's "current" prompt exists only as a `response_item`, so it no longer returns any prompt
-/// -- a different defect than the checkpoint one, not covered by the orchestrator's ruling. The
-/// fixture stays byte-identical; the real twin-record shape it used to stand in for is covered by
-/// `read_codex_prompts_incremental_reads_the_real_twin_record_shape_once` instead.
+/// The restored case below (`codex-session-response-item.jsonl`, offset `695`) is the frozen
+/// sub-case round-1 finding 1 originally covered and f593132 deleted when the round-4 reader still
+/// ignored `response_item` records; its checkpoint is the scanned-through offset, not the position
+/// of the last prompt found in range, for the same reason given in
+/// [`read_captured_claude_terminal_prompt_with_position`].
 #[test]
 fn read_captured_codex_terminal_prompts_once_with_position() {
     let cases = [(
-        "tests/fixtures/codex-session.jsonl",
-        236_u64,
+        "tests/fixtures/codex-session-response-item.jsonl",
+        695_u64,
         "current",
-        311_u64,
-        892_u64,
+        814_u64,
+        1_697_u64,
     )];
     for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
         cases
@@ -134,7 +137,7 @@ fn read_claude_prompts_incremental_rejects_injected_and_compact_summary_records(
 }
 
 #[test]
-fn read_codex_prompts_incremental_ignores_the_response_item_twin_and_injected_content() {
+fn read_codex_prompts_incremental_ignores_the_event_msg_twin_and_injected_content() {
     let (prompts, _) =
         read_codex_prompts_incremental(Path::new("tests/fixtures/codex-injected-prompts.jsonl"), 0)
             .expect("read Codex injected-content fixture");
@@ -144,8 +147,9 @@ fn read_codex_prompts_incremental_ignores_the_response_item_twin_and_injected_co
             .map(|(text, _)| text)
             .collect::<Vec<_>>(),
         vec!["fix the build".to_owned()],
-        "an injected <environment_context> record written only as a response_item must be \
-         rejected; only the genuine event_msg/user_message prompt is returned"
+        "an injected <environment_context> response_item must be rejected, and the genuine \
+         response_item prompt must be counted once even though its event_msg/user_message twin \
+         repeats the same text"
     );
 }
 
