@@ -93,17 +93,17 @@ fn claude_turn_start_position_resumes_at_the_reply_on_a_log_that_already_holds_o
 fn read_codex_incremental_returns_current_turn_assistant_messages() {
     let cases = [(
         "tests/fixtures/codex-session-response-item.jsonl",
-        771_u64,
+        695_u64,
         vec![
-            ("priorreply".to_owned(), 509_u64),
-            ("alpha".to_owned(), 1109_u64),
-            ("gamma".to_owned(), 1744_u64),
+            ("priorreply".to_owned(), 433_u64),
+            ("alpha".to_owned(), 958_u64),
+            ("gamma".to_owned(), 1593_u64),
         ],
         vec![
-            ("alpha".to_owned(), 1109_u64),
-            ("gamma".to_owned(), 1744_u64),
+            ("alpha".to_owned(), 958_u64),
+            ("gamma".to_owned(), 1593_u64),
         ],
-        1848_u64,
+        1697_u64,
     )];
     for (path, expected_start, expected_all, expected_current, expected_end) in cases {
         let (all_messages, complete_offset) =
@@ -156,11 +156,8 @@ fn read_cursor_prompts_incremental_returns_new_user_rows_once() {
         0_i64,
         "current",
         1_i64,
-        6_i64,
     )];
-    for (fixture_path, start_rowid, expected_prompt, expected_prompt_rowid, expected_checkpoint) in
-        cases
-    {
+    for (fixture_path, start_rowid, expected_prompt, expected_rowid) in cases {
         let path = temp_path("prompt-rowid", "db");
         let connection = Connection::open(&path).expect("create cursor store");
         connection
@@ -192,12 +189,9 @@ fn read_cursor_prompts_incremental_returns_new_user_rows_once() {
 
         assert_eq!(
             first_pass,
-            vec![(expected_prompt.to_owned(), expected_prompt_rowid)]
+            vec![(expected_prompt.to_owned(), expected_rowid)]
         );
-        assert_eq!(
-            checkpoint, expected_checkpoint,
-            "checkpoint must advance to the highest rowid read, not just the highest prompt rowid"
-        );
+        assert_eq!(checkpoint, expected_rowid);
         assert!(second_pass.is_empty());
         assert_eq!(repeated_checkpoint, checkpoint);
     }

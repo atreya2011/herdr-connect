@@ -3437,12 +3437,12 @@ mod tests {
             std::process::id()
         ));
         let test_result = std::panic::catch_unwind(|| {
-            fs::copy("tests/fixtures/codex-session-response-item.jsonl", &path)
+            fs::copy("tests/fixtures/codex-session-prompt-twin.jsonl", &path)
                 .expect("copy committed Codex fixture");
 
             let initial_position = initial_terminal_prompt_position(VENDOR_CODEX, &path)
                 .expect("initial Codex terminal prompt position resolves");
-            assert!(matches!(initial_position, LivePosition::Bytes(1_848)));
+            assert!(matches!(initial_position, LivePosition::Bytes(1_215)));
 
             // Codex writes every typed prompt twice: an `event_msg`/`user_message` record and a
             // `response_item` user-message twin. Appending both and finding exactly one prompt
@@ -3461,14 +3461,14 @@ mod tests {
             let (prompts, checkpoint) =
                 read_new_terminal_prompts(VENDOR_CODEX, &path, initial_position)
                     .expect("read appended Codex terminal prompt");
-            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_931_i64)]);
-            assert!(matches!(checkpoint, LivePosition::Bytes(2_058)));
+            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_298_i64)]);
+            assert!(matches!(checkpoint, LivePosition::Bytes(1_425)));
 
             let (repeated_prompts, repeated_checkpoint) =
                 read_new_terminal_prompts(VENDOR_CODEX, &path, checkpoint)
                     .expect("repeat Codex terminal prompt read");
             assert!(repeated_prompts.is_empty());
-            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(2_058)));
+            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(1_425)));
         });
         let cleanup = fs::remove_file(&path);
         assert!(

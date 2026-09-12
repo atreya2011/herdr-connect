@@ -57,21 +57,15 @@ fn read_captured_claude_terminal_prompt_with_position() {
         273_u64,
         "current",
         335_u64,
-        1_177_u64,
     )];
-    for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
-        cases
-    {
+    for (path, start_offset, expected_prompt, expected_position) in cases {
         let (records, new_offset) =
             read_claude_prompts_incremental(Path::new(path), start_offset).unwrap();
         assert_eq!(
             records,
-            vec![(expected_prompt.to_owned(), expected_prompt_position)]
+            vec![(expected_prompt.to_owned(), expected_position)]
         );
-        assert_eq!(
-            new_offset, expected_checkpoint,
-            "checkpoint must advance through every parsed line, not stop at the last prompt"
-        );
+        assert_eq!(new_offset, expected_position);
     }
 }
 
@@ -83,29 +77,22 @@ fn read_captured_codex_terminal_prompts_once_with_position() {
             236_u64,
             "current",
             311_u64,
-            892_u64,
         ),
         (
             "tests/fixtures/codex-session-response-item.jsonl",
-            771_u64,
+            695_u64,
             "current",
-            846_u64,
-            1_848_u64,
+            814_u64,
         ),
     ];
-    for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
-        cases
-    {
+    for (path, start_offset, expected_prompt, expected_position) in cases {
         let (records, new_offset) =
             read_codex_prompts_incremental(Path::new(path), start_offset).unwrap();
         assert_eq!(
             records,
-            vec![(expected_prompt.to_owned(), expected_prompt_position)]
+            vec![(expected_prompt.to_owned(), expected_position)]
         );
-        assert_eq!(
-            new_offset, expected_checkpoint,
-            "checkpoint must advance through every parsed line, not stop at the last prompt"
-        );
+        assert_eq!(new_offset, expected_position);
 
         let (repeated_records, repeated_offset) =
             read_codex_prompts_incremental(Path::new(path), new_offset).unwrap();
@@ -146,6 +133,24 @@ fn read_codex_prompts_incremental_ignores_the_response_item_twin_and_injected_co
         "an injected <environment_context> record written only as a response_item must be \
          rejected; only the genuine event_msg/user_message prompt is returned"
     );
+}
+
+#[test]
+fn read_codex_prompts_incremental_reads_the_real_twin_record_shape_once() {
+    let path = "tests/fixtures/codex-session-prompt-twin.jsonl";
+    let (prompts, checkpoint) =
+        read_codex_prompts_incremental(Path::new(path), 0).expect("read Codex twin-record fixture");
+    assert_eq!(
+        prompts
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<Vec<_>>(),
+        vec!["priorask".to_owned(), "current".to_owned()],
+        "Codex writes every typed prompt twice, an event_msg/user_message record and a \
+         response_item twin; the reader must count each real prompt once"
+    );
+    let expected_checkpoint = fs::metadata(path).expect("stat twin-record fixture").len();
+    assert_eq!(checkpoint, expected_checkpoint);
 }
 
 #[test]

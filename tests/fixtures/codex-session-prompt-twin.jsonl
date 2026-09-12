@@ -1,15 +1,12 @@
 {"type":"session_meta","payload":{"session_id":"capture-session","cwd":"/srv/bridge","cli_version":"0.153.4"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-0"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"priorask"}}
 {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"priorask"}]}}
 {"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"priorreply"}]}}
 {"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-0","last_agent_message":"priorreply"}}
 {"type":"turn_context","payload":{"turn_id":"turn-1","model":"capture-model"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"current"}}
 {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current"}]}}
-{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"alpha"}],"phase":"commentary"}}
-{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call-1","input":"echo beta"}}
-{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["echo","beta"],"exit_code":0}}}
-{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"beta\n"}]}}
-{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":42}}}}
 {"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"gamma"}],"phase":"final_answer"}}
 {"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"gamma"}}
