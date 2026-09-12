@@ -31,10 +31,10 @@ use herdr_connect_rs::{
     fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
     lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
     read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_cursor_incremental, reconcile_topology_cache, resolve_terminal_prompt_webhook,
-    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
-    sync_topology, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
-    workspace_channel_id, workspace_list_result,
+    read_codex_prompts_incremental, read_cursor_incremental, reconcile_topology_cache,
+    resolve_terminal_prompt_webhook, route_topology, split_live_message, status_subscriptions,
+    subscribe_herdr_events, sync_topology, tab_list_result, take_owner_prompt_suppression,
+    transition_card_nonce, workspace_channel_id, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1185,6 +1185,8 @@ fn initial_terminal_prompt_position(vendor: &str, path: &Path) -> Result<LivePos
     match vendor {
         VENDOR_CLAUDE => read_claude_prompts_incremental(path, 0)
             .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
+        VENDOR_CODEX => read_codex_prompts_incremental(path, 0)
+            .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
         other => Err(format!(
             "terminal prompt mirroring: unsupported vendor {other}"
         )),
@@ -1207,6 +1209,14 @@ fn read_new_terminal_prompts(
     match (vendor, position) {
         (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
             let (prompts, checkpoint) = read_claude_prompts_incremental(path, offset)?;
+            let prompts = prompts
+                .into_iter()
+                .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
+                .collect();
+            Ok((prompts, LivePosition::Bytes(checkpoint)))
+        }
+        (VENDOR_CODEX, LivePosition::Bytes(offset)) => {
+            let (prompts, checkpoint) = read_codex_prompts_incremental(path, offset)?;
             let prompts = prompts
                 .into_iter()
                 .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
@@ -1491,7 +1501,7 @@ async fn mirror_terminal_prompts(
     route: &TopologyRoute,
     state: &mut BridgeState,
 ) {
-    if vendor != VENDOR_CLAUDE {
+    if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX) {
         return;
     }
     let Some(position) = state.terminal_prompt_positions.get(terminal).copied() else {
@@ -3248,6 +3258,52 @@ mod tests {
         assert!(
             cleanup.is_ok(),
             "remove temporary Claude fixture: {cleanup:?}"
+        );
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn codex_terminal_prompt_position_discards_existing_prompts_and_reads_one_append_once() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-codex-terminal-prompts-{}.jsonl",
+            std::process::id()
+        ));
+        let test_result = std::panic::catch_unwind(|| {
+            fs::copy("tests/fixtures/codex-session-response-item.jsonl", &path)
+                .expect("copy committed Codex fixture");
+
+            let initial_position = initial_terminal_prompt_position(VENDOR_CODEX, &path)
+                .expect("initial Codex terminal prompt position resolves");
+            assert!(matches!(initial_position, LivePosition::Bytes(814)));
+
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| {
+                    file.write_all(
+                        b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"terminal-direct\"}]}}\n",
+                    )
+                })
+                .expect("append real-schema Codex user record");
+
+            let (prompts, checkpoint) =
+                read_new_terminal_prompts(VENDOR_CODEX, &path, initial_position)
+                    .expect("read appended Codex terminal prompt");
+            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_824_i64)]);
+            assert!(matches!(checkpoint, LivePosition::Bytes(1_824)));
+
+            let (repeated_prompts, repeated_checkpoint) =
+                read_new_terminal_prompts(VENDOR_CODEX, &path, checkpoint)
+                    .expect("repeat Codex terminal prompt read");
+            assert!(repeated_prompts.is_empty());
+            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(1_824)));
+        });
+        let cleanup = fs::remove_file(&path);
+        assert!(
+            cleanup.is_ok(),
+            "remove temporary Codex fixture: {cleanup:?}"
         );
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
@@ -5668,34 +5724,36 @@ mod tests {
         Discord,
     }
 
-    /// Everything one [`run_claude_terminal_prompt_turn`] call needs about the fixed pane under
-    /// test, bundled to stay under the argument-count lint; only `submission` and `prompt` change
-    /// between the three turns [`terminal_origin_claude_prompt_exercise`] drives.
+    /// Everything one [`run_terminal_prompt_turn`] call needs about the fixed pane under test,
+    /// bundled to stay under the argument-count lint; only `submission` and `prompt` change between
+    /// the turns a single exercise drives.
     #[cfg(unix)]
     #[derive(Clone, Copy)]
-    struct ClaudeTerminalPromptFixture<'a> {
+    struct TerminalPromptFixture<'a> {
         tab: &'a Tab,
         agent_name: &'a str,
+        vendor: &'static str,
         connection: &'a super::DiscordConnection,
         tabs: &'a [herdr_connect_rs::HerdrTab],
         terminal: &'a str,
     }
 
-    /// Drives one real Claude turn to settle, submitting `prompt` through `submission`, then
-    /// leaves `state` ready for the caller to inspect: the turn's own live-capture watch has run at
-    /// least once more after settling, so any terminal prompt or assistant text it produced has
-    /// already been mirrored or delivered.
+    /// Drives one real turn to settle, submitting `prompt` through `submission`, then leaves
+    /// `state` ready for the caller to inspect: the turn's own live-capture watch has run at least
+    /// once more after settling, so any terminal prompt or assistant text it produced has already
+    /// been mirrored or delivered.
     #[cfg(unix)]
-    async fn run_claude_terminal_prompt_turn(
-        fixture: &ClaudeTerminalPromptFixture<'_>,
+    async fn run_terminal_prompt_turn(
+        fixture: &TerminalPromptFixture<'_>,
         state: &mut BridgeState,
         live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         submission: TerminalPromptSubmission,
         prompt: &str,
     ) -> Result<(), String> {
-        let ClaudeTerminalPromptFixture {
+        let TerminalPromptFixture {
             tab,
             agent_name,
+            vendor,
             connection,
             tabs,
             terminal,
@@ -5734,9 +5792,11 @@ mod tests {
             || working
                 .session
                 .as_ref()
-                .is_none_or(|session| session.agent != VENDOR_CLAUDE)
+                .is_none_or(|session| session.agent != vendor)
         {
-            return Err(format!("no confirmed Claude working session: {working:?}"));
+            return Err(format!(
+                "no confirmed {vendor} working session: {working:?}"
+            ));
         }
         own(&working, tabs, connection, state).await;
         let watch_deadline = Instant::now() + Duration::from_secs(5);
@@ -5853,18 +5913,20 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real Claude pane through three turns: a first turn whose own initiating prompt
-    /// predates the bridge's terminal-prompt watch (never mirrored, by design -- the baseline is
-    /// established the moment the watch first attaches), a second terminal-origin turn whose
-    /// prompt is mirrored ahead of its assistant reply, and a third turn submitted through the
-    /// bridge's own Discord path (`submit_owner_prompt`) whose prompt must not be mirrored back.
+    /// Drives one real pane through three turns for `vendor`: a first turn whose own initiating
+    /// prompt predates the bridge's terminal-prompt watch (never mirrored, by design -- the
+    /// baseline is established the moment the watch first attaches), a second terminal-origin turn
+    /// whose prompt is mirrored ahead of its assistant reply, and a third turn submitted through
+    /// the bridge's own Discord path (`submit_owner_prompt`) whose prompt must not be mirrored
+    /// back.
     #[cfg(unix)]
-    async fn terminal_origin_claude_prompt_exercise(
+    async fn terminal_origin_prompt_exercise(
         guild: &BlockedCaptureGuild,
         tab: &Tab,
         agent_name: &str,
+        vendor: &'static str,
     ) -> Result<(), String> {
-        start_claude_haiku_agent(agent_name, &tab.pane_id)?;
+        start_live_capture_agent(vendor, agent_name, &tab.pane_id)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
         let terminal = idle.terminal_id.clone();
         let matching = matching_tab(&tab.tab_id)?;
@@ -5890,16 +5952,17 @@ mod tests {
         let identity =
             herdr_connect_rs::fetch_owner_identity(guild.client.as_ref(), owner_id).await?;
         let nonce = agent_name_nonce()?;
-        let fixture = ClaudeTerminalPromptFixture {
+        let fixture = TerminalPromptFixture {
             tab,
             agent_name,
+            vendor,
             connection: &connection,
             tabs,
             terminal: &terminal,
         };
 
-        let baseline_reply = format!("terminal-origin-claude-baseline-{nonce}");
-        run_claude_terminal_prompt_turn(
+        let baseline_reply = format!("terminal-origin-{vendor}-baseline-{nonce}");
+        run_terminal_prompt_turn(
             &fixture,
             &mut state,
             &mut live_events,
@@ -5908,9 +5971,9 @@ mod tests {
         )
         .await?;
 
-        let mirrored_reply = format!("terminal-origin-claude-mirrored-{nonce}");
+        let mirrored_reply = format!("terminal-origin-{vendor}-mirrored-{nonce}");
         let mirrored_prompt = format!("Reply with exactly: {mirrored_reply}");
-        run_claude_terminal_prompt_turn(
+        run_terminal_prompt_turn(
             &fixture,
             &mut state,
             &mut live_events,
@@ -5926,9 +5989,9 @@ mod tests {
             &identity.display_name,
         )?;
 
-        let suppressed_reply = format!("terminal-origin-claude-suppressed-{nonce}");
+        let suppressed_reply = format!("terminal-origin-{vendor}-suppressed-{nonce}");
         let suppressed_prompt = format!("Reply with exactly: {suppressed_reply}");
-        run_claude_terminal_prompt_turn(
+        run_terminal_prompt_turn(
             &fixture,
             &mut state,
             &mut live_events,
@@ -5941,11 +6004,10 @@ mod tests {
         Ok(())
     }
 
+    /// Real-service coverage shared by every vendor's terminal-prompt exercise: fixture creation,
+    /// the exercise itself, and the same zero-leftover cleanup regardless of outcome.
     #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn terminal_origin_claude_prompt_mirrors_new_prompts_and_suppresses_bridge_submitted_ones()
-     {
+    async fn run_terminal_origin_prompt_test(vendor: &'static str) {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -5955,7 +6017,7 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
+        let label = format!("{LIVE_CAPTURE_LABEL}-{vendor}");
         assert_eq!(
             remaining_tabs(&label).expect("tab.list succeeds"),
             0,
@@ -5964,7 +6026,7 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let created = live_capture_tab_fixture("claude");
+        let created = live_capture_tab_fixture(vendor);
         let (tab_id, cwd_dir, result, session_cleanup) = match created {
             Ok((tab, cwd_dir)) => {
                 let agent_name = format!(
@@ -5972,7 +6034,7 @@ mod tests {
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
                 let outcome =
-                    terminal_origin_claude_prompt_exercise(&guild, &tab, &agent_name).await;
+                    terminal_origin_prompt_exercise(&guild, &tab, &agent_name, vendor).await;
                 let session_cleanup = match snapshot_for_pane(&tab.pane_id) {
                     Ok(snapshot) => snapshot.session.as_ref().map_or(Ok(()), |session| {
                         resolve_session_path(&home, &snapshot, session)
@@ -6000,6 +6062,22 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
         assert!(session_cleanup.is_ok(), "{session_cleanup:?}");
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn terminal_origin_claude_prompt_mirrors_new_prompts_and_suppresses_bridge_submitted_ones()
+     {
+        run_terminal_origin_prompt_test(VENDOR_CLAUDE).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn terminal_origin_codex_prompt_mirrors_new_prompts_and_suppresses_bridge_submitted_ones()
+    {
+        run_terminal_origin_prompt_test(VENDOR_CODEX).await;
     }
 
     #[cfg(unix)]
