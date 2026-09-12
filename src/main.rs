@@ -497,8 +497,10 @@ async fn maybe_sync_fresh_session_topology(
         .get(&snapshot.terminal_id)
         .map(|(previous, _)| previous.as_str());
     if snapshot.session.is_none()
-        || previous_status
-            .is_some_and(|previous| previous != "unknown" || snapshot.agent_status != STATUS_IDLE)
+        || previous_status.is_some_and(|previous| {
+            previous != "unknown"
+                || !matches!(snapshot.agent_status.as_str(), STATUS_IDLE | STATUS_DONE)
+        })
     {
         return;
     }
