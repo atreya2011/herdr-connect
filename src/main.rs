@@ -8911,9 +8911,6 @@ mod tests {
             "named zero-leftover check"
         );
 
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .expect("HOME is set by the real Herdr pane environment");
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after unix epoch")
@@ -8953,11 +8950,9 @@ mod tests {
                     )
                     .await;
 
-                    let agent_name = format!(
-                        "testrun-late-{}",
-                        agent_name_nonce().expect("system clock is after unix epoch")
-                    );
-                    start_claude_haiku_agent(&agent_name, &workspace.pane_id)?;
+                    report_agent_state(&workspace.pane_id, "idle")?;
+                    let session_id = generate_claude_session_id()?;
+                    report_agent_session(&workspace.pane_id, &session_id)?;
                     let idle = wait_for_status(
                         &workspace.pane_id,
                         &[STATUS_IDLE],
@@ -9048,7 +9043,6 @@ mod tests {
                     Ok::<(), String>(())
                 }
                 .await;
-                cleanup_real_claude_session_dir(&home, &workspace.pane_id);
                 (Some(workspace_id), outcome)
             }
             Err(error) => (None, Err(error)),
