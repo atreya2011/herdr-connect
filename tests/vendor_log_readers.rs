@@ -57,15 +57,21 @@ fn read_captured_claude_terminal_prompt_with_position() {
         273_u64,
         "current",
         335_u64,
+        1_177_u64,
     )];
-    for (path, start_offset, expected_prompt, expected_position) in cases {
+    for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
+        cases
+    {
         let (records, new_offset) =
             read_claude_prompts_incremental(Path::new(path), start_offset).unwrap();
         assert_eq!(
             records,
-            vec![(expected_prompt.to_owned(), expected_position)]
+            vec![(expected_prompt.to_owned(), expected_prompt_position)]
         );
-        assert_eq!(new_offset, expected_position);
+        assert_eq!(
+            new_offset, expected_checkpoint,
+            "checkpoint must advance through every parsed line, not stop at the last prompt"
+        );
     }
 }
 
@@ -77,28 +83,69 @@ fn read_captured_codex_terminal_prompts_once_with_position() {
             236_u64,
             "current",
             311_u64,
+            892_u64,
         ),
         (
             "tests/fixtures/codex-session-response-item.jsonl",
-            695_u64,
+            771_u64,
             "current",
-            814_u64,
+            846_u64,
+            1_848_u64,
         ),
     ];
-    for (path, start_offset, expected_prompt, expected_position) in cases {
+    for (path, start_offset, expected_prompt, expected_prompt_position, expected_checkpoint) in
+        cases
+    {
         let (records, new_offset) =
             read_codex_prompts_incremental(Path::new(path), start_offset).unwrap();
         assert_eq!(
             records,
-            vec![(expected_prompt.to_owned(), expected_position)]
+            vec![(expected_prompt.to_owned(), expected_prompt_position)]
         );
-        assert_eq!(new_offset, expected_position);
+        assert_eq!(
+            new_offset, expected_checkpoint,
+            "checkpoint must advance through every parsed line, not stop at the last prompt"
+        );
 
         let (repeated_records, repeated_offset) =
             read_codex_prompts_incremental(Path::new(path), new_offset).unwrap();
         assert!(repeated_records.is_empty());
         assert_eq!(repeated_offset, new_offset);
     }
+}
+
+#[test]
+fn read_claude_prompts_incremental_rejects_injected_and_compact_summary_records() {
+    let (prompts, _) = read_claude_prompts_incremental(
+        Path::new("tests/fixtures/claude-injected-prompts.jsonl"),
+        0,
+    )
+    .expect("read Claude injected-content fixture");
+    assert_eq!(
+        prompts
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<Vec<_>>(),
+        vec!["fix the build".to_owned()],
+        "a compaction summary, an interruption notice, and every wrapped or echoed harness form \
+         must be rejected; only the genuine typed prompt is returned"
+    );
+}
+
+#[test]
+fn read_codex_prompts_incremental_ignores_the_response_item_twin_and_injected_content() {
+    let (prompts, _) =
+        read_codex_prompts_incremental(Path::new("tests/fixtures/codex-injected-prompts.jsonl"), 0)
+            .expect("read Codex injected-content fixture");
+    assert_eq!(
+        prompts
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<Vec<_>>(),
+        vec!["fix the build".to_owned()],
+        "an injected <environment_context> record written only as a response_item must be \
+         rejected; only the genuine event_msg/user_message prompt is returned"
+    );
 }
 
 #[test]

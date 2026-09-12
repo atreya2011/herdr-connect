@@ -224,8 +224,36 @@ pub fn read_codex_incremental(
     })
 }
 
+/// Marks a Claude user record as a harness-generated compaction continuation summary rather than
+/// owner-typed text, even though it otherwise has the same shape as a real prompt.
+const COMPACT_SUMMARY_KEY: &str = "isCompactSummary";
+
+/// Leading markers of Claude harness-injected text that share a real prompt's record shape:
+/// slash-command and bash-input echoes, tool-output wrappers, interruption notices, and
+/// task-notification wrappers. None of these are text the owner typed to the assistant.
+const INJECTED_CLAUDE_TEXT_PREFIXES: &[&str] = &[
+    "<command-name>",
+    "<bash-input>",
+    "<local-command-stdout>",
+    "<bash-stdout>",
+    "<task-notification>",
+    "[Request interrupted",
+];
+
+/// Whether a Claude user record's text is one the owner actually typed to the assistant, as
+/// opposed to harness-injected content that happens to share a real prompt's record shape.
+fn is_owner_typed_claude_text(text: &str) -> bool {
+    !INJECTED_CLAUDE_TEXT_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
 /// Reads new complete Claude user text records appended to a session JSONL log since `offset`,
 /// each paired with the byte offset immediately after its record.
+///
+/// Excludes compaction continuation summaries and harness-injected text (slash-command and
+/// bash-input echoes, tool-output wrappers, interruption notices, task notifications): text the
+/// owner never typed to the assistant, even though the record has the same shape as a real prompt.
 ///
 /// # Errors
 ///
@@ -238,17 +266,19 @@ pub fn read_claude_prompts_incremental(
     let (bytes, complete_len) = read_new_bytes(path, offset)?;
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
-    let (prompts, _) = extract_tolerant(&lines, offset, |record| {
+    extract_tolerant(&lines, offset, |record| {
         let Some(content) = record
             .get(MESSAGE_KEY)
             .and_then(|message| message.get(CONTENT_KEY))
         else {
             return Vec::new();
         };
-        if !is_qualifying_claude_user_record(record) {
+        if !is_qualifying_claude_user_record(record)
+            || record.get(COMPACT_SUMMARY_KEY) == Some(&Value::Bool(true))
+        {
             return Vec::new();
         }
-        match content {
+        let texts: Vec<String> = match content {
             Value::String(text) if !text.is_empty() => vec![text.clone()],
             Value::Array(parts) => parts
                 .iter()
@@ -261,14 +291,21 @@ pub fn read_claude_prompts_incremental(
                 .map(str::to_owned)
                 .collect(),
             _ => Vec::new(),
-        }
-    })?;
-    let new_offset = prompts.last().map_or(offset, |(_, end_offset)| *end_offset);
-    Ok((prompts, new_offset))
+        };
+        texts
+            .into_iter()
+            .filter(|text| is_owner_typed_claude_text(text))
+            .collect()
+    })
 }
 
 /// Reads new complete Codex user text records appended to a session JSONL log since `offset`,
 /// each paired with the byte offset immediately after its record.
+///
+/// Reads only `event_msg`/`user_message` records: Codex also writes every typed prompt a second
+/// time as a `response_item` user message (and writes injected records, such as
+/// `<environment_context>`, in that same `response_item` shape), so counting both would post each
+/// real prompt twice and mirror injected content under the owner's name.
 ///
 /// # Errors
 ///
@@ -281,46 +318,23 @@ pub fn read_codex_prompts_incremental(
     let (bytes, complete_len) = read_new_bytes(path, offset)?;
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
-    let (prompts, _) = extract_tolerant(&lines, offset, |record| {
+    extract_tolerant(&lines, offset, |record| {
         let Some(payload) = record.get(PAYLOAD_KEY) else {
             return Vec::new();
         };
-        match (
-            record.get(RECORD_TYPE_KEY).and_then(Value::as_str),
-            payload.get(PAYLOAD_TYPE_KEY).and_then(Value::as_str),
-        ) {
-            (Some(EVENT_MSG_RECORD_TYPE_VALUE), Some("user_message")) => payload
-                .get(MESSAGE_KEY)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-                .into_iter()
-                .collect(),
-            (Some("response_item"), Some("message"))
-                if payload.get(ROLE_KEY).and_then(Value::as_str) == Some(USER_ROLE_VALUE) =>
-            {
-                payload
-                    .get(CONTENT_KEY)
-                    .and_then(Value::as_array)
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter(|part| {
-                                part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
-                                    == Some("input_text")
-                            })
-                            .filter_map(|part| part.get(TEXT_KEY).and_then(Value::as_str))
-                            .filter(|text| !text.is_empty())
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-            _ => Vec::new(),
+        if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(EVENT_MSG_RECORD_TYPE_VALUE)
+            || payload.get(PAYLOAD_TYPE_KEY).and_then(Value::as_str) != Some("user_message")
+        {
+            return Vec::new();
         }
-    })?;
-    let new_offset = prompts.last().map_or(offset, |(_, end_offset)| *end_offset);
-    Ok((prompts, new_offset))
+        payload
+            .get(MESSAGE_KEY)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    })
 }
 
 /// Reads new complete Cursor assistant text parts from rows with `rowid` > `last_rowid`, paired
@@ -413,6 +427,7 @@ pub fn read_cursor_prompts_incremental(
     let mut new_last_rowid = last_rowid;
     let mut prompts = Vec::new();
     for (rowid, record) in rows {
+        new_last_rowid = new_last_rowid.max(rowid);
         let data = record
             .get(ROW_DATA_KEY)
             .cloned()
@@ -430,7 +445,6 @@ pub fn read_cursor_prompts_incremental(
                 && !part_text.is_empty()
             {
                 prompts.push((part_text.to_owned(), rowid));
-                new_last_rowid = rowid;
             }
         }
     }

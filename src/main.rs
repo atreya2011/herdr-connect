@@ -3239,7 +3239,7 @@ mod tests {
 
             let initial_position = initial_terminal_prompt_position(VENDOR_CLAUDE, &path)
                 .expect("initial Claude terminal prompt position resolves");
-            assert!(matches!(initial_position, LivePosition::Bytes(335)));
+            assert!(matches!(initial_position, LivePosition::Bytes(1_177)));
 
             fs::OpenOptions::new()
                 .append(true)
@@ -3285,29 +3285,33 @@ mod tests {
 
             let initial_position = initial_terminal_prompt_position(VENDOR_CODEX, &path)
                 .expect("initial Codex terminal prompt position resolves");
-            assert!(matches!(initial_position, LivePosition::Bytes(814)));
+            assert!(matches!(initial_position, LivePosition::Bytes(1_848)));
 
+            // Codex writes every typed prompt twice: an `event_msg`/`user_message` record and a
+            // `response_item` user-message twin. Appending both and finding exactly one prompt
+            // proves the reader counts the twin once, sourced from the `event_msg` copy alone.
             fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .and_then(|mut file| {
                     file.write_all(
-                        b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"terminal-direct\"}]}}\n",
+                        b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"terminal-direct\"}}\n\
+                          {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"terminal-direct\"}]}}\n",
                     )
                 })
-                .expect("append real-schema Codex user record");
+                .expect("append real-schema Codex twin user record");
 
             let (prompts, checkpoint) =
                 read_new_terminal_prompts(VENDOR_CODEX, &path, initial_position)
                     .expect("read appended Codex terminal prompt");
-            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_824_i64)]);
-            assert!(matches!(checkpoint, LivePosition::Bytes(1_824)));
+            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_931_i64)]);
+            assert!(matches!(checkpoint, LivePosition::Bytes(2_058)));
 
             let (repeated_prompts, repeated_checkpoint) =
                 read_new_terminal_prompts(VENDOR_CODEX, &path, checkpoint)
                     .expect("repeat Codex terminal prompt read");
             assert!(repeated_prompts.is_empty());
-            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(1_824)));
+            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(2_058)));
         });
         let cleanup = fs::remove_file(&path);
         assert!(
@@ -3347,7 +3351,7 @@ mod tests {
             std::panic::catch_unwind(|| {
                 let initial_position = initial_terminal_prompt_position(VENDOR_CURSOR, &path)
                     .expect("initial Cursor terminal prompt position resolves");
-                assert!(matches!(initial_position, LivePosition::RowId(1)));
+                assert!(matches!(initial_position, LivePosition::RowId(6)));
 
                 let connection = Connection::open(&path).expect("reopen cursor store");
                 connection
