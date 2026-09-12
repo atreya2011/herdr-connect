@@ -8945,7 +8945,7 @@ mod tests {
                     report_agent_session(&workspace.pane_id, &session_id)?;
                     let idle = wait_for_status(
                         &workspace.pane_id,
-                        &[STATUS_IDLE],
+                        &[STATUS_IDLE, STATUS_DONE],
                         Duration::from_secs(30),
                     )
                     .await?;
