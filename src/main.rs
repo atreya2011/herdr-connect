@@ -31,10 +31,11 @@ use herdr_connect_rs::{
     fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
     lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
     read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, reconcile_topology_cache,
-    resolve_terminal_prompt_webhook, route_topology, split_live_message, status_subscriptions,
-    subscribe_herdr_events, sync_topology, tab_list_result, take_owner_prompt_suppression,
-    transition_card_nonce, workspace_channel_id, workspace_list_result,
+    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
+    reconcile_topology_cache, resolve_terminal_prompt_webhook, route_topology, split_live_message,
+    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
+    take_owner_prompt_suppression, transition_card_nonce, workspace_channel_id,
+    workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1187,6 +1188,8 @@ fn initial_terminal_prompt_position(vendor: &str, path: &Path) -> Result<LivePos
             .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
         VENDOR_CODEX => read_codex_prompts_incremental(path, 0)
             .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
+        VENDOR_CURSOR => read_cursor_prompts_incremental(path, 0)
+            .map(|(_, checkpoint)| LivePosition::RowId(checkpoint)),
         other => Err(format!(
             "terminal prompt mirroring: unsupported vendor {other}"
         )),
@@ -1222,6 +1225,10 @@ fn read_new_terminal_prompts(
                 .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
                 .collect();
             Ok((prompts, LivePosition::Bytes(checkpoint)))
+        }
+        (VENDOR_CURSOR, LivePosition::RowId(last_rowid)) => {
+            let (prompts, new_rowid) = read_cursor_prompts_incremental(path, last_rowid)?;
+            Ok((prompts, LivePosition::RowId(new_rowid)))
         }
         (vendor, position) => Err(format!(
             "terminal prompt mirroring: unsupported vendor {vendor} with position {position:?}"
@@ -1501,7 +1508,7 @@ async fn mirror_terminal_prompts(
     route: &TopologyRoute,
     state: &mut BridgeState,
 ) {
-    if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX) {
+    if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR) {
         return;
     }
     let Some(position) = state.terminal_prompt_positions.get(terminal).copied() else {
@@ -3188,6 +3195,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use rusqlite::Connection;
     use serde_json::{Value, json};
     use serial_test::serial;
     use twilight_model::id::{
@@ -3213,9 +3221,10 @@ mod tests {
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-        Transition, VENDOR_CLAUDE, VENDOR_CODEX, lifecycle_subscriptions, read_claude_incremental,
-        read_codex_incremental, read_cursor_incremental, status_subscriptions, submit_owner_prompt,
-        subscribe_herdr_events, transition_card_nonce, workspace_list_result,
+        Transition, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions,
+        read_claude_incremental, read_codex_incremental, read_cursor_incremental,
+        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
+        workspace_list_result,
     };
 
     #[test]
@@ -3304,6 +3313,68 @@ mod tests {
         assert!(
             cleanup.is_ok(),
             "remove temporary Codex fixture: {cleanup:?}"
+        );
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn cursor_terminal_prompt_position_discards_existing_prompts_and_reads_one_append_once() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-cursor-terminal-prompts-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let connection = Connection::open(&path).expect("create cursor store");
+        connection
+            .execute("CREATE TABLE blobs (data BLOB)", [])
+            .expect("create blobs table");
+        let rows: Vec<Value> = serde_json::from_str(
+            &fs::read_to_string("tests/fixtures/cursor-session.json")
+                .expect("read committed Cursor fixture"),
+        )
+        .expect("parse committed Cursor fixture");
+        for row in rows {
+            let bytes = serde_json::to_vec(&row).expect("encode Cursor row");
+            connection
+                .execute("INSERT INTO blobs (data) VALUES (?1)", [bytes])
+                .expect("insert Cursor row");
+        }
+        drop(connection);
+
+        let test_result =
+            std::panic::catch_unwind(|| {
+                let initial_position = initial_terminal_prompt_position(VENDOR_CURSOR, &path)
+                    .expect("initial Cursor terminal prompt position resolves");
+                assert!(matches!(initial_position, LivePosition::RowId(1)));
+
+                let connection = Connection::open(&path).expect("reopen cursor store");
+                connection
+                .execute(
+                    "INSERT INTO blobs (data) VALUES (?1)",
+                    [br#"{"role":"user","content":[{"type":"text","text":"terminal-direct"}]}"#
+                        .as_slice()],
+                )
+                .expect("append real-schema Cursor user row");
+                drop(connection);
+
+                let (prompts, checkpoint) =
+                    read_new_terminal_prompts(VENDOR_CURSOR, &path, initial_position)
+                        .expect("read appended Cursor terminal prompt");
+                assert_eq!(prompts, vec![("terminal-direct".to_owned(), 7_i64)]);
+                assert!(matches!(checkpoint, LivePosition::RowId(7)));
+
+                let (repeated_prompts, repeated_checkpoint) =
+                    read_new_terminal_prompts(VENDOR_CURSOR, &path, checkpoint)
+                        .expect("repeat Cursor terminal prompt read");
+                assert!(repeated_prompts.is_empty());
+                assert!(matches!(repeated_checkpoint, LivePosition::RowId(7)));
+            });
+        let cleanup = fs::remove_file(&path);
+        assert!(
+            cleanup.is_ok(),
+            "remove temporary Cursor fixture: {cleanup:?}"
         );
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
@@ -6078,6 +6149,14 @@ mod tests {
     async fn terminal_origin_codex_prompt_mirrors_new_prompts_and_suppresses_bridge_submitted_ones()
     {
         run_terminal_origin_prompt_test(VENDOR_CODEX).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn terminal_origin_cursor_prompt_mirrors_new_prompts_and_suppresses_bridge_submitted_ones()
+     {
+        run_terminal_origin_prompt_test(VENDOR_CURSOR).await;
     }
 
     #[cfg(unix)]
