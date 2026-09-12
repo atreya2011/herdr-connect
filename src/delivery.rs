@@ -203,7 +203,8 @@ pub async fn resolve_terminal_prompt_webhook(
 ///
 /// # Errors
 ///
-/// Returns Discord request or response errors.
+/// Returns Discord request or response errors, [`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed when
+/// the target thread no longer exists.
 pub async fn execute_terminal_prompt_webhook(
     client: &twilight_http::Client,
     webhook_id: twilight_model::id::Id<twilight_model::id::marker::WebhookMarker>,
@@ -226,7 +227,7 @@ pub async fn execute_terminal_prompt_webhook(
     request
         .wait()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| map_send_error(&error))?
         .model()
         .await
         .map(|message| message.id)

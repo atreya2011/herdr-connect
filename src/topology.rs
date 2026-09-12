@@ -498,7 +498,8 @@ async fn delete_channel_if_present(
 }
 
 /// The id of the channel whose topic identifies `workspace_id`, if one is present.
-fn workspace_channel_id(channels: &[Channel], workspace_id: &str) -> Option<Id<ChannelMarker>> {
+#[must_use]
+pub fn workspace_channel_id(channels: &[Channel], workspace_id: &str) -> Option<Id<ChannelMarker>> {
     let topic = format!("herdr workspace [{workspace_id}]");
     channels
         .iter()

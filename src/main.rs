@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twilight_http::Client;
 use twilight_model::id::{
     Id,
-    marker::{ChannelMarker, GuildMarker, MessageMarker},
+    marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker, WebhookMarker},
 };
 
 use herdr_connect_rs::{
@@ -21,18 +21,20 @@ use herdr_connect_rs::{
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
-    RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache,
-    TopologyRoute, Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
+    OwnerIdentity, RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
+    TopologyCache, TopologyRoute, Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
     agent_read_detection, cached_route, claude_turn_start_position, codex_turn_start_position,
     create_transition_messages, create_unsupported_blocked_card, cursor_turn_start_rowid,
     delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
     deliver_live_message, deliver_transition_card, drive_gateway_with_components,
-    expire_informational_card, fetch_topology_lists, format_detection_question, hook_timeout,
-    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
-    load_discord_config, read_claude_incremental, read_codex_incremental, read_cursor_incremental,
-    reconcile_topology_cache, route_topology, split_live_message, status_subscriptions,
-    subscribe_herdr_events, sync_topology, tab_list_result, transition_card_nonce,
-    workspace_list_result,
+    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
+    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
+    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
+    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
+    read_cursor_incremental, reconcile_topology_cache, resolve_terminal_prompt_webhook,
+    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
+    sync_topology, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
+    workspace_channel_id, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -59,7 +61,7 @@ struct InformationalCard {
 
 /// Where an incremental vendor-log reader resumes from: a byte offset for the Claude JSONL log, a
 /// `rowid` for the Cursor sqlite store.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum LivePosition {
     Bytes(u64),
     RowId(i64),
@@ -126,6 +128,18 @@ struct BridgeState {
     /// activity frame that outlives its turn, or that names a pane with no reported session, has
     /// nothing to gate its creation without it.
     activity_eligible_panes: HashSet<String>,
+    /// The owner's mirrored display name and avatar, fetched once at startup. `None` when Discord
+    /// is not configured or the fetch failed; terminal-prompt mirroring drops silently without it.
+    owner_identity: Option<OwnerIdentity>,
+    /// Per-terminal read position for terminal-prompt mirroring, established once the first time a
+    /// terminal is ever seen and never reset by a later turn's fresh [`LiveWatch`] (unlike that
+    /// watch's own turn-scoped `position`): existing prompts already in the log at that first sight
+    /// are never replayed, but every prompt recorded afterward, across every later turn, is.
+    terminal_prompt_positions: HashMap<String, LivePosition>,
+    /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
+    /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
+    /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
+    terminal_prompt_webhooks: HashMap<Id<ChannelMarker>, (Id<WebhookMarker>, String)>,
 }
 
 /// The Discord message tracking one pane's current turn of tool activity: `count` tool calls
@@ -170,6 +184,10 @@ const BLOCKED_CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(1_500);
 
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// The bridge-owned webhook name every workspace channel's terminal-prompt webhook is looked up or
+/// created under.
+const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
 
 /// How long a lifecycle batch keeps draining after its most recent event before it is acted on. A
 /// resubscribe replay burst pushes events back-to-back well inside this window, so the whole
@@ -1160,6 +1178,47 @@ fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, Stri
     }
 }
 
+/// The position a terminal's terminal-prompt mirroring starts from the first time it is ever
+/// established for that terminal: past every prompt already in the vendor log, so a bridge that
+/// discovers a pane mid-conversation never replays its history.
+fn initial_terminal_prompt_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
+    match vendor {
+        VENDOR_CLAUDE => read_claude_prompts_incremental(path, 0)
+            .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
+        other => Err(format!(
+            "terminal prompt mirroring: unsupported vendor {other}"
+        )),
+    }
+}
+
+/// Reads new complete owner prompts appended to a terminal's vendor log since `position`, paired
+/// with the byte offset (Claude) or `rowid` (Cursor) immediately after each.
+///
+/// # Errors
+///
+/// Returns the incremental reader's error for the follower's vendor, or a mismatch error when
+/// `position`'s shape does not match the vendor's own (Claude/Codex track a byte offset, Cursor a
+/// `rowid`).
+fn read_new_terminal_prompts(
+    vendor: &str,
+    path: &Path,
+    position: LivePosition,
+) -> Result<(Vec<(String, i64)>, LivePosition), String> {
+    match (vendor, position) {
+        (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
+            let (prompts, checkpoint) = read_claude_prompts_incremental(path, offset)?;
+            let prompts = prompts
+                .into_iter()
+                .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
+                .collect();
+            Ok((prompts, LivePosition::Bytes(checkpoint)))
+        }
+        (vendor, position) => Err(format!(
+            "terminal prompt mirroring: unsupported vendor {vendor} with position {position:?}"
+        )),
+    }
+}
+
 /// Starts a live-capture follower for a terminal newly observed as `working`, unless one is
 /// already running or the terminal was already marked unfollowable. Retried on every later
 /// snapshot while the pane stays `working`, except that a non-transient `live_log_path` error, or
@@ -1280,6 +1339,219 @@ fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, i64)>, i64), S
     }
 }
 
+/// Resolves both a route's workspace channel and its tab thread, reusing [`sync_route`]'s
+/// cache-first synchronization and then reading the now-populated cache for the workspace channel
+/// alongside it.
+///
+/// # Errors
+///
+/// Returns [`sync_route`]'s error, or a topology error when the cache does not hold the workspace
+/// channel immediately after a successful sync (a topology invariant `sync_route` itself relies
+/// on).
+async fn sync_route_channels(
+    client: &Client,
+    guild: Id<GuildMarker>,
+    route: &TopologyRoute,
+    topology_cache: &TopologyCache,
+) -> Result<(Id<ChannelMarker>, Id<ChannelMarker>), String> {
+    let thread = sync_route(client, guild, route, topology_cache).await?;
+    let guard = topology_cache.lock().await;
+    let found = guard
+        .as_ref()
+        .and_then(|(channels, _)| workspace_channel_id(channels, &route.workspace_id));
+    drop(guard);
+    let workspace_channel = found.ok_or_else(|| {
+        "herdr topology error: workspace channel missing from cache after sync".to_owned()
+    })?;
+    Ok((workspace_channel, thread))
+}
+
+/// The bridge-owned terminal-prompt webhook for `workspace_channel`, from
+/// [`BridgeState::terminal_prompt_webhooks`] when already resolved, otherwise resolved fresh and
+/// cached.
+///
+/// # Errors
+///
+/// Returns [`resolve_terminal_prompt_webhook`]'s error.
+async fn cached_terminal_prompt_webhook(
+    client: &Client,
+    workspace_channel: Id<ChannelMarker>,
+    state: &mut BridgeState,
+) -> Result<(Id<WebhookMarker>, String), String> {
+    if let Some(webhook) = state.terminal_prompt_webhooks.get(&workspace_channel) {
+        return Ok(webhook.clone());
+    }
+    let webhook =
+        resolve_terminal_prompt_webhook(client, workspace_channel, TERMINAL_PROMPT_WEBHOOK_NAME)
+            .await?;
+    state
+        .terminal_prompt_webhooks
+        .insert(workspace_channel, webhook.clone());
+    Ok(webhook)
+}
+
+/// Everything [`mirror_one_terminal_prompt`] needs to deliver into one already-resolved route,
+/// bundled to stay under the argument-count lint; `workspace_channel`/`thread` are re-resolved and
+/// replaced on an unknown-channel retry, the rest stays fixed for the whole mirrored batch.
+#[derive(Clone, Copy)]
+struct TerminalPromptTarget<'a> {
+    client: &'a Client,
+    guild: Id<GuildMarker>,
+    route: &'a TopologyRoute,
+    topology_cache: &'a TopologyCache,
+    workspace_channel: Id<ChannelMarker>,
+    thread: Id<ChannelMarker>,
+}
+
+/// Delivers one mirrored terminal prompt through the bridge-owned webhook. An unknown-channel
+/// failure invalidates the shared topology cache and the cached webhook for the stale workspace
+/// channel, re-resolves both the route and the webhook, and retries the delivery once against the
+/// fresh pair; any other failure is returned as-is.
+///
+/// # Errors
+///
+/// Returns a Discord request or response error.
+async fn mirror_one_terminal_prompt(
+    target: TerminalPromptTarget<'_>,
+    identity: &OwnerIdentity,
+    content: &str,
+    state: &mut BridgeState,
+) -> Result<(), String> {
+    let (webhook_id, webhook_token) =
+        cached_terminal_prompt_webhook(target.client, target.workspace_channel, state).await?;
+    let sent = execute_terminal_prompt_webhook(
+        target.client,
+        webhook_id,
+        &webhook_token,
+        target.thread,
+        &identity.display_name,
+        identity.avatar_url.as_deref(),
+        content,
+    )
+    .await;
+    let Err(error) = &sent else {
+        return sent.map(|_| ());
+    };
+    if !error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
+        return sent.map(|_| ());
+    }
+    *target.topology_cache.lock().await = None;
+    state
+        .terminal_prompt_webhooks
+        .remove(&target.workspace_channel);
+    let (workspace_channel, thread) = sync_route_channels(
+        target.client,
+        target.guild,
+        target.route,
+        target.topology_cache,
+    )
+    .await?;
+    let retry = TerminalPromptTarget {
+        workspace_channel,
+        thread,
+        ..target
+    };
+    let (webhook_id, webhook_token) =
+        cached_terminal_prompt_webhook(retry.client, retry.workspace_channel, state).await?;
+    execute_terminal_prompt_webhook(
+        retry.client,
+        webhook_id,
+        &webhook_token,
+        retry.thread,
+        &identity.display_name,
+        identity.avatar_url.as_deref(),
+        content,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Mirrors newly recorded owner prompts from one terminal's vendor log into its tab thread through
+/// the bridge-owned webhook, in log order, ahead of any assistant text the same `notify` tick
+/// delivers -- the caller runs this before reading live text.
+///
+/// The read baseline is established once per terminal, the first time this function ever runs for
+/// it (normally the immediate read [`ensure_live_watch_started`] performs right after creating a
+/// terminal's first-ever [`LiveWatch`]): whatever the log already holds at that instant is
+/// discarded, never mirrored. Every later tick reads forward from the position the previous tick
+/// left at, in [`BridgeState::terminal_prompt_positions`] -- independent of the live-text watch's
+/// own turn-scoped position, so a later turn's own initiating prompt is mirrored rather than
+/// treated as pre-existing.
+///
+/// A prompt equal to a pending [`take_owner_prompt_suppression`] marker is dropped once instead of
+/// mirrored: it is the bridge's own Discord-originated prompt, already posted by the owner in the
+/// thread it came from. No session, no route, or no owner identity: dropped silently. A delivery
+/// failure is logged once and the position still advances past it -- a stuck prompt does not block
+/// mirroring later ones.
+async fn mirror_terminal_prompts(
+    discord: Option<&DiscordConnection>,
+    terminal: &str,
+    vendor: &str,
+    path: &Path,
+    route: &TopologyRoute,
+    state: &mut BridgeState,
+) {
+    if vendor != VENDOR_CLAUDE {
+        return;
+    }
+    let Some(position) = state.terminal_prompt_positions.get(terminal).copied() else {
+        match initial_terminal_prompt_position(vendor, path) {
+            Ok(baseline) => {
+                state
+                    .terminal_prompt_positions
+                    .insert(terminal.to_owned(), baseline);
+            }
+            Err(error) => eprintln!("terminal prompt baseline error for {terminal}: {error}"),
+        }
+        return;
+    };
+    let (prompts, new_position) = match read_new_terminal_prompts(vendor, path, position) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("terminal prompt read error for {terminal}: {error}");
+            return;
+        }
+    };
+    state
+        .terminal_prompt_positions
+        .insert(terminal.to_owned(), new_position);
+    if prompts.is_empty() {
+        return;
+    }
+    let Some((client, guild, _owner_id, responder)) = discord else {
+        return;
+    };
+    let Some(identity) = state.owner_identity.clone() else {
+        return;
+    };
+    let topology_cache = responder.topology_cache();
+    let Ok((workspace_channel, thread)) =
+        sync_route_channels(client.as_ref(), *guild, route, topology_cache).await
+    else {
+        return;
+    };
+    let target = TerminalPromptTarget {
+        client: client.as_ref(),
+        guild: *guild,
+        route,
+        topology_cache,
+        workspace_channel,
+        thread,
+    };
+    for (text, _position) in prompts {
+        if take_owner_prompt_suppression(&route.pane_id, &text) {
+            continue;
+        }
+        if let Err(error) = mirror_one_terminal_prompt(target, &identity, &text, state).await {
+            eprintln!("terminal prompt delivery error for {terminal}: {error}");
+        }
+    }
+}
+
+/// Mirrors any new owner terminal prompts via [`mirror_terminal_prompts`] before reading this
+/// tick's live text, so a prompt that started the current turn is posted to Discord ahead of the
+/// assistant text it produced.
+///
 /// Updates `state.last_posted` per fully delivered text so a turn-end card repeating it is
 /// skipped. The nonce is derived from the terminal id and log position, not a counter, so it
 /// survives a watch restart that resumes at the same position. A read failure logs once per
@@ -1316,6 +1588,14 @@ async fn handle_live_event(
     };
     let mut channel = watch.channel;
     let route = watch.route.clone();
+    let vendor = watch.vendor.clone();
+    let path = watch.path.clone();
+    // `watch`'s borrow of `state.live_watches` ends here (its last use above); mirroring needs
+    // `&mut state`, so it runs before `state.live_watches` is borrowed again below for live text.
+    mirror_terminal_prompts(discord, terminal, &vendor, &path, &route, state).await;
+    let Some(watch) = state.live_watches.get(terminal) else {
+        return;
+    };
     let (texts, read_position) = match read_new_live_texts(watch) {
         Ok(result) => {
             state.live_read_errors_reported.remove(terminal);
@@ -2798,6 +3078,29 @@ async fn next_status_event(
     }
 }
 
+/// Fetches the owner's mirrored identity once at startup, when Discord is configured. Terminal
+/// prompt mirroring drops silently for the rest of the process without it: `None` when Discord is
+/// not configured, or when the fetch itself fails (logged once here).
+async fn fetch_startup_owner_identity(
+    discord: Option<&DiscordConnection>,
+) -> Option<OwnerIdentity> {
+    let (client, _guild, owner_id, _responder) = discord?;
+    let owner_id = match owner_id.parse::<u64>() {
+        Ok(value) => Id::<UserMarker>::new(value),
+        Err(error) => {
+            eprintln!("owner identity fetch error: DISCORD_OWNER_ID is not numeric: {error}");
+            return None;
+        }
+    };
+    match fetch_owner_identity(client.as_ref(), owner_id).await {
+        Ok(identity) => Some(identity),
+        Err(error) => {
+            eprintln!("owner identity fetch error: {error}");
+            None
+        }
+    }
+}
+
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
@@ -2809,9 +3112,11 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => (None, None, None),
     };
+    let owner_identity = fetch_startup_owner_identity(discord.as_ref()).await;
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
         live_tx: Some(live_tx),
+        owner_identity,
         ..BridgeState::default()
     };
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -2877,7 +3182,7 @@ mod tests {
     use serial_test::serial;
     use twilight_model::id::{
         Id,
-        marker::{ChannelMarker, GuildMarker, MessageMarker},
+        marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker},
     };
 
     use super::{
@@ -2888,9 +3193,10 @@ mod tests {
         card_capture_for_delivery, create_transition_messages, decide_blocked_response,
         delete_closed_topology_batch, deliver_blocked_messages, deliver_to_route,
         discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_topology_lists,
-        handle_blocked_card, handle_lifecycle_select_result, handle_live_event, lifecycle_closure,
-        lifecycle_membership, list_agents, live_log_path, next_state_change_sequence,
-        process_snapshot, repeats_last_live_text, resolve_session_path, route_topology,
+        handle_blocked_card, handle_lifecycle_select_result, handle_live_event,
+        initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
+        live_log_path, next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
+        repeats_last_live_text, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
         start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
         sync_route, sync_startup_topology, tab_list_result, unique_existing_path,
@@ -2901,6 +3207,52 @@ mod tests {
         read_codex_incremental, read_cursor_incremental, status_subscriptions, submit_owner_prompt,
         subscribe_herdr_events, transition_card_nonce, workspace_list_result,
     };
+
+    #[test]
+    fn claude_terminal_prompt_position_discards_existing_prompts_and_reads_one_append_once() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-terminal-prompts-{}.jsonl",
+            std::process::id()
+        ));
+        let test_result = std::panic::catch_unwind(|| {
+            fs::copy("tests/fixtures/claude-session.jsonl", &path)
+                .expect("copy committed Claude fixture");
+
+            let initial_position = initial_terminal_prompt_position(VENDOR_CLAUDE, &path)
+                .expect("initial Claude terminal prompt position resolves");
+            assert!(matches!(initial_position, LivePosition::Bytes(335)));
+
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| {
+                    file.write_all(
+                        b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"terminal-direct\"}]}}\n",
+                    )
+                })
+                .expect("append real-schema Claude user record");
+
+            let (prompts, checkpoint) =
+                read_new_terminal_prompts(VENDOR_CLAUDE, &path, initial_position)
+                    .expect("read appended Claude terminal prompt");
+            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_272_i64)]);
+            assert!(matches!(checkpoint, LivePosition::Bytes(1_272)));
+
+            let (repeated_prompts, repeated_checkpoint) =
+                read_new_terminal_prompts(VENDOR_CLAUDE, &path, checkpoint)
+                    .expect("repeat Claude terminal prompt read");
+            assert!(repeated_prompts.is_empty());
+            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(1_272)));
+        });
+        let cleanup = fs::remove_file(&path);
+        assert!(
+            cleanup.is_ok(),
+            "remove temporary Claude fixture: {cleanup:?}"
+        );
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[test]
     fn cursor_broker_failures_emit_deny_objects() {
@@ -5301,6 +5653,353 @@ mod tests {
     #[serial]
     async fn live_capture_posts_first_live_text_before_settle_for_codex() {
         run_live_capture_test("codex").await;
+    }
+
+    /// Which path a terminal-prompt-turn helper submits its prompt through: [`Terminal`] mimics
+    /// the owner typing directly in the Herdr pane (via `herdr agent prompt`, terminal-origin from
+    /// the bridge's point of view); [`Discord`] mimics the bridge's own owner-message path
+    /// (`submit_owner_prompt`, exactly what the Discord gateway handler calls).
+    ///
+    /// [`Terminal`]: TerminalPromptSubmission::Terminal
+    /// [`Discord`]: TerminalPromptSubmission::Discord
+    #[cfg(unix)]
+    enum TerminalPromptSubmission {
+        Terminal,
+        Discord,
+    }
+
+    /// Everything one [`run_claude_terminal_prompt_turn`] call needs about the fixed pane under
+    /// test, bundled to stay under the argument-count lint; only `submission` and `prompt` change
+    /// between the three turns [`terminal_origin_claude_prompt_exercise`] drives.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct ClaudeTerminalPromptFixture<'a> {
+        tab: &'a Tab,
+        agent_name: &'a str,
+        connection: &'a super::DiscordConnection,
+        tabs: &'a [herdr_connect_rs::HerdrTab],
+        terminal: &'a str,
+    }
+
+    /// Drives one real Claude turn to settle, submitting `prompt` through `submission`, then
+    /// leaves `state` ready for the caller to inspect: the turn's own live-capture watch has run at
+    /// least once more after settling, so any terminal prompt or assistant text it produced has
+    /// already been mirrored or delivered.
+    #[cfg(unix)]
+    async fn run_claude_terminal_prompt_turn(
+        fixture: &ClaudeTerminalPromptFixture<'_>,
+        state: &mut BridgeState,
+        live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        submission: TerminalPromptSubmission,
+        prompt: &str,
+    ) -> Result<(), String> {
+        let ClaudeTerminalPromptFixture {
+            tab,
+            agent_name,
+            connection,
+            tabs,
+            terminal,
+        } = *fixture;
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+        let submit_task: tokio::task::JoinHandle<Result<(), String>> = match submission {
+            TerminalPromptSubmission::Terminal => {
+                let agent_name = agent_name.to_owned();
+                let prompt = prompt.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    prompt_claude_agent_and_wait(&agent_name, &prompt)
+                })
+            }
+            TerminalPromptSubmission::Discord => {
+                let pane_id = tab.pane_id.clone();
+                let prompt = prompt.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    submit_owner_prompt(&pane_id, &prompt).map(drop)
+                })
+            }
+        };
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some(STATUS_WORKING),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let working = poll_snapshot(&tab.pane_id, Duration::from_secs(10), |snapshot| {
+            snapshot.session.is_some()
+        })?;
+        if working.agent_status != STATUS_WORKING
+            || working
+                .session
+                .as_ref()
+                .is_none_or(|session| session.agent != VENDOR_CLAUDE)
+        {
+            return Err(format!("no confirmed Claude working session: {working:?}"));
+        }
+        own(&working, tabs, connection, state).await;
+        let watch_deadline = Instant::now() + Duration::from_secs(5);
+        while !state.live_watches.contains_key(terminal) && Instant::now() < watch_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            own(&working, tabs, connection, state).await;
+        }
+        loop {
+            tokio::select! {
+                Some(event_terminal) = live_events.recv() => {
+                    handle_live_event(Some(connection), &event_terminal, state).await;
+                }
+                event = wait_for_event(
+                    &mut sub,
+                    "pane.agent_status_changed",
+                    &tab.pane_id,
+                    "/data/pane_id",
+                    None,
+                    Duration::from_secs(30),
+                ) => {
+                    let event = event?;
+                    if matches!(
+                        event.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some(STATUS_DONE | STATUS_IDLE)
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
+        submit_task
+            .await
+            .map_err(|error| format!("prompt task failed: {error}"))??;
+        own(&settled, tabs, connection, state).await;
+        while let Ok(event_terminal) = live_events.try_recv() {
+            handle_live_event(Some(connection), &event_terminal, state).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn thread_full_messages(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+    ) -> Result<Vec<twilight_model::channel::Message>, String> {
+        guild
+            .client
+            .channel_messages(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Asserts the thread carries exactly one webhook-authored message with `prompt`'s content,
+    /// under `owner_display_name`, positioned before the plain (non-webhook) message carrying the
+    /// assistant's `reply`.
+    #[cfg(unix)]
+    fn assert_terminal_prompt_mirrored_before_reply(
+        messages: &[twilight_model::channel::Message],
+        prompt: &str,
+        reply: &str,
+        owner_display_name: &str,
+    ) -> Result<(), String> {
+        let mut sorted: Vec<_> = messages.iter().collect();
+        sorted.sort_by_key(|message| message.id);
+        let mirrored: Vec<_> = sorted
+            .iter()
+            .filter(|message| message.webhook_id.is_some() && message.content == prompt)
+            .collect();
+        let [mirrored] = mirrored.as_slice() else {
+            return Err(format!(
+                "expected exactly one mirrored prompt message, found {}",
+                mirrored.len()
+            ));
+        };
+        if mirrored.author.name != owner_display_name {
+            return Err(format!(
+                "mirrored prompt author was {:?}, expected {owner_display_name:?}",
+                mirrored.author.name
+            ));
+        }
+        let prompt_position = sorted
+            .iter()
+            .position(|message| message.id == mirrored.id)
+            .ok_or("mirrored prompt disappeared from the sorted thread")?;
+        let reply_position = sorted
+            .iter()
+            .position(|message| message.webhook_id.is_none() && message.content == reply)
+            .ok_or_else(|| format!("assistant reply {reply:?} did not appear in the thread"))?;
+        if prompt_position >= reply_position {
+            return Err("mirrored prompt did not precede the assistant's reply".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Asserts no webhook-authored message carries `prompt`'s content: a prompt submitted through
+    /// the bridge's own Discord path must not be mirrored back into the thread it came from.
+    #[cfg(unix)]
+    fn assert_prompt_was_not_mirrored(
+        messages: &[twilight_model::channel::Message],
+        prompt: &str,
+    ) -> Result<(), String> {
+        if messages
+            .iter()
+            .any(|message| message.webhook_id.is_some() && message.content == prompt)
+        {
+            return Err(format!(
+                "prompt {prompt:?} submitted through the bridge's own Discord path was mirrored"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drives one real Claude pane through three turns: a first turn whose own initiating prompt
+    /// predates the bridge's terminal-prompt watch (never mirrored, by design -- the baseline is
+    /// established the moment the watch first attaches), a second terminal-origin turn whose
+    /// prompt is mirrored ahead of its assistant reply, and a third turn submitted through the
+    /// bridge's own Discord path (`submit_owner_prompt`) whose prompt must not be mirrored back.
+    #[cfg(unix)]
+    async fn terminal_origin_claude_prompt_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+    ) -> Result<(), String> {
+        start_claude_haiku_agent(agent_name, &tab.pane_id)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = BridgeState {
+            live_tx: Some(live_tx),
+            ..BridgeState::default()
+        };
+        let connection = discord_tuple(guild);
+        own(&idle, tabs, &connection, &mut state).await;
+
+        let route = route_topology(std::slice::from_ref(&idle), tabs, &terminal)?;
+        let topology_cache = Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+
+        let owner_id = Id::<UserMarker>::new(
+            std::env::var("DISCORD_OWNER_ID")
+                .map_err(|error| error.to_string())?
+                .parse::<u64>()
+                .map_err(|error| error.to_string())?,
+        );
+        let identity =
+            herdr_connect_rs::fetch_owner_identity(guild.client.as_ref(), owner_id).await?;
+        let nonce = agent_name_nonce()?;
+        let fixture = ClaudeTerminalPromptFixture {
+            tab,
+            agent_name,
+            connection: &connection,
+            tabs,
+            terminal: &terminal,
+        };
+
+        let baseline_reply = format!("terminal-origin-claude-baseline-{nonce}");
+        run_claude_terminal_prompt_turn(
+            &fixture,
+            &mut state,
+            &mut live_events,
+            TerminalPromptSubmission::Terminal,
+            &format!("Reply with exactly: {baseline_reply}"),
+        )
+        .await?;
+
+        let mirrored_reply = format!("terminal-origin-claude-mirrored-{nonce}");
+        let mirrored_prompt = format!("Reply with exactly: {mirrored_reply}");
+        run_claude_terminal_prompt_turn(
+            &fixture,
+            &mut state,
+            &mut live_events,
+            TerminalPromptSubmission::Terminal,
+            &mirrored_prompt,
+        )
+        .await?;
+        let mirrored_messages = thread_full_messages(guild, thread).await?;
+        assert_terminal_prompt_mirrored_before_reply(
+            &mirrored_messages,
+            &mirrored_prompt,
+            &mirrored_reply,
+            &identity.display_name,
+        )?;
+
+        let suppressed_reply = format!("terminal-origin-claude-suppressed-{nonce}");
+        let suppressed_prompt = format!("Reply with exactly: {suppressed_reply}");
+        run_claude_terminal_prompt_turn(
+            &fixture,
+            &mut state,
+            &mut live_events,
+            TerminalPromptSubmission::Discord,
+            &suppressed_prompt,
+        )
+        .await?;
+        let after_suppressed = thread_full_messages(guild, thread).await?;
+        assert_prompt_was_not_mirrored(&after_suppressed, &suppressed_prompt)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn terminal_origin_claude_prompt_mirrors_new_prompts_and_suppresses_bridge_submitted_ones()
+     {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let created = live_capture_tab_fixture("claude");
+        let (tab_id, cwd_dir, result, session_cleanup) = match created {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "toc-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome =
+                    terminal_origin_claude_prompt_exercise(&guild, &tab, &agent_name).await;
+                let session_cleanup = match snapshot_for_pane(&tab.pane_id) {
+                    Ok(snapshot) => snapshot.session.as_ref().map_or(Ok(()), |session| {
+                        resolve_session_path(&home, &snapshot, session)
+                            .map_err(|error| error.to_string())
+                            .and_then(|path| {
+                                fs::remove_file(path).map_err(|error| error.to_string())
+                            })
+                    }),
+                    Err(error) if error.contains("agent.list has no entry") => Ok(()),
+                    Err(error) => Err(error),
+                };
+                (Some(tab.tab_id), Some(cwd_dir), outcome, session_cleanup)
+            }
+            Err(error) => (None, None, Err(error), Ok(())),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = clear_directory_contents(&cwd_dir);
+        }
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(&label).expect("tab.list succeeds");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert!(session_cleanup.is_ok(), "{session_cleanup:?}");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[cfg(unix)]

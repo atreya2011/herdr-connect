@@ -55,6 +55,7 @@ pub use permission::{
 };
 pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
+    take_owner_prompt_suppression,
 };
 pub use readers::{
     AgentLog, claude_turn_start_position, codex_turn_start_position, cursor_turn_start_rowid,
@@ -65,6 +66,7 @@ pub use readers::{
 pub use topology::{
     RouteError, TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
-    reconcile_topology_cache, route_topology, sync_topology, workspace_channel_name,
+    reconcile_topology_cache, route_topology, sync_topology, workspace_channel_id,
+    workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};
