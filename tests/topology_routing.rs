@@ -39,14 +39,14 @@ fn captured_agent_list_preserves_live_socket_shape_statistics() {
         .as_array()
         .expect("captured agents are an array");
     let cases = [
-        ("agent count", agents.len(), 43),
+        ("agent count", agents.len(), 44),
         (
             "foreground cwd count",
             agents
                 .iter()
                 .filter(|agent| agent.get("foreground_cwd").is_some())
                 .count(),
-            39,
+            40,
         ),
         (
             "agent session count",
@@ -56,9 +56,44 @@ fn captured_agent_list_preserves_live_socket_shape_statistics() {
                 .count(),
             30,
         ),
+        (
+            "no-agent count",
+            agents
+                .iter()
+                .filter(|agent| agent.get("agent").is_none())
+                .count(),
+            1,
+        ),
     ];
     for (description, actual, expected) in cases {
         assert_eq!(actual, expected, "{description}");
     }
     assert_eq!(value["result"]["type"], "agent_list");
+}
+
+/// Herdr 0.9.0 may omit `agent` entirely while a pane's agent is still being detected. That entry
+/// must still deserialize (not fail the whole `agent.list`) and must not be treated as a supported,
+/// mirrorable vendor.
+#[test]
+fn agent_list_entry_missing_agent_parses_as_unmirrored() {
+    let value: Value = serde_json::from_str(include_str!("fixtures/herdr-agent-list.json"))
+        .expect("captured snapshot is JSON");
+    let agents: Vec<AgentSnapshot> =
+        serde_json::from_value(value["result"]["agents"].clone()).expect("captured shape is valid");
+    let detecting = agents
+        .iter()
+        .find(|agent| agent.agent.is_none())
+        .expect("fixture contains an entry with no detected agent");
+    assert_eq!(detecting.agent_status, "unknown");
+    assert!(
+        detecting.session.is_none(),
+        "an undetected agent must not carry a session"
+    );
+    assert!(
+        !matches!(
+            detecting.agent.as_deref(),
+            Some(herdr_connect_rs::VENDOR_CLAUDE | herdr_connect_rs::VENDOR_CODEX)
+        ),
+        "an undetected agent must not be treated as a supported, mirrorable vendor"
+    );
 }

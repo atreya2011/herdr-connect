@@ -187,6 +187,11 @@ enum BlockedResponse {
     Unsupported,
 }
 
+#[must_use]
+fn vendor_is_supported(agent: Option<&str>) -> bool {
+    matches!(agent, Some(VENDOR_CLAUDE | VENDOR_CODEX))
+}
+
 const fn decide_blocked_response(
     vendor_supported: bool,
     question: Option<&str>,
@@ -247,7 +252,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
             return;
         }
     };
-    let vendor_supported = matches!(snapshot.agent.as_str(), VENDOR_CLAUDE | VENDOR_CODEX);
+    let vendor_supported = vendor_is_supported(snapshot.agent.as_deref());
     let supported_broker_pending = vendor_supported
         && snapshot
             .session
@@ -256,7 +261,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     if supported_broker_pending {
         return;
     }
-    let detection_question = (snapshot.agent == VENDOR_CLAUDE)
+    let detection_question = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
         .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten()
         .and_then(|text| format_detection_question(&text));
@@ -289,7 +294,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
                 from: from_status.to_owned(),
                 to: STATUS_BLOCKED.to_owned(),
                 terminal_id: terminal.to_owned(),
-                agent: snapshot.agent.clone(),
+                agent: snapshot.agent.clone().unwrap_or_default(),
             };
             create_transition_messages(&transition, &capture, owner_id)
         }
@@ -299,7 +304,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
                 Instant::now().saturating_duration_since(*started)
             });
             vec![create_unsupported_blocked_card(
-                &snapshot.agent,
+                snapshot.agent.as_deref().unwrap_or("none"),
                 &route.pane_id,
                 capture.question.as_deref().unwrap_or(&capture.message),
                 owner_id,
@@ -519,7 +524,10 @@ async fn process_snapshot(
     state: &mut BridgeState,
 ) {
     let (terminal, status) = (snapshot.terminal_id.clone(), snapshot.agent_status.clone());
-    println!("{} {terminal}: {status}", snapshot.agent);
+    println!(
+        "{} {terminal}: {status}",
+        snapshot.agent.as_deref().unwrap_or("none")
+    );
     update_activity_eligibility(state, snapshot, &status);
     maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
     maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
@@ -610,9 +618,20 @@ async fn process_snapshot(
     } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
         retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
     }
-    state
-        .previous
-        .insert(terminal.clone(), (status.clone(), snapshot.agent.clone()));
+    remember_previous_status(state, &terminal, &status, snapshot.agent.as_deref());
+}
+
+/// Split out of [`process_snapshot`] to keep it under the line-count lint.
+fn remember_previous_status(
+    state: &mut BridgeState,
+    terminal: &str,
+    status: &str,
+    agent: Option<&str>,
+) {
+    state.previous.insert(
+        terminal.to_owned(),
+        (status.to_owned(), agent.unwrap_or_default().to_owned()),
+    );
 }
 
 struct PostableTransitionContext<'a> {
@@ -3077,7 +3096,7 @@ mod tests {
             value: session_id.to_owned(),
         };
         let snapshot = AgentSnapshot {
-            agent: "claude".to_owned(),
+            agent: Some("claude".to_owned()),
             terminal_id: "claude-search-root-terminal".to_owned(),
             agent_status: "done".to_owned(),
             tab_id: None,
@@ -3249,7 +3268,7 @@ mod tests {
                 value: "capture-session".to_owned(),
             };
             let snapshot = AgentSnapshot {
-                agent: VENDOR_CODEX.to_owned(),
+                agent: Some(VENDOR_CODEX.to_owned()),
                 terminal_id: "codex-custom-home-terminal".to_owned(),
                 agent_status: STATUS_DONE.to_owned(),
                 tab_id: None,
@@ -3467,7 +3486,7 @@ mod tests {
     #[test]
     fn claude_pending_question_fixture_yields_question_capture_and_card() {
         let snapshot = AgentSnapshot {
-            agent: "claude".to_owned(),
+            agent: Some("claude".to_owned()),
             terminal_id: "question-terminal".to_owned(),
             agent_status: "blocked".to_owned(),
             tab_id: None,
@@ -3491,7 +3510,7 @@ mod tests {
             from: "working".to_owned(),
             to: "blocked".to_owned(),
             terminal_id: snapshot.terminal_id,
-            agent: snapshot.agent,
+            agent: snapshot.agent.unwrap_or_default(),
         };
         let card = create_transition_messages(&transition, &capture, "42")
             .into_iter()
@@ -3505,7 +3524,7 @@ mod tests {
     async fn leaving_blocked_clears_capture_retry_bookkeeping() {
         let terminal = "leaving-blocked-terminal".to_owned();
         let snapshot = AgentSnapshot {
-            agent: "claude".to_owned(),
+            agent: Some("claude".to_owned()),
             terminal_id: terminal.clone(),
             agent_status: "idle".to_owned(),
             tab_id: None,
@@ -3753,7 +3772,7 @@ mod tests {
     ) -> Result<(), String> {
         let terminal = "testrun-blocked-capture-terminal".to_owned();
         let no_question_snapshot = AgentSnapshot {
-            agent: "claude".to_owned(),
+            agent: Some("claude".to_owned()),
             terminal_id: terminal.clone(),
             agent_status: "blocked".to_owned(),
             tab_id: None,
@@ -3844,7 +3863,7 @@ mod tests {
     ) -> Result<(), String> {
         let question_terminal = "testrun-blocked-capture-terminal-question".to_owned();
         let question_snapshot = AgentSnapshot {
-            agent: "claude".to_owned(),
+            agent: Some("claude".to_owned()),
             terminal_id: question_terminal.clone(),
             agent_status: "blocked".to_owned(),
             tab_id: None,
@@ -6230,7 +6249,10 @@ mod tests {
         let mut state = BridgeState {
             previous: HashMap::from([(
                 terminal.clone(),
-                (confirmed.agent_status.clone(), confirmed.agent.clone()),
+                (
+                    confirmed.agent_status.clone(),
+                    confirmed.agent.clone().unwrap_or_default(),
+                ),
             )]),
             herdr_state_change_seq: HashMap::from([(terminal.clone(), base_seq.saturating_sub(1))]),
             ..Default::default()
@@ -6493,7 +6515,7 @@ mod tests {
                 let terminal_id = format!("{workspace_id}:terminal");
                 let pane_id = format!("{workspace_id}:pane");
                 let snapshot = AgentSnapshot {
-                    agent: agent.to_owned(),
+                    agent: Some(agent.to_owned()),
                     terminal_id: terminal_id.clone(),
                     agent_status: STATUS_IDLE.to_owned(),
                     tab_id: Some(tab_id.to_owned()),

@@ -228,7 +228,8 @@ pub fn tab_list_result() -> Result<Vec<HerdrTab>, String> {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct AgentSnapshot {
-    pub agent: String,
+    /// `None` while Herdr is still detecting the pane's agent (0.9.0 omits the key entirely).
+    pub agent: Option<String>,
     pub terminal_id: String,
     pub agent_status: String,
     pub tab_id: Option<String>,
