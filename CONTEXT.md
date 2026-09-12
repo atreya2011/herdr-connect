@@ -32,6 +32,10 @@ _Avoid_: Terminal session, inferred session
 Text authored by the owner in a tab thread for semantic submission to its mapped agent.
 _Avoid_: Key injection, terminal input
 
+**Terminal prompt**:
+Text the owner types directly into a Herdr pane, mirrored into its tab thread through the bridge-owned workspace webhook under the owner's identity, unless it is the pane's echo of an owner prompt the bridge itself just submitted.
+_Avoid_: Owner prompt, terminal input, key injection
+
 **Permission request**:
 A synchronous vendor request that requires an allow or deny decision before the vendor continues.
 _Avoid_: Blocked pane, menu prompt
