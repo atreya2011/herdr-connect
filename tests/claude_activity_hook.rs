@@ -178,6 +178,15 @@ fn cursor_hooks_register_activity_and_permission_commands() {
             "{event}: unexpected command"
         );
     }
+    let permission_hook = &config["hooks"]["beforeShellExecution"][0];
+    assert_eq!(
+        permission_hook["timeout"], 50000,
+        "beforeShellExecution: unexpected timeout"
+    );
+    assert_eq!(
+        permission_hook["failClosed"], true,
+        "beforeShellExecution: unexpected failClosed"
+    );
 }
 
 fn invoke_activity_with_args(args: &[&str]) -> std::process::Output {

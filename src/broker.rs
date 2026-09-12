@@ -31,7 +31,7 @@ use crate::{
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
-const CURSOR_PERMISSION_TIMEOUT: Duration = Duration::from_secs(25);
+const CURSOR_PERMISSION_TIMEOUT: Duration = PERMISSION_TIMEOUT;
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[must_use]
@@ -758,9 +758,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingKey, PendingRequests,
-        PermissionResponder, correlate_decision, read_json_line, return_decision_before_card_edit,
-        spawn_hook_monitor,
+        BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, PERMISSION_TIMEOUT, PendingKey,
+        PendingRequests, PermissionResponder, correlate_decision, hook_timeout, read_json_line,
+        return_decision_before_card_edit, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
 
@@ -775,6 +775,12 @@ mod tests {
             },
             vendor: PermissionVendor::Claude,
         }
+    }
+
+    #[test]
+    fn cursor_permission_window_matches_generic_hook_margin() {
+        assert_eq!(CURSOR_PERMISSION_TIMEOUT, PERMISSION_TIMEOUT);
+        assert_eq!(hook_timeout(), Duration::from_secs(50));
     }
 
     #[test]
