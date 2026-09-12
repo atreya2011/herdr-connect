@@ -8910,6 +8910,7 @@ mod tests {
                 let outcome = async {
                     let mut state = BridgeState::default();
                     let connection = discord_tuple(&guild);
+                    report_agent_state(&workspace.pane_id, "unknown")?;
                     let unknown = wait_for_status(
                         &workspace.pane_id,
                         &["unknown"],
