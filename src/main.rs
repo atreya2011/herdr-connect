@@ -23,19 +23,19 @@ use herdr_connect_rs::{
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
     OwnerIdentity, RouteError, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
     TopologyCache, TopologyRoute, Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
-    agent_read_detection, cached_route, claude_turn_start_position, codex_turn_start_position,
-    create_transition_messages, create_unsupported_blocked_card, cursor_turn_start_rowid,
-    delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
-    deliver_live_message, deliver_transition_card, drive_gateway_with_components,
-    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
-    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
-    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
-    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
-    reconcile_topology_cache, resolve_terminal_prompt_webhook, route_topology, split_live_message,
-    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
-    take_owner_prompt_suppression, transition_card_nonce, workspace_channel_id,
-    workspace_list_result,
+    UNKNOWN_WEBHOOK_DELIVERY_ERROR, agent_read_detection, cached_route, claude_turn_start_position,
+    codex_turn_start_position, create_transition_messages, create_unsupported_blocked_card,
+    cursor_turn_start_rowid, delete_tab_thread, delete_topology_absent_from_herdr,
+    delete_workspace_channel, deliver_live_message, deliver_transition_card,
+    drive_gateway_with_components, execute_terminal_prompt_webhook, expire_informational_card,
+    fetch_owner_identity, fetch_topology_lists, format_detection_question, hook_timeout,
+    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
+    load_discord_config, read_claude_incremental, read_claude_prompts_incremental,
+    read_codex_incremental, read_codex_prompts_incremental, read_cursor_incremental,
+    read_cursor_prompts_incremental, reconcile_topology_cache, resolve_terminal_prompt_webhook,
+    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
+    sync_topology, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
+    workspace_channel_id, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1456,10 +1456,24 @@ struct TerminalPromptTarget<'a> {
     thread: Id<ChannelMarker>,
 }
 
-/// Delivers one mirrored terminal prompt through the bridge-owned webhook. An unknown-channel
-/// failure invalidates the shared topology cache and the cached webhook for the stale workspace
-/// channel, re-resolves both the route and the webhook, and retries the delivery once against the
-/// fresh pair; any other failure is returned as-is.
+/// Whether a terminal-prompt delivery failure is worth one retry against a freshly resolved
+/// workspace channel, thread, and webhook: the cached thread or the cached webhook is stale
+/// (deleted outside the bridge's own tracking -- deleting a channel deletes its webhooks with it,
+/// so either can go stale independently of the other).
+fn is_retriable_terminal_prompt_error(error: &str) -> bool {
+    error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
+        || error.starts_with(UNKNOWN_WEBHOOK_DELIVERY_ERROR)
+}
+
+/// Delivers one mirrored terminal prompt through the bridge-owned webhook, split into parts the
+/// same way live text is so Discord's 2000-character message limit never silently drops it, one
+/// webhook message per part, in order.
+///
+/// A retriable failure ([`is_retriable_terminal_prompt_error`]) on any part invalidates the shared
+/// topology cache and the cached webhook for the stale pair, re-resolves both the route and the
+/// webhook, and retries that one part once against the fresh pair, which later parts then reuse
+/// too; any other failure, or a repeat failure after the retry, stops the batch there rather than
+/// sending later parts out of order.
 ///
 /// # Errors
 ///
@@ -1470,53 +1484,58 @@ async fn mirror_one_terminal_prompt(
     content: &str,
     state: &mut BridgeState,
 ) -> Result<(), String> {
-    let (webhook_id, webhook_token) =
-        cached_terminal_prompt_webhook(target.client, target.workspace_channel, state).await?;
-    let sent = execute_terminal_prompt_webhook(
-        target.client,
-        webhook_id,
-        &webhook_token,
-        target.thread,
-        &identity.display_name,
-        identity.avatar_url.as_deref(),
-        content,
-    )
-    .await;
-    let Err(error) = &sent else {
-        return sent.map(|_| ());
-    };
-    if !error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
-        return sent.map(|_| ());
+    let mut current = target;
+    for part in split_live_message(content) {
+        let (webhook_id, webhook_token) =
+            cached_terminal_prompt_webhook(current.client, current.workspace_channel, state)
+                .await?;
+        let sent = execute_terminal_prompt_webhook(
+            current.client,
+            webhook_id,
+            &webhook_token,
+            current.thread,
+            &identity.display_name,
+            identity.avatar_url.as_deref(),
+            &part,
+        )
+        .await;
+        let Err(error) = &sent else {
+            continue;
+        };
+        if !is_retriable_terminal_prompt_error(error) {
+            return sent.map(|_| ());
+        }
+        *current.topology_cache.lock().await = None;
+        state
+            .terminal_prompt_webhooks
+            .remove(&current.workspace_channel);
+        let (workspace_channel, thread) = sync_route_channels(
+            current.client,
+            current.guild,
+            current.route,
+            current.topology_cache,
+        )
+        .await?;
+        current = TerminalPromptTarget {
+            workspace_channel,
+            thread,
+            ..current
+        };
+        let (webhook_id, webhook_token) =
+            cached_terminal_prompt_webhook(current.client, current.workspace_channel, state)
+                .await?;
+        execute_terminal_prompt_webhook(
+            current.client,
+            webhook_id,
+            &webhook_token,
+            current.thread,
+            &identity.display_name,
+            identity.avatar_url.as_deref(),
+            &part,
+        )
+        .await?;
     }
-    *target.topology_cache.lock().await = None;
-    state
-        .terminal_prompt_webhooks
-        .remove(&target.workspace_channel);
-    let (workspace_channel, thread) = sync_route_channels(
-        target.client,
-        target.guild,
-        target.route,
-        target.topology_cache,
-    )
-    .await?;
-    let retry = TerminalPromptTarget {
-        workspace_channel,
-        thread,
-        ..target
-    };
-    let (webhook_id, webhook_token) =
-        cached_terminal_prompt_webhook(retry.client, retry.workspace_channel, state).await?;
-    execute_terminal_prompt_webhook(
-        retry.client,
-        webhook_id,
-        &webhook_token,
-        retry.thread,
-        &identity.display_name,
-        identity.avatar_url.as_deref(),
-        content,
-    )
-    .await
-    .map(|_| ())
+    Ok(())
 }
 
 /// Establishes (or re-establishes, on a session change) the terminal-prompt read baseline for
@@ -3176,27 +3195,27 @@ async fn next_status_event(
     }
 }
 
-/// Fetches the owner's mirrored identity once at startup, when Discord is configured. Terminal
-/// prompt mirroring drops silently for the rest of the process without it: `None` when Discord is
-/// not configured, or when the fetch itself fails (logged once here).
+/// Fetches the owner's mirrored identity once at startup, when Discord is configured: `Ok(None)`
+/// when it is not, since the rest of the bridge runs perfectly well without Discord at all.
+///
+/// # Errors
+///
+/// Returns an error when `DISCORD_OWNER_ID` is not numeric or the fetch itself fails. Terminal
+/// prompt mirroring has no fallback identity to mirror under, so [`run_bridge`] fails startup on
+/// this error rather than silently running the rest of the process without it.
 async fn fetch_startup_owner_identity(
     discord: Option<&DiscordConnection>,
-) -> Option<OwnerIdentity> {
-    let (client, _guild, owner_id, _responder) = discord?;
-    let owner_id = match owner_id.parse::<u64>() {
-        Ok(value) => Id::<UserMarker>::new(value),
-        Err(error) => {
-            eprintln!("owner identity fetch error: DISCORD_OWNER_ID is not numeric: {error}");
-            return None;
-        }
+) -> Result<Option<OwnerIdentity>, String> {
+    let Some((client, _guild, owner_id, _responder)) = discord else {
+        return Ok(None);
     };
-    match fetch_owner_identity(client.as_ref(), owner_id).await {
-        Ok(identity) => Some(identity),
-        Err(error) => {
-            eprintln!("owner identity fetch error: {error}");
-            None
-        }
-    }
+    let owner_id = owner_id.parse::<u64>().map_err(|error| {
+        format!("owner identity fetch error: DISCORD_OWNER_ID is not numeric: {error}")
+    })?;
+    fetch_owner_identity(client.as_ref(), Id::<UserMarker>::new(owner_id))
+        .await
+        .map(Some)
+        .map_err(|error| format!("owner identity fetch error: {error}"))
 }
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
@@ -3210,7 +3229,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => (None, None, None),
     };
-    let owner_identity = fetch_startup_owner_identity(discord.as_ref()).await;
+    let owner_identity = fetch_startup_owner_identity(discord.as_ref()).await?;
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
         live_tx: Some(live_tx),
@@ -3291,10 +3310,11 @@ mod tests {
         agent_read_detection, apply_membership, capture_for_with_search_root,
         card_capture_for_delivery, create_transition_messages, decide_blocked_response,
         delete_closed_topology_batch, deliver_blocked_messages, deliver_to_route,
-        discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_topology_lists,
-        handle_blocked_card, handle_lifecycle_select_result, handle_live_event,
-        initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
-        live_log_path, next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
+        discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_startup_owner_identity,
+        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
+        handle_live_event, initial_terminal_prompt_position, is_retriable_terminal_prompt_error,
+        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
         repeats_last_live_text, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
         start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
@@ -3303,10 +3323,10 @@ mod tests {
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-        Transition, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions,
-        read_claude_incremental, read_codex_incremental, read_cursor_incremental,
-        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
-        workspace_list_result,
+        Transition, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, VENDOR_CLAUDE,
+        VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions, read_claude_incremental,
+        read_codex_incremental, read_cursor_incremental, status_subscriptions, submit_owner_prompt,
+        subscribe_herdr_events, transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -3494,6 +3514,59 @@ mod tests {
         assert!(
             !terminal_prompt_baseline_is_current(&positions, "terminal-2", &first_path),
             "a different terminal's baseline must not be reused either"
+        );
+    }
+
+    #[test]
+    fn terminal_prompt_delivery_retries_on_unknown_channel_or_unknown_webhook_only() {
+        let cases = [
+            (
+                "the target channel or thread is gone",
+                format!("{UNKNOWN_CHANNEL_DELIVERY_ERROR}: response error: status code 404"),
+                true,
+            ),
+            (
+                "the target webhook is gone",
+                format!("{UNKNOWN_WEBHOOK_DELIVERY_ERROR}: response error: status code 404"),
+                true,
+            ),
+            (
+                "an unrelated failure",
+                "response error: status code 500".to_owned(),
+                false,
+            ),
+        ];
+        for (label, error, expected) in cases {
+            assert_eq!(
+                is_retriable_terminal_prompt_error(&error),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_identity_fetch_is_none_without_discord_configured() {
+        assert_eq!(fetch_startup_owner_identity(None).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn owner_identity_fetch_fails_startup_when_the_owner_id_is_not_numeric() {
+        let client = Arc::new(Client::builder().token("fake-token".to_owned()).build());
+        let guild = Id::<GuildMarker>::new(1);
+        let owner_id = "not-a-number".to_owned();
+        let responder = Arc::new(PermissionResponder::new(
+            Arc::clone(&client),
+            guild,
+            owner_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+        ));
+        let connection: super::DiscordConnection = (client, guild, owner_id, responder);
+        let result = fetch_startup_owner_identity(Some(&connection)).await;
+        assert!(
+            result.is_err(),
+            "a non-numeric DISCORD_OWNER_ID must fail startup, not silently run without an \
+             identity: {result:?}"
         );
     }
 

@@ -485,6 +485,19 @@ pub fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
     )
 }
 
+/// True when a Discord API error means the target webhook is already gone (deleting its channel
+/// deletes its webhooks with it, so a cached webhook can go stale independently of its channel).
+pub fn is_unknown_webhook_error(error: &twilight_http::Error) -> bool {
+    matches!(
+        error.kind(),
+        twilight_http::error::ErrorType::Response {
+            status,
+            error: twilight_http::api_error::ApiError::General(api_error),
+            ..
+        } if *status == twilight_http::response::StatusCode::NOT_FOUND && api_error.code == 10015
+    )
+}
+
 /// Deletes one Discord channel or thread, treating an already-deleted target as done.
 async fn delete_channel_if_present(
     client: &twilight_http::Client,

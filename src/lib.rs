@@ -34,11 +34,11 @@ pub use config::{
     load_discord_config,
 };
 pub use delivery::{
-    OwnerIdentity, UNKNOWN_CHANNEL_DELIVERY_ERROR, deliver_activity_message, deliver_live_message,
-    deliver_permission_card, deliver_terminal_prompt, deliver_transition_card,
-    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
-    live_message_nonce, resolve_terminal_prompt_webhook, transition_card_nonce,
-    update_activity_message,
+    OwnerIdentity, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR,
+    deliver_activity_message, deliver_live_message, deliver_permission_card,
+    deliver_terminal_prompt, deliver_transition_card, execute_terminal_prompt_webhook,
+    expire_informational_card, fetch_owner_identity, live_message_nonce,
+    resolve_terminal_prompt_webhook, transition_card_nonce, update_activity_message,
 };
 pub use gateway::{ComponentHandler, drive_gateway_with_components};
 pub use herdr::{

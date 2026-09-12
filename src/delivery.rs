@@ -6,13 +6,21 @@ use twilight_model::channel::message::Embed;
 
 use crate::cards::TransitionMessage;
 use crate::permission::PermissionVendor;
-use crate::topology::is_unknown_channel_error;
+use crate::topology::{is_unknown_channel_error, is_unknown_webhook_error};
 
 /// Prefixes a delivery error whose target channel or thread no longer exists on Discord.
 ///
 /// Lets a caller holding a cached route tell "the send failed" from "the cached route is stale"
 /// and refetch instead of retrying the same, permanently-invalid target.
 pub const UNKNOWN_CHANNEL_DELIVERY_ERROR: &str = "discord unknown channel";
+
+/// Prefixes a delivery error whose target webhook no longer exists on Discord.
+///
+/// Its channel was deleted, which deletes its webhooks with it, independently of the channel
+/// itself being recreated or still present under a stale cached id. Lets a caller holding a cached
+/// webhook tell "the send failed" from "the cached webhook is stale" and re-resolve instead of
+/// retrying the same, permanently-invalid webhook.
+pub const UNKNOWN_WEBHOOK_DELIVERY_ERROR: &str = "discord unknown webhook";
 
 const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
@@ -59,10 +67,13 @@ pub fn live_message_nonce(terminal_id: &str, position: i64, part_index: usize) -
 }
 
 /// Maps a failed Discord send to a plain string, distinguishing "the target channel or thread no
-/// longer exists" ([`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed) from every other request failure.
+/// longer exists" ([`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed) and "the target webhook no longer
+/// exists" ([`UNKNOWN_WEBHOOK_DELIVERY_ERROR`]-prefixed) from every other request failure.
 fn map_send_error(error: &twilight_http::Error) -> String {
     if is_unknown_channel_error(error) {
         format!("{UNKNOWN_CHANNEL_DELIVERY_ERROR}: {error}")
+    } else if is_unknown_webhook_error(error) {
+        format!("{UNKNOWN_WEBHOOK_DELIVERY_ERROR}: {error}")
     } else {
         error.to_string()
     }
@@ -153,7 +164,8 @@ fn owner_avatar_url(
 /// # Errors
 ///
 /// Returns an error when the workspace channel has duplicate named webhooks, the resolved webhook
-/// has no token, or Discord rejects the request.
+/// has no token, or Discord rejects the request, [`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed when
+/// the workspace channel no longer exists.
 pub async fn resolve_terminal_prompt_webhook(
     client: &twilight_http::Client,
     workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -168,7 +180,7 @@ pub async fn resolve_terminal_prompt_webhook(
     let webhooks = client
         .channel_webhooks(workspace_channel)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| map_send_error(&error))?
         .model()
         .await
         .map_err(|error| error.to_string())?;
@@ -187,7 +199,7 @@ pub async fn resolve_terminal_prompt_webhook(
         client
             .create_webhook(workspace_channel, webhook_name)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| map_send_error(&error))?
             .model()
             .await
             .map_err(|error| error.to_string())?
