@@ -62,7 +62,7 @@ struct InformationalCard {
 
 /// Where an incremental vendor-log reader resumes from: a byte offset for the Claude JSONL log, a
 /// `rowid` for the Cursor sqlite store.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LivePosition {
     Bytes(u64),
     RowId(i64),
@@ -144,11 +144,16 @@ struct BridgeState {
     terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition)>,
     /// Terminals whose session was seen with [`live_log_path`] returning `Ok(None)` (the log or
     /// store does not exist on disk yet): a fresh pane, or a new session after `/clear` or a
-    /// relaunch, before its first write. Removed the moment the path first resolves, at which point
-    /// [`maybe_establish_terminal_prompt_baseline`] baselines it at position 0 rather than past
-    /// whatever the now-existing file holds: everything in it postdates first sight, including the
-    /// prompt that may have just created it.
-    terminal_prompt_awaiting_first_log: HashSet<String>,
+    /// relaunch, before its first write. Valued by the session's own value, not just its terminal:
+    /// a pane can switch to a *different*, already-populated session before the pending one's log
+    /// ever appears (Claude `/resume`, or a relaunch straight into an existing session), and that
+    /// resumed session's own, unrelated history must never be baselined at 0 just because this
+    /// terminal happened to have an unrelated fresh session pending. Removed the moment a path
+    /// resolves for this terminal, whichever session it belongs to: [`maybe_establish_terminal_prompt_baseline`]
+    /// baselines at position 0 only when the resolved path's session matches the one recorded here;
+    /// any other session (including one that was never recorded pending at all) gets the normal
+    /// discard-what-already-exists baseline instead.
+    terminal_prompt_awaiting_first_log: HashMap<String, String>,
     /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
     /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
     /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
@@ -1577,12 +1582,17 @@ async fn mirror_one_terminal_prompt<'a>(
 /// never have the old file's position applied to the new one.
 ///
 /// [`live_log_path`] returning `Ok(None)` (the log or store does not exist on disk yet -- a fresh
-/// pane, or a new session before its first write) records the terminal in
+/// pane, or a new session before its first write) records the terminal's current session value in
 /// [`BridgeState::terminal_prompt_awaiting_first_log`] and retries on the next snapshot. The first
-/// time the path then resolves, the baseline is 0, not [`initial_terminal_prompt_position`]'s
-/// discard-what-already-exists checkpoint: the log was created after this terminal was already
-/// being watched, so everything now in it -- including the prompt that may have just created it --
-/// postdates first sight and belongs to this bridge run, not a discarded history. A permanent
+/// time a path then resolves for this terminal, the baseline is 0 -- not
+/// [`initial_terminal_prompt_position`]'s discard-what-already-exists checkpoint -- only when that
+/// path's session is the SAME one that was recorded pending: its log was created after this
+/// terminal was already being watched, so everything now in it, including the prompt that may have
+/// just created it, postdates first sight and belongs to this bridge run, not a discarded history.
+/// A path resolving for any OTHER session (one that was never recorded pending, or a different one
+/// that superseded it -- a `/resume` onto an existing session before the pending one's log ever
+/// appeared) gets the normal discard-what-already-exists baseline instead, and the stale pending
+/// record is dropped either way so it cannot later misapply to a third session. A permanent
 /// resolution error is logged and retried too, since resolving it costs only a directory read.
 fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
     let terminal = &snapshot.terminal_id;
@@ -1598,7 +1608,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
         Ok(None) => {
             state
                 .terminal_prompt_awaiting_first_log
-                .insert(terminal.clone());
+                .insert(terminal.clone(), session.value.clone());
             return;
         }
         Err(error) => {
@@ -1609,7 +1619,11 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     if terminal_prompt_baseline_is_current(&state.terminal_prompt_positions, terminal, &path) {
         return;
     }
-    let position = if state.terminal_prompt_awaiting_first_log.remove(terminal) {
+    let was_awaiting_this_session = state
+        .terminal_prompt_awaiting_first_log
+        .remove(terminal)
+        .is_some_and(|awaiting_session| awaiting_session == session.value);
+    let position = if was_awaiting_this_session {
         Ok(zero_terminal_prompt_position(vendor))
     } else {
         initial_terminal_prompt_position(vendor, &path)
@@ -3369,8 +3383,8 @@ mod tests {
         fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
         handle_live_event, initial_terminal_prompt_position, is_retriable_terminal_prompt_error,
         lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
-        repeats_last_live_text, resolve_session_path, route_topology,
+        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
+        read_new_terminal_prompts, repeats_last_live_text, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
         start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
         sync_route, sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
@@ -3570,6 +3584,119 @@ mod tests {
             !terminal_prompt_baseline_is_current(&positions, "terminal-2", &first_path),
             "a different terminal's baseline must not be reused either"
         );
+    }
+
+    /// Repro case b (a fresh session's pending marker must not leak onto a later, unrelated,
+    /// already-populated session) and control case c (the same existing session, discovered
+    /// directly, with no intervening fresh session) side by side: both must baseline identically,
+    /// discarding the existing history rather than replaying it.
+    #[test]
+    fn resumed_session_with_existing_log_is_never_replayed_after_a_fresh_session_was_pending() {
+        let original_home = std::env::var_os("HOME");
+        let temp_home = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-resume-replay-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_home);
+        fs::create_dir_all(&temp_home).expect("create temp HOME");
+        // SAFETY: `cargo test -- --test-threads=1` (this crate's mandated invocation) serializes
+        // every test in this binary, so no other test observes HOME mid-mutation.
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+        }
+
+        let test_result = std::panic::catch_unwind(|| {
+            let cwd_dir = temp_home.join("project");
+            fs::create_dir_all(&cwd_dir).expect("create project cwd");
+            let cwd = cwd_dir.to_str().expect("utf8 cwd").to_owned();
+            let cwd_slug: String = cwd
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let session_dir = temp_home.join(".claude").join("projects").join(&cwd_slug);
+            fs::create_dir_all(&session_dir).expect("create Claude session dir");
+
+            // The existing, already-resumable session: prior history already on disk.
+            let old_session_path = session_dir.join("old-session.jsonl");
+            fs::write(
+                &old_session_path,
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"history one\"}]}}\n\
+                 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"history two\"}]}}\n\
+                 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"history three\"}]}}\n",
+            )
+            .expect("write existing Claude session log");
+            let expected_discard_position = fs::metadata(&old_session_path)
+                .expect("stat existing Claude session log")
+                .len();
+
+            let snapshot_for = |session_value: &str| AgentSnapshot {
+                agent: VENDOR_CLAUDE.to_owned(),
+                terminal_id: "terminal-resume".to_owned(),
+                agent_status: STATUS_IDLE.to_owned(),
+                tab_id: None,
+                workspace_id: None,
+                pane_id: None,
+                cwd: Some(cwd.clone()),
+                terminal_title_stripped: None,
+                session: Some(AgentSession {
+                    agent: VENDOR_CLAUDE.to_owned(),
+                    value: session_value.to_owned(),
+                }),
+                state_change_seq: 0,
+            };
+
+            // Case b: a fresh session with no log yet is seen first (marks the terminal
+            // "awaiting"), then the same terminal switches to the existing, already-populated
+            // session before the fresh one's log ever appears.
+            let mut replay_state = BridgeState::default();
+            maybe_establish_terminal_prompt_baseline(&snapshot_for("fresh-b"), &mut replay_state);
+            maybe_establish_terminal_prompt_baseline(
+                &snapshot_for("old-session"),
+                &mut replay_state,
+            );
+            let (replay_path, replay_position) = replay_state
+                .terminal_prompt_positions
+                .get("terminal-resume")
+                .expect("resumed session baselines once its log resolves");
+            assert_eq!(replay_path, &old_session_path);
+            assert_eq!(
+                *replay_position,
+                LivePosition::Bytes(expected_discard_position),
+                "a resumed session with prior history must discard it, not replay it"
+            );
+
+            // Control case c: the same existing session, discovered directly, with no intervening
+            // fresh session -- must baseline identically to case b.
+            let mut control_state = BridgeState::default();
+            maybe_establish_terminal_prompt_baseline(
+                &snapshot_for("old-session"),
+                &mut control_state,
+            );
+            let (control_path, control_position) = control_state
+                .terminal_prompt_positions
+                .get("terminal-resume")
+                .expect("baseline established for the control case");
+            assert_eq!(control_path, &old_session_path);
+            assert_eq!(
+                replay_position, control_position,
+                "case b and control case c must baseline identically"
+            );
+        });
+
+        match original_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(&temp_home);
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]
