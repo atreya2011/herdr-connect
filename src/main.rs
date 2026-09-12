@@ -142,6 +142,13 @@ struct BridgeState {
     /// a different path; [`process_snapshot`] re-baselines against it rather than reusing a stale
     /// position from the old file.
     terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition)>,
+    /// Terminals whose session was seen with [`live_log_path`] returning `Ok(None)` (the log or
+    /// store does not exist on disk yet): a fresh pane, or a new session after `/clear` or a
+    /// relaunch, before its first write. Removed the moment the path first resolves, at which point
+    /// [`maybe_establish_terminal_prompt_baseline`] baselines it at position 0 rather than past
+    /// whatever the now-existing file holds: everything in it postdates first sight, including the
+    /// prompt that may have just created it.
+    terminal_prompt_awaiting_first_log: HashSet<String>,
     /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
     /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
     /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
@@ -1547,9 +1554,16 @@ async fn mirror_one_terminal_prompt(
 /// Keyed by terminal id in [`BridgeState::terminal_prompt_positions`], but re-baselined whenever
 /// the freshly resolved log path differs from the one already stored there: a later session on the
 /// same terminal (`/clear`, resume, a relaunch, or a vendor starting a fresh file or store) must
-/// never have the old file's position applied to the new one. [`live_log_path`] returning `Ok(None)`
-/// (not created on disk yet) is retried on the next snapshot; a permanent resolution error is
-/// logged and retried too, since resolving it costs only a directory read.
+/// never have the old file's position applied to the new one.
+///
+/// [`live_log_path`] returning `Ok(None)` (the log or store does not exist on disk yet -- a fresh
+/// pane, or a new session before its first write) records the terminal in
+/// [`BridgeState::terminal_prompt_awaiting_first_log`] and retries on the next snapshot. The first
+/// time the path then resolves, the baseline is 0, not [`initial_terminal_prompt_position`]'s
+/// discard-what-already-exists checkpoint: the log was created after this terminal was already
+/// being watched, so everything now in it -- including the prompt that may have just created it --
+/// postdates first sight and belongs to this bridge run, not a discarded history. A permanent
+/// resolution error is logged and retried too, since resolving it costs only a directory read.
 fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
     let terminal = &snapshot.terminal_id;
     let Some(session) = snapshot.session.as_ref() else {
@@ -1561,7 +1575,12 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     }
     let path = match live_log_path(snapshot, session) {
         Ok(Some(path)) => path,
-        Ok(None) => return,
+        Ok(None) => {
+            state
+                .terminal_prompt_awaiting_first_log
+                .insert(terminal.clone());
+            return;
+        }
         Err(error) => {
             eprintln!("terminal prompt baseline error for {terminal}: {error}");
             return;
@@ -1570,13 +1589,28 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     if terminal_prompt_baseline_is_current(&state.terminal_prompt_positions, terminal, &path) {
         return;
     }
-    match initial_terminal_prompt_position(vendor, &path) {
+    let position = if state.terminal_prompt_awaiting_first_log.remove(terminal) {
+        Ok(zero_terminal_prompt_position(vendor))
+    } else {
+        initial_terminal_prompt_position(vendor, &path)
+    };
+    match position {
         Ok(position) => {
             state
                 .terminal_prompt_positions
                 .insert(terminal.clone(), (path, position));
         }
         Err(error) => eprintln!("terminal prompt baseline error for {terminal}: {error}"),
+    }
+}
+
+/// The terminal-prompt baseline for a log a terminal is only now seeing resolve for the first time:
+/// a byte offset for Claude and Codex, a `rowid` for Cursor.
+fn zero_terminal_prompt_position(vendor: &str) -> LivePosition {
+    if vendor == VENDOR_CURSOR {
+        LivePosition::RowId(0)
+    } else {
+        LivePosition::Bytes(0)
     }
 }
 
@@ -6173,13 +6207,11 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real pane through three turns for `vendor`: a first turn that establishes the
-    /// pane's terminal-prompt baseline (`process_snapshot` sets it the moment it first sees the
-    /// pane's session, in any status, so this turn's own prompt may or may not already be mirrored
-    /// depending on exactly when that first sight lands relative to the prompt landing in the log --
-    /// its mirror status is deliberately not asserted here), a second terminal-origin turn whose
-    /// prompt is mirrored ahead of its assistant reply, and a third turn submitted through the
-    /// bridge's own Discord path (`submit_owner_prompt`) whose prompt must not be mirrored back.
+    /// Drives one real pane through three turns for `vendor`: a first turn -- the new session's
+    /// very first prompt, typed before its log even exists -- whose prompt is mirrored ahead of its
+    /// assistant reply exactly like the second, ordinary terminal-origin turn's is, and a third turn
+    /// submitted through the bridge's own Discord path (`submit_owner_prompt`) whose prompt must not
+    /// be mirrored back.
     #[cfg(unix)]
     async fn terminal_origin_prompt_exercise(
         guild: &BlockedCaptureGuild,
@@ -6222,15 +6254,23 @@ mod tests {
             terminal: &terminal,
         };
 
-        let baseline_reply = format!("terminal-origin-{vendor}-baseline-{nonce}");
+        let first_reply = format!("terminal-origin-{vendor}-first-{nonce}");
+        let first_prompt = format!("Reply with exactly: {first_reply}");
         run_terminal_prompt_turn(
             &fixture,
             &mut state,
             &mut live_events,
             TerminalPromptSubmission::Terminal,
-            &format!("Reply with exactly: {baseline_reply}"),
+            &first_prompt,
         )
         .await?;
+        let first_messages = thread_full_messages(guild, thread).await?;
+        assert_terminal_prompt_mirrored_before_reply(
+            &first_messages,
+            &first_prompt,
+            &first_reply,
+            &identity.display_name,
+        )?;
 
         let mirrored_reply = format!("terminal-origin-{vendor}-mirrored-{nonce}");
         let mirrored_prompt = format!("Reply with exactly: {mirrored_reply}");
