@@ -7179,7 +7179,8 @@ mod tests {
     /// Drives one real `claude --model haiku` agent with the `AskUserQuestion` hook registered
     /// against a real bridge broker through a forced single-select question, resolves it the way an
     /// owner's Discord button tap would (see [`synthetic_component_interaction`]), and returns the
-    /// pane's settled status alongside every message the exercise left in its tab thread.
+    /// pane's settled status and every message the exercise left in its tab thread, alongside what
+    /// Claude's own session transcript recorded for the question's answer.
     #[cfg(unix)]
     async fn question_hook_exercise(
         guild: &BlockedCaptureGuild,
@@ -7187,7 +7188,14 @@ mod tests {
         agent_name: &str,
         broker_socket: &Path,
         settings_path: &Path,
-    ) -> Result<(String, Vec<(String, bool, Id<MessageMarker>)>), String> {
+    ) -> Result<
+        (
+            String,
+            Vec<(String, bool, Id<MessageMarker>)>,
+            Option<String>,
+        ),
+        String,
+    > {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
         let responder = Arc::clone(&connection.3);
@@ -7275,7 +7283,39 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             messages = thread_messages(guild, thread).await?;
         }
-        Ok((settled.agent_status, messages))
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let transcript_answer = transcript_question_answer(&home, &settled, "Which color?")?;
+        Ok((settled.agent_status, messages, transcript_answer))
+    }
+
+    /// Reads the resolved pane's own real Claude session transcript and returns what it recorded
+    /// for the `AskUserQuestion` `toolUseResult.answers[question]`, proving Claude itself received
+    /// the answer -- not only that the broker's own card text (written independently, from its own
+    /// resolution) says so.
+    #[cfg(unix)]
+    fn transcript_question_answer(
+        home: &Path,
+        snapshot: &AgentSnapshot,
+        question: &str,
+    ) -> Result<Option<String>, String> {
+        let session = snapshot
+            .session
+            .as_ref()
+            .ok_or_else(|| "settled pane has no reported session".to_owned())?;
+        let path =
+            resolve_session_path(home, snapshot, session).map_err(|error| error.to_string())?;
+        let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        Ok(contents.lines().rev().find_map(|line| {
+            let record: Value = serde_json::from_str(line).ok()?;
+            record
+                .get("toolUseResult")?
+                .get("answers")?
+                .get(question)?
+                .as_str()
+                .map(str::to_owned)
+        }))
     }
 
     #[cfg(unix)]
@@ -7345,7 +7385,8 @@ mod tests {
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left =
             remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
-        let (status, messages) = result.unwrap_or_else(|error| panic!("{error}"));
+        let (status, messages, transcript_answer) =
+            result.unwrap_or_else(|error| panic!("{error}"));
         assert_ne!(
             status, "blocked",
             "the pane must never block on Claude's own dialog once the hook answers it"
@@ -7355,6 +7396,12 @@ mod tests {
                 .iter()
                 .any(|(content, _, _)| content == "resolved: Blue"),
             "question card must read resolved: Blue, thread has {messages:?}"
+        );
+        assert_eq!(
+            transcript_answer.as_deref(),
+            Some("Blue"),
+            "Claude's own session transcript must record toolUseResult.answers[\"Which color?\"] as \
+             Blue, not just the broker's own card text"
         );
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
@@ -7433,7 +7480,19 @@ mod tests {
         broker_task.abort();
         let _ = std::fs::remove_file(broker_socket);
 
-        let messages = thread_messages(guild, thread).await?;
+        // The card's own expiry edit runs detached from the status transition the hook's own
+        // timeout races against (see `return_value_before_card_edit`), so give it the same bounded
+        // moment to land the resolve row gives its own edit before reading.
+        let mut messages = thread_messages(guild, thread).await?;
+        let edit_deadline = Instant::now() + Duration::from_secs(5);
+        while !messages
+            .iter()
+            .any(|(content, _, _)| content.starts_with("expired:"))
+            && Instant::now() < edit_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            messages = thread_messages(guild, thread).await?;
+        }
         Ok((status, messages))
     }
 
@@ -7466,10 +7525,10 @@ mod tests {
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         ));
-        let settings_path = write_question_settings(&broker_socket)
-            .expect("write question settings for the exercise");
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
             .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let settings_path = write_question_settings(&broker_socket)
+            .expect("write question settings for the exercise");
         let cwd_dir = claude_testrun_dir(&home);
         let created = clear_directory_contents(&cwd_dir).and_then(|()| {
             let cwd = cwd_dir

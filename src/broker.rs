@@ -444,6 +444,11 @@ impl PermissionResponder {
     /// The first question that expires, or whose card cannot be delivered, aborts the whole
     /// request: no further question in the same call gets a card, and the caller falls through to
     /// Claude's own dialog -- an `AskUserQuestion` call is answered in full or not at all.
+    ///
+    /// Every card in the call shares one `call_deadline` (`QUESTION_TIMEOUT` from the call's own
+    /// start), not its own fresh `QUESTION_TIMEOUT` window: a multi-question call otherwise lets a
+    /// later card outlive the hook's own `question_hook_timeout` margin over a single card's
+    /// window, discarding an already-answered earlier question when the hook gives up.
     async fn request_question(
         &self,
         frame: &QuestionFrame,
@@ -451,10 +456,17 @@ impl PermissionResponder {
     ) -> Option<BTreeMap<String, QuestionAnswer>> {
         let route = self.route(&frame.session_id, &liveness).await?;
         let channel = self.sync_channel(&route, &liveness).await?;
+        let call_deadline = std::time::Instant::now() + QUESTION_TIMEOUT;
         let mut answers = BTreeMap::new();
         for question in &frame.questions {
             let answer = self
-                .request_one_question(channel, &frame.session_id, question, &liveness)
+                .request_one_question(
+                    channel,
+                    &frame.session_id,
+                    question,
+                    call_deadline,
+                    &liveness,
+                )
                 .await?;
             answers.insert(question.question.clone(), answer);
         }
@@ -466,9 +478,11 @@ impl PermissionResponder {
         channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
         session_id: &str,
         question: &Question,
+        call_deadline: std::time::Instant,
         liveness: &HookLiveness,
     ) -> Option<QuestionAnswer> {
         let created_at = std::time::Instant::now();
+        let expiry = question_card_expiry(created_at, call_deadline);
         let issued = self
             .question_registry
             .issue_with_liveness(
@@ -478,7 +492,7 @@ impl PermissionResponder {
                 },
                 question.options.clone(),
                 created_at,
-                created_at + QUESTION_TIMEOUT,
+                expiry,
                 Arc::clone(&liveness.alive),
             )
             .ok()?;
@@ -694,6 +708,16 @@ impl PermissionResponder {
             std::time::Instant::now(),
         )
     }
+}
+
+/// One question card's own expiry: `QUESTION_TIMEOUT` from when its card is issued, clamped to the
+/// whole call's shared `call_deadline` so a later card in a multi-question call never outlives the
+/// call's own timeout margin.
+fn question_card_expiry(
+    created_at: std::time::Instant,
+    call_deadline: std::time::Instant,
+) -> std::time::Instant {
+    (created_at + QUESTION_TIMEOUT).min(call_deadline)
 }
 
 /// Truncates `content` to fit Discord's message content limit, marking a cut with a trailing `…`:
@@ -1238,8 +1262,8 @@ mod tests {
         BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, MAX_QUESTION_CARD_CONTENT_LENGTH,
         PERMISSION_TIMEOUT, PendingKey, PendingRequests, PermissionResponder, QUESTION_TIMEOUT,
         QuestionBrokerResponse, bound_card_content, correlate_decision, correlate_question_answers,
-        hook_timeout, question_hook_timeout, read_json_line, return_value_before_card_edit,
-        spawn_hook_monitor,
+        hook_timeout, question_card_expiry, question_hook_timeout, read_json_line,
+        return_value_before_card_edit, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
@@ -1269,6 +1293,28 @@ mod tests {
     fn question_hook_margin_matches_the_question_timeout() {
         assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(300));
         assert_eq!(question_hook_timeout(), Duration::from_secs(305));
+    }
+
+    #[test]
+    fn question_card_expiry_never_outlives_the_shared_call_deadline() {
+        let call_start = std::time::Instant::now();
+        let call_deadline = call_start + QUESTION_TIMEOUT;
+
+        // The first card, issued right at the call's start, gets the full window.
+        assert_eq!(
+            question_card_expiry(call_start, call_deadline),
+            call_deadline
+        );
+
+        // A later card, issued after the first question already used up some of the call's
+        // window, is clamped to the same shared deadline rather than getting its own fresh
+        // QUESTION_TIMEOUT from its later start.
+        let second_card_created_at = call_start + Duration::from_secs(200);
+        assert_eq!(
+            question_card_expiry(second_card_created_at, call_deadline),
+            call_deadline,
+            "a later card must not outlive the call's own deadline"
+        );
     }
 
     #[test]
