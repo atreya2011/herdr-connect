@@ -7539,7 +7539,7 @@ mod tests {
         let (tab_id, result) = match created {
             Ok(tab) => {
                 let agent_name = format!(
-                    "question-expiry-claude-{}",
+                    "q-expiry-claude-{}",
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
                 let outcome = tokio::time::timeout(
