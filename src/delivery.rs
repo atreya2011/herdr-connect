@@ -505,7 +505,7 @@ pub async fn deliver_question_button_card(
     let payload = serde_json::json!({
         PAYLOAD_EMBEDS_KEY: [{
             "title": question_card_title(&question.header),
-            "description": question_card_description(&question.question, true),
+            "description": question_card_description(&question.question),
             "color": 0x00f1_c40f,
         }],
         PAYLOAD_COMPONENTS_KEY: question_button_components(&question.options, token, false),
@@ -523,7 +523,8 @@ pub async fn deliver_question_button_card(
         .map_err(|error| error.to_string())
 }
 
-/// Delivers a multiSelect question card: one Discord string select menu offering every option.
+/// Delivers a multiSelect question card: one Discord string select menu offering every option,
+/// plus a "Type an answer" hint for a free-text thread reply.
 ///
 /// # Errors
 ///
@@ -537,7 +538,7 @@ pub async fn deliver_question_select_card(
     let payload = serde_json::json!({
         PAYLOAD_EMBEDS_KEY: [{
             "title": question_card_title(&question.header),
-            "description": question_card_description(&question.question, false),
+            "description": question_card_description(&question.question),
             "color": 0x00f1_c40f,
         }],
         PAYLOAD_COMPONENTS_KEY: question_select_components(&question.options, token, false),
@@ -564,13 +565,9 @@ fn question_card_title(header: &str) -> String {
     }
 }
 
-fn question_card_description(question: &str, single_select: bool) -> String {
+fn question_card_description(question: &str) -> String {
     let sanitized: String = question.chars().filter(|c| !c.is_control()).collect();
-    if single_select {
-        format!("{sanitized}\n\nOr reply in this thread with your own answer.")
-    } else {
-        sanitized
-    }
+    format!("{sanitized}\n\nOr reply in this thread with your own answer.")
 }
 
 /// One action row of up to five option buttons, `herdrask:<token>:<option index>`.
@@ -1016,14 +1013,14 @@ mod tests {
     }
 
     #[test]
-    fn question_card_description_only_hints_a_free_text_reply_for_single_select() {
+    fn question_card_description_always_hints_a_free_text_reply() {
         assert_eq!(
-            question_card_description("Which color?", true),
+            question_card_description("Which color?"),
             "Which color?\n\nOr reply in this thread with your own answer."
         );
         assert_eq!(
-            question_card_description("Which toppings?", false),
-            "Which toppings?"
+            question_card_description("Which toppings?"),
+            "Which toppings?\n\nOr reply in this thread with your own answer."
         );
     }
 

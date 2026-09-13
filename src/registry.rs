@@ -196,10 +196,6 @@ pub struct IssuedQuestion {
 #[derive(Debug)]
 struct QuestionEntry {
     request: ApprovalRequest,
-    /// Whether this card accepts a free-text thread reply as its answer: only true for a
-    /// single-select card, matching its "Type an answer" hint (a multiSelect card has no such
-    /// hint and is only ever resolved through its select menu).
-    single_select: bool,
     /// The card's own options, so a component tap naming an option by index can be resolved back
     /// to its label without the caller re-supplying the question.
     options: Vec<QuestionOption>,
@@ -224,7 +220,6 @@ impl QuestionRegistry {
     pub fn issue_with_liveness(
         &self,
         request: ApprovalRequest,
-        single_select: bool,
         options: Vec<QuestionOption>,
         created_at: Instant,
         expiry: Instant,
@@ -246,7 +241,6 @@ impl QuestionRegistry {
             token.clone(),
             QuestionEntry {
                 request,
-                single_select,
                 options,
                 created_at,
                 expiry,
@@ -271,7 +265,6 @@ impl QuestionRegistry {
         &self,
         token: String,
         request: ApprovalRequest,
-        single_select: bool,
         created_at: Instant,
         expiry: Instant,
     ) -> Result<IssuedQuestion, String> {
@@ -290,7 +283,6 @@ impl QuestionRegistry {
             token.clone(),
             QuestionEntry {
                 request,
-                single_select,
                 options: Vec::new(),
                 created_at,
                 expiry,
@@ -353,15 +345,15 @@ impl QuestionRegistry {
         let _ = sender.send(answer);
         Ok(())
     }
-    /// The token of the pending single-select card for `session_id`, if one is currently open: the
-    /// one card a thread reply can be consumed against as a free-text answer.
-    pub fn pending_single_select_token(&self, session_id: &str) -> Option<String> {
+    /// The token of the pending question card for `session_id`, if one is currently open: the one
+    /// card a thread reply can be consumed against as a free-text answer, single-select or
+    /// multiSelect alike.
+    pub fn pending_question_token(&self, session_id: &str) -> Option<String> {
         self.entries.lock().ok().and_then(|entries| {
             entries
                 .iter()
                 .find(|(_, entry)| {
-                    entry.single_select
-                        && entry.request.session_id == session_id
+                    entry.request.session_id == session_id
                         && entry.hook_alive.load(Ordering::Acquire)
                 })
                 .map(|(token, _)| token.clone())
@@ -490,7 +482,6 @@ mod tests {
         let issued = registry
             .issue_with_liveness(
                 request(7, "session"),
-                true,
                 vec![option("Red"), option("Blue")],
                 now,
                 now + Duration::from_secs(30),
@@ -514,7 +505,6 @@ mod tests {
             .issue_with_token(
                 "token".to_owned(),
                 request(7, "session"),
-                true,
                 now,
                 now + Duration::from_secs(30),
             )
@@ -531,34 +521,23 @@ mod tests {
     }
 
     #[test]
-    fn only_a_single_select_card_is_returned_as_the_pending_free_text_target() {
+    fn pending_question_token_finds_a_multi_select_card_too() {
         let now = Instant::now();
         let registry = QuestionRegistry::default();
         registry
             .issue_with_token(
                 "multi-select-token".to_owned(),
                 request(7, "session-a"),
-                false,
                 now,
                 now + Duration::from_secs(30),
             )
             .expect("issue multiSelect token");
-        assert_eq!(registry.pending_single_select_token("session-a"), None);
-
-        registry
-            .issue_with_token(
-                "single-select-token".to_owned(),
-                request(7, "session-a"),
-                true,
-                now,
-                now + Duration::from_secs(30),
-            )
-            .expect("issue single-select token");
         assert_eq!(
-            registry.pending_single_select_token("session-a"),
-            Some("single-select-token".to_owned())
+            registry.pending_question_token("session-a"),
+            Some("multi-select-token".to_owned()),
+            "a thread reply must be able to answer a pending multiSelect card too"
         );
-        assert_eq!(registry.pending_single_select_token("session-b"), None);
+        assert_eq!(registry.pending_question_token("session-b"), None);
     }
 
     #[tokio::test]
@@ -569,7 +548,6 @@ mod tests {
             .issue_with_token(
                 "opaque-question-token".to_owned(),
                 request(7, "session"),
-                true,
                 now,
                 now + Duration::from_secs(30),
             )
@@ -604,7 +582,6 @@ mod tests {
         let issued = registry
             .issue_with_liveness(
                 request(7, "session"),
-                true,
                 Vec::new(),
                 now,
                 now + Duration::from_secs(30),

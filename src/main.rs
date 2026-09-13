@@ -7226,7 +7226,7 @@ mod tests {
         let token = {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
-                if let Some(token) = connection.3.pending_single_select_question(&session_id) {
+                if let Some(token) = connection.3.pending_question_token(&session_id) {
                     break token;
                 }
                 if Instant::now() >= deadline {
@@ -7415,11 +7415,7 @@ mod tests {
         .value;
 
         let deadline = Instant::now() + Duration::from_secs(60);
-        while connection
-            .3
-            .pending_single_select_question(&session_id)
-            .is_none()
-        {
+        while connection.3.pending_question_token(&session_id).is_none() {
             if Instant::now() >= deadline {
                 broker_task.abort();
                 return Err(

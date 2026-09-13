@@ -48,10 +48,11 @@ static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
-/// A thread reply while a single-select question card is pending for the mapped pane's session is
-/// consumed as that question's free-text answer instead of being submitted as an `agent.prompt`
-/// (the pane's Herdr status is `working`, not `idle`/`done`, while a question is pending, so this
-/// check runs before -- not through -- [`resolve_prompt_pane`]'s status gate).
+/// A thread reply while any question card -- single-select or multiSelect -- is pending for the
+/// mapped pane's session is consumed as that question's free-text answer instead of being
+/// submitted as an `agent.prompt` (the pane's Herdr status is `working`, not `idle`/`done`, while a
+/// question is pending, so this check runs before -- not through -- [`resolve_prompt_pane`]'s
+/// status gate).
 ///
 /// # Errors
 ///
@@ -122,7 +123,7 @@ pub async fn handle_owner_message(
     };
     if let Ok(agent) = matching_agent(tab_id, workspace_id, &agents)
         && let Some(session_id) = agent.session.as_ref().map(|session| session.value.as_str())
-        && let Some(token) = responder.pending_single_select_question(session_id)
+        && let Some(token) = responder.pending_question_token(session_id)
     {
         let response = match responder.resolve_question_text(
             &token,

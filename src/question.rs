@@ -102,9 +102,23 @@ pub fn decode_claude_ask_question(input: &[u8]) -> Result<QuestionInteraction, S
     })
 }
 
-/// Encodes the broker's resolved answers as Claude's `PreToolUse` `updatedInput` hook response,
-/// splicing `answers` into the original `tool_input` so every other field it carried round-trips
-/// unchanged.
+/// Formats one resolved answer as Claude's own dialog would record it: a single-select answer is
+/// its label verbatim, a multiSelect answer is every chosen label joined with `", "` into one
+/// string -- never a JSON array, matching `AskUserQuestion`'s `answers` schema
+/// (`{additionalProperties: {type: "string"}}`) and what Claude's own dialog actually writes.
+#[must_use]
+pub fn format_question_answer(answer: &QuestionAnswer) -> String {
+    match answer {
+        QuestionAnswer::Single(label) => label.clone(),
+        QuestionAnswer::Multiple(labels) => labels.join(", "),
+    }
+}
+
+/// Encodes the broker's resolved answers as Claude's `PreToolUse` `updatedInput` hook response.
+///
+/// Splices `answers` into the original `tool_input` so every other field it carried round-trips
+/// unchanged. Every answer is formatted through [`format_question_answer`] first, so `answers`
+/// always carries plain strings on the wire, never a `QuestionAnswer::Multiple` array.
 ///
 /// # Errors
 ///
@@ -117,7 +131,11 @@ pub fn encode_claude_question_decision(
         .as_object()
         .cloned()
         .ok_or_else(|| "AskUserQuestion tool_input is not a JSON object".to_owned())?;
-    let answers = serde_json::to_value(answers).map_err(|error| error.to_string())?;
+    let string_answers: BTreeMap<String, String> = answers
+        .iter()
+        .map(|(question, answer)| (question.clone(), format_question_answer(answer)))
+        .collect();
+    let answers = serde_json::to_value(string_answers).map_err(|error| error.to_string())?;
     updated_input.insert("answers".to_owned(), answers);
     serde_json::to_vec(&serde_json::json!({
         "hookSpecificOutput": {
@@ -133,7 +151,7 @@ pub fn encode_claude_question_decision(
 mod tests {
     use super::{
         ASK_QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, decode_claude_ask_question,
-        encode_claude_question_decision,
+        encode_claude_question_decision, format_question_answer,
     };
     use std::collections::BTreeMap;
 
@@ -225,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_single_and_multi_select_answers_into_the_original_tool_input() {
+    fn encodes_every_answer_as_a_wire_string_never_an_array() {
         let raw_tool_input = serde_json::json!({
             "questions": [{"question": "Which color?", "header": "Color", "options": [], "multiSelect": false}],
         });
@@ -244,7 +262,7 @@ mod tests {
                     "Which toppings?".to_owned(),
                     QuestionAnswer::Multiple(vec!["Cheese".to_owned(), "Olives".to_owned()]),
                 )]),
-                serde_json::json!(["Cheese", "Olives"]),
+                serde_json::json!("Cheese, Olives"),
             ),
         ];
         for (name, answers, expected_value) in cases {
@@ -271,6 +289,55 @@ mod tests {
                 "case={name}"
             );
         }
+    }
+
+    #[test]
+    fn every_encoded_answer_is_a_json_string_never_an_array() {
+        let raw_tool_input = serde_json::json!({"questions": []});
+        let answers = BTreeMap::from([
+            (
+                "Which color?".to_owned(),
+                QuestionAnswer::Single("Blue".to_owned()),
+            ),
+            (
+                "Which toppings?".to_owned(),
+                QuestionAnswer::Multiple(vec!["Cheese".to_owned(), "Mushrooms".to_owned()]),
+            ),
+        ]);
+        let encoded = encode_claude_question_decision(&raw_tool_input, &answers).expect("encodes");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("encoded decision is JSON");
+        let answers_object = value["hookSpecificOutput"]["updatedInput"]["answers"]
+            .as_object()
+            .expect("answers is a JSON object");
+        for (question, answer) in answers_object {
+            assert!(
+                answer.is_string(),
+                "{question} answer must be a JSON string, matching AskUserQuestion's schema"
+            );
+        }
+        assert_eq!(
+            answers_object["Which toppings?"],
+            serde_json::json!(format_question_answer(&QuestionAnswer::Multiple(vec![
+                "Cheese".to_owned(),
+                "Mushrooms".to_owned()
+            ])))
+        );
+    }
+
+    #[test]
+    fn format_question_answer_joins_multi_select_labels_with_a_comma() {
+        assert_eq!(
+            format_question_answer(&QuestionAnswer::Single("Blue".to_owned())),
+            "Blue"
+        );
+        assert_eq!(
+            format_question_answer(&QuestionAnswer::Multiple(vec![
+                "Cheese".to_owned(),
+                "Mushrooms".to_owned()
+            ])),
+            "Cheese, Mushrooms"
+        );
     }
 
     #[test]

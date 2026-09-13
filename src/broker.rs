@@ -23,7 +23,9 @@ use twilight_model::id::{Id, marker::GuildMarker};
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::delivery::expire_permission_card;
 use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
-use crate::question::{QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction};
+use crate::question::{
+    QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction, format_question_answer,
+};
 use crate::registry::{ApprovalRequest, InteractionRegistry, QuestionRegistry, ResolveError};
 use crate::{
     TopologyCache, deliver_permission_card, deliver_question_button_card,
@@ -204,14 +206,14 @@ impl PermissionResponder {
         self.registry.has_pending_session(session_id)
     }
 
-    /// The token of the pending single-select question card for `session_id`, if one is open.
+    /// The token of the pending question card for `session_id`, if one is open, single-select or
+    /// multiSelect alike.
     #[must_use]
-    pub fn pending_single_select_question(&self, session_id: &str) -> Option<String> {
-        self.question_registry
-            .pending_single_select_token(session_id)
+    pub fn pending_question_token(&self, session_id: &str) -> Option<String> {
+        self.question_registry.pending_question_token(session_id)
     }
 
-    /// Resolves the pending single-select question card `token` with a free-text owner answer.
+    /// Resolves the pending question card `token` with a free-text owner answer.
     ///
     /// # Errors
     ///
@@ -470,7 +472,6 @@ impl PermissionResponder {
                     channel_id: channel.get(),
                     session_id: session_id.to_owned(),
                 },
-                !question.multi_select,
                 question.options.clone(),
                 created_at,
                 created_at + QUESTION_TIMEOUT,
@@ -682,13 +683,6 @@ impl PermissionResponder {
             QuestionAnswer::Multiple(labels),
             std::time::Instant::now(),
         )
-    }
-}
-
-fn format_question_answer(answer: &QuestionAnswer) -> String {
-    match answer {
-        QuestionAnswer::Single(label) => label.clone(),
-        QuestionAnswer::Multiple(labels) => labels.join(", "),
     }
 }
 
@@ -1438,7 +1432,6 @@ mod tests {
                     channel_id: 7,
                     session_id: "session".to_owned(),
                 },
-                true,
                 vec![question_option("Red"), question_option("Blue")],
                 now,
                 now + Duration::from_secs(30),
@@ -1468,7 +1461,6 @@ mod tests {
                     channel_id: 7,
                     session_id: "session".to_owned(),
                 },
-                true,
                 vec![question_option("Red")],
                 now,
                 now + Duration::from_secs(30),
@@ -1494,7 +1486,6 @@ mod tests {
                     channel_id: 7,
                     session_id: "session".to_owned(),
                 },
-                false,
                 vec![
                     question_option("Cheese"),
                     question_option("Olives"),
@@ -1515,6 +1506,41 @@ mod tests {
                 "Cheese".to_owned(),
                 "Mushrooms".to_owned()
             ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thread_reply_answers_a_pending_multi_select_question_as_free_text() {
+        let responder = test_responder();
+        let now = Instant::now();
+        let issued = responder
+            .question_registry
+            .issue_with_liveness(
+                ApprovalRequest {
+                    channel_id: 7,
+                    session_id: "session".to_owned(),
+                },
+                vec![
+                    question_option("Cheese"),
+                    question_option("Olives"),
+                    question_option("Mushrooms"),
+                ],
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect("issue token");
+
+        let token = responder
+            .pending_question_token("session")
+            .expect("a pending multiSelect card is still found by a free-text lookup");
+        assert_eq!(token, issued.token);
+        responder
+            .resolve_question_text(&token, 7, "none of these")
+            .expect("free-text reply resolves a pending multiSelect card");
+        assert_eq!(
+            issued.receiver.await,
+            Ok(QuestionAnswer::Single("none of these".to_owned()))
         );
     }
 
