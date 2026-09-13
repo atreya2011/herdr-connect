@@ -992,4 +992,75 @@ mod tests {
             assert_eq!(permission_card_title(vendor), expected);
         }
     }
+
+    use super::{question_button_components, question_card_description, question_card_title};
+    use crate::question::QuestionOption;
+
+    fn option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.to_owned(),
+            description: format!("{label} description"),
+        }
+    }
+
+    #[test]
+    fn question_card_title_falls_back_without_a_header() {
+        let cases = [
+            ("Color", "Claude question: Color"),
+            ("", "Claude question"),
+            ("   ", "Claude question"),
+        ];
+        for (header, expected) in cases {
+            assert_eq!(question_card_title(header), expected);
+        }
+    }
+
+    #[test]
+    fn question_card_description_only_hints_a_free_text_reply_for_single_select() {
+        assert_eq!(
+            question_card_description("Which color?", true),
+            "Which color?\n\nOr reply in this thread with your own answer."
+        );
+        assert_eq!(
+            question_card_description("Which toppings?", false),
+            "Which toppings?"
+        );
+    }
+
+    #[test]
+    fn question_button_components_encode_one_button_per_option_with_the_option_index() {
+        let options = vec![option("Red"), option("Blue")];
+        let components = question_button_components(&options, "tok", false);
+        assert_eq!(
+            components,
+            json!([{
+                "type": 1,
+                "components": [
+                    {"type": 2, "style": 1, "label": "Red", "custom_id": "herdrask:tok:0", "disabled": false},
+                    {"type": 2, "style": 1, "label": "Blue", "custom_id": "herdrask:tok:1", "disabled": false},
+                ],
+            }])
+        );
+        let disabled = question_button_components(&options, "tok", true);
+        assert_eq!(disabled[0]["components"][0]["disabled"], json!(true));
+    }
+
+    #[test]
+    fn question_select_components_offer_every_option_with_a_matching_value_range() {
+        let options = vec![option("Cheese"), option("Olives"), option("Mushrooms")];
+        let components = super::question_select_components(&options, "tok", false);
+        let menu = &components[0]["components"][0];
+        assert_eq!(menu["type"], json!(3));
+        assert_eq!(menu["custom_id"], json!("herdrask-multi:tok"));
+        assert_eq!(menu["min_values"], json!(1));
+        assert_eq!(menu["max_values"], json!(3));
+        assert_eq!(
+            menu["options"],
+            json!([
+                {"label": "Cheese", "value": "0", "description": "Cheese description"},
+                {"label": "Olives", "value": "1", "description": "Olives description"},
+                {"label": "Mushrooms", "value": "2", "description": "Mushrooms description"},
+            ])
+        );
+    }
 }

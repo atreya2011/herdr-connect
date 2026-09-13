@@ -261,6 +261,50 @@ impl QuestionRegistry {
             expiry,
         })
     }
+    /// Inserts a supplied token for deterministic state-machine tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lifetimes, empty tokens, or collisions.
+    #[cfg(test)]
+    fn issue_with_token(
+        &self,
+        token: String,
+        request: ApprovalRequest,
+        single_select: bool,
+        created_at: Instant,
+        expiry: Instant,
+    ) -> Result<IssuedQuestion, String> {
+        if token.is_empty() || expiry <= created_at {
+            return Err("invalid question registry entry".to_owned());
+        }
+        let (sender, receiver) = oneshot::channel();
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "question registry lock poisoned".to_owned())?;
+        if entries.contains_key(&token) {
+            return Err("question token collision".to_owned());
+        }
+        entries.insert(
+            token.clone(),
+            QuestionEntry {
+                request,
+                single_select,
+                options: Vec::new(),
+                created_at,
+                expiry,
+                hook_alive: Arc::new(AtomicBool::new(true)),
+                sender,
+            },
+        );
+        drop(entries);
+        Ok(IssuedQuestion {
+            token,
+            receiver,
+            expiry,
+        })
+    }
     /// The label of `index` among the token's own options, if the token is still pending.
     pub fn option_label(&self, token: &str, index: usize) -> Option<String> {
         self.entries.lock().ok().and_then(|entries| {
@@ -425,6 +469,155 @@ mod tests {
         hook_alive.store(false, Ordering::Release);
         assert_eq!(
             registry.resolve(&issued.token, 7, Decision::allow(), now,),
+            Err(ResolveError::UnknownOrExpired)
+        );
+    }
+
+    use super::QuestionRegistry;
+    use crate::{QuestionAnswer, QuestionOption};
+
+    fn option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.to_owned(),
+            description: format!("{label} description"),
+        }
+    }
+
+    #[test]
+    fn option_label_resolves_by_index_and_is_none_once_removed() {
+        let now = Instant::now();
+        let registry = QuestionRegistry::default();
+        let issued = registry
+            .issue_with_liveness(
+                request(7, "session"),
+                true,
+                vec![option("Red"), option("Blue")],
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect("issue token");
+        assert_eq!(
+            registry.option_label(&issued.token, 1),
+            Some("Blue".to_owned())
+        );
+        assert_eq!(registry.option_label(&issued.token, 5), None);
+        assert!(registry.remove(&issued.token));
+        assert_eq!(registry.option_label(&issued.token, 1), None);
+    }
+
+    #[test]
+    fn question_registry_state_machine_rejects_invalid_taps() {
+        let now = Instant::now();
+        let registry = QuestionRegistry::default();
+        let issued = registry
+            .issue_with_token(
+                "token".to_owned(),
+                request(7, "session"),
+                true,
+                now,
+                now + Duration::from_secs(30),
+            )
+            .expect("issue token");
+        assert_eq!(
+            registry.resolve(
+                &issued.token,
+                8,
+                QuestionAnswer::Single("Blue".to_owned()),
+                now,
+            ),
+            Err(ResolveError::WrongChannel)
+        );
+    }
+
+    #[test]
+    fn only_a_single_select_card_is_returned_as_the_pending_free_text_target() {
+        let now = Instant::now();
+        let registry = QuestionRegistry::default();
+        registry
+            .issue_with_token(
+                "multi-select-token".to_owned(),
+                request(7, "session-a"),
+                false,
+                now,
+                now + Duration::from_secs(30),
+            )
+            .expect("issue multiSelect token");
+        assert_eq!(registry.pending_single_select_token("session-a"), None);
+
+        registry
+            .issue_with_token(
+                "single-select-token".to_owned(),
+                request(7, "session-a"),
+                true,
+                now,
+                now + Duration::from_secs(30),
+            )
+            .expect("issue single-select token");
+        assert_eq!(
+            registry.pending_single_select_token("session-a"),
+            Some("single-select-token".to_owned())
+        );
+        assert_eq!(registry.pending_single_select_token("session-b"), None);
+    }
+
+    #[tokio::test]
+    async fn question_registry_issues_and_resolves_exactly_once() {
+        let now = Instant::now();
+        let registry = QuestionRegistry::default();
+        let issued = registry
+            .issue_with_token(
+                "opaque-question-token".to_owned(),
+                request(7, "session"),
+                true,
+                now,
+                now + Duration::from_secs(30),
+            )
+            .expect("issue token");
+        registry
+            .resolve(
+                &issued.token,
+                7,
+                QuestionAnswer::Single("Blue".to_owned()),
+                now,
+            )
+            .expect("first tap resolves");
+        assert_eq!(
+            issued.receiver.await,
+            Ok(QuestionAnswer::Single("Blue".to_owned()))
+        );
+        assert_eq!(
+            registry.resolve(
+                "opaque-question-token",
+                7,
+                QuestionAnswer::Single("Red".to_owned()),
+                now,
+            ),
+            Err(ResolveError::UnknownOrExpired)
+        );
+    }
+
+    #[test]
+    fn disconnected_hook_cannot_resolve_a_pending_question_token() {
+        let now = Instant::now();
+        let registry = QuestionRegistry::default();
+        let issued = registry
+            .issue_with_liveness(
+                request(7, "session"),
+                true,
+                Vec::new(),
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("issue token");
+        assert_eq!(
+            registry.resolve(
+                &issued.token,
+                7,
+                QuestionAnswer::Single("Blue".to_owned()),
+                now,
+            ),
             Err(ResolveError::UnknownOrExpired)
         );
     }

@@ -1224,6 +1224,7 @@ mod tests {
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
+    use crate::registry::ApprovalRequest;
     use std::collections::BTreeMap;
 
     fn interaction() -> Interaction {
@@ -1392,5 +1393,153 @@ mod tests {
         assert!(!edit_started.load(Ordering::Acquire));
         tokio::task::yield_now().await;
         assert!(edit_started.load(Ordering::Acquire));
+    }
+
+    use super::{
+        permission_component_response, question_button_response, question_select_response,
+    };
+    use std::time::Instant;
+    use twilight_http::Client;
+    use twilight_model::http::interaction::InteractionResponse;
+    use twilight_model::id::Id;
+
+    fn test_responder() -> PermissionResponder {
+        PermissionResponder::new(
+            Arc::new(Client::builder().token("test-token".to_owned()).build()),
+            Id::new(1),
+            "owner-id".to_owned(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+        )
+    }
+
+    fn question_option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.to_owned(),
+            description: String::new(),
+        }
+    }
+
+    fn response_content(response: Option<InteractionResponse>) -> String {
+        response
+            .expect("component dispatch replies")
+            .data
+            .and_then(|data| data.content)
+            .expect("ephemeral reply has content")
+    }
+
+    #[tokio::test]
+    async fn question_button_tap_resolves_by_option_index_and_rejects_a_replay() {
+        let responder = test_responder();
+        let now = Instant::now();
+        let issued = responder
+            .question_registry
+            .issue_with_liveness(
+                ApprovalRequest {
+                    channel_id: 7,
+                    session_id: "session".to_owned(),
+                },
+                true,
+                vec![question_option("Red"), question_option("Blue")],
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect("issue token");
+
+        let response = question_button_response(&responder, &format!("{}:1", issued.token), 7);
+        assert_eq!(response_content(response), "answer recorded");
+        assert_eq!(
+            issued.receiver.await,
+            Ok(QuestionAnswer::Single("Blue".to_owned()))
+        );
+
+        let replay = question_button_response(&responder, &format!("{}:0", issued.token), 7);
+        assert_eq!(response_content(replay), "expired");
+    }
+
+    #[tokio::test]
+    async fn question_button_tap_rejects_the_wrong_channel_or_a_bad_index() {
+        let responder = test_responder();
+        let now = Instant::now();
+        let issued = responder
+            .question_registry
+            .issue_with_liveness(
+                ApprovalRequest {
+                    channel_id: 7,
+                    session_id: "session".to_owned(),
+                },
+                true,
+                vec![question_option("Red")],
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect("issue token");
+
+        let out_of_range = question_button_response(&responder, &format!("{}:9", issued.token), 7);
+        assert_eq!(response_content(out_of_range), "expired");
+
+        let wrong_channel = question_button_response(&responder, &format!("{}:0", issued.token), 8);
+        assert_eq!(response_content(wrong_channel), "expired");
+    }
+
+    #[tokio::test]
+    async fn question_select_tap_resolves_every_chosen_index() {
+        let responder = test_responder();
+        let now = Instant::now();
+        let issued = responder
+            .question_registry
+            .issue_with_liveness(
+                ApprovalRequest {
+                    channel_id: 7,
+                    session_id: "session".to_owned(),
+                },
+                false,
+                vec![
+                    question_option("Cheese"),
+                    question_option("Olives"),
+                    question_option("Mushrooms"),
+                ],
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect("issue token");
+
+        let values = ["0".to_owned(), "2".to_owned()];
+        let response = question_select_response(&responder, &issued.token, 7, &values);
+        assert_eq!(response_content(response), "answer recorded");
+        assert_eq!(
+            issued.receiver.await,
+            Ok(QuestionAnswer::Multiple(vec![
+                "Cheese".to_owned(),
+                "Mushrooms".to_owned()
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_component_dispatch_records_allow_and_rejects_unknown_actions() {
+        let responder = test_responder();
+        let now = Instant::now();
+        let issued = responder
+            .registry
+            .issue_with_liveness(
+                ApprovalRequest {
+                    channel_id: 7,
+                    session_id: "session".to_owned(),
+                },
+                now,
+                now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect("issue token");
+
+        let unknown = permission_component_response(&responder, "snooze", &issued.token, 7);
+        assert_eq!(unknown, None);
+        let allowed = permission_component_response(&responder, "allow", &issued.token, 7);
+        assert_eq!(response_content(allowed), "decision recorded");
+        let replay = permission_component_response(&responder, "allow", &issued.token, 7);
+        assert_eq!(response_content(replay), "expired");
     }
 }

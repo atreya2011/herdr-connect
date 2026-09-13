@@ -411,7 +411,7 @@ mod tests {
 
     use super::{
         OWNER_PROMPT_SUPPRESSIONS, agent_list_failure_reply, has_prompt_content, is_thread_channel,
-        pane_status_is_working, prompt_surface_markers, resolve_prompt_pane,
+        matching_agent, pane_status_is_working, prompt_surface_markers, resolve_prompt_pane,
         take_owner_prompt_suppression,
     };
     use crate::AgentSnapshot;
@@ -595,6 +595,42 @@ mod tests {
                 "branch={branch}"
             );
         }
+    }
+
+    /// Unlike [`resolve_prompt_pane`], `matching_agent` must resolve a `working` or `blocked` pane:
+    /// it backs the pending-question check, which has to find a pane's session while a question is
+    /// pending and the pane therefore reports `working`, not `idle`/`done`.
+    #[test]
+    fn matching_agent_ignores_status_unlike_resolve_prompt_pane() {
+        let value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
+                .expect("captured agent snapshot is JSON");
+        let captured: Vec<AgentSnapshot> =
+            serde_json::from_value(value["result"]["agents"].clone())
+                .expect("captured agent snapshot has the expected shape");
+        let workspace_id = captured[0]
+            .workspace_id
+            .as_deref()
+            .expect("captured agent has a workspace id")
+            .to_owned();
+        let tab_id = captured[0]
+            .tab_id
+            .as_deref()
+            .expect("captured agent has a tab id")
+            .to_owned();
+        let mut working = captured[0].clone();
+        working.agent_status = "working".to_owned();
+        let pane_id = working.pane_id.clone();
+
+        let resolved = matching_agent(&tab_id, &workspace_id, std::slice::from_ref(&working))
+            .expect("a working pane is still resolvable by matching_agent");
+        assert_eq!(resolved.pane_id, pane_id);
+        assert_eq!(
+            matching_agent("missing-tab", &workspace_id, std::slice::from_ref(&working))
+                .err()
+                .as_deref(),
+            Some("refused: unmapped pane")
+        );
     }
 
     #[test]

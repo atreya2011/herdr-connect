@@ -237,6 +237,37 @@ fn codex_hooks_register_activity_and_permission_commands() {
     );
 }
 
+#[test]
+fn claude_hooks_register_activity_and_ask_question_commands() {
+    let config: Value = serde_json::from_str(include_str!("../examples/claude-hooks.json"))
+        .expect("parse Claude hook config");
+    let pre_tool_use = config["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse: missing hook key");
+    assert_eq!(pre_tool_use.len(), 2, "PreToolUse: expected two matchers");
+    assert_eq!(
+        pre_tool_use[0]["hooks"][0]["command"], "herdr-connect-rs activity --vendor claude",
+        "PreToolUse[0]: unexpected command"
+    );
+    let question_matcher = &pre_tool_use[1];
+    assert_eq!(
+        question_matcher["matcher"], "AskUserQuestion",
+        "PreToolUse[1]: unexpected matcher"
+    );
+    assert_eq!(
+        question_matcher["hooks"][0]["command"], "herdr-connect-rs hook --vendor claude",
+        "PreToolUse[1]: unexpected command"
+    );
+    let timeout = question_matcher["hooks"][0]["timeout"]
+        .as_u64()
+        .expect("PreToolUse[1]: timeout is a number");
+    assert!(
+        Duration::from_secs(timeout) >= herdr_connect_rs::question_hook_timeout(),
+        "PreToolUse[1]: timeout {timeout}s is shorter than the hook's own {:?} deadline",
+        herdr_connect_rs::question_hook_timeout()
+    );
+}
+
 fn invoke_activity_with_args(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
         .arg("activity")

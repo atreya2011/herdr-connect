@@ -7067,6 +7067,475 @@ mod tests {
         run_activity_hook_test().await;
     }
 
+    #[cfg(unix)]
+    const QUESTION_LABEL: &str = "testrun-question";
+
+    /// Instructs a real `claude --model haiku` agent to call `AskUserQuestion` with exactly the
+    /// shape the exercise below expects to resolve.
+    #[cfg(unix)]
+    const QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly one \
+        question with header \"Color\", question text \"Which color?\", and exactly two options: \
+        label \"Red\" with description \"The color red\", and label \"Blue\" with description \
+        \"The color blue\". multiSelect must be false. Do not do anything else and do not say \
+        anything else.";
+
+    /// Testrun tab cwd fixture for the question hook exercise, mirroring `activity_tab_fixture`
+    /// under its own label so the two tests' zero-leftover checks never collide.
+    #[cfg(unix)]
+    fn question_tab_fixture() -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let label = format!("{QUESTION_LABEL}-claude");
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir)?;
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        create_tab(&label, &workspace_id, cwd).map(|tab| (tab, cwd_dir))
+    }
+
+    /// Writes a Claude `--settings` file registering the `PreToolUse` `AskUserQuestion` hook
+    /// against `broker_socket`, per [examples/claude-hooks.json](../examples/claude-hooks.json)'s
+    /// shape.
+    #[cfg(unix)]
+    fn write_question_settings(broker_socket: &Path) -> Result<PathBuf, String> {
+        let binary = activity_binary_path()?;
+        let binary = binary
+            .to_str()
+            .ok_or_else(|| "built binary path is valid UTF-8".to_owned())?;
+        let socket_arg = broker_socket
+            .to_str()
+            .ok_or_else(|| "broker socket path is valid UTF-8".to_owned())?;
+        let command = format!("{binary} hook --vendor claude --socket {socket_arg}");
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": [
+                            {"type": "command", "command": command, "timeout": 600}
+                        ]
+                    }
+                ]
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-question-settings-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec(&settings).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(path)
+    }
+
+    /// Builds a `MessageComponent` interaction JSON has no way to synthesize from a real Discord
+    /// client (there is no bot API that simulates a human clicking a button), so this constructs
+    /// the minimal wire shape [`handle_component`] actually reads: guild, a real channel (fetched
+    /// live so its shape is never guessed), the owner as the invoking user, and the tapped
+    /// component's `custom_id` plus any select-menu `values`. Every downstream effect this drives
+    /// -- the registry resolution, the real Discord card edit, the attempted (and discarded)
+    /// interaction response -- is real; only this upstream "a human tapped a button" event is
+    /// synthetic, the same gap the project's own permission-card click path has not yet closed
+    /// (see ROADMAP.md's Cursor permission viability item).
+    #[cfg(unix)]
+    fn synthetic_component_interaction(
+        guild_id: Id<GuildMarker>,
+        owner_id: &str,
+        channel: &twilight_model::channel::Channel,
+        custom_id: &str,
+        values: &[&str],
+    ) -> Result<twilight_model::application::interaction::Interaction, String> {
+        let channel_value = serde_json::to_value(channel).map_err(|error| error.to_string())?;
+        let component_type = if values.is_empty() { 2 } else { 3 };
+        let payload = json!({
+            "id": "1",
+            "application_id": "1",
+            "authorizing_integration_owners": {},
+            "token": "synthetic-test-token",
+            "type": 3,
+            "guild_id": guild_id.to_string(),
+            "channel": channel_value,
+            "user": {"id": owner_id, "username": "owner", "discriminator": "0"},
+            "data": {
+                "custom_id": custom_id,
+                "component_type": component_type,
+                "values": values,
+            },
+        });
+        serde_json::from_value(payload).map_err(|error| error.to_string())
+    }
+
+    /// Drives one real `claude --model haiku` agent with the `AskUserQuestion` hook registered
+    /// against a real bridge broker through a forced single-select question, resolves it the way an
+    /// owner's Discord button tap would (see [`synthetic_component_interaction`]), and returns the
+    /// pane's settled status alongside every message the exercise left in its tab thread.
+    #[cfg(unix)]
+    async fn question_hook_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+        broker_socket: &Path,
+        settings_path: &Path,
+    ) -> Result<(String, Vec<(String, bool, Id<MessageMarker>)>), String> {
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+        let responder = Arc::clone(&connection.3);
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(activity_rx);
+        let broker_socket_owned = broker_socket.to_path_buf();
+        let broker_task = tokio::spawn(async move {
+            super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
+        });
+        let broker_deadline = Instant::now() + Duration::from_secs(2);
+        while !broker_socket.exists() && Instant::now() < broker_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !broker_socket.exists() {
+            broker_task.abort();
+            return Err("test broker did not create its socket".to_owned());
+        }
+
+        start_claude_haiku_agent_with_settings(agent_name, &tab.pane_id, settings_path)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let (tabs, agents) = (std::slice::from_ref(&matching), std::slice::from_ref(&idle));
+        let route = route_topology(agents, tabs, &terminal)?;
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+
+        submit_owner_prompt(&tab.pane_id, QUESTION_FORCE_PROMPT)?;
+
+        let session_id = poll_snapshot(&tab.pane_id, Duration::from_secs(15), |snapshot| {
+            snapshot.session.is_some()
+        })?
+        .session
+        .ok_or("pane never reported a session while asking its question")?
+        .value;
+
+        let token = {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(token) = connection.3.pending_single_select_question(&session_id) {
+                    break token;
+                }
+                if Instant::now() >= deadline {
+                    broker_task.abort();
+                    return Err(
+                        "AskUserQuestion hook never reached the broker with a pending card"
+                            .to_owned(),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+
+        let channel = guild
+            .client
+            .channel(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let interaction = synthetic_component_interaction(
+            guild.id,
+            &connection.2,
+            &channel,
+            &format!("herdrask:{token}:1"),
+            &[],
+        )?;
+        super::handle_component(Arc::clone(&connection.3), interaction).await;
+
+        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(45), |snapshot| {
+            matches!(snapshot.agent_status.as_str(), "done" | "idle")
+        })?;
+        broker_task.abort();
+        let _ = std::fs::remove_file(broker_socket);
+
+        // The card's own edit runs detached from the resolution the hook waited on (see
+        // `return_value_before_card_edit`), so give it a bounded moment to land before reading.
+        let mut messages = thread_messages(guild, thread).await?;
+        let edit_deadline = Instant::now() + Duration::from_secs(5);
+        while !messages
+            .iter()
+            .any(|(content, _, _)| content.starts_with("resolved:"))
+            && Instant::now() < edit_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            messages = thread_messages(guild, thread).await?;
+        }
+        Ok((settled.agent_status, messages))
+    }
+
+    #[cfg(unix)]
+    async fn run_question_hook_test() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{QUESTION_LABEL}-claude");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let broker_socket = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-question-broker-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        let settings_path = write_question_settings(&broker_socket)
+            .expect("write question settings for the exercise");
+        let created = question_tab_fixture();
+        let (tab_id, cwd_dir, result) = match created {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "question-claude-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    question_hook_exercise(
+                        &guild,
+                        &tab,
+                        &agent_name,
+                        &broker_socket,
+                        &settings_path,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err("question hook exercise timed out".to_owned()));
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = clear_directory_contents(&cwd_dir);
+        }
+        let _ = std::fs::remove_file(&broker_socket);
+        let _ = std::fs::remove_file(&settings_path);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        let (status, messages) = result.unwrap_or_else(|error| panic!("{error}"));
+        assert_ne!(
+            status, "blocked",
+            "the pane must never block on Claude's own dialog once the hook answers it"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|(content, _, _)| content == "resolved: Blue"),
+            "question card must read resolved: Blue, thread has {messages:?}"
+        );
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn question_hook_answers_from_discord_without_blocking_the_pane() {
+        run_question_hook_test().await;
+    }
+
+    /// Mirrors [`question_hook_exercise`] but never resolves the card: the hook's own
+    /// `QUESTION_TIMEOUT` window (five real minutes -- this test does not fake the clock, per the
+    /// real-services law) must elapse before the card reads `expired: no owner answer` and the pane
+    /// falls back to blocking on Claude's own dialog.
+    #[cfg(unix)]
+    async fn question_hook_expiry_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+        broker_socket: &Path,
+        settings_path: &Path,
+    ) -> Result<(String, Vec<(String, bool, Id<MessageMarker>)>), String> {
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+        let responder = Arc::clone(&connection.3);
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(activity_rx);
+        let broker_socket_owned = broker_socket.to_path_buf();
+        let broker_task = tokio::spawn(async move {
+            super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
+        });
+        let broker_deadline = Instant::now() + Duration::from_secs(2);
+        while !broker_socket.exists() && Instant::now() < broker_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !broker_socket.exists() {
+            broker_task.abort();
+            return Err("test broker did not create its socket".to_owned());
+        }
+
+        start_claude_haiku_agent_with_settings(agent_name, &tab.pane_id, settings_path)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let (tabs, agents) = (std::slice::from_ref(&matching), std::slice::from_ref(&idle));
+        let route = route_topology(agents, tabs, &terminal)?;
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+
+        submit_owner_prompt(&tab.pane_id, QUESTION_FORCE_PROMPT)?;
+
+        let session_id = poll_snapshot(&tab.pane_id, Duration::from_secs(15), |snapshot| {
+            snapshot.session.is_some()
+        })?
+        .session
+        .ok_or("pane never reported a session while asking its question")?
+        .value;
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while connection
+            .3
+            .pending_single_select_question(&session_id)
+            .is_none()
+        {
+            if Instant::now() >= deadline {
+                broker_task.abort();
+                return Err(
+                    "AskUserQuestion hook never reached the broker with a pending card".to_owned(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // No resolution: wait out the real QUESTION_TIMEOUT window plus the card-edit margin.
+        let status = poll_snapshot(&tab.pane_id, Duration::from_secs(320), |snapshot| {
+            matches!(snapshot.agent_status.as_str(), "blocked")
+        })?
+        .agent_status;
+        broker_task.abort();
+        let _ = std::fs::remove_file(broker_socket);
+
+        let messages = thread_messages(guild, thread).await?;
+        Ok((status, messages))
+    }
+
+    #[cfg(unix)]
+    async fn run_question_hook_expiry_test() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{QUESTION_LABEL}-expiry-claude");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let broker_socket = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-question-expiry-broker-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        let settings_path = write_question_settings(&broker_socket)
+            .expect("write question settings for the exercise");
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
+            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
+        let cwd_dir = claude_testrun_dir(&home);
+        let created = clear_directory_contents(&cwd_dir).and_then(|()| {
+            let cwd = cwd_dir
+                .to_str()
+                .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+            create_tab(&label, &workspace_id, cwd)
+        });
+        let (tab_id, result) = match created {
+            Ok(tab) => {
+                let agent_name = format!(
+                    "question-expiry-claude-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(360),
+                    question_hook_expiry_exercise(
+                        &guild,
+                        &tab,
+                        &agent_name,
+                        &broker_socket,
+                        &settings_path,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err("question hook expiry exercise timed out".to_owned()));
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
+                (Some(tab.tab_id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        let _ = clear_directory_contents(&cwd_dir);
+        let _ = std::fs::remove_file(&broker_socket);
+        let _ = std::fs::remove_file(&settings_path);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        let (status, messages) = result.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            status, "blocked",
+            "an expired question card must fall back to Claude's own dialog"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|(content, _, _)| content == "expired: no owner answer"),
+            "question card must read expired: no owner answer, thread has {messages:?}"
+        );
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn question_hook_expires_and_falls_back_to_the_dialog() {
+        run_question_hook_expiry_test().await;
+    }
+
     /// The real Codex account's own broker socket, matching its already-installed
     /// `CODEX_HOME/hooks.json` (`PreToolUse` activity hook and `PermissionRequest` hook, both
     /// `--socket /tmp/herdr-claude-broker.sock`), per [examples/codex-hooks.json](../examples/codex-hooks.json)'s
