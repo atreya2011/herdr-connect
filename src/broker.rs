@@ -21,7 +21,9 @@ use twilight_model::http::interaction::{
 use twilight_model::id::{Id, marker::GuildMarker};
 
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
-use crate::delivery::expire_permission_card;
+use crate::delivery::{
+    MAX_QUESTION_CARD_CONTENT_LENGTH, expire_permission_card, truncate_with_ellipsis,
+};
 use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
 use crate::question::{
     QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction, format_question_answer,
@@ -37,10 +39,6 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 const CURSOR_PERMISSION_TIMEOUT: Duration = PERMISSION_TIMEOUT;
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-/// Discord's message content length limit (`twilight-validate`'s `MESSAGE_CONTENT_LENGTH_MAX`): a
-/// free-text answer can run well past it, and an oversized `update_message` is rejected outright,
-/// leaving the card's buttons enabled and unresolved.
-const MAX_QUESTION_CARD_CONTENT_LENGTH: usize = 2_000;
 /// How long one question card stays open for an owner answer before the hook falls through to
 /// Claude's own dialog.
 const QUESTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -482,7 +480,6 @@ impl PermissionResponder {
         liveness: &HookLiveness,
     ) -> Option<QuestionAnswer> {
         let created_at = std::time::Instant::now();
-        let expiry = question_card_expiry(created_at, call_deadline);
         let issued = self
             .question_registry
             .issue_with_liveness(
@@ -492,7 +489,7 @@ impl PermissionResponder {
                 },
                 question.options.clone(),
                 created_at,
-                expiry,
+                call_deadline,
                 Arc::clone(&liveness.alive),
             )
             .ok()?;
@@ -521,7 +518,10 @@ impl PermissionResponder {
                 }
             },
             |resolved| {
-                bound_card_content(format!("resolved: {}", format_question_answer(resolved)))
+                truncate_with_ellipsis(
+                    &format!("resolved: {}", format_question_answer(resolved)),
+                    MAX_QUESTION_CARD_CONTENT_LENGTH,
+                )
             },
         );
         let client = Arc::clone(&self.client);
@@ -708,30 +708,6 @@ impl PermissionResponder {
             std::time::Instant::now(),
         )
     }
-}
-
-/// One question card's own expiry: `QUESTION_TIMEOUT` from when its card is issued, clamped to the
-/// whole call's shared `call_deadline` so a later card in a multi-question call never outlives the
-/// call's own timeout margin.
-fn question_card_expiry(
-    created_at: std::time::Instant,
-    call_deadline: std::time::Instant,
-) -> std::time::Instant {
-    (created_at + QUESTION_TIMEOUT).min(call_deadline)
-}
-
-/// Truncates `content` to fit Discord's message content limit, marking a cut with a trailing `…`:
-/// a free-text owner answer can run well past it, and an oversized card edit is rejected outright.
-fn bound_card_content(content: String) -> String {
-    if content.chars().count() <= MAX_QUESTION_CARD_CONTENT_LENGTH {
-        return content;
-    }
-    let mut bounded: String = content
-        .chars()
-        .take(MAX_QUESTION_CARD_CONTENT_LENGTH.saturating_sub(1))
-        .collect();
-    bounded.push('…');
-    bounded
 }
 
 pub async fn handle_component(
@@ -1259,11 +1235,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, MAX_QUESTION_CARD_CONTENT_LENGTH,
-        PERMISSION_TIMEOUT, PendingKey, PendingRequests, PermissionResponder, QUESTION_TIMEOUT,
-        QuestionBrokerResponse, bound_card_content, correlate_decision, correlate_question_answers,
-        hook_timeout, question_card_expiry, question_hook_timeout, read_json_line,
-        return_value_before_card_edit, spawn_hook_monitor,
+        BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, PERMISSION_TIMEOUT, PendingKey,
+        PendingRequests, PermissionResponder, QUESTION_TIMEOUT, QuestionBrokerResponse,
+        correlate_decision, correlate_question_answers, hook_timeout, question_hook_timeout,
+        read_json_line, return_value_before_card_edit, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
@@ -1293,39 +1268,6 @@ mod tests {
     fn question_hook_margin_matches_the_question_timeout() {
         assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(300));
         assert_eq!(question_hook_timeout(), Duration::from_secs(305));
-    }
-
-    #[test]
-    fn question_card_expiry_never_outlives_the_shared_call_deadline() {
-        let call_start = std::time::Instant::now();
-        let call_deadline = call_start + QUESTION_TIMEOUT;
-
-        // The first card, issued right at the call's start, gets the full window.
-        assert_eq!(
-            question_card_expiry(call_start, call_deadline),
-            call_deadline
-        );
-
-        // A later card, issued after the first question already used up some of the call's
-        // window, is clamped to the same shared deadline rather than getting its own fresh
-        // QUESTION_TIMEOUT from its later start.
-        let second_card_created_at = call_start + Duration::from_secs(200);
-        assert_eq!(
-            question_card_expiry(second_card_created_at, call_deadline),
-            call_deadline,
-            "a later card must not outlive the call's own deadline"
-        );
-    }
-
-    #[test]
-    fn bound_card_content_only_truncates_past_the_discord_message_limit() {
-        let at_limit = "x".repeat(MAX_QUESTION_CARD_CONTENT_LENGTH);
-        assert_eq!(bound_card_content(at_limit.clone()), at_limit);
-
-        let over_limit = "x".repeat(MAX_QUESTION_CARD_CONTENT_LENGTH + 500);
-        let bounded = bound_card_content(over_limit);
-        assert_eq!(bounded.chars().count(), MAX_QUESTION_CARD_CONTENT_LENGTH);
-        assert!(bounded.ends_with('…'));
     }
 
     fn question_interaction() -> QuestionInteraction {

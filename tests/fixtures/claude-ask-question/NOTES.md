@@ -83,8 +83,7 @@ output:
 ```
 
 The tool result carried no error (`is_error` absent/`None`). The real session transcript
-(`~/.claude-one/projects/-home-user--cache-herdr-connect-testrun-claude/<session>.jsonl`)
-recorded:
+(`<config dir>/projects/<cwd slug>/<session>.jsonl`) recorded:
 
 ```json
 {
