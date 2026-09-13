@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -23,6 +23,7 @@ use twilight_model::id::{Id, marker::GuildMarker};
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::delivery::expire_permission_card;
 use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
+use crate::question::{QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction};
 use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
 use crate::{
     TopologyCache, deliver_permission_card, fetch_topology_lists, list_agents, route_topology,
@@ -33,10 +34,88 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 const CURSOR_PERMISSION_TIMEOUT: Duration = PERMISSION_TIMEOUT;
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one question card stays open for an owner answer before the hook falls through to
+/// Claude's own dialog.
+const QUESTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[must_use]
 pub const fn hook_timeout() -> Duration {
     Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
+}
+
+/// The `AskUserQuestion` hook's own margin over [`QUESTION_TIMEOUT`], mirroring [`hook_timeout`]'s
+/// margin over `PERMISSION_TIMEOUT`.
+#[must_use]
+pub const fn question_hook_timeout() -> Duration {
+    Duration::from_secs(QUESTION_TIMEOUT.as_secs() + 5)
+}
+
+/// One `AskUserQuestion` request forwarded to the broker over the shared socket, tagged the same
+/// way [`ActivityFrame`] is so [`handle_connection`] can tell frame kinds apart before choosing
+/// which type to decode into.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct QuestionFrame {
+    kind: String,
+    session_id: String,
+    request_id: String,
+    questions: Vec<Question>,
+}
+
+impl From<&QuestionInteraction> for QuestionFrame {
+    fn from(interaction: &QuestionInteraction) -> Self {
+        Self {
+            kind: QUESTION_KIND.to_owned(),
+            session_id: interaction.session_id.clone(),
+            request_id: interaction.request_id.clone(),
+            questions: interaction.questions.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct QuestionBrokerResponse {
+    session_id: String,
+    request_id: String,
+    answers: BTreeMap<String, QuestionAnswer>,
+}
+
+/// Accepts a broker answer set only when its session and request id match the request.
+///
+/// # Errors
+///
+/// Returns `MismatchedRequest` for a response belonging to another or stale request.
+fn correlate_question_answers(
+    interaction: &QuestionInteraction,
+    response: QuestionBrokerResponse,
+) -> Result<BTreeMap<String, QuestionAnswer>, CorrelationError> {
+    if interaction.session_id != response.session_id
+        || interaction.request_id != response.request_id
+    {
+        return Err(CorrelationError::MismatchedRequest);
+    }
+    Ok(response.answers)
+}
+
+/// Sends one `AskUserQuestion` request to the broker and awaits its resolved answers.
+///
+/// Returns `None` on any connect failure, malformed or mismatched response, or timeout, matching
+/// the hook's best-effort contract: the caller falls through to Claude's own dialog rather than
+/// failing the tool call.
+pub async fn request_question_answers(
+    interaction: &QuestionInteraction,
+    socket_path: &Path,
+    timeout_duration: Duration,
+) -> Option<BTreeMap<String, QuestionAnswer>> {
+    let frame = QuestionFrame::from(interaction);
+    tokio::time::timeout(timeout_duration, async {
+        let mut stream = UnixStream::connect(socket_path).await.map_err(|_| ())?;
+        write_json_line(&mut stream, &frame).await.map_err(|_| ())?;
+        let response: QuestionBrokerResponse = read_json_line(&mut stream).await.map_err(|_| ())?;
+        correlate_question_answers(interaction, response).map_err(|_| ())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
 }
 
 pub struct PermissionResponder {
@@ -759,10 +838,13 @@ mod tests {
 
     use super::{
         BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, PERMISSION_TIMEOUT, PendingKey,
-        PendingRequests, PermissionResponder, correlate_decision, hook_timeout, read_json_line,
-        return_decision_before_card_edit, spawn_hook_monitor,
+        PendingRequests, PermissionResponder, QUESTION_TIMEOUT, QuestionBrokerResponse,
+        correlate_decision, correlate_question_answers, hook_timeout, question_hook_timeout,
+        read_json_line, return_decision_before_card_edit, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
+    use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
+    use std::collections::BTreeMap;
 
     fn interaction() -> Interaction {
         Interaction {
@@ -781,6 +863,58 @@ mod tests {
     fn cursor_permission_window_matches_generic_hook_margin() {
         assert_eq!(CURSOR_PERMISSION_TIMEOUT, PERMISSION_TIMEOUT);
         assert_eq!(hook_timeout(), Duration::from_secs(50));
+    }
+
+    #[test]
+    fn question_hook_margin_matches_the_question_timeout() {
+        assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(question_hook_timeout(), Duration::from_secs(305));
+    }
+
+    fn question_interaction() -> QuestionInteraction {
+        QuestionInteraction {
+            session_id: "session".to_owned(),
+            request_id: "toolu_1".to_owned(),
+            questions: vec![Question {
+                question: "Which color?".to_owned(),
+                header: "Color".to_owned(),
+                options: vec![
+                    QuestionOption {
+                        label: "Red".to_owned(),
+                        description: "The color red".to_owned(),
+                    },
+                    QuestionOption {
+                        label: "Blue".to_owned(),
+                        description: "The color blue".to_owned(),
+                    },
+                ],
+                multi_select: false,
+            }],
+            raw_tool_input: serde_json::json!({"questions": []}),
+        }
+    }
+
+    #[test]
+    fn mismatched_question_session_or_request_id_is_rejected() {
+        let request = question_interaction();
+        let answers = BTreeMap::from([(
+            "Which color?".to_owned(),
+            QuestionAnswer::Single("Blue".to_owned()),
+        )]);
+        for (session_id, request_id) in [("other", "toolu_1"), ("session", "other")] {
+            let response = QuestionBrokerResponse {
+                session_id: session_id.to_owned(),
+                request_id: request_id.to_owned(),
+                answers: answers.clone(),
+            };
+            assert!(correlate_question_answers(&request, response).is_err());
+        }
+        let response = QuestionBrokerResponse {
+            session_id: request.session_id.clone(),
+            request_id: request.request_id.clone(),
+            answers: answers.clone(),
+        };
+        assert_eq!(correlate_question_answers(&request, response), Ok(answers));
     }
 
     #[test]

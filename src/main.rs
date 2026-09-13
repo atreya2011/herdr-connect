@@ -44,6 +44,10 @@ use herdr_connect_rs::{
     encode_cursor_decision, handle_component, request_decision,
     run_broker as run_permission_broker,
 };
+use herdr_connect_rs::{
+    decode_claude_ask_question, encode_claude_question_decision, question_hook_timeout,
+    request_question_answers,
+};
 
 type DiscordConnection = (
     Arc<Client>,
@@ -2432,6 +2436,11 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
+    if matches!(explicit_vendor, None | Some(PermissionVendor::Claude))
+        && let Ok(question) = decode_claude_ask_question(&input)
+    {
+        return run_question_hook(&question, requested_socket).await;
+    }
     let Some(interaction) = decode_hook_request(&input, explicit_vendor) else {
         if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
             write_hook_decision(PermissionVendor::Cursor, None).await?;
@@ -2456,6 +2465,33 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     write_hook_decision(interaction.vendor, decision.as_ref()).await
+}
+
+/// Answers one decoded `AskUserQuestion` request over the broker socket and prints Claude's
+/// `updatedInput` hook response, always exiting 0: with no socket configured, no broker reachable,
+/// or no owner answer before the deadline, this prints nothing so Claude's own dialog appears,
+/// matching the activity hook's best-effort contract rather than the permission hook's fail-loud
+/// one (a question has no safe deny to fall back to).
+async fn run_question_hook(
+    question: &herdr_connect_rs::QuestionInteraction,
+    requested_socket: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(socket_path) = requested_socket
+        .or_else(|| std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET").map(std::path::PathBuf::from))
+    else {
+        return Ok(());
+    };
+    let Some(answers) =
+        request_question_answers(question, &socket_path, question_hook_timeout()).await
+    else {
+        return Ok(());
+    };
+    let output = encode_claude_question_decision(&question.raw_tool_input, &answers)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(&output).await?;
+    stdout.flush().await?;
+    Ok(())
 }
 
 async fn write_hook_decision(

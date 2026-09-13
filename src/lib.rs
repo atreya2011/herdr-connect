@@ -12,6 +12,7 @@ mod gateway;
 mod herdr;
 mod permission;
 mod prompting;
+mod question;
 mod readers;
 mod registry;
 mod topology;
@@ -22,8 +23,8 @@ pub use activity::{
     decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
 };
 pub use broker::{
-    PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
-    send_activity_frame,
+    PermissionResponder, handle_component, hook_timeout, question_hook_timeout, request_decision,
+    request_question_answers, run_broker, send_activity_frame,
 };
 pub use cards::{
     AgentLogCapture, ThreadNameError, TransitionMessage, create_transition_messages,
@@ -56,6 +57,10 @@ pub use permission::{
 pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
     take_owner_prompt_suppression,
+};
+pub use question::{
+    ASK_QUESTION_TOOL, QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction,
+    QuestionOption, decode_claude_ask_question, encode_claude_question_decision,
 };
 pub use readers::{
     AgentLog, claude_turn_start_position, codex_turn_start_position, cursor_turn_start_rowid,
