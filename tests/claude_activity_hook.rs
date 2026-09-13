@@ -12,10 +12,6 @@ const FILE_PATH_FIXTURE: &str = include_str!("fixtures/claude-activity-request/f
 const EMPTY_TOOL_INPUT_FIXTURE: &str =
     include_str!("fixtures/claude-activity-request/empty-tool-input.json");
 const CODEX_COMMAND_FIXTURE: &str = include_str!("fixtures/codex-activity-request/command.json");
-const CODEX_OTHER_FIELD_FIXTURE: &str =
-    include_str!("fixtures/codex-activity-request/other-field.json");
-const CODEX_EMPTY_TOOL_INPUT_FIXTURE: &str =
-    include_str!("fixtures/codex-activity-request/empty-tool-input.json");
 
 fn socket_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -121,51 +117,29 @@ async fn activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
 
 #[tokio::test]
 async fn codex_activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
-    let cases = [
-        (
-            "command",
-            CODEX_COMMAND_FIXTURE,
-            "Bash",
-            "find . -maxdepth 3 -name '*.rs' -newer Cargo.toml -print | xargs wc -l",
-        ),
-        (
-            "other-field",
-            CODEX_OTHER_FIELD_FIXTURE,
-            "Read",
-            "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t4-activity/src/main.rs",
-        ),
-        (
-            "empty-tool-input",
-            CODEX_EMPTY_TOOL_INPUT_FIXTURE,
-            "TodoWrite",
-            "",
-        ),
-    ];
-    for (name, payload, expected_tool, expected_summary) in cases {
-        let path = socket_path(name);
-        let listener = UnixListener::bind(&path).expect("bind test listener");
-        let output = tokio::task::spawn_blocking({
-            let path = path.clone();
-            let payload = payload.to_owned();
-            move || invoke_activity_for_vendor(&payload, "codex", &path)
-        })
-        .await
-        .expect("activity process task completes");
-        assert!(output.status.success(), "{name}: {output:?}");
-        assert!(output.stdout.is_empty(), "{name}: unexpected stdout");
+    let path = socket_path("command");
+    let listener = UnixListener::bind(&path).expect("bind test listener");
+    let output = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || invoke_activity_for_vendor(CODEX_COMMAND_FIXTURE, "codex", &path)
+    })
+    .await
+    .expect("activity process task completes");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "unexpected stdout");
 
-        let frame = recv_frame(&listener)
-            .await
-            .unwrap_or_else(|| panic!("{name}: no frame received"));
-        assert_eq!(frame["kind"], "activity", "{name}");
-        assert_eq!(frame["vendor"], "codex", "{name}");
-        assert_eq!(frame["workspace_id"], "w1", "{name}");
-        assert_eq!(frame["tab_id"], "w1:t1", "{name}");
-        assert_eq!(frame["pane_id"], "w1:p1", "{name}");
-        assert_eq!(frame["tool"], expected_tool, "{name}");
-        assert_eq!(frame["summary"], expected_summary, "{name}");
-        let _ = std::fs::remove_file(&path);
-    }
+    let frame = recv_frame(&listener).await.expect("no frame received");
+    assert_eq!(frame["kind"], "activity");
+    assert_eq!(frame["vendor"], "codex");
+    assert_eq!(frame["workspace_id"], "w1");
+    assert_eq!(frame["tab_id"], "w1:t1");
+    assert_eq!(frame["pane_id"], "w1:p1");
+    assert_eq!(frame["tool"], "Bash");
+    assert_eq!(
+        frame["summary"],
+        "find . -maxdepth 3 -name '*.rs' -newer Cargo.toml -print | xargs wc -l"
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

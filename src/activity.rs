@@ -103,10 +103,7 @@ pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
 
 /// Decodes one Codex `PreToolUse` hook payload into its activity essentials.
 ///
-/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command` when present,
-/// else the first string-valued field in `tool_input`: unlike Claude, Codex's `tool_input` shape
-/// varies per tool with no fixed fallback field list, so `command` is the only name assumed to
-/// mean the same thing everywhere.
+/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`, else empty.
 ///
 /// # Errors
 ///
@@ -121,12 +118,8 @@ pub fn decode_codex_activity_request(input: &[u8]) -> Result<ClaudeActivityReque
     let summary = request
         .tool_input
         .as_object()
-        .and_then(|fields| {
-            fields
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| fields.values().find_map(serde_json::Value::as_str))
-        })
+        .and_then(|fields| fields.get("command"))
+        .and_then(serde_json::Value::as_str)
         .map(truncate_chars)
         .unwrap_or_default();
     Ok(ClaudeActivityRequest {
@@ -229,26 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn decodes_codex_command_or_first_string_field_in_priority_order() {
-        let cases = [
-            (
-                r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cmd","other":"zz"}}"#,
-                "cmd",
-            ),
-            (
-                r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"fp","other":"zz"}}"#,
-                "fp",
-            ),
-            (
-                r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"TodoWrite","tool_input":{}}"#,
-                "",
-            ),
-        ];
-        for (payload, expected_summary) in cases {
-            let request = decode_codex_activity_request(payload.as_bytes())
-                .unwrap_or_else(|error| panic!("{payload} decodes: {error}"));
-            assert_eq!(request.summary, expected_summary);
-        }
+    fn decodes_codex_command_from_tool_input() {
+        let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cmd","other":"zz"}}"#;
+        let request = decode_codex_activity_request(payload.as_bytes())
+            .unwrap_or_else(|error| panic!("{payload} decodes: {error}"));
+        assert_eq!(request.summary, "cmd");
     }
 
     #[test]
