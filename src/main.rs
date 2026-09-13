@@ -5758,73 +5758,24 @@ mod tests {
         run_activity_hook_test().await;
     }
 
-    /// Builds a temporary `CODEX_HOME` for the exercise: `hooks.json` registers the `PreToolUse`
-    /// activity hook against `broker_socket`, per [examples/codex-hooks.json](../examples/codex-hooks.json)'s
-    /// shape; `auth.json` and `config.toml` are symlinked (never copied) from the caller's own
-    /// `CODEX_HOME` so the spawned Codex process authenticates with the same account as the test
-    /// process. Codex has no `--settings` flag like Claude's to inject a hook per run, so the hook
-    /// has to live in the account's own config directory instead.
+    /// The real Codex account's own broker socket, matching its already-installed
+    /// `CODEX_HOME/hooks.json` (`PreToolUse` activity hook and `PermissionRequest` hook, both
+    /// `--socket /tmp/herdr-claude-broker.sock`), per [examples/codex-hooks.json](../examples/codex-hooks.json)'s
+    /// shape. Environment precondition, the same way [`codex_testrun_dir`] is: Codex has no
+    /// `--settings` flag like Claude's to inject a hook per run, and a temporary `CODEX_HOME`
+    /// (even one symlinking every file from the real one) never gets a Codex session reported by
+    /// Herdr, so this exercise runs `CODEX_HOME=/home/user/.codex-one` directly and binds the
+    /// hook's own fixed socket instead of a private one. Second precondition: the account's hooks
+    /// must already be trusted -- after `hooks.json` changes, Codex shows "Hooks need review" and
+    /// runs no hooks at all until a pane trusts them, so an untrusted `SessionStart` hook silently
+    /// stops Herdr from ever reporting a session for the account.
     #[cfg(unix)]
-    fn write_codex_activity_home(broker_socket: &Path) -> Result<PathBuf, String> {
-        let source = std::env::var("CODEX_HOME")
-            .map(PathBuf::from)
-            .map_err(|_| "CODEX_HOME is set by the caller for real Codex tests".to_owned())?;
-        let binary = activity_binary_path()?;
-        let binary = binary
-            .to_str()
-            .ok_or_else(|| "built binary path is valid UTF-8".to_owned())?;
-        let socket_arg = broker_socket
-            .to_str()
-            .ok_or_else(|| "broker socket path is valid UTF-8".to_owned())?;
-        let command = format!("{binary} activity --vendor codex --socket {socket_arg}");
-        let home = std::env::temp_dir().join(format!(
-            "herdr-connect-rs-codex-activity-home-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_nanos()
-        ));
-        fs::create_dir_all(&home).map_err(|error| error.to_string())?;
-        for name in ["auth.json", "config.toml"] {
-            std::os::unix::fs::symlink(source.join(name), home.join(name))
-                .map_err(|error| error.to_string())?;
-        }
-        let hooks = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {
-                        "matcher": "",
-                        "hooks": [
-                            {"type": "command", "command": command, "timeout": 5}
-                        ]
-                    }
-                ]
-            }
-        });
-        fs::write(
-            home.join("hooks.json"),
-            serde_json::to_vec(&hooks).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(home)
-    }
-
-    /// Removes the temporary `CODEX_HOME` directory built by [`write_codex_activity_home`].
-    #[cfg(unix)]
-    fn remove_codex_activity_home(home: &Path) {
-        let _ = fs::remove_dir_all(home);
-    }
+    const CODEX_ACTIVITY_BROKER_SOCKET: &str = "/tmp/herdr-claude-broker.sock";
 
     /// Testrun tab cwd fixture for the Codex activity hook exercise, mirroring `activity_tab_fixture`
-    /// under its own label so the two tests' zero-leftover checks never collide. Creates the tab
-    /// with `codex_home` as its `CODEX_HOME`, not the ambient one `create_tab`'s passthrough would
-    /// use, so the spawned Codex process finds the exercise's own hooks.json.
+    /// under its own label so the two tests' zero-leftover checks never collide.
     #[cfg(unix)]
-    fn codex_activity_tab_fixture(
-        label: &str,
-        codex_home: &Path,
-    ) -> Result<(Tab, PathBuf), String> {
+    fn codex_activity_tab_fixture(label: &str) -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
             "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
         })?;
@@ -5836,33 +5787,8 @@ mod tests {
         let cwd = cwd_dir
             .to_str()
             .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
-        let codex_home = codex_home
-            .to_str()
-            .ok_or_else(|| "codex home path is valid UTF-8".to_owned())?;
-        let env_arg = format!("CODEX_HOME={codex_home}");
-        let args = [
-            "tab",
-            "create",
-            "--workspace",
-            &workspace_id,
-            "--cwd",
-            cwd,
-            "--label",
-            label,
-            "--no-focus",
-            "--env",
-            &env_arg,
-        ];
-        let created = herdr_json(&args)?;
-        let tab_id = created["result"]["tab"]["tab_id"]
-            .as_str()
-            .ok_or("herdr tab create result missing tab_id")?
-            .to_owned();
-        let pane_id = created["result"]["root_pane"]["pane_id"]
-            .as_str()
-            .ok_or("herdr tab create result missing pane_id")?
-            .to_owned();
-        Ok((Tab { tab_id, pane_id }, cwd_dir))
+        let tab = create_tab(label, &workspace_id, cwd)?;
+        Ok((tab, cwd_dir))
     }
 
     /// Removes the real on-disk Codex session file a live pane's reported session resolves to, if
@@ -5883,10 +5809,11 @@ mod tests {
     }
 
     /// Codex counterpart to `activity_hook_exercise`: drives one real `codex --model gpt-5.6-luna`
-    /// agent, started (via the already vendor-generic `start_live_capture_agent`) in a pane whose
-    /// `CODEX_HOME` points at a temporary hooks.json, through the same turn-boundary table --
-    /// reusing `drive_one_activity_turn`, `assert_first_turn_activity`, and
-    /// `assert_second_turn_activity` verbatim, since none of them are vendor-specific.
+    /// agent, started (via the already vendor-generic `start_live_capture_agent`) in a pane on the
+    /// real Codex account, through the same turn-boundary table -- reusing `drive_one_activity_turn`,
+    /// `assert_first_turn_activity`, and `assert_second_turn_activity` verbatim, since none of them
+    /// are vendor-specific. `broker_socket` is [`CODEX_ACTIVITY_BROKER_SOCKET`], the account's own
+    /// pre-installed hook target, not a private socket.
     #[cfg(unix)]
     async fn codex_activity_hook_exercise(
         guild: &BlockedCaptureGuild,
@@ -6007,17 +5934,8 @@ mod tests {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let broker_socket = std::env::temp_dir().join(format!(
-            "herdr-connect-rs-codex-activity-broker-{}-{}.sock",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        let codex_home = write_codex_activity_home(&broker_socket)
-            .expect("write Codex activity home for the exercise");
-        let created = codex_activity_tab_fixture(&label, &codex_home);
+        let broker_socket = Path::new(CODEX_ACTIVITY_BROKER_SOCKET);
+        let created = codex_activity_tab_fixture(&label);
         let (tab_id, cwd_dir, result) = match created {
             Ok((tab, cwd_dir)) => {
                 let agent_name = format!(
@@ -6026,7 +5944,7 @@ mod tests {
                 );
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(300),
-                    codex_activity_hook_exercise(&guild, &tab, &agent_name, &broker_socket),
+                    codex_activity_hook_exercise(&guild, &tab, &agent_name, broker_socket),
                 )
                 .await
                 .unwrap_or_else(|_| Err("codex activity hook exercise timed out".to_owned()));
@@ -6041,8 +5959,7 @@ mod tests {
         if let Some(cwd_dir) = cwd_dir {
             let _ = clear_directory_contents(&cwd_dir);
         }
-        let _ = std::fs::remove_file(&broker_socket);
-        remove_codex_activity_home(&codex_home);
+        let _ = std::fs::remove_file(broker_socket);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left =
