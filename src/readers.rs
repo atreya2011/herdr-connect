@@ -429,6 +429,23 @@ pub fn read_cursor_incremental(
     Ok((texts, new_last_rowid))
 }
 
+/// Cursor wraps every real user turn in a `<timestamp>...</timestamp>` / `<user_query>...
+/// </user_query>` envelope before storing it. Returns the query's own text, trimmed, when the
+/// wrapper is present; otherwise the text unchanged.
+fn strip_cursor_user_query_wrapper(text: &str) -> &str {
+    const OPEN_TAG: &str = "<user_query>";
+    const CLOSE_TAG: &str = "</user_query>";
+    let Some(after_open) = text
+        .find(OPEN_TAG)
+        .map(|start| &text[start + OPEN_TAG.len()..])
+    else {
+        return text;
+    };
+    after_open
+        .find(CLOSE_TAG)
+        .map_or(text, |end| after_open[..end].trim())
+}
+
 /// Reads new complete Cursor user text parts from rows with `rowid` > `last_rowid`, paired with
 /// each row's `rowid` (store opened read-only).
 ///
@@ -477,9 +494,11 @@ pub fn read_cursor_prompts_incremental(
             if part.get(CONTENT_PART_TYPE_KEY).and_then(Value::as_str)
                 == Some(CONTENT_PART_TEXT_VALUE)
                 && let Some(part_text) = part.get(TEXT_KEY).and_then(Value::as_str)
-                && !part_text.is_empty()
             {
-                prompts.push((part_text.to_owned(), rowid));
+                let prompt_text = strip_cursor_user_query_wrapper(part_text);
+                if !prompt_text.is_empty() {
+                    prompts.push((prompt_text.to_owned(), rowid));
+                }
             }
         }
     }
