@@ -5814,6 +5814,18 @@ mod tests {
     /// `assert_first_turn_activity`, and `assert_second_turn_activity` verbatim, since none of them
     /// are vendor-specific. `broker_socket` is [`CODEX_ACTIVITY_BROKER_SOCKET`], the account's own
     /// pre-installed hook target, not a private socket.
+    /// Deletes the broker socket file on drop, so the Codex activity exercise removes it only
+    /// once this test has confirmed it bound it -- never on an early failure before or during bind.
+    #[cfg(unix)]
+    struct RemoveSocketOnDrop<'a>(&'a Path);
+
+    #[cfg(unix)]
+    impl Drop for RemoveSocketOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+
     #[cfg(unix)]
     async fn codex_activity_hook_exercise(
         guild: &BlockedCaptureGuild,
@@ -5821,6 +5833,13 @@ mod tests {
         agent_name: &str,
         broker_socket: &Path,
     ) -> Result<(), String> {
+        if std::os::unix::net::UnixStream::connect(broker_socket).is_ok() {
+            return Err(format!(
+                "production bridge is listening on {}; stop it before running this exercise",
+                broker_socket.display()
+            ));
+        }
+
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
         let mut state = BridgeState::default();
@@ -5828,17 +5847,26 @@ mod tests {
         let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
         let responder = Arc::clone(&connection.3);
         let broker_socket_owned = broker_socket.to_path_buf();
-        let broker_task = tokio::spawn(async move {
+        let mut broker_task = tokio::spawn(async move {
             super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
         });
         let broker_deadline = Instant::now() + Duration::from_secs(2);
-        while !broker_socket.exists() && Instant::now() < broker_deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        loop {
+            if broker_socket.exists() {
+                break;
+            }
+            if Instant::now() >= broker_deadline {
+                broker_task.abort();
+                return Err("test broker did not create its socket".to_owned());
+            }
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                joined = &mut broker_task => {
+                    return Err(format!("test broker exited before binding: {joined:?}"));
+                }
+            }
         }
-        if !broker_socket.exists() {
-            broker_task.abort();
-            return Err("test broker did not create its socket".to_owned());
-        }
+        let _remove_socket_on_drop = RemoveSocketOnDrop(broker_socket);
 
         // The activity hook only connects once Codex registers it at agent start, so the
         // snapshot -- and everything routed from it -- is only meaningful once the agent exists.
@@ -5907,7 +5935,6 @@ mod tests {
         )
         .await?;
         broker_task.abort();
-        let _ = std::fs::remove_file(broker_socket);
 
         let after_second_turn = thread_messages(guild, thread).await?;
         assert_second_turn_activity(&after_second_turn, first_activity_id)
@@ -5959,7 +5986,6 @@ mod tests {
         if let Some(cwd_dir) = cwd_dir {
             let _ = clear_directory_contents(&cwd_dir);
         }
-        let _ = std::fs::remove_file(broker_socket);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left =
