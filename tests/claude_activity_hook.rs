@@ -11,6 +11,11 @@ const COMMAND_FIXTURE: &str = include_str!("fixtures/claude-activity-request/com
 const FILE_PATH_FIXTURE: &str = include_str!("fixtures/claude-activity-request/file-path.json");
 const EMPTY_TOOL_INPUT_FIXTURE: &str =
     include_str!("fixtures/claude-activity-request/empty-tool-input.json");
+const CODEX_COMMAND_FIXTURE: &str = include_str!("fixtures/codex-activity-request/command.json");
+const CODEX_OTHER_FIELD_FIXTURE: &str =
+    include_str!("fixtures/codex-activity-request/other-field.json");
+const CODEX_EMPTY_TOOL_INPUT_FIXTURE: &str =
+    include_str!("fixtures/codex-activity-request/empty-tool-input.json");
 
 fn socket_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -115,6 +120,55 @@ async fn activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
 }
 
 #[tokio::test]
+async fn codex_activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
+    let cases = [
+        (
+            "command",
+            CODEX_COMMAND_FIXTURE,
+            "Bash",
+            "find . -maxdepth 3 -name '*.rs' -newer Cargo.toml -print | xargs wc -l",
+        ),
+        (
+            "other-field",
+            CODEX_OTHER_FIELD_FIXTURE,
+            "Read",
+            "<tmp>/herdr-connect-rs-gauntlet-20260815-102236/t4-activity/src/main.rs",
+        ),
+        (
+            "empty-tool-input",
+            CODEX_EMPTY_TOOL_INPUT_FIXTURE,
+            "TodoWrite",
+            "",
+        ),
+    ];
+    for (name, payload, expected_tool, expected_summary) in cases {
+        let path = socket_path(name);
+        let listener = UnixListener::bind(&path).expect("bind test listener");
+        let output = tokio::task::spawn_blocking({
+            let path = path.clone();
+            let payload = payload.to_owned();
+            move || invoke_activity_for_vendor(&payload, "codex", &path)
+        })
+        .await
+        .expect("activity process task completes");
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert!(output.stdout.is_empty(), "{name}: unexpected stdout");
+
+        let frame = recv_frame(&listener)
+            .await
+            .unwrap_or_else(|| panic!("{name}: no frame received"));
+        assert_eq!(frame["kind"], "activity", "{name}");
+        assert_eq!(frame["vendor"], "codex", "{name}");
+        assert_eq!(frame["workspace_id"], "w1", "{name}");
+        assert_eq!(frame["tab_id"], "w1:t1", "{name}");
+        assert_eq!(frame["pane_id"], "w1:p1", "{name}");
+        assert_eq!(frame["tool"], expected_tool, "{name}");
+        assert_eq!(frame["summary"], expected_summary, "{name}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[tokio::test]
 async fn cursor_activity_subcommand_writes_the_documented_frame() {
     let cases = [(
         "documented Cursor preToolUse event",
@@ -189,6 +243,26 @@ fn cursor_hooks_register_activity_and_permission_commands() {
     );
 }
 
+#[test]
+fn codex_hooks_register_activity_and_permission_commands() {
+    let config: Value = serde_json::from_str(include_str!("../examples/codex-hooks.json"))
+        .expect("parse Codex hook config");
+    let activity_hook = &config["hooks"]["PreToolUse"][0]["hooks"][0];
+    assert_eq!(
+        activity_hook["command"], "herdr-connect-rs activity --vendor codex",
+        "PreToolUse: unexpected command"
+    );
+    let permission_hook = &config["hooks"]["PermissionRequest"][0]["hooks"][0];
+    assert_eq!(
+        permission_hook["command"], "herdr-connect-rs hook --vendor codex",
+        "PermissionRequest: unexpected command"
+    );
+    assert_eq!(
+        config["hooks"]["PermissionRequest"][0]["matcher"], "Bash",
+        "PermissionRequest: unexpected matcher"
+    );
+}
+
 fn invoke_activity_with_args(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
         .arg("activity")
@@ -207,7 +281,7 @@ fn invoke_activity_with_args(args: &[&str]) -> std::process::Output {
 #[test]
 fn activity_subcommand_exits_zero_with_no_output_for_every_argument_error() {
     let cases: [(&str, &[&str]); 5] = [
-        ("unsupported vendor", &["--vendor", "codex"]),
+        ("unsupported vendor", &["--vendor", "gemini"]),
         ("unknown flag", &["--vendor", "claude", "--oops"]),
         ("no arguments", &[]),
         ("--vendor with no value", &["--vendor"]),

@@ -15,8 +15,8 @@ use twilight_model::id::{
 
 use herdr_connect_rs::{
     ACTIVITY_KIND, ActivityFrame, activity_message_text, decode_claude_activity_request,
-    decode_cursor_activity_request, deliver_activity_message, send_activity_frame,
-    update_activity_message,
+    decode_codex_activity_request, decode_cursor_activity_request, deliver_activity_message,
+    send_activity_frame, update_activity_message,
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
@@ -2064,6 +2064,7 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     tokio::io::stdin().read_to_end(&mut input).await?;
     let Ok(request) = (match vendor {
         VENDOR_CLAUDE => decode_claude_activity_request(&input),
+        VENDOR_CODEX => decode_codex_activity_request(&input),
         VENDOR_CURSOR => decode_cursor_activity_request(&input),
         _ => return Ok(()),
     }) else {
@@ -2100,11 +2101,12 @@ fn parse_activity_args(
                 index += 1;
                 let value = args
                     .get(index)
-                    .ok_or("--vendor requires claude or cursor")?;
+                    .ok_or("--vendor requires claude, codex, or cursor")?;
                 vendor = Some(match value.as_str() {
                     VENDOR_CLAUDE => VENDOR_CLAUDE,
+                    VENDOR_CODEX => VENDOR_CODEX,
                     VENDOR_CURSOR => VENDOR_CURSOR,
-                    _ => return Err("--vendor requires claude or cursor".to_owned()),
+                    _ => return Err("--vendor requires claude, codex, or cursor".to_owned()),
                 });
             }
             "--socket" => {
@@ -2120,7 +2122,7 @@ fn parse_activity_args(
         index += 1;
     }
     Ok((
-        vendor.ok_or("activity requires --vendor claude or cursor")?,
+        vendor.ok_or("activity requires --vendor claude, codex, or cursor")?,
         socket,
     ))
 }
@@ -5755,6 +5757,308 @@ mod tests {
     async fn activity_hook_keeps_messages_inside_their_turn() {
         run_activity_hook_test().await;
     }
+
+    /// Builds a temporary `CODEX_HOME` for the exercise: `hooks.json` registers the `PreToolUse`
+    /// activity hook against `broker_socket`, per [examples/codex-hooks.json](../examples/codex-hooks.json)'s
+    /// shape; `auth.json` and `config.toml` are symlinked (never copied) from the caller's own
+    /// `CODEX_HOME` so the spawned Codex process authenticates with the same account as the test
+    /// process. Codex has no `--settings` flag like Claude's to inject a hook per run, so the hook
+    /// has to live in the account's own config directory instead.
+    #[cfg(unix)]
+    fn write_codex_activity_home(broker_socket: &Path) -> Result<PathBuf, String> {
+        let source = std::env::var("CODEX_HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "CODEX_HOME is set by the caller for real Codex tests".to_owned())?;
+        let binary = activity_binary_path()?;
+        let binary = binary
+            .to_str()
+            .ok_or_else(|| "built binary path is valid UTF-8".to_owned())?;
+        let socket_arg = broker_socket
+            .to_str()
+            .ok_or_else(|| "broker socket path is valid UTF-8".to_owned())?;
+        let command = format!("{binary} activity --vendor codex --socket {socket_arg}");
+        let home = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-codex-activity-home-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&home).map_err(|error| error.to_string())?;
+        for name in ["auth.json", "config.toml"] {
+            std::os::unix::fs::symlink(source.join(name), home.join(name))
+                .map_err(|error| error.to_string())?;
+        }
+        let hooks = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {"type": "command", "command": command, "timeout": 5}
+                        ]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            home.join("hooks.json"),
+            serde_json::to_vec(&hooks).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(home)
+    }
+
+    /// Removes the temporary `CODEX_HOME` directory built by [`write_codex_activity_home`].
+    #[cfg(unix)]
+    fn remove_codex_activity_home(home: &Path) {
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// Testrun tab cwd fixture for the Codex activity hook exercise, mirroring `activity_tab_fixture`
+    /// under its own label so the two tests' zero-leftover checks never collide. Creates the tab
+    /// with `codex_home` as its `CODEX_HOME`, not the ambient one `create_tab`'s passthrough would
+    /// use, so the spawned Codex process finds the exercise's own hooks.json.
+    #[cfg(unix)]
+    fn codex_activity_tab_fixture(
+        label: &str,
+        codex_home: &Path,
+    ) -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let cwd_dir = codex_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir)?;
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        let codex_home = codex_home
+            .to_str()
+            .ok_or_else(|| "codex home path is valid UTF-8".to_owned())?;
+        let env_arg = format!("CODEX_HOME={codex_home}");
+        let args = [
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--cwd",
+            cwd,
+            "--label",
+            label,
+            "--no-focus",
+            "--env",
+            &env_arg,
+        ];
+        let created = herdr_json(&args)?;
+        let tab_id = created["result"]["tab"]["tab_id"]
+            .as_str()
+            .ok_or("herdr tab create result missing tab_id")?
+            .to_owned();
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .ok_or("herdr tab create result missing pane_id")?
+            .to_owned();
+        Ok((Tab { tab_id, pane_id }, cwd_dir))
+    }
+
+    /// Removes the real on-disk Codex session file a live pane's reported session resolves to, if
+    /// any. Best-effort, mirroring `cleanup_real_claude_session_dir` for Codex's flat session-file
+    /// layout (a session id is one file, not a project directory), the same way
+    /// `live_capture_exercise`'s own Codex cleanup branch does.
+    #[cfg(unix)]
+    fn cleanup_real_codex_session_file(home: &Path, pane_id: &str) {
+        let Ok(snapshot) = snapshot_for_pane(pane_id) else {
+            return;
+        };
+        let Some(session) = snapshot.session.as_ref() else {
+            return;
+        };
+        if let Ok(path) = resolve_session_path(home, &snapshot, session) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Codex counterpart to `activity_hook_exercise`: drives one real `codex --model gpt-5.6-luna`
+    /// agent, started (via the already vendor-generic `start_live_capture_agent`) in a pane whose
+    /// `CODEX_HOME` points at a temporary hooks.json, through the same turn-boundary table --
+    /// reusing `drive_one_activity_turn`, `assert_first_turn_activity`, and
+    /// `assert_second_turn_activity` verbatim, since none of them are vendor-specific.
+    #[cfg(unix)]
+    async fn codex_activity_hook_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+        broker_socket: &Path,
+    ) -> Result<(), String> {
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+        let mut state = BridgeState::default();
+
+        let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
+        let responder = Arc::clone(&connection.3);
+        let broker_socket_owned = broker_socket.to_path_buf();
+        let broker_task = tokio::spawn(async move {
+            super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
+        });
+        let broker_deadline = Instant::now() + Duration::from_secs(2);
+        while !broker_socket.exists() && Instant::now() < broker_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !broker_socket.exists() {
+            broker_task.abort();
+            return Err("test broker did not create its socket".to_owned());
+        }
+
+        // The activity hook only connects once Codex registers it at agent start, so the
+        // snapshot -- and everything routed from it -- is only meaningful once the agent exists.
+        start_live_capture_agent("codex", agent_name, &tab.pane_id)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let (tabs, agents) = (std::slice::from_ref(&matching), std::slice::from_ref(&idle));
+
+        own(&idle, tabs, &connection, &mut state).await;
+        let route = route_topology(agents, tabs, &terminal)?;
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+
+        // Row 1: a frame during the turn posts before the end card.
+        drive_one_activity_turn(
+            &tab.pane_id,
+            tabs,
+            &mut sub,
+            &connection,
+            &mut state,
+            &mut activity_rx,
+            ACTIVITY_FORCE_PROMPT,
+        )
+        .await?;
+        let after_first_turn = thread_messages(guild, thread).await?;
+        let first_activity_id = assert_first_turn_activity(&after_first_turn)?;
+
+        // Row 2: a frame injected after the turn settled is dropped, not edited or recreated.
+        let late_frame = herdr_connect_rs::ActivityFrame {
+            kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
+            vendor: VENDOR_CODEX.to_owned(),
+            workspace_id: route.workspace_id.clone(),
+            tab_id: route.tab_id.clone(),
+            pane_id: route.pane_id.clone(),
+            session_id: "late-frame-synthetic".to_owned(),
+            tool: "LateGhost".to_owned(),
+            summary: "late-frame-should-be-dropped".to_owned(),
+        };
+        herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
+            .await;
+        let received = tokio::time::timeout(Duration::from_secs(2), activity_rx.recv())
+            .await
+            .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
+            .ok_or_else(|| "activity channel closed before the late frame arrived".to_owned())?;
+        super::handle_activity_event(Some(&connection), received, &mut state).await;
+        let after_late_frame = thread_messages(guild, thread).await?;
+        if after_late_frame != after_first_turn {
+            return Err(format!(
+                "late frame changed the thread: before {after_first_turn:?}, after {after_late_frame:?}"
+            ));
+        }
+
+        // Row 2 continued: the next turn starts its own message with count 1, not a continuation
+        // of the dropped late frame or turn one's count.
+        drive_one_activity_turn(
+            &tab.pane_id,
+            tabs,
+            &mut sub,
+            &connection,
+            &mut state,
+            &mut activity_rx,
+            ACTIVITY_FORCE_PROMPT,
+        )
+        .await?;
+        broker_task.abort();
+        let _ = std::fs::remove_file(broker_socket);
+
+        let after_second_turn = thread_messages(guild, thread).await?;
+        assert_second_turn_activity(&after_second_turn, first_activity_id)
+    }
+
+    #[cfg(unix)]
+    async fn run_codex_activity_hook_test() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{ACTIVITY_LABEL}-codex");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let broker_socket = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-codex-activity-broker-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        let codex_home = write_codex_activity_home(&broker_socket)
+            .expect("write Codex activity home for the exercise");
+        let created = codex_activity_tab_fixture(&label, &codex_home);
+        let (tab_id, cwd_dir, result) = match created {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "activity-codex-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(300),
+                    codex_activity_hook_exercise(&guild, &tab, &agent_name, &broker_socket),
+                )
+                .await
+                .unwrap_or_else(|_| Err("codex activity hook exercise timed out".to_owned()));
+                cleanup_real_codex_session_file(&home, &tab.pane_id);
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = clear_directory_contents(&cwd_dir);
+        }
+        let _ = std::fs::remove_file(&broker_socket);
+        remove_codex_activity_home(&codex_home);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn codex_activity_hook_keeps_messages_inside_their_turn() {
+        run_codex_activity_hook_test().await;
+    }
+
     /// Drives one real `claude --model haiku` agent through a genuine settled round-trip and
     /// asserts the seq backstop still posts a card carrying the real captured reply. Status and
     /// the seq counter come only from live `agent.list` snapshots; nothing is set by hand (the
