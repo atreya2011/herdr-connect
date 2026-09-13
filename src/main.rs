@@ -3396,7 +3396,7 @@ mod tests {
         BlockedCardContext, BlockedDeliveryRoute, BlockedResponse, BridgeRuntime, BridgeState,
         BrokerTask, Client, LIVE_DELIVERY_ATTEMPTS, LivePosition, LiveWatch, Membership,
         PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
-        agent_read_detection, apply_membership, capture_for_with_search_root,
+        agent_read_detection, apply_membership, capture_for, capture_for_with_search_root,
         card_capture_for_delivery, create_transition_messages, decide_blocked_response,
         delete_closed_topology_batch, deliver_blocked_messages, deliver_to_route,
         discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_startup_owner_identity,
@@ -6294,6 +6294,17 @@ mod tests {
         submit_task
             .await
             .map_err(|error| format!("prompt task failed: {error}"))??;
+        // Cursor's SQLite write can commit well after Herdr itself reports `done`; wait for the
+        // reply to actually be readable before `own` triggers delivery, so the transition card's
+        // capture does not race the write and report an empty log.
+        let capture_deadline = Instant::now() + Duration::from_secs(10);
+        while let Err(error) = capture_for(&settled) {
+            if Instant::now() >= capture_deadline {
+                eprintln!("reply capture never became readable before settle: {error}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         own(&settled, tabs, connection, state).await;
         while let Ok(event_terminal) = live_events.try_recv() {
             handle_live_event(Some(connection), &event_terminal, state).await;
@@ -6413,6 +6424,9 @@ mod tests {
         );
         let identity =
             herdr_connect_rs::fetch_owner_identity(guild.client.as_ref(), owner_id).await?;
+        // `mirror_terminal_prompts` reads `state.owner_identity`, which only the real startup path
+        // (`run_bridge`) populates; this harness builds its own `BridgeState` and must set it too.
+        state.owner_identity = Some(identity.clone());
         let nonce = agent_name_nonce()?;
         let fixture = TerminalPromptFixture {
             tab,
