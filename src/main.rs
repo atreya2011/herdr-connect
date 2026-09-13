@@ -7584,8 +7584,13 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
+    /// Multi-threaded like [`startup_sweep_survives_a_concurrent_cache_clear`], for the same
+    /// reason: this test's own `poll_snapshot` wait blocks its thread with `std::thread::sleep`
+    /// for the real ~300s `QUESTION_TIMEOUT` window, and on a single-threaded runtime that starves
+    /// the broker's own concurrently-awaited `request_one_question` task, delaying the card's
+    /// `"expired: ..."` edit until after this test has already read the thread.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn question_hook_expires_and_falls_back_to_the_dialog() {
         run_question_hook_expiry_test().await;
