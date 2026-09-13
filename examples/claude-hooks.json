@@ -10,6 +10,16 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "herdr-connect-rs hook --vendor claude",
+            "timeout": 600
+          }
+        ]
       }
     ]
   }

@@ -16,13 +16,17 @@ use twilight_model::{
     },
 };
 
+use crate::broker::PermissionResponder;
 use crate::herdr::{
     PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
     agent_prompt, agent_send_keys,
 };
+use crate::registry::ResolveError;
 use crate::{AgentSnapshot, list_agents};
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
+const QUESTION_ANSWER_ACCEPTED_REPLY: &str = "accepted: answer recorded";
+const QUESTION_ANSWER_STALE_REPLY: &str = "refused: the question already resolved or expired";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
 const STALL_RECOVERY_POLL_BOUND: Duration = Duration::from_secs(5);
 const STALL_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -44,6 +48,11 @@ static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
+/// A thread reply while a single-select question card is pending for the mapped pane's session is
+/// consumed as that question's free-text answer instead of being submitted as an `agent.prompt`
+/// (the pane's Herdr status is `working`, not `idle`/`done`, while a question is pending, so this
+/// check runs before -- not through -- [`resolve_prompt_pane`]'s status gate).
+///
 /// # Errors
 ///
 /// Returns Discord, Herdr, or task-dispatch errors.
@@ -52,6 +61,7 @@ pub async fn handle_owner_message(
     guild: Id<GuildMarker>,
     owner_id: &str,
     message: Message,
+    responder: &PermissionResponder,
 ) -> Result<(), String> {
     if message.guild_id != Some(guild)
         || !should_handle_owner_message(
@@ -110,6 +120,23 @@ pub async fn handle_owner_message(
             return Err(error);
         }
     };
+    if let Ok(agent) = matching_agent(tab_id, workspace_id, &agents)
+        && let Some(session_id) = agent.session.as_ref().map(|session| session.value.as_str())
+        && let Some(token) = responder.pending_single_select_question(session_id)
+    {
+        let response = match responder.resolve_question_text(
+            &token,
+            message.channel_id.get(),
+            &message.content,
+        ) {
+            Ok(()) => QUESTION_ANSWER_ACCEPTED_REPLY,
+            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
+                QUESTION_ANSWER_STALE_REPLY
+            }
+        };
+        reply(&client, &message, response).await?;
+        return Ok(());
+    }
     let pane_id = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
         Ok(target) => target,
         Err(reason) => {
@@ -168,21 +195,33 @@ fn prompt_surface_markers<'a, 'b>(
     Some((tab_id, workspace_id))
 }
 
-fn resolve_prompt_pane(
+/// The one pane mapped to `tab_id`/`workspace_id`, independent of its Herdr status: shared by
+/// [`resolve_prompt_pane`] (which additionally gates on status) and the pending-question check in
+/// [`handle_owner_message`] (which must not, since a pane awaiting a question answer reports
+/// `working`).
+fn matching_agent<'agents>(
     tab_id: &str,
     workspace_id: &str,
-    agents: &[AgentSnapshot],
-) -> Result<String, String> {
+    agents: &'agents [AgentSnapshot],
+) -> Result<&'agents AgentSnapshot, String> {
     let matches: Vec<&AgentSnapshot> = agents
         .iter()
         .filter(|agent| agent.tab_id.as_deref() == Some(tab_id))
         .filter(|agent| agent.workspace_id.as_deref() == Some(workspace_id))
         .collect();
-    let agent = match matches.as_slice() {
-        [] => return Err("refused: unmapped pane".to_owned()),
-        [_first, _second, ..] => return Err("refused: ambiguous pane mapping".to_owned()),
-        [agent] => agent,
-    };
+    match matches.as_slice() {
+        [] => Err("refused: unmapped pane".to_owned()),
+        [_first, _second, ..] => Err("refused: ambiguous pane mapping".to_owned()),
+        [agent] => Ok(agent),
+    }
+}
+
+fn resolve_prompt_pane(
+    tab_id: &str,
+    workspace_id: &str,
+    agents: &[AgentSnapshot],
+) -> Result<String, String> {
+    let agent = matching_agent(tab_id, workspace_id, agents)?;
     let pane_id = agent
         .pane_id
         .as_deref()

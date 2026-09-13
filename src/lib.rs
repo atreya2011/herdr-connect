@@ -37,11 +37,13 @@ pub use config::{
 pub use delivery::{
     OwnerIdentity, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR,
     deliver_activity_message, deliver_live_message, deliver_permission_card,
-    deliver_terminal_prompt, deliver_transition_card, execute_terminal_prompt_webhook,
-    expire_informational_card, fetch_owner_identity, live_message_nonce,
-    resolve_terminal_prompt_webhook, transition_card_nonce, update_activity_message,
+    deliver_question_button_card, deliver_question_select_card, deliver_terminal_prompt,
+    deliver_transition_card, execute_terminal_prompt_webhook, expire_informational_card,
+    expire_question_button_card, expire_question_select_card, fetch_owner_identity,
+    live_message_nonce, resolve_terminal_prompt_webhook, transition_card_nonce,
+    update_activity_message,
 };
-pub use gateway::{ComponentHandler, drive_gateway_with_components};
+pub use gateway::{ComponentHandler, GatewayContext, drive_gateway_with_components};
 pub use herdr::{
     AgentSession, AgentSnapshot, EVENT_KEY, HerdrSubscription, HerdrTab, HerdrWorkspace,
     STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, SubscribeError, agent_read_detection,

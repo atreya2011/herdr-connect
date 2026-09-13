@@ -9,6 +9,8 @@ use twilight_gateway::{
 use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
 
+use crate::broker::PermissionResponder;
+
 pub type ComponentHandler = Arc<
     dyn Fn(
             twilight_model::application::interaction::Interaction,
@@ -17,10 +19,18 @@ pub type ComponentHandler = Arc<
         + Sync,
 >;
 
+/// The Discord identity and permission state shared by every owner message the gateway dispatches,
+/// bundled so [`drive_gateway_with_components`] stays under the arity lint.
+#[derive(Clone)]
+pub struct GatewayContext {
+    pub client: Arc<Client>,
+    pub guild: Id<GuildMarker>,
+    pub owner_id: String,
+    pub responder: Arc<PermissionResponder>,
+}
+
 struct OwnerPromptRequest {
-    client: Arc<Client>,
-    guild: Id<GuildMarker>,
-    owner_id: String,
+    context: GatewayContext,
     message: twilight_model::channel::Message,
     notices: Sender<String>,
 }
@@ -44,10 +54,11 @@ fn spawn_owner_prompt_consumer() -> UnboundedSender<OwnerPromptRequest> {
 
 async fn process_owner_prompt(request: OwnerPromptRequest) {
     let result = crate::prompting::handle_owner_message(
-        request.client,
-        request.guild,
-        &request.owner_id,
+        request.context.client,
+        request.context.guild,
+        &request.context.owner_id,
         request.message,
+        request.context.responder.as_ref(),
     )
     .await;
     if let Err(error) = result {
@@ -65,30 +76,17 @@ async fn process_owner_prompt(request: OwnerPromptRequest) {
 pub async fn drive_gateway_with_components(
     token: String,
     gateway_url: Option<String>,
-    client: Arc<Client>,
-    guild: Id<GuildMarker>,
-    owner_id: String,
+    context: GatewayContext,
     notices: Sender<String>,
     components: ComponentHandler,
 ) -> Result<(), String> {
-    drive_gateway(
-        token,
-        gateway_url,
-        client,
-        guild,
-        owner_id,
-        notices,
-        components,
-    )
-    .await
+    drive_gateway(token, gateway_url, context, notices, components).await
 }
 
 async fn drive_gateway(
     token: String,
     gateway_url: Option<String>,
-    client: Arc<Client>,
-    guild: Id<GuildMarker>,
-    owner_id: String,
+    context: GatewayContext,
     notices: Sender<String>,
     components: ComponentHandler,
 ) -> Result<(), String> {
@@ -107,9 +105,7 @@ async fn drive_gateway(
         let notice = match item {
             Ok(Event::MessageCreate(message)) => {
                 let request = OwnerPromptRequest {
-                    client: Arc::clone(&client),
-                    guild,
-                    owner_id: owner_id.clone(),
+                    context: context.clone(),
                     message: message.0,
                     notices: notices.clone(),
                 };

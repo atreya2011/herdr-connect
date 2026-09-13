@@ -6,6 +6,7 @@ use twilight_model::channel::message::Embed;
 
 use crate::cards::TransitionMessage;
 use crate::permission::PermissionVendor;
+use crate::question::{Question, QuestionOption};
 use crate::topology::{is_unknown_channel_error, is_unknown_webhook_error};
 
 /// Prefixes a delivery error whose target channel or thread no longer exists on Discord.
@@ -487,6 +488,187 @@ fn permission_components(token: &str, disabled: bool) -> serde_json::Value {
             {COMPONENT_TYPE_KEY: 2, "style": 4, "label": "Deny", "custom_id": format!("herdr:deny:{token}"), "disabled": disabled}
         ]
     }])
+}
+
+/// Delivers a single-select question card: one button per option (Claude's `AskUserQuestion`
+/// schema bounds this to 2-4), plus a "Type an answer" hint for a free-text thread reply.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn deliver_question_button_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    question: &Question,
+    token: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let payload = serde_json::json!({
+        PAYLOAD_EMBEDS_KEY: [{
+            "title": question_card_title(&question.header),
+            "description": question_card_description(&question.question, true),
+            "color": 0x00f1_c40f,
+        }],
+        PAYLOAD_COMPONENTS_KEY: question_button_components(&question.options, token, false),
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .create_message(channel)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+/// Delivers a multiSelect question card: one Discord string select menu offering every option.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn deliver_question_select_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    question: &Question,
+    token: &str,
+) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
+    let payload = serde_json::json!({
+        PAYLOAD_EMBEDS_KEY: [{
+            "title": question_card_title(&question.header),
+            "description": question_card_description(&question.question, false),
+            "color": 0x00f1_c40f,
+        }],
+        PAYLOAD_COMPONENTS_KEY: question_select_components(&question.options, token, false),
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .create_message(channel)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+fn question_card_title(header: &str) -> String {
+    let sanitized: String = header.chars().filter(|c| !c.is_control()).collect();
+    if sanitized.trim().is_empty() {
+        "Claude question".to_owned()
+    } else {
+        format!("Claude question: {sanitized}")
+    }
+}
+
+fn question_card_description(question: &str, single_select: bool) -> String {
+    let sanitized: String = question.chars().filter(|c| !c.is_control()).collect();
+    if single_select {
+        format!("{sanitized}\n\nOr reply in this thread with your own answer.")
+    } else {
+        sanitized
+    }
+}
+
+/// One action row of up to five option buttons, `herdrask:<token>:<option index>`.
+fn question_button_components(options: &[QuestionOption], token: &str, disabled: bool) -> Value {
+    let buttons: Vec<Value> = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            json!({
+                COMPONENT_TYPE_KEY: 2,
+                "style": 1,
+                "label": option.label,
+                "custom_id": format!("herdrask:{token}:{index}"),
+                "disabled": disabled,
+            })
+        })
+        .collect();
+    json!([{COMPONENT_TYPE_KEY: 1, PAYLOAD_COMPONENTS_KEY: buttons}])
+}
+
+/// One action row holding a `herdrask-multi:<token>` string select menu offering every option.
+fn question_select_components(options: &[QuestionOption], token: &str, disabled: bool) -> Value {
+    let select_options: Vec<Value> = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            json!({
+                "label": option.label,
+                "value": index.to_string(),
+                "description": option.description,
+            })
+        })
+        .collect();
+    json!([{
+        COMPONENT_TYPE_KEY: 1,
+        PAYLOAD_COMPONENTS_KEY: [{
+            COMPONENT_TYPE_KEY: 3,
+            "custom_id": format!("herdrask-multi:{token}"),
+            "options": select_options,
+            "min_values": 1,
+            "max_values": options.len(),
+            "disabled": disabled,
+        }],
+    }])
+}
+
+/// Disables the controls on an expired or resolved single-select question card.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
+pub async fn expire_question_button_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+    options: &[QuestionOption],
+    token: &str,
+    content: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        PAYLOAD_CONTENT_KEY: content,
+        PAYLOAD_COMPONENTS_KEY: question_button_components(options, token, true),
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .update_message(channel, message)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Disables the controls on an expired or resolved multiSelect question card.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
+pub async fn expire_question_select_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+    options: &[QuestionOption],
+    token: &str,
+    content: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        PAYLOAD_CONTENT_KEY: content,
+        PAYLOAD_COMPONENTS_KEY: question_select_components(options, token, true),
+        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .update_message(channel, message)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn deliver_payload(

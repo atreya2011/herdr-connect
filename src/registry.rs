@@ -9,8 +9,25 @@ use std::time::Instant;
 
 use tokio::sync::oneshot;
 
-use crate::Decision;
+use crate::{Decision, QuestionAnswer, QuestionOption};
 const TOKEN_BYTES: usize = 24;
+
+/// Generates one opaque, random hex token for a newly issued registry entry.
+///
+/// # Errors
+///
+/// Returns an error when `/dev/urandom` cannot be read.
+fn generate_token() -> Result<String, String> {
+    let mut token_bytes = [0_u8; TOKEN_BYTES];
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut token_bytes))
+        .map_err(|error| format!("cannot create interaction token: {error}"))?;
+    let mut token = String::with_capacity(TOKEN_BYTES * 2);
+    for byte in token_bytes {
+        write!(&mut token, "{byte:02x}").map_err(|_| "token formatting failed".to_owned())?;
+    }
+    Ok(token)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
@@ -48,14 +65,7 @@ impl InteractionRegistry {
         expiry: Instant,
         hook_alive: Arc<AtomicBool>,
     ) -> Result<IssuedApproval, String> {
-        let mut token_bytes = [0_u8; TOKEN_BYTES];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut token_bytes))
-            .map_err(|error| format!("cannot create interaction token: {error}"))?;
-        let mut token = String::with_capacity(TOKEN_BYTES * 2);
-        for byte in token_bytes {
-            write!(&mut token, "{byte:02x}").map_err(|_| "token formatting failed".to_owned())?;
-        }
+        let token = generate_token()?;
         self.issue_with_token_and_liveness(token, request, created_at, expiry, hook_alive)
     }
     /// Inserts a supplied token for deterministic state-machine tests.
@@ -176,6 +186,152 @@ impl InteractionRegistry {
             .is_some()
     }
 }
+
+#[derive(Debug)]
+pub struct IssuedQuestion {
+    pub token: String,
+    pub receiver: oneshot::Receiver<QuestionAnswer>,
+    pub expiry: Instant,
+}
+#[derive(Debug)]
+struct QuestionEntry {
+    request: ApprovalRequest,
+    /// Whether this card accepts a free-text thread reply as its answer: only true for a
+    /// single-select card, matching its "Type an answer" hint (a multiSelect card has no such
+    /// hint and is only ever resolved through its select menu).
+    single_select: bool,
+    /// The card's own options, so a component tap naming an option by index can be resolved back
+    /// to its label without the caller re-supplying the question.
+    options: Vec<QuestionOption>,
+    created_at: Instant,
+    expiry: Instant,
+    hook_alive: Arc<AtomicBool>,
+    sender: oneshot::Sender<QuestionAnswer>,
+}
+/// Correlates one Discord question card per `AskUserQuestion` question with the hook awaiting its
+/// answer, mirroring [`InteractionRegistry`] with a [`QuestionAnswer`] resolution instead of a
+/// [`Decision`].
+#[derive(Default, Debug)]
+pub struct QuestionRegistry {
+    entries: Mutex<HashMap<String, QuestionEntry>>,
+}
+impl QuestionRegistry {
+    /// Issues one token for a pending question card.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a token cannot be generated or the lifetime is invalid.
+    pub fn issue_with_liveness(
+        &self,
+        request: ApprovalRequest,
+        single_select: bool,
+        options: Vec<QuestionOption>,
+        created_at: Instant,
+        expiry: Instant,
+        hook_alive: Arc<AtomicBool>,
+    ) -> Result<IssuedQuestion, String> {
+        let token = generate_token()?;
+        if expiry <= created_at {
+            return Err("invalid question registry entry".to_owned());
+        }
+        let (sender, receiver) = oneshot::channel();
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "question registry lock poisoned".to_owned())?;
+        if entries.contains_key(&token) {
+            return Err("question token collision".to_owned());
+        }
+        entries.insert(
+            token.clone(),
+            QuestionEntry {
+                request,
+                single_select,
+                options,
+                created_at,
+                expiry,
+                hook_alive,
+                sender,
+            },
+        );
+        drop(entries);
+        Ok(IssuedQuestion {
+            token,
+            receiver,
+            expiry,
+        })
+    }
+    /// The label of `index` among the token's own options, if the token is still pending.
+    pub fn option_label(&self, token: &str, index: usize) -> Option<String> {
+        self.entries.lock().ok().and_then(|entries| {
+            entries
+                .get(token)
+                .and_then(|entry| entry.options.get(index))
+                .map(|option| option.label.clone())
+        })
+    }
+    /// Resolves one pending token exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rejection reason for an unknown, expired, or wrong-channel question.
+    pub fn resolve(
+        &self,
+        token: &str,
+        channel_id: u64,
+        answer: QuestionAnswer,
+        now: Instant,
+    ) -> Result<(), ResolveError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ResolveError::UnknownOrExpired)?;
+        let Some(entry) = entries.get(token) else {
+            return Err(ResolveError::UnknownOrExpired);
+        };
+        if now < entry.created_at
+            || now >= entry.expiry
+            || !entry.hook_alive.load(Ordering::Acquire)
+        {
+            return Err(ResolveError::UnknownOrExpired);
+        }
+        if channel_id != entry.request.channel_id {
+            return Err(ResolveError::WrongChannel);
+        }
+        let entry = entries
+            .remove(token)
+            .ok_or(ResolveError::UnknownOrExpired)?;
+        if !entry.hook_alive.load(Ordering::Acquire) {
+            return Err(ResolveError::UnknownOrExpired);
+        }
+        let sender = entry.sender;
+        drop(entries);
+        let _ = sender.send(answer);
+        Ok(())
+    }
+    /// The token of the pending single-select card for `session_id`, if one is currently open: the
+    /// one card a thread reply can be consumed against as a free-text answer.
+    pub fn pending_single_select_token(&self, session_id: &str) -> Option<String> {
+        self.entries.lock().ok().and_then(|entries| {
+            entries
+                .iter()
+                .find(|(_, entry)| {
+                    entry.single_select
+                        && entry.request.session_id == session_id
+                        && entry.hook_alive.load(Ordering::Acquire)
+                })
+                .map(|(token, _)| token.clone())
+        })
+    }
+    pub fn remove(&self, token: &str) -> bool {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|mut entries| entries.remove(token))
+            .is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
