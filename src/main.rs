@@ -7033,31 +7033,23 @@ mod tests {
     /// shape. Environment precondition, the same way [`codex_testrun_dir`] is: Codex has no
     /// `--settings` flag like Claude's to inject a hook per run, and a temporary `CODEX_HOME`
     /// (even one symlinking every file from the real one) never gets a Codex session reported by
-    /// Herdr, so this exercise runs `CODEX_HOME=/home/user/.codex-one` directly and binds the
-    /// hook's own fixed socket instead of a private one. Second precondition: the account's hooks
-    /// must already be trusted -- after `hooks.json` changes, Codex shows "Hooks need review" and
-    /// runs no hooks at all until a pane trusts them, so an untrusted `SessionStart` hook silently
-    /// stops Herdr from ever reporting a session for the account.
+    /// Herdr, so this exercise requires `CODEX_HOME` to already be set to the real account's own
+    /// config directory and binds the hook's own fixed socket instead of a private one. Second
+    /// precondition: the account's hooks must already be trusted -- after `hooks.json` changes,
+    /// Codex shows "Hooks need review" and runs no hooks at all until a pane trusts them, so an
+    /// untrusted `SessionStart` hook silently stops Herdr from ever reporting a session for the
+    /// account.
     #[cfg(unix)]
     const CODEX_ACTIVITY_BROKER_SOCKET: &str = "/tmp/herdr-claude-broker.sock";
 
-    /// The `CODEX_HOME` this exercise must run under, per the doc comment above.
-    #[cfg(unix)]
-    const CODEX_ACTIVITY_HOME: &str = "/home/user/.codex-one";
-
     /// Fails fast, naming exactly what is missing, when the Codex activity row's environment
-    /// preconditions are unmet: `CODEX_HOME` is not [`CODEX_ACTIVITY_HOME`], its `hooks.json`
-    /// lacks the activity hook on [`CODEX_ACTIVITY_BROKER_SOCKET`], or a hook entry it declares
-    /// has no trust record in the shared `config.toml`'s `[hooks.state]`.
+    /// preconditions are unmet: `CODEX_HOME` is not set, its `hooks.json` lacks the activity hook
+    /// on [`CODEX_ACTIVITY_BROKER_SOCKET`], or a hook entry it declares has no trust record in the
+    /// shared `config.toml`'s `[hooks.state]`.
     #[cfg(unix)]
     fn assert_codex_activity_environment() -> Result<(), String> {
-        let codex_home = std::env::var("CODEX_HOME")
-            .map_err(|_| format!("CODEX_HOME is not set; expected {CODEX_ACTIVITY_HOME}"))?;
-        if codex_home != CODEX_ACTIVITY_HOME {
-            return Err(format!(
-                "CODEX_HOME is {codex_home}, expected {CODEX_ACTIVITY_HOME}"
-            ));
-        }
+        let codex_home =
+            std::env::var("CODEX_HOME").map_err(|_| "CODEX_HOME is not set".to_owned())?;
 
         let hooks_path = Path::new(&codex_home).join("hooks.json");
         let hooks_raw = std::fs::read_to_string(&hooks_path)
