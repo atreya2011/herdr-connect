@@ -5772,6 +5772,65 @@ mod tests {
     #[cfg(unix)]
     const CODEX_ACTIVITY_BROKER_SOCKET: &str = "/tmp/herdr-claude-broker.sock";
 
+    /// The `CODEX_HOME` this exercise must run under, per the doc comment above.
+    #[cfg(unix)]
+    const CODEX_ACTIVITY_HOME: &str = "/home/user/.codex-one";
+
+    /// Fails fast, naming exactly what is missing, when the Codex activity row's environment
+    /// preconditions are unmet: `CODEX_HOME` is not [`CODEX_ACTIVITY_HOME`], its `hooks.json`
+    /// lacks the activity hook on [`CODEX_ACTIVITY_BROKER_SOCKET`], or a hook entry it declares
+    /// has no trust record in the shared `config.toml`'s `[hooks.state]`.
+    #[cfg(unix)]
+    fn assert_codex_activity_environment() -> Result<(), String> {
+        let codex_home = std::env::var("CODEX_HOME")
+            .map_err(|_| format!("CODEX_HOME is not set; expected {CODEX_ACTIVITY_HOME}"))?;
+        if codex_home != CODEX_ACTIVITY_HOME {
+            return Err(format!(
+                "CODEX_HOME is {codex_home}, expected {CODEX_ACTIVITY_HOME}"
+            ));
+        }
+
+        let hooks_path = Path::new(&codex_home).join("hooks.json");
+        let hooks_raw = std::fs::read_to_string(&hooks_path)
+            .map_err(|error| format!("{}: {error}", hooks_path.display()))?;
+        let hooks: serde_json::Value = serde_json::from_str(&hooks_raw)
+            .map_err(|error| format!("{}: {error}", hooks_path.display()))?;
+        let activity_socket_flag = format!("--socket {CODEX_ACTIVITY_BROKER_SOCKET}");
+        let activity_command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .ok_or_else(|| format!("{}: no PreToolUse activity hook", hooks_path.display()))?;
+        if !activity_command.contains(&activity_socket_flag) {
+            return Err(format!(
+                "{}: PreToolUse hook does not target {CODEX_ACTIVITY_BROKER_SOCKET}: {activity_command}",
+                hooks_path.display()
+            ));
+        }
+
+        let config_path = Path::new(&codex_home).join("config.toml");
+        let config_raw = std::fs::read_to_string(&config_path)
+            .map_err(|error| format!("{}: {error}", config_path.display()))?;
+        let hooks_path_str = hooks_path
+            .to_str()
+            .ok_or_else(|| "hooks.json path is valid UTF-8".to_owned())?;
+        for (pascal_event, snake_event) in [
+            ("SessionStart", "session_start"),
+            ("PermissionRequest", "permission_request"),
+            ("PreToolUse", "pre_tool_use"),
+        ] {
+            if hooks["hooks"][pascal_event].is_null() {
+                continue;
+            }
+            let trust_key = format!("[hooks.state.\"{hooks_path_str}:{snake_event}:0:0\"]");
+            if !config_raw.lines().any(|line| line.trim() == trust_key) {
+                return Err(format!(
+                    "{}: no trust record for {hooks_path_str}:{snake_event}:0:0",
+                    config_path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Testrun tab cwd fixture for the Codex activity hook exercise, mirroring `activity_tab_fixture`
     /// under its own label so the two tests' zero-leftover checks never collide.
     #[cfg(unix)]
@@ -5957,6 +6016,7 @@ mod tests {
             0,
             "named zero-leftover check"
         );
+        assert_codex_activity_environment().unwrap_or_else(|error| panic!("{error}"));
 
         let home = std::env::var("HOME")
             .map(PathBuf::from)
