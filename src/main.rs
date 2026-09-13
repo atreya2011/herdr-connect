@@ -142,18 +142,22 @@ struct BridgeState {
     /// a different path; [`process_snapshot`] re-baselines against it rather than reusing a stale
     /// position from the old file.
     terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition)>,
-    /// Terminals whose session was seen with [`live_log_path`] returning `Ok(None)` (the log or
-    /// store does not exist on disk yet): a fresh pane, or a new session after `/clear` or a
-    /// relaunch, before its first write. Valued by the session's own value, not just its terminal:
-    /// a pane can switch to a *different*, already-populated session before the pending one's log
-    /// ever appears (Claude `/resume`, or a relaunch straight into an existing session), and that
-    /// resumed session's own, unrelated history must never be baselined at 0 just because this
-    /// terminal happened to have an unrelated fresh session pending. Removed the moment a path
-    /// resolves for this terminal, whichever session it belongs to: [`maybe_establish_terminal_prompt_baseline`]
-    /// baselines at position 0 only when the resolved path's session matches the one recorded here;
-    /// any other session (including one that was never recorded pending at all) gets the normal
-    /// discard-what-already-exists baseline instead.
-    terminal_prompt_awaiting_first_log: HashMap<String, String>,
+    /// Terminals first seen either with no session reported at all yet (`None`), or with a session
+    /// whose [`live_log_path`] returned `Ok(None)` (`Some(session value)`: the log or store does not
+    /// exist on disk yet) -- a fresh pane, a new session after `/clear` or a relaunch before its
+    /// first write, or a vendor (Codex) that does not report a session identity until the pane is
+    /// already `working`, by which point its log can already hold the very prompt that started the
+    /// turn. A pane can switch to a *different*, already-populated session before the pending one's
+    /// log ever appears (Claude `/resume`, or a relaunch straight into an existing session), and
+    /// that resumed session's own, unrelated history must never be baselined at 0 just because this
+    /// terminal happened to have an unrelated fresh session pending; the `None` entry carries no
+    /// session to compare against, so it matches whichever session resolves first. Removed the
+    /// moment a path resolves for this terminal, whichever session it belongs to:
+    /// [`maybe_establish_terminal_prompt_baseline`] baselines at position 0 when the recorded entry
+    /// is `None` or its session matches the resolved path's session; any other session (including
+    /// one that was never recorded pending at all) gets the normal discard-what-already-exists
+    /// baseline instead.
+    terminal_prompt_awaiting_first_log: HashMap<String, Option<String>>,
     /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
     /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
     /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
@@ -1587,22 +1591,30 @@ async fn mirror_one_terminal_prompt<'a>(
 /// same terminal (`/clear`, resume, a relaunch, or a vendor starting a fresh file or store) must
 /// never have the old file's position applied to the new one.
 ///
-/// [`live_log_path`] returning `Ok(None)` (the log or store does not exist on disk yet -- a fresh
-/// pane, or a new session before its first write) records the terminal's current session value in
-/// [`BridgeState::terminal_prompt_awaiting_first_log`] and retries on the next snapshot. The first
-/// time a path then resolves for this terminal, the baseline is 0 -- not
-/// [`initial_terminal_prompt_position`]'s discard-what-already-exists checkpoint -- only when that
-/// path's session is the SAME one that was recorded pending: its log was created after this
-/// terminal was already being watched, so everything now in it, including the prompt that may have
-/// just created it, postdates first sight and belongs to this bridge run, not a discarded history.
-/// A path resolving for any OTHER session (one that was never recorded pending, or a different one
-/// that superseded it -- a `/resume` onto an existing session before the pending one's log ever
+/// A terminal seen with no session at all yet (Codex does not report one until the pane is already
+/// `working`, by which point its log can already hold the prompt that started the turn) records
+/// `None` in [`BridgeState::terminal_prompt_awaiting_first_log`]; one seen with a session whose
+/// [`live_log_path`] returns `Ok(None)` (the log or store does not exist on disk yet -- a fresh
+/// pane, or a new session before its first write) records `Some` of the session's current value.
+/// Either way the terminal retries on the next snapshot. The first time a path then resolves for
+/// this terminal, the baseline is 0 -- not [`initial_terminal_prompt_position`]'s
+/// discard-what-already-exists checkpoint -- when the recorded entry is `None` (no session was ever
+/// visible before this one, so it cannot be a history that predates this terminal being watched) or
+/// `Some` of the SAME session that was recorded pending: its log was created after this terminal was
+/// already being watched, so everything now in it, including the prompt that may have just created
+/// it, postdates first sight and belongs to this bridge run, not a discarded history. A path
+/// resolving for any OTHER session (one that was never recorded pending, or a different one that
+/// superseded it -- a `/resume` onto an existing session before the pending one's log ever
 /// appeared) gets the normal discard-what-already-exists baseline instead, and the stale pending
 /// record is dropped either way so it cannot later misapply to a third session. A permanent
 /// resolution error is logged and retried too, since resolving it costs only a directory read.
 fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
     let terminal = &snapshot.terminal_id;
     let Some(session) = snapshot.session.as_ref() else {
+        state
+            .terminal_prompt_awaiting_first_log
+            .entry(terminal.clone())
+            .or_insert(None);
         return;
     };
     let vendor = session.agent.as_str();
@@ -1614,7 +1626,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
         Ok(None) => {
             state
                 .terminal_prompt_awaiting_first_log
-                .insert(terminal.clone(), session.value.clone());
+                .insert(terminal.clone(), Some(session.value.clone()));
             return;
         }
         Err(error) => {
@@ -1625,10 +1637,12 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     if terminal_prompt_baseline_is_current(&state.terminal_prompt_positions, terminal, &path) {
         return;
     }
-    let was_awaiting_this_session = state
-        .terminal_prompt_awaiting_first_log
-        .remove(terminal)
-        .is_some_and(|awaiting_session| awaiting_session == session.value);
+    let was_awaiting_this_session = match state.terminal_prompt_awaiting_first_log.remove(terminal)
+    {
+        Some(None) => true,
+        Some(Some(awaiting_session)) => awaiting_session == session.value,
+        None => false,
+    };
     let position = if was_awaiting_this_session {
         Ok(zero_terminal_prompt_position(vendor))
     } else {
