@@ -631,23 +631,19 @@ async fn process_snapshot(
                 state,
             )
             .await;
-            if is_postable_transition(&transition)
-                && let Err(error) = deliver_postable_transition(
-                    PostableTransitionContext {
-                        snapshot,
-                        agents,
-                        tabs,
-                        discord,
-                        terminal: &terminal,
-                        transition: &transition,
-                        state_change_seq: seq,
-                    },
-                    state,
-                )
-                .await
-            {
-                eprintln!("{error}");
-            }
+            deliver_transition_if_postable(
+                PostableTransitionContext {
+                    snapshot,
+                    agents,
+                    tabs,
+                    discord,
+                    terminal: &terminal,
+                    transition: &transition,
+                    state_change_seq: seq,
+                },
+                state,
+            )
+            .await;
             if old_was_working {
                 forget_activity_message(state, snapshot.pane_id.as_deref());
             }
@@ -665,23 +661,19 @@ async fn process_snapshot(
                 terminal_id: terminal.clone(),
                 agent: prior_agent,
             };
-            if is_postable_transition(&transition)
-                && let Err(error) = deliver_postable_transition(
-                    PostableTransitionContext {
-                        snapshot,
-                        agents,
-                        tabs,
-                        discord,
-                        terminal: &terminal,
-                        transition: &transition,
-                        state_change_seq,
-                    },
-                    state,
-                )
-                .await
-            {
-                eprintln!("{error}");
-            }
+            deliver_transition_if_postable(
+                PostableTransitionContext {
+                    snapshot,
+                    agents,
+                    tabs,
+                    discord,
+                    terminal: &terminal,
+                    transition: &transition,
+                    state_change_seq,
+                },
+                state,
+            )
+            .await;
             forget_activity_message(state, snapshot.pane_id.as_deref());
         }
     } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
@@ -822,6 +814,20 @@ async fn deliver_postable_transition(
         .last_posted
         .insert(terminal.to_owned(), capture.message);
     Ok(())
+}
+
+/// Split out of [`process_snapshot`] to keep it under the line-count lint: delivers `context`'s
+/// transition when postable and logs any delivery error, shared by the status-change and
+/// seq-backstop paths.
+async fn deliver_transition_if_postable(
+    context: PostableTransitionContext<'_>,
+    state: &mut BridgeState,
+) {
+    if is_postable_transition(context.transition)
+        && let Err(error) = deliver_postable_transition(context, state).await
+    {
+        eprintln!("{error}");
+    }
 }
 
 /// Whether a reply card would only repeat a text already shown live: the caller's dedup guard
@@ -3637,7 +3643,7 @@ mod tests {
                 .len();
 
             let snapshot_for = |session_value: &str| AgentSnapshot {
-                agent: VENDOR_CLAUDE.to_owned(),
+                agent: Some(VENDOR_CLAUDE.to_owned()),
                 terminal_id: "terminal-resume".to_owned(),
                 agent_status: STATUS_IDLE.to_owned(),
                 tab_id: None,
