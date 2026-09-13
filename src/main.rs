@@ -3961,9 +3961,26 @@ mod tests {
     #[cfg(unix)]
     const SEQ_BACKSTOP_LABEL: &str = "testrun-seq-backstop";
 
-    /// Creates a testrun tab, passing the caller's own `CLAUDE_CONFIG_DIR` through to it when set,
-    /// so a real Claude agent started in it authenticates with the same account as the test
-    /// process rather than falling back to `claude`'s default config directory.
+    /// Environment variables passed through to every real-agent test tab and workspace when set
+    /// in the caller's own environment, so an agent started in it authenticates with the same
+    /// account as the test process rather than falling back to its harness's default config
+    /// directory: `CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex.
+    #[cfg(unix)]
+    const PASSTHROUGH_ENV_VARS: &[&str] = &["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
+    #[cfg(unix)]
+    fn passthrough_env_args() -> Vec<String> {
+        PASSTHROUGH_ENV_VARS
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect()
+    }
+
+    /// Creates a testrun tab, passing the caller's own [`PASSTHROUGH_ENV_VARS`] through to it.
     #[cfg(unix)]
     fn create_tab(label: &str, workspace_id: &str, cwd: &str) -> Result<Tab, String> {
         let mut args = vec![
@@ -3977,11 +3994,8 @@ mod tests {
             label,
             "--no-focus",
         ];
-        let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        let env_arg = claude_config_dir
-            .as_deref()
-            .map(|dir| format!("CLAUDE_CONFIG_DIR={dir}"));
-        if let Some(env_arg) = &env_arg {
+        let env_args = passthrough_env_args();
+        for env_arg in &env_args {
             args.push("--env");
             args.push(env_arg);
         }
@@ -4103,7 +4117,7 @@ mod tests {
 
     /// Creates a workspace and renames its root tab to the same label, so both the workspace and
     /// its root tab are visible to a zero-leftover check by that one label. Passes the caller's
-    /// own `CLAUDE_CONFIG_DIR` through when set, for the same reason as [`create_tab`].
+    /// own [`PASSTHROUGH_ENV_VARS`] through, for the same reason as [`create_tab`].
     #[cfg(unix)]
     fn create_workspace(label: &str, cwd: &str) -> Result<Workspace, String> {
         let mut args = vec![
@@ -4115,11 +4129,8 @@ mod tests {
             label,
             "--no-focus",
         ];
-        let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        let env_arg = claude_config_dir
-            .as_deref()
-            .map(|dir| format!("CLAUDE_CONFIG_DIR={dir}"));
-        if let Some(env_arg) = &env_arg {
+        let env_args = passthrough_env_args();
+        for env_arg in &env_args {
             args.push("--env");
             args.push(env_arg);
         }
