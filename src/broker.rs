@@ -37,6 +37,10 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 const CURSOR_PERMISSION_TIMEOUT: Duration = PERMISSION_TIMEOUT;
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Discord's message content length limit (`twilight-validate`'s `MESSAGE_CONTENT_LENGTH_MAX`): a
+/// free-text answer can run well past it, and an oversized `update_message` is rejected outright,
+/// leaving the card's buttons enabled and unresolved.
+const MAX_QUESTION_CARD_CONTENT_LENGTH: usize = 2_000;
 /// How long one question card stays open for an owner answer before the hook falls through to
 /// Claude's own dialog.
 const QUESTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -502,7 +506,9 @@ impl PermissionResponder {
                     "expired: hook disconnected".to_owned()
                 }
             },
-            |resolved| format!("resolved: {}", format_question_answer(resolved)),
+            |resolved| {
+                bound_card_content(format!("resolved: {}", format_question_answer(resolved)))
+            },
         );
         let client = Arc::clone(&self.client);
         let options = question.options.clone();
@@ -566,9 +572,13 @@ impl PermissionResponder {
         tokio::pin!(delivery);
         tokio::select! {
             result = &mut delivery => {
-                let Some(message) = result.ok() else {
-                    self.question_registry.remove(token);
-                    return None;
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => {
+                        eprintln!("question card delivery failed: {error}");
+                        self.question_registry.remove(token);
+                        return None;
+                    }
                 };
                 if liveness.is_alive() {
                     Some(message)
@@ -684,6 +694,20 @@ impl PermissionResponder {
             std::time::Instant::now(),
         )
     }
+}
+
+/// Truncates `content` to fit Discord's message content limit, marking a cut with a trailing `…`:
+/// a free-text owner answer can run well past it, and an oversized card edit is rejected outright.
+fn bound_card_content(content: String) -> String {
+    if content.chars().count() <= MAX_QUESTION_CARD_CONTENT_LENGTH {
+        return content;
+    }
+    let mut bounded: String = content
+        .chars()
+        .take(MAX_QUESTION_CARD_CONTENT_LENGTH.saturating_sub(1))
+        .collect();
+    bounded.push('…');
+    bounded
 }
 
 pub async fn handle_component(
@@ -1211,10 +1235,11 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, PERMISSION_TIMEOUT, PendingKey,
-        PendingRequests, PermissionResponder, QUESTION_TIMEOUT, QuestionBrokerResponse,
-        correlate_decision, correlate_question_answers, hook_timeout, question_hook_timeout,
-        read_json_line, return_value_before_card_edit, spawn_hook_monitor,
+        BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, MAX_QUESTION_CARD_CONTENT_LENGTH,
+        PERMISSION_TIMEOUT, PendingKey, PendingRequests, PermissionResponder, QUESTION_TIMEOUT,
+        QuestionBrokerResponse, bound_card_content, correlate_decision, correlate_question_answers,
+        hook_timeout, question_hook_timeout, read_json_line, return_value_before_card_edit,
+        spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
@@ -1244,6 +1269,17 @@ mod tests {
     fn question_hook_margin_matches_the_question_timeout() {
         assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(300));
         assert_eq!(question_hook_timeout(), Duration::from_secs(305));
+    }
+
+    #[test]
+    fn bound_card_content_only_truncates_past_the_discord_message_limit() {
+        let at_limit = "x".repeat(MAX_QUESTION_CARD_CONTENT_LENGTH);
+        assert_eq!(bound_card_content(at_limit.clone()), at_limit);
+
+        let over_limit = "x".repeat(MAX_QUESTION_CARD_CONTENT_LENGTH + 500);
+        let bounded = bound_card_content(over_limit);
+        assert_eq!(bounded.chars().count(), MAX_QUESTION_CARD_CONTENT_LENGTH);
+        assert!(bounded.ends_with('…'));
     }
 
     fn question_interaction() -> QuestionInteraction {

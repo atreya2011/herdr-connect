@@ -25,6 +25,13 @@ pub const UNKNOWN_WEBHOOK_DELIVERY_ERROR: &str = "discord unknown webhook";
 
 const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
+/// Discord's select-option description and select-option label length limits
+/// (`twilight-validate`'s `SELECT_OPTION_DESCRIPTION_LENGTH`/label bound); `payload_json` bypasses
+/// twilight's own validation, so this crate enforces them itself before a real question can exceed
+/// them and silently fail to post its card.
+const SELECT_OPTION_TEXT_LIMIT: usize = 100;
+/// Discord's button label length limit (`twilight-validate`'s `COMPONENT_BUTTON_LABEL_LENGTH`).
+const BUTTON_LABEL_LIMIT: usize = 80;
 const STARTUP_COMPONENT_MASK: u64 = (1_u64 << 44) - 1;
 const PAYLOAD_COMPONENT_MASK: u64 = (1_u64 << 52) - 1;
 const COMPONENT_TYPE_KEY: &str = "type";
@@ -570,6 +577,16 @@ fn question_card_description(question: &str) -> String {
     format!("{sanitized}\n\nOr reply in this thread with your own answer.")
 }
 
+/// Truncates `value` to at most `limit` characters, marking a cut with a trailing `…`.
+fn truncate_with_ellipsis(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    let mut truncated: String = value.chars().take(limit.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
 /// One action row of up to five option buttons, `herdrask:<token>:<option index>`.
 fn question_button_components(options: &[QuestionOption], token: &str, disabled: bool) -> Value {
     let buttons: Vec<Value> = options
@@ -579,7 +596,7 @@ fn question_button_components(options: &[QuestionOption], token: &str, disabled:
             json!({
                 COMPONENT_TYPE_KEY: 2,
                 "style": 1,
-                "label": option.label,
+                "label": truncate_with_ellipsis(&option.label, BUTTON_LABEL_LIMIT),
                 "custom_id": format!("herdrask:{token}:{index}"),
                 "disabled": disabled,
             })
@@ -595,9 +612,9 @@ fn question_select_components(options: &[QuestionOption], token: &str, disabled:
         .enumerate()
         .map(|(index, option)| {
             json!({
-                "label": option.label,
+                "label": truncate_with_ellipsis(&option.label, SELECT_OPTION_TEXT_LIMIT),
                 "value": index.to_string(),
-                "description": option.description,
+                "description": truncate_with_ellipsis(&option.description, SELECT_OPTION_TEXT_LIMIT),
             })
         })
         .collect();
@@ -990,7 +1007,10 @@ mod tests {
         }
     }
 
-    use super::{question_button_components, question_card_description, question_card_title};
+    use super::{
+        BUTTON_LABEL_LIMIT, SELECT_OPTION_TEXT_LIMIT, question_button_components,
+        question_card_description, question_card_title, truncate_with_ellipsis,
+    };
     use crate::question::QuestionOption;
 
     fn option(label: &str) -> QuestionOption {
@@ -998,6 +1018,59 @@ mod tests {
             label: label.to_owned(),
             description: format!("{label} description"),
         }
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_only_cuts_when_over_the_limit() {
+        let cases = [
+            ("at the limit", "x".repeat(80), 80, "x".repeat(80)),
+            (
+                "over the limit",
+                "x".repeat(81),
+                80,
+                format!("{}…", "x".repeat(79)),
+            ),
+        ];
+        for (name, input, limit, expected) in cases {
+            let truncated = truncate_with_ellipsis(&input, limit);
+            assert_eq!(truncated, expected, "case={name}");
+            assert!(
+                truncated.chars().count() <= limit,
+                "case={name} exceeded the limit"
+            );
+        }
+    }
+
+    #[test]
+    fn question_button_components_truncate_an_oversized_label() {
+        let long_label = "x".repeat(BUTTON_LABEL_LIMIT + 1);
+        let options = vec![option(&long_label)];
+        let components = question_button_components(&options, "tok", false);
+        let label = components[0]["components"][0]["label"]
+            .as_str()
+            .expect("button label is a string");
+        assert!(label.chars().count() <= BUTTON_LABEL_LIMIT);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn question_select_components_truncate_an_oversized_label_and_description() {
+        let long_label = "x".repeat(SELECT_OPTION_TEXT_LIMIT + 1);
+        let long_description = "y".repeat(SELECT_OPTION_TEXT_LIMIT + 50);
+        let options = vec![QuestionOption {
+            label: long_label,
+            description: long_description,
+        }];
+        let components = super::question_select_components(&options, "tok", false);
+        let menu_option = &components[0]["components"][0]["options"][0];
+        let label = menu_option["label"].as_str().expect("label is a string");
+        let description = menu_option["description"]
+            .as_str()
+            .expect("description is a string");
+        assert!(label.chars().count() <= SELECT_OPTION_TEXT_LIMIT);
+        assert!(label.ends_with('…'));
+        assert!(description.chars().count() <= SELECT_OPTION_TEXT_LIMIT);
+        assert!(description.ends_with('…'));
     }
 
     #[test]
