@@ -239,8 +239,6 @@ pub struct AgentSnapshot {
     pub terminal_title_stripped: Option<String>,
     #[serde(alias = "agent_session")]
     pub session: Option<AgentSession>,
-    #[serde(default)]
-    pub state_change_seq: u64,
 }
 /// Lists agents from Herdr.
 ///

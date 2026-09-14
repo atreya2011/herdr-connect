@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use herdr_connect_rs::{
-    claude_turn_start_position, codex_turn_start_position, read_claude_incremental,
-    read_codex_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
+    read_claude_incremental, read_codex_incremental, read_cursor_incremental,
+    read_cursor_prompts_incremental,
 };
 use rusqlite::Connection;
 
@@ -79,44 +79,21 @@ fn read_claude_incremental_recovers_a_completed_record_at_the_same_offset() {
 }
 
 #[test]
-fn claude_turn_start_position_resumes_at_the_reply_on_a_log_that_already_holds_one() {
-    let path = "tests/fixtures/claude-session.jsonl";
-    let start = claude_turn_start_position(path.as_ref()).expect("turn start resolves");
-    let (texts, _) = read_claude_incremental(path.as_ref(), start).expect("read from turn start");
-    assert_eq!(
-        texts.into_iter().map(|(text, _)| text).collect::<Vec<_>>(),
-        vec!["narration".to_owned(), "final answer".to_owned()]
-    );
-}
-
-#[test]
-fn read_codex_incremental_returns_current_turn_assistant_messages() {
+fn read_codex_incremental_returns_every_assistant_message() {
     let cases = [(
         "tests/fixtures/codex-session-response-item.jsonl",
-        695_u64,
         vec![
             ("priorreply".to_owned(), 433_u64),
             ("alpha".to_owned(), 958_u64),
             ("gamma".to_owned(), 1593_u64),
         ],
-        vec![
-            ("alpha".to_owned(), 958_u64),
-            ("gamma".to_owned(), 1593_u64),
-        ],
         1697_u64,
     )];
-    for (path, expected_start, expected_all, expected_current, expected_end) in cases {
+    for (path, expected_all, expected_end) in cases {
         let (all_messages, complete_offset) =
             read_codex_incremental(path.as_ref(), 0).expect("read complete Codex capture");
         assert_eq!(all_messages, expected_all);
         assert_eq!(complete_offset, expected_end);
-
-        let start = codex_turn_start_position(path.as_ref()).expect("Codex turn start resolves");
-        assert_eq!(start, expected_start);
-        let (current_messages, current_offset) =
-            read_codex_incremental(path.as_ref(), start).expect("read current Codex turn");
-        assert_eq!(current_messages, expected_current);
-        assert_eq!(current_offset, expected_end);
     }
 }
 

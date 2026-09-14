@@ -571,7 +571,7 @@ async fn deliver_transition_if_postable(
     context: PostableTransitionContext<'_>,
     state: &mut BridgeState,
 ) {
-    if context.transition.to == STATUS_BLOCKED && is_postable_transition(context.transition) {
+    if is_postable_transition(context.transition) {
         deliver_postable_transition(context, state).await;
     }
 }
@@ -1745,52 +1745,47 @@ async fn sync_startup_topology(
     }
 }
 
-/// Applies every `tab.closed`/`workspace.closed` Herdr event in a batch to Discord with ONE
-/// topology fetch shared across the whole batch, deleting only the tabs and workspaces the
-/// fetched lists actually contain. A closure with no match in the active list and no match in that
-/// closure's workspace channel's archived listing makes no further Discord request: the archived
-/// listing itself is fetched at most once per distinct workspace channel in the batch and reused
-/// by every closure that channel contains. A per-closure delete error is logged and does not stop
-/// the remaining closures in the batch; only a failure of the shared fetch itself aborts the batch.
-async fn delete_closed_topology_batch(
+/// Applies one `tab.closed`/`workspace.closed` Herdr event to Discord from a fresh topology fetch,
+/// deleting only the tab or workspace the fetched lists actually contain. A tab closure with no
+/// match in the active list and no match in its workspace channel's archived listing makes no
+/// further Discord request. The delete error is logged; only a failure of the fetch itself is
+/// returned.
+async fn delete_closed_topology(
     discord: Option<&DiscordConnection>,
-    closures: &[TopologyClosure],
+    closure: &TopologyClosure,
 ) -> Result<(), String> {
     let Some((client, guild, _, responder)) = discord else {
         return Ok(());
     };
-    if closures.is_empty() {
-        return Ok(());
-    }
     let topology_cache = responder.topology_cache();
     let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
     let mut guard = topology_cache.lock().await;
     let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
-    let mut archived_cache: HashMap<Id<ChannelMarker>, Vec<twilight_model::channel::Channel>> =
-        HashMap::new();
-    for closure in closures {
-        let result = match closure {
-            TopologyClosure::Tab {
+    let result = match closure {
+        TopologyClosure::Tab {
+            workspace_id,
+            tab_id,
+        } => {
+            let mut archived_cache: HashMap<
+                Id<ChannelMarker>,
+                Vec<twilight_model::channel::Channel>,
+            > = HashMap::new();
+            delete_tab_thread(
+                client.as_ref(),
+                channels,
+                active_threads,
+                &mut archived_cache,
                 workspace_id,
                 tab_id,
-            } => {
-                delete_tab_thread(
-                    client.as_ref(),
-                    channels,
-                    active_threads,
-                    &mut archived_cache,
-                    workspace_id,
-                    tab_id,
-                )
-                .await
-            }
-            TopologyClosure::Workspace { workspace_id } => {
-                delete_workspace_channel(client.as_ref(), channels, workspace_id).await
-            }
-        };
-        if let Err(error) = result {
-            bridge_eprintln!("herdr topology closure error: {error}");
+            )
+            .await
         }
+        TopologyClosure::Workspace { workspace_id } => {
+            delete_workspace_channel(client.as_ref(), channels, workspace_id).await
+        }
+    };
+    if let Err(error) = result {
+        bridge_eprintln!("herdr topology closure error: {error}");
     }
     Ok(())
 }
@@ -2432,8 +2427,7 @@ async fn apply_lifecycle_event(
     }
 
     if let Some(closure) = lifecycle_closure(event)
-        && let Err(error) =
-            delete_closed_topology_batch(discord, std::slice::from_ref(&closure)).await
+        && let Err(error) = delete_closed_topology(discord, &closure).await
     {
         bridge_eprintln!("herdr topology closure error: {error}");
     }
@@ -2863,14 +2857,14 @@ mod tests {
         BridgeRuntime, BridgeState, BrokerTask, Client, LivePosition, Membership,
         PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
         agent_read_detection, apply_membership, capture_for_with_search_root,
-        create_transition_messages, delete_closed_topology_batch,
-        discover_pending_and_unusable_tabs, fetch_startup_owner_identity, fetch_topology_lists,
-        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
-        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
-        read_new_terminal_prompts, resolve_session_path, route_topology, subscribe_status,
-        subscribe_status_with_backoff, sync_pending_titles, sync_route, sync_startup_topology,
-        tab_list_result, terminal_prompt_baseline_is_current, unique_existing_path,
+        create_transition_messages, delete_closed_topology, discover_pending_and_unusable_tabs,
+        fetch_startup_owner_identity, fetch_topology_lists, handle_lifecycle_select_result,
+        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
+        next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
+        resolve_session_path, route_topology, subscribe_status, subscribe_status_with_backoff,
+        sync_pending_titles, sync_route, sync_startup_topology, tab_list_result,
+        terminal_prompt_baseline_is_current, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
@@ -3135,7 +3129,6 @@ mod tests {
                     agent: VENDOR_CLAUDE.to_owned(),
                     value: session_value.to_owned(),
                 }),
-                state_change_seq: 0,
             };
 
             // Case b: a fresh session with no log yet is seen first (marks the terminal
@@ -3359,7 +3352,6 @@ mod tests {
             cwd: Some(cwd.to_owned()),
             terminal_title_stripped: None,
             session: Some(session.clone()),
-            state_change_seq: 0,
         };
         (snapshot, session)
     }
@@ -3531,7 +3523,6 @@ mod tests {
                 cwd: Some("/srv/bridge".to_owned()),
                 terminal_title_stripped: None,
                 session: Some(session.clone()),
-                state_change_seq: 0,
             };
 
             let resolved_path = resolve_session_path(&root, &snapshot, &session);
@@ -3691,7 +3682,6 @@ mod tests {
                 agent: "claude".to_owned(),
                 value: "9a11cafe-affe-4f5c-8bda-b10cb6a5cafe".to_owned(),
             }),
-            state_change_seq: 0,
         };
         let capture = capture_for_with_search_root(&snapshot, Path::new("tests/fixtures"))
             .expect("fixture-backed claude session resolves");
@@ -4211,8 +4201,9 @@ mod tests {
         let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
         let result = async {
             report_agent_state(&tab.pane_id, "idle")?;
-            let mut sub = subscribe_herdr_events(&status_subscriptions(std::slice::from_ref(&tab.pane_id)))
-                .await?;
+            let mut sub =
+                subscribe_herdr_events(&status_subscriptions(std::slice::from_ref(&tab.pane_id)))
+                    .await?;
             report_agent_state(&tab.pane_id, "working")?;
             let event = wait_for_event(
                 &mut sub,
@@ -4230,8 +4221,8 @@ mod tests {
             let snapshot = snapshot_for_pane(&tab.pane_id)?;
             assert_eq!(snapshot.agent_status, "working");
             assert!(
-                snapshot.cwd.is_some() || snapshot.session.is_some() || snapshot.state_change_seq > 0,
-                "doorbell agent.list must carry cwd, reported session, or state_change_seq: {snapshot:?}"
+                snapshot.cwd.is_some() || snapshot.session.is_some(),
+                "doorbell agent.list must carry cwd or a reported session: {snapshot:?}"
             );
             Ok::<(), String>(())
         }
@@ -7058,7 +7049,6 @@ mod tests {
                         agent: agent.to_owned(),
                         value: format!("{agent}-fresh-session"),
                     }),
-                    state_change_seq: 0,
                 };
                 let tabs = [herdr_connect_rs::HerdrTab {
                     tab_id: tab_id.to_owned(),
@@ -7838,12 +7828,12 @@ mod tests {
         expect_survives: bool,
     }
 
-    /// Table-driven, against a real Discord guild: a batch of several `tab.closed` closures for
-    /// tabs in the same workspace channel deletes only the closed tabs whose threads the fetched
-    /// active list or that channel's one archived listing actually contains, and a live tab's
-    /// thread outside the batch survives untouched.
+    /// Table-driven, against a real Discord guild: applying each `tab.closed` closure on its own
+    /// (as the lifecycle loop now does, one event at a time) deletes only the closed tabs whose
+    /// threads the fetched active list or that channel's archived listing actually contains, and a
+    /// live tab's thread whose closure is never applied survives untouched.
     #[cfg(unix)]
-    async fn closure_batch_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
+    async fn closed_topology_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -7922,7 +7912,9 @@ mod tests {
         }
 
         let connection = discord_tuple(guild);
-        delete_closed_topology_batch(Some(&connection), &closures).await?;
+        for closure in &closures {
+            delete_closed_topology(Some(&connection), closure).await?;
+        }
 
         for (case, suffix) in cases.iter().zip(suffixes.iter()) {
             let survives = thread_with_suffix_survives(guild, channel.id, suffix).await?;
@@ -7939,7 +7931,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn closure_batch_deletes_matching_threads_and_spares_live_ones() {
+    async fn closed_topology_deletes_matching_threads_and_spares_live_ones() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -7950,7 +7942,7 @@ mod tests {
             "named zero-leftover check"
         );
 
-        let result = closure_batch_exercise(&guild).await;
+        let result = closed_topology_exercise(&guild).await;
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");

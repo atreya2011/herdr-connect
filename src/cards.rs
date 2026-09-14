@@ -23,15 +23,11 @@ pub fn create_transition_messages(
     capture: &AgentLogCapture,
     owner: &str,
 ) -> Vec<TransitionMessage> {
-    let mut body = if transition.to == STATUS_BLOCKED {
-        capture
-            .question
-            .as_deref()
-            .unwrap_or(&capture.message)
-            .to_owned()
-    } else {
-        capture.message.clone()
-    };
+    let mut body = capture
+        .question
+        .as_deref()
+        .unwrap_or(&capture.message)
+        .to_owned();
     if let Some(failure) = &capture.failure {
         if !body.is_empty() {
             body.push_str("\n\n");
@@ -40,10 +36,8 @@ pub fn create_transition_messages(
     }
     let color = if capture.failure.is_some() {
         0x00ed_4245
-    } else if transition.to == STATUS_BLOCKED {
-        0x00fe_e75c
     } else {
-        0x0057_f287
+        0x00fe_e75c
     };
     let mut parts = split_body(&body);
     let total = parts.len();
@@ -211,32 +205,4 @@ pub fn format_thread_name(
         base.chars().take(capacity).collect::<String>(),
         suffix
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AgentLogCapture, create_transition_messages};
-    use crate::herdr::STATUS_DONE;
-    use crate::watcher::Transition;
-
-    #[test]
-    fn error_turn_card_with_an_empty_message_shows_only_the_failure() {
-        let transition = Transition {
-            from: "working".to_owned(),
-            to: STATUS_DONE.to_owned(),
-            terminal_id: "terminal".to_owned(),
-            agent: "claude".to_owned(),
-        };
-        let capture = AgentLogCapture {
-            message: String::new(),
-            failure: Some("tool errored".to_owned()),
-            question: None,
-        };
-
-        let messages = create_transition_messages(&transition, &capture, "42");
-
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].description, "tool errored");
-        assert!(!messages[0].description.starts_with('\n'));
-    }
 }

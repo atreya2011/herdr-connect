@@ -65,8 +65,7 @@ pub use question::{
     QuestionOption, decode_claude_ask_question, encode_claude_question_decision,
 };
 pub use readers::{
-    AgentLog, claude_turn_start_position, codex_turn_start_position, cursor_turn_start_rowid,
-    format_detection_question, read_agent_log, read_claude_incremental,
+    AgentLog, format_detection_question, read_agent_log, read_claude_incremental,
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
     read_cursor_incremental, read_cursor_prompts_incremental,
 };

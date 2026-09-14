@@ -111,15 +111,15 @@ mod real_guild {
         }
         let second_card = create_transition_messages(
             &Transition {
-                from: "blocked".into(),
-                to: "idle".into(),
+                from: "working".into(),
+                to: "blocked".into(),
                 terminal_id: test_terminal.clone(),
                 agent: "claude".into(),
             },
             &AgentLogCapture {
-                message: "idle".into(),
+                message: "blocked".into(),
                 failure: None,
-                question: None,
+                question: Some("second choice".into()),
             },
             &owner.to_string(),
         )
@@ -155,8 +155,8 @@ mod real_guild {
             &second_card_nonce,
         )
         .await?;
-        let delivered_idle = fetch_message(guild, channel, second_card_id).await?;
-        assert_no_user_mentions(&delivered_idle)?;
+        let delivered_second = fetch_message(guild, channel, second_card_id).await?;
+        assert_owner_mention(&delivered_second, owner)?;
         if first_card_id == second_card_id {
             return Err("distinct cards reused one message".to_owned());
         }
@@ -419,14 +419,6 @@ mod real_guild {
             Ok(())
         } else {
             Err("blocked card did not mention the owner".to_owned())
-        }
-    }
-
-    fn assert_no_user_mentions(message: &twilight_model::channel::Message) -> Result<(), String> {
-        if message.mentions.is_empty() {
-            Ok(())
-        } else {
-            Err("non-blocked card mentioned a user".to_owned())
         }
     }
 }
