@@ -95,11 +95,6 @@ struct BridgeState {
     blocked_since: HashMap<String, Instant>,
     informational_cards: HashMap<String, InformationalCard>,
     blocked_capture_attempts: HashMap<String, u32>,
-    /// Last reply card text delivered per terminal. A reply card whose captured text equals this
-    /// entry is not posted again, whether it arrives on the status-change path or the
-    /// seq-backstop path; a legitimately identical consecutive reply is intentionally not
-    /// reposted.
-    last_posted: HashMap<String, String>,
     /// Tab ids waiting on a cold-start terminal title: `route_topology` reported
     /// [`RouteError::TitlePending`] for them. `discover_pending_and_unusable_tabs` inserts one on
     /// every snapshot pass, independent of any status transition; a resolved delivery-path route
@@ -622,22 +617,15 @@ fn report_route_error(error: RouteError, state: &mut BridgeState) -> bool {
     }
 }
 
-/// Delivers one postable transition's card to Discord: an agent reporting no session is not
-/// mirrored and returns before any topology is routed, blocked cards included. A tab whose
-/// topology cannot be routed is handled by `report_route_error` and otherwise skipped. Otherwise,
-/// a blocked transition goes through `handle_blocked_card`, while a reply-card transition is
-/// captured from the vendor log and delivered. A reply card whose captured text equals the last
-/// one delivered for this terminal is skipped instead of reposted. The check applies on both the
-/// status-change path and the seq-backstop path, so a legitimately identical consecutive reply is
-/// intentionally not reposted either.
-///
-/// # Errors
-///
-/// Returns Discord delivery errors.
+/// Delivers a blocked transition's card to Discord: an agent reporting no session is not mirrored
+/// and returns before any topology is routed. A tab whose topology cannot be routed is handled by
+/// `report_route_error` and otherwise skipped. Working, done, and idle transitions post nothing --
+/// assistant text reaches Discord live from the pane's vendor-log watch, not as a turn-end card,
+/// and a failed turn shows as the agent's own text the same way.
 async fn deliver_postable_transition(
     context: PostableTransitionContext<'_>,
     state: &mut BridgeState,
-) -> Result<(), String> {
+) {
     let PostableTransitionContext {
         snapshot,
         agents,
@@ -649,102 +637,49 @@ async fn deliver_postable_transition(
     } = context;
     if snapshot.session.is_none() {
         bridge_println!("{terminal}: no reported session, not mirrored");
-        return Ok(());
+        return;
     }
     let route = match route_topology(agents, tabs, terminal) {
         Ok(route) => route,
         Err(error) => {
             report_route_error(error, state);
-            return Ok(());
+            return;
         }
     };
     // A tab this call just resolved is no longer pending; without this, `sync_pending_titles`
     // would see the same tab still in the set later in the same snapshot pass and sync it again.
     state.title_pending.remove(&route.tab_id);
     let Some(connection) = discord else {
-        return Ok(());
+        return;
     };
     let (client, guild, owner_id, responder) = connection;
-    if transition.to == STATUS_BLOCKED {
-        handle_blocked_card(BlockedCardContext {
-            client: client.as_ref(),
-            guild: *guild,
-            owner_id,
-            responder: responder.as_ref(),
-            topology_cache: responder.topology_cache(),
-            route: &route,
-            snapshot,
-            terminal,
-            from_status: &transition.from,
-            blocked_since: state.blocked_since.get(terminal),
-            state_change_seq,
-            informational_cards: &mut state.informational_cards,
-            blocked_capture_attempts: &mut state.blocked_capture_attempts,
-            search_root: None,
-        })
-        .await;
-        return Ok(());
-    }
-    let Some(capture) = capture_for_or_report(snapshot) else {
-        return Ok(());
-    };
-    let last_posted = state.last_posted.get(terminal).map(String::as_str);
-    if capture.failure.is_none() && repeats_last_live_text(&capture, last_posted) {
-        bridge_println!("{terminal}: skipped duplicate reply card");
-        return Ok(());
-    }
-    let card_capture = card_capture_for_delivery(&capture, last_posted);
-    deliver_to_route(
-        connection,
-        &route,
-        transition,
-        &card_capture,
+    handle_blocked_card(BlockedCardContext {
+        client: client.as_ref(),
+        guild: *guild,
+        owner_id,
+        responder: responder.as_ref(),
+        topology_cache: responder.topology_cache(),
+        route: &route,
+        snapshot,
+        terminal,
+        from_status: &transition.from,
+        blocked_since: state.blocked_since.get(terminal),
         state_change_seq,
-    )
-    .await?;
-    state
-        .last_posted
-        .insert(terminal.to_owned(), capture.message);
-    Ok(())
+        informational_cards: &mut state.informational_cards,
+        blocked_capture_attempts: &mut state.blocked_capture_attempts,
+        search_root: None,
+    })
+    .await;
 }
 
-/// Split out of [`process_snapshot`] to keep it under the line-count lint: delivers `context`'s
-/// transition when postable and logs any delivery error, shared by the status-change and
-/// seq-backstop paths.
+/// Split out of [`process_snapshot`] to keep it under the line-count lint: delivers a blocked
+/// transition's card. Working, done, and idle transitions post nothing.
 async fn deliver_transition_if_postable(
     context: PostableTransitionContext<'_>,
     state: &mut BridgeState,
 ) {
-    if is_postable_transition(context.transition)
-        && let Err(error) = deliver_postable_transition(context, state).await
-    {
-        bridge_eprintln!("{error}");
-    }
-}
-
-/// Whether a reply card would only repeat a text already shown live: the caller's dedup guard
-/// skips posting in that case unless the turn also failed and needs reporting.
-#[must_use]
-fn repeats_last_live_text(capture: &AgentLogCapture, last_posted: Option<&str>) -> bool {
-    last_posted == Some(capture.message.as_str())
-}
-
-/// The capture used to build a reply card's content. Unchanged, unless this turn's message
-/// already appeared live and the turn also failed: then the message portion is cleared so the
-/// card shows only the failure instead of repeating text already posted live.
-#[must_use]
-fn card_capture_for_delivery(
-    capture: &AgentLogCapture,
-    last_posted: Option<&str>,
-) -> AgentLogCapture {
-    if capture.failure.is_some() && repeats_last_live_text(capture, last_posted) {
-        AgentLogCapture {
-            message: String::new(),
-            failure: capture.failure.clone(),
-            question: capture.question.clone(),
-        }
-    } else {
-        capture.clone()
+    if context.transition.to == STATUS_BLOCKED && is_postable_transition(context.transition) {
+        deliver_postable_transition(context, state).await;
     }
 }
 
@@ -819,11 +754,6 @@ fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
         let responder = Arc::clone(&responder);
         Box::pin(async move { handle_component(responder, interaction).await })
     })
-}
-
-fn capture_for(snapshot: &AgentSnapshot) -> Result<AgentLogCapture, String> {
-    let home = std::env::var_os(ENV_HOME).ok_or_else(|| "HOME is not configured".to_owned())?;
-    capture_for_with_search_root(snapshot, Path::new(&home))
 }
 
 /// Why a Claude/Codex/Cursor session's on-disk log could not be resolved, classified by KIND
@@ -1609,18 +1539,17 @@ async fn mirror_terminal_prompts(
 /// tick's live text, so a prompt that started the current turn is posted to Discord ahead of the
 /// assistant text it produced.
 ///
-/// Updates `state.last_posted` per fully delivered text so a turn-end card repeating it is
-/// skipped. The nonce is derived from the terminal id and log position, not a counter, so it
+/// Each posted text's nonce is derived from the terminal id and log position, not a counter, so it
 /// survives a watch restart that resumes at the same position. A read failure logs once per
 /// terminal and leaves the follower running at its unchanged position, to retry on the next event.
 ///
 /// A delivery that fails against the watch's cached channel because the thread is gone (deleted
 /// outside the bridge's own tracking) invalidates the shared topology cache, re-resolves the
-/// route once, and retries that same text at the recreated thread, exactly like
-/// [`deliver_to_route`]; the watch's `channel` is updated on a successful recovery so later events
-/// do not repeat the round trip. The stored log position only advances past text that was
-/// actually delivered: a text that still fails after the retry stops the batch there, so it and
-/// everything read after it are re-read and re-sent on the next event instead of being lost.
+/// route once, and retries that same text at the recreated thread; the watch's `channel` is
+/// updated on a successful recovery so later events do not repeat the round trip. The stored log
+/// position only advances past text that was actually delivered: a text that still fails after the
+/// retry stops the batch there, so it and everything read after it are re-read and re-sent on the
+/// next event instead of being lost.
 ///
 /// That retry-on-the-next-tick behavior is only safe because it is bounded:
 /// [`BridgeState::live_delivery_attempts`] counts consecutive failed ticks for whatever text is
@@ -1694,7 +1623,6 @@ async fn handle_live_event(
             all_delivered = false;
             break;
         }
-        state.last_posted.insert(terminal.to_owned(), text);
         delivered_position = position;
     }
     if all_delivered {
@@ -1828,16 +1756,6 @@ async fn handle_activity_event(
     }
 }
 
-fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
-    match capture_for(snapshot) {
-        Ok(capture) => Some(capture),
-        Err(error) => {
-            bridge_eprintln!("agent log capture error: {error}");
-            None
-        }
-    }
-}
-
 fn capture_for_blocked(snapshot: &AgentSnapshot) -> AgentLogCapture {
     std::env::var_os(ENV_HOME).map_or_else(
         || AgentLogCapture {
@@ -1864,42 +1782,6 @@ fn capture_for_blocked_with_search_root(
             }
         }
     }
-}
-
-/// Delivers a transition's cards to the route resolved from one Herdr snapshot, including its `format_thread_name` result.
-///
-/// # Errors
-///
-/// Returns Discord topology or card-delivery errors.
-async fn deliver_to_route(
-    discord: &DiscordConnection,
-    route: &TopologyRoute,
-    transition: &Transition,
-    capture: &AgentLogCapture,
-    state_change_seq: u64,
-) -> Result<Id<MessageMarker>, String> {
-    let (client, guild, owner_id, responder) = discord;
-    let topology_cache = responder.topology_cache();
-    let messages = create_transition_messages(transition, capture, owner_id);
-    let mut target = sync_route(client.as_ref(), *guild, route, topology_cache).await?;
-    let mut last_message_id = None;
-    for (index, message) in messages.iter().enumerate() {
-        let nonce = transition_card_nonce(&transition.terminal_id, state_change_seq, index);
-        let mut sent = deliver_transition_card(client.as_ref(), target, message, &nonce).await;
-        if let Err(error) = &sent
-            && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
-        {
-            // The cached route no longer exists on Discord (deleted outside the bridge's own
-            // tracking, since every deletion the bridge itself performs already keeps this same
-            // cache in sync): drop it and resolve fresh before retrying once, rather than
-            // repeating a send that can only fail again against the same stale id.
-            *topology_cache.lock().await = None;
-            target = sync_route(client.as_ref(), *guild, route, topology_cache).await?;
-            sent = deliver_transition_card(client.as_ref(), target, message, &nonce).await;
-        }
-        last_message_id = Some(sent.map_err(|error| format!("discord delivery error: {error}"))?);
-    }
-    last_message_id.ok_or_else(|| "discord delivery produced no messages".to_owned())
 }
 
 /// Resolves `route`'s tab thread, serving it straight from `topology_cache` when the cache
@@ -2142,9 +2024,6 @@ fn prune_departed_state(
         .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .blocked_capture_attempts
-        .retain(|terminal, _| current_terminals.contains(terminal));
-    state
-        .last_posted
         .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .live_watches
@@ -3202,20 +3081,20 @@ mod tests {
         BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
         LIVE_DELIVERY_ATTEMPTS, LivePosition, LiveWatch, Membership, PermissionResponder,
         SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
-        capture_for, capture_for_with_search_root, card_capture_for_delivery,
-        create_transition_messages, decide_blocked_response, delete_closed_topology_batch,
-        discover_pending_and_unusable_tabs, fetch_startup_owner_identity, fetch_topology_lists,
-        handle_blocked_card, handle_lifecycle_select_result, handle_live_event,
-        initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
-        live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
-        process_snapshot, read_new_terminal_prompts, repeats_last_live_text, resolve_session_path,
-        route_topology, start_notify_watcher, subscribe_status, subscribe_status_with_backoff,
-        sync_pending_titles, sync_route, sync_startup_topology, tab_list_result,
-        terminal_prompt_baseline_is_current, unique_existing_path,
+        capture_for_with_search_root, create_transition_messages, decide_blocked_response,
+        delete_closed_topology_batch, discover_pending_and_unusable_tabs,
+        fetch_startup_owner_identity, fetch_topology_lists, handle_blocked_card,
+        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
+        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
+        read_new_terminal_prompts, resolve_session_path, route_topology, start_notify_watcher,
+        subscribe_status, subscribe_status_with_backoff, sync_pending_titles, sync_route,
+        sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
+        unique_existing_path,
     };
     use herdr_connect_rs::{
-        AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-        Transition, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions,
+        AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
+        VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions,
         read_claude_incremental, read_codex_incremental, read_cursor_incremental,
         status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
         workspace_list_result,
@@ -4028,42 +3907,6 @@ mod tests {
                 decide_blocked_response(vendor_supported, question, attempts_so_far),
                 expected,
                 "vendor_supported={vendor_supported} question={question:?} attempts_so_far={attempts_so_far}"
-            );
-        }
-    }
-
-    #[test]
-    fn reply_card_dedup_only_suppresses_the_message_never_a_failure() {
-        let capture = |message: &str, failure: Option<&str>| AgentLogCapture {
-            message: message.to_owned(),
-            failure: failure.map(str::to_owned),
-            question: None,
-        };
-        let cases = [
-            (
-                "repeats last live text, no failure: dedup skips the card entirely",
-                capture("gamma", None),
-                true,
-                "gamma",
-            ),
-            (
-                "repeats last live text, with failure: card must still post, message-only",
-                capture("gamma", Some("tool errored")),
-                false,
-                "",
-            ),
-        ];
-        for (name, capture, expect_skip, expect_card_message) in cases {
-            let last_posted = Some("gamma");
-            assert_eq!(
-                capture.failure.is_none() && repeats_last_live_text(&capture, last_posted),
-                expect_skip,
-                "{name}: skip decision"
-            );
-            assert_eq!(
-                card_capture_for_delivery(&capture, last_posted).message,
-                expect_card_message,
-                "{name}: card message"
             );
         }
     }
@@ -5147,118 +4990,6 @@ mod tests {
         }
     }
 
-    /// Drives one real `claude --model haiku` agent through a genuine idle -> working -> settled
-    /// round-trip observed via real Herdr subscribe events (unlike `seq_backstop_round_trip`,
-    /// which only polls `agent.list`), and asserts a card carrying the real captured reply is
-    /// posted. Status comes only from live `agent.list` snapshots; nothing is set by hand.
-    #[cfg(unix)]
-    async fn seed_then_working_then_done_card(
-        guild: &BlockedCaptureGuild,
-        tab: &Tab,
-        agent_name: &str,
-    ) -> Result<(), String> {
-        start_claude_haiku_agent(agent_name, &tab.pane_id)?;
-        let idle = snapshot_for_pane(&tab.pane_id)?;
-        let session = idle.session.as_ref().ok_or_else(|| {
-            format!(
-                "pane {} has no reported session after agent start",
-                tab.pane_id
-            )
-        })?;
-        if session.agent != "claude" {
-            return Err(format!(
-                "expected a claude session on pane {}, agent.list reported {session:?}",
-                tab.pane_id
-            ));
-        }
-        let terminal = idle.terminal_id.clone();
-
-        let matching = matching_tab(&tab.tab_id)?;
-        let tabs = std::slice::from_ref(&matching);
-        let agents = std::slice::from_ref(&idle);
-        let mut state = BridgeState::default();
-        let connection = discord_tuple(guild);
-        process_snapshot(&idle, agents, tabs, Some(&connection), &mut state).await;
-
-        let route = route_topology(agents, tabs, &terminal)?;
-        let topology_cache: herdr_connect_rs::TopologyCache =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
-        let before = thread_card_descriptions(guild, thread).await?;
-        if before
-            .iter()
-            .any(|description| description.to_lowercase().contains("ready"))
-        {
-            return Err("silent seed posted a transition card".to_owned());
-        }
-
-        let mut sub =
-            subscribe_herdr_events(&status_subscriptions(std::slice::from_ref(&tab.pane_id)))
-                .await?;
-        herdr_json(&[
-            "agent",
-            "prompt",
-            agent_name,
-            "Reply with exactly the word ready.",
-        ])?;
-        wait_for_event(
-            &mut sub,
-            "pane.agent_status_changed",
-            &tab.pane_id,
-            "/data/pane_id",
-            Some("working"),
-            Duration::from_secs(15),
-        )
-        .await?;
-        let working = snapshot_for_pane(&tab.pane_id)?;
-        process_snapshot(
-            &working,
-            std::slice::from_ref(&working),
-            tabs,
-            Some(&connection),
-            &mut state,
-        )
-        .await;
-
-        let settled = loop {
-            let event = wait_for_event(
-                &mut sub,
-                "pane.agent_status_changed",
-                &tab.pane_id,
-                "/data/pane_id",
-                None,
-                Duration::from_secs(30),
-            )
-            .await?;
-            if matches!(
-                event.pointer("/data/agent_status").and_then(Value::as_str),
-                Some("done" | "idle")
-            ) {
-                break snapshot_for_pane(&tab.pane_id)?;
-            }
-        };
-        process_snapshot(
-            &settled,
-            std::slice::from_ref(&settled),
-            tabs,
-            Some(&connection),
-            &mut state,
-        )
-        .await;
-
-        let messages = thread_card_descriptions(guild, thread).await?;
-        if messages
-            .iter()
-            .any(|description| description.to_lowercase().contains("ready"))
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "idle -> working -> settled via subscribe did not post a card, thread has {messages:?}"
-            ))
-        }
-    }
-
     #[cfg(unix)]
     async fn wait_for_status(
         pane_id: &str,
@@ -5287,56 +5018,6 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn subscribe_idle_working_done_posts_transition_card() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        assert_eq!(
-            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
-            0,
-            "named zero-leftover check"
-        );
-
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .expect("HOME is set by the real Herdr pane environment");
-        let created = subscribe_tab_fixture();
-        let (tab_id, cwd_dir, result) = match created {
-            Ok((tab, cwd_dir)) => {
-                let agent_name = format!(
-                    "testrun-subscribe-{}",
-                    agent_name_nonce().expect("system clock is after unix epoch")
-                );
-                let outcome = seed_then_working_then_done_card(&guild, &tab, &agent_name).await;
-                cleanup_real_claude_session_dir(&home, &tab.pane_id);
-                (Some(tab.tab_id), Some(cwd_dir), outcome)
-            }
-            Err(error) => (None, None, Err(error)),
-        };
-        if let Some(tab_id) = &tab_id {
-            close_tab(tab_id);
-        }
-        if let Some(cwd_dir) = cwd_dir {
-            let _ = clear_directory_contents(&cwd_dir);
-        }
-
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left =
-            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-        assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
@@ -5564,33 +5245,24 @@ mod tests {
             other => return Err(format!("unsupported vendor for structural count: {other}")),
         };
         let messages = thread_messages(guild, thread).await?;
-        end_card_matches_last_live_text(&messages, expected_count)
+        live_texts_match_with_no_card(&messages, expected_count)
     }
 
-    /// Asserts the thread carries exactly `expected_count` live (non-embed) messages and that the
-    /// end card never repeats the last one.
+    /// Asserts the thread carries exactly `expected_count` live (non-embed) messages and no card
+    /// (embed) message at all: with the end card removed, a settled turn posts only live text.
     #[cfg(unix)]
-    fn end_card_matches_last_live_text(
+    fn live_texts_match_with_no_card(
         messages: &[(String, bool, Id<MessageMarker>)],
         expected_count: usize,
     ) -> Result<(), String> {
-        let mut live: Vec<_> = messages.iter().filter(|(_, embed, _)| !embed).collect();
-        if live.len() != expected_count {
-            return Err(format!("expected {expected_count} live, got {live:?}"));
+        let live = messages.iter().filter(|(_, embed, _)| !embed).count();
+        if live != expected_count {
+            return Err(format!(
+                "expected {expected_count} live messages, got {live} in {messages:?}"
+            ));
         }
-        live.sort_by_key(|(_, _, id)| *id);
-        // An aborted, refused, or tool-only turn writes no assistant text: fail instead of
-        // panicking, so the caller still runs cleanup and the zero-leftover checks.
-        let Some((last_text, ..)) = live.last() else {
-            return Err(
-                "real turn produced no live text to compare against the end card".to_owned(),
-            );
-        };
-        let repeated = messages
-            .iter()
-            .any(|(content, embed, _)| *embed && content == last_text);
-        if repeated {
-            return Err(format!("end card repeated live text {last_text:?}"));
+        if let Some((content, _, _)) = messages.iter().find(|(_, embed, _)| *embed) {
+            return Err(format!("a card was posted after live text: {content:?}"));
         }
         Ok(())
     }
@@ -5816,10 +5488,11 @@ mod tests {
             .await
             .map_err(|error| format!("prompt task failed: {error}"))??;
         // Cursor's SQLite write can commit well after Herdr itself reports `done`; wait for the
-        // reply to actually be readable before `own` triggers delivery, so the transition card's
-        // capture does not race the write and report an empty log.
+        // reply to actually be readable before the final live read, so live delivery does not race
+        // the write and miss the reply.
+        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
         let capture_deadline = Instant::now() + Duration::from_secs(10);
-        while let Err(error) = capture_for(&settled) {
+        while let Err(error) = capture_for_with_search_root(&settled, Path::new(&home)) {
             if Instant::now() >= capture_deadline {
                 eprintln!("reply capture never became readable before settle: {error}");
                 break;
@@ -8661,9 +8334,7 @@ mod tests {
         state: &mut BridgeState,
     ) -> Result<(), String> {
         handle_live_event(Some(connection), terminal, state).await;
-        if !state.last_posted.contains_key(terminal) {
-            Err("transient delivery failure did not redeliver once it cleared".to_owned())
-        } else if state.live_unfollowable.contains(terminal) {
+        if state.live_unfollowable.contains(terminal) {
             Err("a single transient failure must not mark the terminal unfollowable".to_owned())
         } else if state.live_delivery_attempts.contains_key(terminal) {
             Err("a fully recovered delivery must reset the attempt counter".to_owned())
