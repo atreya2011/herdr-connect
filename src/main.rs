@@ -4634,7 +4634,7 @@ mod tests {
     }
 
     /// Drives one real agent idle -> working -> settled: asserts `working` was observed, `alpha`
-    /// was live before settle, live count matches the log, and the end card skips a repeat.
+    /// was live before settle, the live message count matches the log, and no card was posted.
     #[cfg(unix)]
     async fn live_capture_exercise(
         guild: &BlockedCaptureGuild,
@@ -4852,6 +4852,196 @@ mod tests {
     #[serial]
     async fn live_capture_posts_first_live_text_before_settle_for_codex() {
         run_live_capture_test("codex").await;
+    }
+
+    /// A real-schema Claude assistant record, mirroring the shape in
+    /// `tests/fixtures/claude-session.jsonl`, appended to a live session log so the follower reads
+    /// an assistant text the running agent itself did not write.
+    #[cfg(unix)]
+    fn append_claude_assistant_record(path: &Path, text: &str) -> Result<(), String> {
+        let record = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        });
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        writeln!(file, "{record}").map_err(|error| error.to_string())
+    }
+
+    /// Rule 2 past settle: drives one real Claude turn to `done`/`idle`, then appends a fresh
+    /// assistant record to the pane's session log while it stays settled. The still-open watcher
+    /// posts that text -- status plays no part -- and the turn's own live texts are not reposted.
+    #[cfg(unix)]
+    async fn live_text_after_settle_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+    ) -> Result<(), String> {
+        start_live_capture_agent("claude", agent_name, &tab.pane_id)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let terminal = idle.terminal_id.clone();
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = std::slice::from_ref(&matching);
+        let mut state = BridgeState::default();
+        let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
+        state.live_tx = Some(live_tx);
+        let connection = discord_tuple(guild);
+
+        own(&idle, tabs, &connection, &mut state).await;
+        let route = route_topology(std::slice::from_ref(&idle), tabs, &terminal)?;
+        let topology_cache = Arc::new(tokio::sync::Mutex::new(None));
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+        submit_owner_prompt(&tab.pane_id, LIVE_CAPTURE_FORCE_PROMPT)?;
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some("working"),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let working = poll_snapshot(&tab.pane_id, Duration::from_secs(10), |s| {
+            s.session.is_some()
+        })?;
+        if working.agent_status != STATUS_WORKING
+            || working
+                .session
+                .as_ref()
+                .is_none_or(|sn| sn.agent != "claude")
+        {
+            return Err(format!("no confirmed claude working session: {working:?}"));
+        }
+        own(&working, tabs, &connection, &mut state).await;
+        let watch_deadline = Instant::now() + Duration::from_secs(5);
+        while !state.live_watches.contains_key(&terminal) && Instant::now() < watch_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            own(&working, tabs, &connection, &mut state).await;
+        }
+
+        let settled = loop {
+            tokio::select! {
+                Some(terminal_id) = live_events.recv() => {
+                    handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+                }
+                event = wait_for_event(
+                    &mut sub, "pane.agent_status_changed", &tab.pane_id, "/data/pane_id", None,
+                    Duration::from_secs(30),
+                ) => {
+                    let event = event?;
+                    if matches!(
+                        event.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some("done" | "idle")
+                    ) {
+                        break poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
+                    }
+                }
+            }
+        };
+        own(&settled, tabs, &connection, &mut state).await;
+        while let Ok(terminal_id) = live_events.try_recv() {
+            handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+        }
+        // One more read so any text written just before `done` is delivered before the baseline
+        // count is taken, isolating the post-settle append as the only new message.
+        handle_live_event(Some(&connection), &terminal, &mut state).await;
+        let live_before = thread_messages(guild, thread)
+            .await?
+            .into_iter()
+            .filter(|(_, embed, _)| !embed)
+            .count();
+
+        let Some(session) = settled.session.clone() else {
+            return Err("settled snapshot lost its session".to_owned());
+        };
+        let log_path = live_log_path(&settled, &session)?.ok_or("no log path yet")?;
+        let marker = format!("post-settle-{agent_name}");
+        append_claude_assistant_record(&log_path, &marker)?;
+        // The pane is settled; rule 2 still posts the appended text through the open watcher.
+        handle_live_event(Some(&connection), &terminal, &mut state).await;
+
+        let messages = thread_messages(guild, thread).await?;
+        let live: Vec<_> = messages.iter().filter(|(_, embed, _)| !embed).collect();
+        if !live.iter().any(|(content, _, _)| content.contains(&marker)) {
+            return Err(format!(
+                "assistant text appended after settle was not posted: {messages:?}"
+            ));
+        }
+        if live.len() != live_before + 1 {
+            return Err(format!(
+                "expected exactly one new live message after settle, before={live_before} \
+                 after={} in {messages:?}",
+                live.len()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn live_text_after_settle_posts_and_does_not_repeat() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{LIVE_CAPTURE_LABEL}-claude");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let created = live_capture_tab_fixture("claude");
+        let (tab_id, cwd_dir, result) = match created {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "settle-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(180),
+                    live_text_after_settle_exercise(&guild, &tab, &agent_name),
+                )
+                .await
+                .unwrap_or_else(|_| Err("live-text-after-settle exercise timed out".to_owned()));
+                if let Ok(snapshot) = snapshot_for_pane(&tab.pane_id)
+                    && let Some(session) = snapshot.session.as_ref()
+                    && let Ok(path) = resolve_session_path(&home, &snapshot, session)
+                    && let Some(parent) = path.parent()
+                {
+                    let _ = fs::remove_dir_all(parent);
+                }
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = clear_directory_contents(&cwd_dir);
+        }
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     /// Which path a terminal-prompt-turn helper submits its prompt through: [`Terminal`] mimics

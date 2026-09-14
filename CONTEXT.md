@@ -20,9 +20,9 @@ _Avoid_: Admin, operator, allowed user
 An observed change in an agent's Herdr lifecycle state.
 _Avoid_: Status event, pane event
 
-**Transition card**:
-A Discord result posted for a qualifying agent transition.
-_Avoid_: Notification, log dump
+**Blocked card**:
+The non-interactive Discord card posted when a pane goes blocked and no live permission or question request covers it, carrying the pending question or the pane's last context and mentioning the owner. Working and done post no card.
+_Avoid_: Transition card, end card, notification, log dump
 
 **Reported session**:
 The vendor session identity supplied by the agent's Herdr integration.
@@ -44,14 +44,10 @@ _Avoid_: Blocked pane, menu prompt
 The interactive Discord representation of a live permission request.
 _Avoid_: Blocked card, approval message
 
-**Informational blocked card**:
-A non-interactive Discord card reporting that an unsupported pane is blocked and must be handled in Herdr.
-_Avoid_: Permission card, fallback approval
-
 **Question card**:
 The interactive Discord representation of one pending `AskUserQuestion` question: buttons for a single-select question, a select menu for a multiSelect question.
 _Avoid_: Permission card, blocked card, poll
 
 **Live message**:
-A plain, content-only Discord message posted for one new complete assistant text a working pane's vendor log records, ahead of its turn's transition card.
+A plain, content-only Discord message posted for one new complete assistant text a pane's vendor log records, whatever the pane's status. It is the only way a reply reaches Discord; there is no turn-end card.
 _Avoid_: Streaming message, partial reply, live card
