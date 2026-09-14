@@ -955,10 +955,13 @@ fn read_new_terminal_prompts(
 /// sees the pane's log resolve -- in any status, not only `working` -- and kept open across turns
 /// so every assistant text the log later gains is posted, regardless of status. The watch is
 /// replaced (its `notify` watcher dropped) only when the pane's session resolves to a different log
-/// path; a closed pane's watch is pruned by [`prune_departed_state`]. It follows the same log path
-/// the prompt baseline resolved for this snapshot, so the two readers agree on where "past
-/// everything already there" is: the live position baselines at 0 when the log did not exist at
-/// first sight (the prompt baseline is 0 too) and past every existing assistant text otherwise.
+/// path; a closed pane's watch is pruned by [`prune_departed_state`]. On every snapshot the watch's
+/// route is refreshed from `route_topology`, before the path check, so a pane moved to a different
+/// tab or workspace mid-session posts to its new thread even though its log path is unchanged. It
+/// follows the same log path the prompt baseline resolved for this snapshot, so the two readers
+/// agree on where "past everything already there" is: the live position baselines at 0 when the log
+/// did not exist at first sight (the prompt baseline is 0 too) and past every existing assistant
+/// text otherwise.
 ///
 /// A bridge restart re-follows from the current end and so reposts nothing; a log that grows before
 /// the restart's first read is still picked up from that end.
@@ -987,11 +990,15 @@ async fn ensure_live_watch_started(
     else {
         return;
     };
-    if state
-        .live_watches
-        .get(&terminal)
-        .is_some_and(|watch| watch.path == path)
+    // Refresh the route on every snapshot, before the path check, so a pane moved to a different
+    // tab or workspace mid-session posts to its new thread even though its log path is unchanged.
+    let Ok(route) = route_topology(agents, tabs, &terminal) else {
+        return;
+    };
+    if let Some(watch) = state.live_watches.get_mut(&terminal)
+        && watch.path == path
     {
+        watch.route = route;
         return;
     }
     let Some(live_tx) = state.live_tx.clone() else {
@@ -1000,9 +1007,6 @@ async fn ensure_live_watch_started(
     if discord.is_none() {
         return;
     }
-    let Ok(route) = route_topology(agents, tabs, &terminal) else {
-        return;
-    };
     let position = if matches!(
         baseline_position,
         LivePosition::Bytes(0) | LivePosition::RowId(0)
