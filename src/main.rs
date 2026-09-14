@@ -216,15 +216,6 @@ const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 /// created under.
 const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
 
-/// How long a lifecycle batch keeps draining after its most recent event before it is acted on. A
-/// resubscribe replay burst pushes events back-to-back well inside this window, so the whole
-/// burst is drained into one batch instead of triggering one doorbell and one topology fetch per
-/// event.
-const LIFECYCLE_BATCH_WINDOW: Duration = Duration::from_millis(100);
-/// Upper bound on events drained into one lifecycle batch, so a pathological event storm still
-/// yields control back to the rest of the event loop.
-const LIFECYCLE_BATCH_CAP: usize = 1_000;
-
 #[derive(Debug, PartialEq, Eq)]
 enum BlockedResponse {
     Question,
@@ -2936,49 +2927,20 @@ async fn bridge_event_loop(
     Ok(())
 }
 
-/// Keeps draining further lifecycle events into `batch` as long as each new one arrives within
-/// [`LIFECYCLE_BATCH_WINDOW`] of the previous one, up to [`LIFECYCLE_BATCH_CAP`] events total
-/// (including the seed event already in `batch`). Returns the terminating subscribe error when
-/// draining stopped because the stream closed, rather than because the window elapsed or the cap
-/// was reached.
-async fn drain_lifecycle_batch(
-    lifecycle: &mut HerdrSubscription,
-    batch: &mut Vec<serde_json::Value>,
-) -> Option<String> {
-    while batch.len() < LIFECYCLE_BATCH_CAP {
-        tokio::select! {
-            result = lifecycle.next_event() => {
-                match result {
-                    Ok(event) => batch.push(event),
-                    Err(error) => return Some(error),
-                }
-            }
-            () = tokio::time::sleep(LIFECYCLE_BATCH_WINDOW) => return None,
-        }
-    }
-    None
-}
-
-/// Applies one drained batch of lifecycle events: every membership change first (one status
-/// resubscribe if any pane joined or left), then every closure with one shared topology fetch,
-/// then one doorbell. A batch made only of `pane.updated` events that report no pending title
-/// keeps the existing early-return rule and skips the doorbell.
-async fn apply_lifecycle_batch(
-    batch: &[serde_json::Value],
+/// Applies one lifecycle event: its membership change first (a status resubscribe if a pane joined
+/// or left), then its closure if it is one (deleting that tab or workspace), then one doorbell. A
+/// `pane.updated` event that reports no pending title keeps the existing early-return rule and
+/// skips the doorbell.
+async fn apply_lifecycle_event(
+    event: &serde_json::Value,
     discord: Option<&DiscordConnection>,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime,
 ) -> bool {
-    let mut membership_changed = false;
-    for event in batch {
-        if let Some(change) = lifecycle_membership(event)
-            && apply_membership(&mut runtime.pane_ids, change)
-        {
-            membership_changed = true;
-        }
-    }
-    if membership_changed {
+    if let Some(change) = lifecycle_membership(event)
+        && apply_membership(&mut runtime.pane_ids, change)
+    {
         let Some(next_status) = unwrap_or_shutdown(
             subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
             broker,
@@ -2988,21 +2950,21 @@ async fn apply_lifecycle_batch(
         runtime.status = next_status;
     }
 
-    let closures: Vec<TopologyClosure> = batch.iter().filter_map(lifecycle_closure).collect();
-    if let Err(error) = delete_closed_topology_batch(discord, &closures).await {
+    if let Some(closure) = lifecycle_closure(event)
+        && let Err(error) =
+            delete_closed_topology_batch(discord, std::slice::from_ref(&closure)).await
+    {
         bridge_eprintln!("herdr topology closure error: {error}");
     }
 
-    let worth_doorbell = batch.iter().any(|event| {
-        let is_pane_updated = canonical_event_name(
-            event
-                .get(EVENT_KEY)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-        ) == "pane_updated";
-        !is_pane_updated || pane_update_reports_a_pending_title(event, &runtime.state.title_pending)
-    });
-    if !worth_doorbell {
+    let is_pane_updated = canonical_event_name(
+        event
+            .get(EVENT_KEY)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    ) == "pane_updated";
+    if is_pane_updated && !pane_update_reports_a_pending_title(event, &runtime.state.title_pending)
+    {
         return true;
     }
     doorbell_unless_shutdown(
@@ -3016,11 +2978,9 @@ async fn apply_lifecycle_batch(
     .await
 }
 
-/// Spawns the startup-style topology sweep (one `list_agents`/`tab_list_result` snapshot, then
-/// `sync_startup_topology`) beside the caller rather than blocking it, exactly as `run_bridge`
-/// does at process start. Run again after every successful lifecycle resubscribe: a replay gap
-/// while the subscribe stream was down can otherwise leave a closed tab's thread or a closed
-/// workspace's channel undeleted until some later, unrelated event happens to touch it.
+/// Spawns the startup topology sweep (one `list_agents`/`tab_list_result` snapshot, then
+/// `sync_startup_topology`) beside the caller rather than blocking it. Runs once, at process
+/// start.
 fn spawn_startup_topology_sweep(discord: &DiscordConnection) {
     match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
         Ok((agents, tabs)) => {
@@ -3052,7 +3012,7 @@ async fn handle_lifecycle_subscribe_error(
         return false;
     };
     runtime.lifecycle = next_lifecycle;
-    let alive = doorbell_unless_shutdown(
+    doorbell_unless_shutdown(
         discord,
         &mut runtime.state,
         &mut runtime.pane_ids,
@@ -3060,11 +3020,7 @@ async fn handle_lifecycle_subscribe_error(
         stop,
         broker,
     )
-    .await;
-    if alive && let Some(discord) = discord {
-        spawn_startup_topology_sweep(discord);
-    }
-    alive
+    .await
 }
 
 async fn handle_lifecycle_select_result(
@@ -3075,19 +3031,7 @@ async fn handle_lifecycle_select_result(
     runtime: &mut BridgeRuntime,
 ) -> bool {
     match result {
-        Ok(event) => {
-            let mut batch = vec![event];
-            let drain_error = drain_lifecycle_batch(&mut runtime.lifecycle, &mut batch).await;
-            if !apply_lifecycle_batch(&batch, discord, stop, broker, runtime).await {
-                return false;
-            }
-            match drain_error {
-                Some(error) => {
-                    handle_lifecycle_subscribe_error(error, discord, stop, broker, runtime).await
-                }
-                None => true,
-            }
-        }
+        Ok(event) => apply_lifecycle_event(&event, discord, stop, broker, runtime).await,
         Err(error) => handle_lifecycle_subscribe_error(error, discord, stop, broker, runtime).await,
     }
 }
@@ -3441,12 +3385,12 @@ mod tests {
         agent_read_detection, apply_membership, capture_for, capture_for_with_search_root,
         card_capture_for_delivery, create_transition_messages, decide_blocked_response,
         delete_closed_topology_batch, deliver_blocked_messages, deliver_to_route,
-        discover_pending_and_unusable_tabs, drain_lifecycle_batch, fetch_startup_owner_identity,
-        fetch_topology_lists, handle_blocked_card, handle_lifecycle_select_result,
-        handle_live_event, initial_terminal_prompt_position, is_retriable_terminal_prompt_error,
-        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
-        read_new_terminal_prompts, repeats_last_live_text, resolve_session_path, route_topology,
+        discover_pending_and_unusable_tabs, fetch_startup_owner_identity, fetch_topology_lists,
+        handle_blocked_card, handle_lifecycle_select_result, handle_live_event,
+        initial_terminal_prompt_position, is_retriable_terminal_prompt_error, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
+        next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
+        repeats_last_live_text, resolve_session_path, route_topology,
         seq_backstop_collapsed_settled_turn, seq_backstop_rewrites_working_from,
         start_notify_watcher, subscribe_status, subscribe_status_with_backoff, sync_pending_titles,
         sync_route, sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
@@ -5478,192 +5422,6 @@ mod tests {
                 "{}: live pane id must be present in the recovered membership",
                 case.name
             );
-            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
-        }
-    }
-
-    #[cfg(unix)]
-    const LIFECYCLE_BATCH_LABEL: &str = "testrun-lifecycle-batch";
-
-    /// A gap in `next_event` results longer than this means no event is currently pending: longer
-    /// than `LIFECYCLE_BATCH_WINDOW` so an ordinary batch-ending gap between live events does not
-    /// read as "nothing pending".
-    #[cfg(unix)]
-    const LIFECYCLE_BATCH_CATCH_UP_IDLE: Duration = Duration::from_millis(600);
-
-    /// One case in [`lifecycle_batch_coalesces_a_live_closure_burst_then_isolates_a_later_closure`]:
-    /// `seeded_closures` tabs are closed back-to-back, after the subscribe, well inside
-    /// `LIFECYCLE_BATCH_WINDOW`, so the whole burst is expected in one drained batch. A batch with
-    /// more than one event is only required when more than one closure was seeded together: a lone
-    /// seeded closure is still expected as its own single-event batch.
-    #[cfg(unix)]
-    struct LifecycleBatchCase {
-        name: &'static str,
-        seeded_closures: usize,
-    }
-
-    /// Extracts the tab ids that `lifecycle_closure` reports as tab closures within a batch.
-    #[cfg(unix)]
-    fn batch_tab_closures(batch: &[Value]) -> HashSet<String> {
-        batch
-            .iter()
-            .filter_map(lifecycle_closure)
-            .filter_map(|closure| match closure {
-                TopologyClosure::Tab { tab_id, .. } => Some(tab_id),
-                TopologyClosure::Workspace { .. } => None,
-            })
-            .collect()
-    }
-
-    /// Pulls one more drained batch from `lifecycle`, seeded by the next available event.
-    /// `Ok(None)` means no event arrived within `LIFECYCLE_BATCH_CATCH_UP_IDLE`.
-    #[cfg(unix)]
-    async fn next_lifecycle_batch(
-        lifecycle: &mut herdr_connect_rs::HerdrSubscription,
-    ) -> Result<Option<Vec<Value>>, String> {
-        let seed = match tokio::time::timeout(LIFECYCLE_BATCH_CATCH_UP_IDLE, lifecycle.next_event())
-            .await
-        {
-            Ok(Ok(event)) => event,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Ok(None),
-        };
-        let mut batch = vec![seed];
-        if let Some(error) = drain_lifecycle_batch(lifecycle, &mut batch).await {
-            return Err(error);
-        }
-        Ok(Some(batch))
-    }
-
-    /// Table-driven, against the real Herdr socket: closing several tabs back-to-back right after
-    /// subscribing coalesces the whole live burst into one drained batch rather than one event at
-    /// a time, and a tab closed only afterward arrives promptly in its own later batch, isolated
-    /// from the burst.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn lifecycle_batch_coalesces_a_live_closure_burst_then_isolates_a_later_closure() {
-        let cases = [
-            LifecycleBatchCase {
-                name: "single seeded closure",
-                seeded_closures: 1,
-            },
-            LifecycleBatchCase {
-                name: "two seeded closures",
-                seeded_closures: 2,
-            },
-        ];
-
-        for case in cases {
-            assert_eq!(
-                remaining_tabs(LIFECYCLE_BATCH_LABEL).expect("tab.list succeeds"),
-                0,
-                "named zero-leftover check: {}",
-                case.name
-            );
-
-            let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-                .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
-            let mut seeded_tab_ids = Vec::new();
-            let mut seeded_cwd_dirs = Vec::new();
-            for _ in 0..case.seeded_closures {
-                let cwd_dir = std::env::temp_dir().join(format!(
-                    "testrun-lifecycle-batch-{}-{}-{}",
-                    std::process::id(),
-                    seeded_tab_ids.len(),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("system clock is after unix epoch")
-                        .as_nanos()
-                ));
-                fs::create_dir_all(&cwd_dir).expect("create lifecycle-batch seed cwd");
-                let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
-                let tab =
-                    create_tab(LIFECYCLE_BATCH_LABEL, &workspace_id, cwd).expect("create seed tab");
-                seeded_tab_ids.push(tab.tab_id);
-                seeded_cwd_dirs.push(cwd_dir);
-            }
-
-            let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-                .await
-                .expect("lifecycle subscribe");
-
-            let result: Result<(), String> = async {
-                // Close every seeded tab back-to-back, well inside `LIFECYCLE_BATCH_WINDOW`: a
-                // live burst that the batching code must coalesce into one drained batch.
-                for tab_id in &seeded_tab_ids {
-                    close_tab(tab_id);
-                }
-
-                let burst_batch = tokio::time::timeout(
-                    Duration::from_secs(15),
-                    next_lifecycle_batch(&mut lifecycle),
-                )
-                .await
-                .map_err(|_| "timed out waiting for the closure burst".to_owned())??
-                .ok_or_else(|| "expected a batch for the closure burst, got none".to_owned())?;
-
-                let burst_closures = batch_tab_closures(&burst_batch);
-                let expected_closures: HashSet<String> = seeded_tab_ids.iter().cloned().collect();
-                if burst_closures != expected_closures {
-                    return Err(format!(
-                        "expected the whole burst {expected_closures:?} in one batch, got {burst_closures:?} from {burst_batch:?}"
-                    ));
-                }
-                if case.seeded_closures > 1 && burst_batch.len() <= 1 {
-                    return Err(format!(
-                        "expected one batch with more than one event while closing {} tabs together, got {burst_batch:?}",
-                        case.seeded_closures
-                    ));
-                }
-
-                // A tab closed only now must arrive promptly, as its own batch, isolated from the
-                // burst.
-                let later_cwd_dir = std::env::temp_dir().join(format!(
-                    "testrun-lifecycle-batch-later-{}-{}",
-                    std::process::id(),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("system clock is after unix epoch")
-                        .as_nanos()
-                ));
-                fs::create_dir_all(&later_cwd_dir).map_err(|error| error.to_string())?;
-                let later_cwd = later_cwd_dir
-                    .to_str()
-                    .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
-                let later_tab = create_tab(LIFECYCLE_BATCH_LABEL, &workspace_id, later_cwd)
-                    .map_err(|error| format!("later tab: {error}"))?;
-                close_tab(&later_tab.tab_id);
-                let _ = fs::remove_dir_all(&later_cwd_dir);
-
-                let later_batch = tokio::time::timeout(
-                    Duration::from_secs(15),
-                    next_lifecycle_batch(&mut lifecycle),
-                )
-                .await
-                .map_err(|_| "timed out waiting for the later closure".to_owned())??
-                .ok_or_else(|| "expected a batch for the later closure, got none".to_owned())?;
-                let later_closures = batch_tab_closures(&later_batch);
-                if !later_closures.contains(&later_tab.tab_id) {
-                    return Err(format!(
-                        "later batch must contain the tab closed after the burst, got {later_closures:?}"
-                    ));
-                }
-                if seeded_tab_ids.iter().any(|tab_id| later_closures.contains(tab_id)) {
-                    return Err(format!(
-                        "later batch must be its own closure, isolated from the burst: {later_closures:?}"
-                    ));
-                }
-                Ok(())
-            }
-            .await;
-
-            for cwd_dir in &seeded_cwd_dirs {
-                let _ = fs::remove_dir_all(cwd_dir);
-            }
-            let tabs_left = remaining_tabs(LIFECYCLE_BATCH_LABEL)
-                .expect("tab.list succeeds for the zero-leftover check");
-            assert!(result.is_ok(), "{}: {result:?}", case.name);
             assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
         }
     }
@@ -10237,211 +9995,6 @@ mod tests {
         let tabs_left = remaining_tabs(LIVE_CLOSE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
         let workspaces_left = remaining_workspaces(LIVE_CLOSE_LABEL)
-            .expect("workspace.list succeeds for the zero-leftover check");
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-        assert_eq!(tabs_left, 0, "named zero-leftover check");
-        assert_eq!(workspaces_left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
-    const RESUBSCRIBE_RECONCILE_LABEL: &str = "testrun-resubscribe-reconcile";
-
-    /// Polls until a tab's thread is gone or `bound` elapses: the resubscribe reconciliation
-    /// sweep runs on a spawned task rather than being awaited inline (exactly like the startup
-    /// sweep it reuses), so its effect on Discord is only eventually observable.
-    #[cfg(unix)]
-    async fn wait_until_thread_absent(
-        guild: &BlockedCaptureGuild,
-        channel_id: Id<ChannelMarker>,
-        suffix: &str,
-        bound: Duration,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + bound;
-        loop {
-            if !thread_with_suffix_survives(guild, channel_id, suffix).await? {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "thread with suffix {suffix} was not deleted within {bound:?}"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-    }
-
-    /// One row in the table [`resubscribe_reconciliation_exercise`] checks after a forced
-    /// resubscribe: whether the named tab's thread is expected to survive the reconciliation
-    /// sweep.
-    #[cfg(unix)]
-    struct ResubscribeReconcileExpectation {
-        name: &'static str,
-        suffix: String,
-        survives: bool,
-    }
-
-    /// Drives a real forced lifecycle-subscribe error through `handle_lifecycle_select_result` and
-    /// asserts that the resubscribe's own reconciliation sweep -- not a live `tab.closed` event --
-    /// deletes a thread whose tab was closed while the subscribe stream was down, while a live
-    /// tab's thread survives.
-    #[cfg(unix)]
-    async fn resubscribe_reconciliation_exercise(
-        guild: &BlockedCaptureGuild,
-        workspace: &Workspace,
-        second_tab: &Tab,
-    ) -> Result<(), String> {
-        report_idle_with_session(&workspace.pane_id)?;
-        report_idle_with_session(&second_tab.pane_id)?;
-        let root_agent = snapshot_for_pane(&workspace.pane_id)?;
-        let second_agent = snapshot_for_pane(&second_tab.pane_id)?;
-        let root_tab = matching_tab(&workspace.tab_id)?;
-        let second_matching_tab = matching_tab(&second_tab.tab_id)?;
-        let tabs = [root_tab, second_matching_tab];
-        let agents = [root_agent.clone(), second_agent.clone()];
-
-        let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
-        let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
-        let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
-
-        let topic = format!("herdr workspace [{}]", root_route.workspace_id);
-        let channel = guild_channel_with_topic(guild, &topic).await?;
-        let root_suffix = format!(" [{}]", root_route.tab_id);
-        let second_suffix = format!(" [{}]", second_route.tab_id);
-        if !thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
-            return Err("sync did not create the second tab's thread".to_owned());
-        }
-
-        // Close the second tab without ever running its tab.closed event through the lifecycle
-        // event loop: this stands in for a closure that happened while the subscribe stream was
-        // down, so only the resubscribe's own reconciliation sweep -- not a live event -- can
-        // catch it.
-        close_tab(&second_tab.tab_id);
-
-        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|error| error.to_string())?;
-        let mut broker: Option<BrokerTask> = None;
-        let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
-        let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-        let mut runtime = BridgeRuntime {
-            lifecycle,
-            pane_ids: Vec::new(),
-            status: None,
-            state: BridgeState::default(),
-            live_events,
-            activity_events,
-        };
-
-        let alive = handle_lifecycle_select_result(
-            Err("test-forced subscribe error".to_owned()),
-            Some(&connection),
-            &mut stop,
-            &mut broker,
-            &mut runtime,
-        )
-        .await;
-        if !alive {
-            return Err(
-                "handle_lifecycle_select_result reported shutdown on a forced resubscribe error"
-                    .to_owned(),
-            );
-        }
-
-        let expectations = [
-            ResubscribeReconcileExpectation {
-                name: "a thread whose tab was closed before the resubscribe is deleted after it",
-                suffix: second_suffix,
-                survives: false,
-            },
-            ResubscribeReconcileExpectation {
-                name: "a live tab keeps its thread",
-                suffix: root_suffix,
-                survives: true,
-            },
-        ];
-        for expectation in expectations {
-            if expectation.survives {
-                if !thread_with_suffix_survives(guild, channel.id, &expectation.suffix).await? {
-                    return Err(format!("{}: thread did not survive", expectation.name));
-                }
-            } else {
-                wait_until_thread_absent(
-                    guild,
-                    channel.id,
-                    &expectation.suffix,
-                    Duration::from_secs(20),
-                )
-                .await
-                .map_err(|error| format!("{}: {error}", expectation.name))?;
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn resubscribe_reconciles_topology_against_closures_missed_while_down() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        assert_eq!(
-            remaining_tabs(RESUBSCRIBE_RECONCILE_LABEL).expect("tab.list succeeds"),
-            0,
-            "named zero-leftover check"
-        );
-        assert_eq!(
-            remaining_workspaces(RESUBSCRIBE_RECONCILE_LABEL).expect("workspace.list succeeds"),
-            0,
-            "named zero-leftover check"
-        );
-
-        let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-resubscribe-reconcile-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&cwd_dir).expect("create resubscribe-reconcile test cwd");
-        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
-
-        let created = match create_workspace(RESUBSCRIBE_RECONCILE_LABEL, cwd) {
-            Ok(workspace) => match create_tab(RESUBSCRIBE_RECONCILE_LABEL, &workspace.id, cwd) {
-                Ok(second_tab) => Ok((workspace, second_tab)),
-                Err(error) => Err((Some(workspace.id), error)),
-            },
-            Err(error) => Err((None, error)),
-        };
-        let (workspace_id, result) = match created {
-            Ok((workspace, second_tab)) => {
-                let workspace_id = workspace.id.clone();
-                let outcome =
-                    resubscribe_reconciliation_exercise(&guild, &workspace, &second_tab).await;
-                (Some(workspace_id), outcome)
-            }
-            Err((workspace_id, error)) => (workspace_id, Err(error)),
-        };
-        if let Some(workspace_id) = &workspace_id {
-            close_workspace(workspace_id);
-        }
-        let _ = fs::remove_dir_all(&cwd_dir);
-
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left = remaining_tabs(RESUBSCRIBE_RECONCILE_LABEL)
-            .expect("tab.list succeeds for the zero-leftover check");
-        let workspaces_left = remaining_workspaces(RESUBSCRIBE_RECONCILE_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
