@@ -5745,10 +5745,10 @@ mod tests {
 
     /// Drives one real `claude --model haiku` agent with the activity hook registered against a
     /// real bridge broker (bound at `broker_socket`) through two turns, exercising every row of
-    /// the turn-boundary table in one continuous scenario: turn one's activity frame posts before
-    /// its end card; a frame injected on the broker socket after the turn settles is dropped (no
-    /// new message, no edit of the settled one); turn two's first frame starts its own fresh
-    /// message rather than continuing turn one's count.
+    /// the turn-boundary table in one continuous scenario: turn one posts one activity frame and no
+    /// card; a frame injected on the broker socket after the turn settles is dropped (no new
+    /// message, no edit of the settled one); turn two's first frame starts its own fresh message
+    /// rather than continuing turn one's count.
     #[cfg(unix)]
     async fn activity_hook_exercise(
         guild: &BlockedCaptureGuild,
@@ -5791,7 +5791,7 @@ mod tests {
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
 
-        // Row 1: a frame during the turn posts before the end card.
+        // Row 1: a frame during the turn posts as an activity message, with no card.
         drive_one_activity_turn(
             &tab.pane_id,
             tabs,
@@ -6633,7 +6633,7 @@ mod tests {
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
 
-        // Row 1: a frame during the turn posts before the end card.
+        // Row 1: a frame during the turn posts as an activity message, with no card.
         drive_one_activity_turn(
             &tab.pane_id,
             tabs,
@@ -7816,9 +7816,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const CLOSURE_BATCH_LABEL: &str = "testrun-closure-batch";
+    const CLOSED_TOPOLOGY_LABEL: &str = "testrun-closed-topology";
 
-    /// Whether a tab's thread exists, and where, before [`closure_batch_exercise`] runs its batch.
+    /// Whether a tab's thread exists, and where, before [`closed_topology_exercise`] runs.
     #[cfg(unix)]
     enum ClosureBatchPresence {
         Active,
@@ -7826,8 +7826,8 @@ mod tests {
         Absent,
     }
 
-    /// One row in [`closure_batch_exercise`]'s table: a tab's thread presence going in, whether its
-    /// closure is included in the batch, and whether the thread is expected to survive the batch.
+    /// One row in [`closed_topology_exercise`]'s table: a tab's thread presence going in, whether
+    /// its closure is applied, and whether the thread is expected to survive.
     #[cfg(unix)]
     struct ClosureBatchCase {
         name: &'static str,
@@ -7850,10 +7850,10 @@ mod tests {
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         );
-        let workspace_id = format!("{CLOSURE_BATCH_LABEL}-{nonce}");
+        let workspace_id = format!("{CLOSED_TOPOLOGY_LABEL}-{nonce}");
         let channel = guild
             .client
-            .create_guild_channel(guild.id, &format!("{CLOSURE_BATCH_LABEL}-{nonce}"))
+            .create_guild_channel(guild.id, &format!("{CLOSED_TOPOLOGY_LABEL}-{nonce}"))
             .topic(&format!("herdr workspace [{workspace_id}]"))
             .await
             .map_err(|error| error.to_string())?

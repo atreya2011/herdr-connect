@@ -539,8 +539,9 @@ fn thread_tab_suffix(name: &str) -> Option<&str> {
 ///
 /// Searches active threads first and the workspace channel's archived threads on a miss, caching
 /// the archived listing per workspace channel in `archived_cache` so repeated misses against the
-/// same channel within one call site (for example, a batch of closures) list it at most once. A
-/// missing workspace channel or thread is not an error: the tab is already gone from Discord.
+/// same channel within one call site (for example, the startup sweep's delete pass over several
+/// tabs) list it at most once. A missing workspace channel or thread is not an error: the tab is
+/// already gone from Discord.
 ///
 /// # Errors
 ///
