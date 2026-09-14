@@ -24,18 +24,17 @@ use herdr_connect_rs::{
     HerdrSubscription, HerdrTab, OwnerIdentity, RouteError, STATUS_BLOCKED, STATUS_DONE,
     STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyRoute, Transition, TransitionMessage,
     UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, agent_read_detection,
-    cached_route, claude_turn_start_position, codex_turn_start_position,
-    create_transition_messages, cursor_turn_start_rowid, delete_tab_thread,
-    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_live_message,
-    deliver_transition_card, drive_gateway_with_components, execute_terminal_prompt_webhook,
-    expire_informational_card, fetch_owner_identity, fetch_topology_lists,
-    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, live_message_nonce, load_discord_config, read_claude_incremental,
-    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
-    read_cursor_incremental, read_cursor_prompts_incremental, reconcile_topology_cache,
-    resolve_terminal_prompt_webhook, route_topology, split_live_message, status_subscriptions,
-    subscribe_herdr_events, sync_topology, tab_list_result, take_owner_prompt_suppression,
-    transition_card_nonce, workspace_channel_id, workspace_list_result,
+    cached_route, create_transition_messages, delete_tab_thread, delete_topology_absent_from_herdr,
+    delete_workspace_channel, deliver_live_message, deliver_transition_card,
+    drive_gateway_with_components, execute_terminal_prompt_webhook, expire_informational_card,
+    fetch_owner_identity, fetch_topology_lists, format_detection_question, hook_timeout,
+    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
+    load_discord_config, read_claude_incremental, read_claude_prompts_incremental,
+    read_codex_incremental, read_codex_prompts_incremental, read_cursor_incremental,
+    read_cursor_prompts_incremental, reconcile_topology_cache, resolve_terminal_prompt_webhook,
+    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
+    sync_topology, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
+    workspace_channel_id, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -108,8 +107,8 @@ struct BridgeState {
     live_errors_reported: HashSet<String>,
     /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
     /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
-    /// Forgotten -- not deleted -- at the point the pane's transition card for that turn is
-    /// posted, so the next turn starts a fresh message instead of editing the last one.
+    /// Forgotten -- not deleted -- when the pane next reports `working`, so the new turn starts a
+    /// fresh message instead of editing the previous turn's.
     activity_messages: HashMap<String, ActivityMessage>,
     /// Pane ids the latest Herdr snapshot reports as `working` with a session, kept fresh by
     /// every [`process_snapshot`] call (whether from the doorbell's `agent.list` sweep or a
@@ -121,23 +120,25 @@ struct BridgeState {
     /// is not configured or the fetch failed; terminal-prompt mirroring drops silently without it.
     owner_identity: Option<OwnerIdentity>,
     /// Per-terminal read path and position for terminal-prompt mirroring, established the first
-    /// time [`process_snapshot`] sees a session-carrying pane in any status -- not only `working`,
-    /// and never reset by a later turn's fresh [`LiveWatch`] (unlike that watch's own turn-scoped
-    /// `position`): existing prompts already in the log at that first sight are never replayed, but
-    /// every prompt recorded afterward, across every later turn, is. Keyed by terminal id but
-    /// valued by the resolved log path alongside the position, because a later session on the same
-    /// terminal (`/clear`, resume, a relaunch, or a vendor starting a fresh file or store) resolves
-    /// a different path; [`process_snapshot`] re-baselines against it rather than reusing a stale
-    /// position from the old file.
+    /// time [`process_snapshot`] sees a session-carrying pane in any status. Existing prompts
+    /// already in the log at that first sight are never replayed, but every prompt recorded
+    /// afterward is. Keyed by terminal id but valued by the resolved log path alongside the
+    /// position, because a later session on the same terminal (`/clear`, resume, a relaunch, or a
+    /// vendor starting a fresh file or store) resolves a different path; [`process_snapshot`]
+    /// re-baselines against it rather than reusing a stale position from the old file. The live
+    /// text watch's own position is baselined against this same path at the same moment, so the
+    /// two readers agree on where "past everything already there" is.
     terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition)>,
-    /// Terminals first seen either with no session reported at all yet (`None`), or with a session
-    /// whose [`live_log_path`] returned `Ok(None)` (`Some(session value)`: the log or store does not
-    /// exist on disk yet) -- a fresh pane, a new session after `/clear` or a relaunch before its
-    /// first write, or a vendor (Codex) that does not report a session identity until the pane is
-    /// already `working`, by which point its log can already hold the very prompt that started the
-    /// turn. A pane can switch to a *different*, already-populated session before the pending one's
-    /// log ever appears (Claude `/resume`, or a relaunch straight into an existing session), and
-    /// that resumed session's own, unrelated history must never be baselined at 0 just because this
+    /// Panes first seen before their log exists on disk: with no session reported at all yet
+    /// (`None`), or with a session whose [`live_log_path`] returned `Ok(None)` (`Some(session
+    /// value)`) -- a fresh pane, a new session after `/clear` or a relaunch before its first write,
+    /// or a vendor (Codex) that does not report a session identity until the pane is already
+    /// `working`, by which point its log can already hold the very prompt that started the turn.
+    /// This is rule 1's position-0-when-absent tracker, shared by the prompt reader and the live
+    /// text watch: when the log finally appears, both baseline at 0 rather than at the current end.
+    /// A pane can switch to a *different*, already-populated session before the pending one's log
+    /// ever appears (Claude `/resume`, or a relaunch straight into an existing session), and that
+    /// resumed session's own, unrelated history must never be baselined at 0 just because this
     /// terminal happened to have an unrelated fresh session pending; the `None` entry carries no
     /// session to compare against, so it matches whichever session resolves first. Removed the
     /// moment a path resolves for this terminal, whichever session it belongs to:
@@ -145,7 +146,7 @@ struct BridgeState {
     /// is `None` or its session matches the resolved path's session; any other session (including
     /// one that was never recorded pending at all) gets the normal discard-what-already-exists
     /// baseline instead.
-    terminal_prompt_awaiting_first_log: HashMap<String, Option<String>>,
+    awaiting_first_log: HashMap<String, Option<String>>,
     /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
     /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
     /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
@@ -369,19 +370,6 @@ async fn expire_departed_card(
     }
 }
 
-/// Split out of [`process_snapshot`] to keep it under the line-count lint.
-async fn maybe_start_live_watch(
-    discord: Option<&DiscordConnection>,
-    snapshot: &AgentSnapshot,
-    agents: &[AgentSnapshot],
-    tabs: &[HerdrTab],
-    state: &mut BridgeState,
-) {
-    if snapshot.agent_status == STATUS_WORKING {
-        ensure_live_watch_started(discord, snapshot, agents, tabs, state).await;
-    }
-}
-
 /// Split out of [`process_snapshot`] to keep it under the line-count lint. Keeps
 /// `state.activity_eligible_panes` in step with this snapshot's pane: eligible while it reports
 /// `working` with a session, not otherwise.
@@ -443,12 +431,11 @@ async fn process_snapshot(
     );
     update_activity_eligibility(state, snapshot, &status);
     maybe_establish_terminal_prompt_baseline(snapshot, state);
-    maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
+    ensure_live_watch_started(discord, snapshot, agents, tabs, state).await;
     maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
     if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned()
         && old != status
     {
-        let old_was_working = old == STATUS_WORKING;
         let seq = next_state_change_sequence(&mut state.state_change_sequences, &terminal);
         let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
         let transition = Transition {
@@ -457,9 +444,6 @@ async fn process_snapshot(
             terminal_id: terminal.clone(),
             agent: prior_agent,
         };
-        if old_was_working {
-            settle_live_watch(discord, &terminal, state).await;
-        }
         update_blocked_lifecycle(discord, &terminal, leaving_blocked, state).await;
         deliver_transition_if_postable(
             PostableTransitionContext {
@@ -474,7 +458,9 @@ async fn process_snapshot(
             state,
         )
         .await;
-        if old_was_working {
+        // The activity message is forgotten when the pane next reports `working`, so the new turn's
+        // first tool call starts a fresh message instead of editing the previous turn's.
+        if status == STATUS_WORKING {
             forget_activity_message(state, snapshot.pane_id.as_deref());
         }
     }
@@ -895,15 +881,16 @@ fn start_notify_watcher(
     Ok(watcher)
 }
 
-/// The position a freshly started live-capture follower resumes from: the start of the current
-/// turn. A watch that attaches mid-turn still posts every assistant text the turn already wrote,
-/// since `ensure_live_watch_started` performs one immediate read from this position before
-/// returning.
+/// The position a freshly opened live-capture follower resumes from when its log already exists at
+/// first sight: past every assistant text currently in it, so a bridge that discovers a pane
+/// mid-conversation never replays its history. A follower whose log did not exist yet at first
+/// sight starts at 0 instead (see [`ensure_live_watch_started`]), so the whole log it later writes
+/// is posted.
 fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
     match vendor {
-        VENDOR_CLAUDE => claude_turn_start_position(path).map(LivePosition::Bytes),
-        VENDOR_CODEX => codex_turn_start_position(path).map(LivePosition::Bytes),
-        VENDOR_CURSOR => cursor_turn_start_rowid(path).map(LivePosition::RowId),
+        VENDOR_CLAUDE => read_claude_incremental(path, 0).map(|(_, end)| LivePosition::Bytes(end)),
+        VENDOR_CODEX => read_codex_incremental(path, 0).map(|(_, end)| LivePosition::Bytes(end)),
+        VENDOR_CURSOR => read_cursor_incremental(path, 0).map(|(_, end)| LivePosition::RowId(end)),
         other => Err(format!(
             "live capture: unsupported vendor for initial position: {other}"
         )),
@@ -967,14 +954,17 @@ fn read_new_terminal_prompts(
     }
 }
 
-/// Starts a live-capture follower for a terminal newly observed as `working`, unless one is
-/// already running. Retried on every later snapshot while the pane stays `working`; a non-transient
-/// `live_log_path` error is logged once (deduped through [`BridgeState::live_errors_reported`]) and
-/// the terminal is otherwise left to retry rather than being permanently dropped.
+/// Ensures one live-capture follower per session-carrying pane, opened the first time the bridge
+/// sees the pane's log resolve -- in any status, not only `working` -- and kept open across turns
+/// so every assistant text the log later gains is posted, regardless of status. The watch is
+/// replaced (its `notify` watcher dropped) only when the pane's session resolves to a different log
+/// path; a closed pane's watch is pruned by [`prune_departed_state`]. It follows the same log path
+/// the prompt baseline resolved for this snapshot, so the two readers agree on where "past
+/// everything already there" is: the live position baselines at 0 when the log did not exist at
+/// first sight (the prompt baseline is 0 too) and past every existing assistant text otherwise.
 ///
-/// A bridge restart re-follows an already-in-progress turn from its start. Discord's nonce dedupe
-/// lasts only a few minutes, so this reposts only the turn's texts older than that window; a
-/// closely-timed restart has its nonce still recognized and the repost suppressed.
+/// A bridge restart re-follows from the current end and so reposts nothing; a log that grows before
+/// the restart's first read is still picked up from that end.
 async fn ensure_live_watch_started(
     discord: Option<&DiscordConnection>,
     snapshot: &AgentSnapshot,
@@ -983,9 +973,6 @@ async fn ensure_live_watch_started(
     state: &mut BridgeState,
 ) {
     let terminal = snapshot.terminal_id.clone();
-    if state.live_watches.contains_key(&terminal) {
-        return;
-    }
     let Some(session) = snapshot.session.clone() else {
         return;
     };
@@ -996,24 +983,41 @@ async fn ensure_live_watch_started(
     ) {
         return;
     }
-    let path = match live_log_path(snapshot, &session) {
-        Ok(Some(path)) => path,
-        Ok(None) => return,
-        Err(error) => {
-            if state.live_errors_reported.insert(terminal) {
-                bridge_eprintln!("live capture watch error: {error}");
-            }
-            return;
-        }
+    // The prompt baseline runs first on this snapshot and resolves the log path; the live watch
+    // follows that same path. No entry means the log is not on disk yet (awaiting first log), so
+    // there is nothing to follow until a later snapshot.
+    let Some((path, baseline_position)) = state.terminal_prompt_positions.get(&terminal).cloned()
+    else {
+        return;
     };
+    if state
+        .live_watches
+        .get(&terminal)
+        .is_some_and(|watch| watch.path == path)
+    {
+        return;
+    }
     let Some(live_tx) = state.live_tx.clone() else {
         return;
     };
-    let position = match initial_live_position(&session.agent, &path) {
-        Ok(position) => position,
-        Err(error) => {
-            bridge_eprintln!("live capture watch error for {terminal}: {error}");
-            return;
+    if discord.is_none() {
+        return;
+    }
+    let Ok(route) = route_topology(agents, tabs, &terminal) else {
+        return;
+    };
+    let position = if matches!(
+        baseline_position,
+        LivePosition::Bytes(0) | LivePosition::RowId(0)
+    ) {
+        zero_terminal_prompt_position(&session.agent)
+    } else {
+        match initial_live_position(&session.agent, &path) {
+            Ok(position) => position,
+            Err(error) => {
+                bridge_eprintln!("live capture watch error for {terminal}: {error}");
+                return;
+            }
         }
     };
     let watcher = match start_notify_watcher(&session.agent, &path, terminal.clone(), live_tx) {
@@ -1022,12 +1026,6 @@ async fn ensure_live_watch_started(
             bridge_eprintln!("live capture watch error for {terminal}: {error}");
             return;
         }
-    };
-    if discord.is_none() {
-        return;
-    }
-    let Ok(route) = route_topology(agents, tabs, &terminal) else {
-        return;
     };
     state.live_watches.insert(
         terminal.clone(),
@@ -1039,8 +1037,8 @@ async fn ensure_live_watch_started(
             route,
         },
     );
-    // Read once immediately: the next `notify` tick may never come if the turn is already near
-    // done.
+    // Read once immediately: a fresh watch that baselined at 0 posts the whole log the pane just
+    // wrote, and the next `notify` tick may never come if nothing more is written.
     handle_live_event(discord, &terminal, state).await;
 }
 
@@ -1241,7 +1239,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     let terminal = &snapshot.terminal_id;
     let Some(session) = snapshot.session.as_ref() else {
         state
-            .terminal_prompt_awaiting_first_log
+            .awaiting_first_log
             .entry(terminal.clone())
             .or_insert(None);
         return;
@@ -1254,7 +1252,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
         Ok(Some(path)) => path,
         Ok(None) => {
             state
-                .terminal_prompt_awaiting_first_log
+                .awaiting_first_log
                 .insert(terminal.clone(), Some(session.value.clone()));
             return;
         }
@@ -1266,8 +1264,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     if terminal_prompt_baseline_is_current(&state.terminal_prompt_positions, terminal, &path) {
         return;
     }
-    let was_awaiting_this_session = match state.terminal_prompt_awaiting_first_log.remove(terminal)
-    {
+    let was_awaiting_this_session = match state.awaiting_first_log.remove(terminal) {
         Some(None) => true,
         Some(Some(awaiting_session)) => awaiting_session == session.value,
         None => false,
@@ -1476,22 +1473,8 @@ async fn handle_live_event(
     }
 }
 
-/// Reads once more first so nothing written just before the pane left `working` is lost.
-async fn settle_live_watch(
-    discord: Option<&DiscordConnection>,
-    terminal: &str,
-    state: &mut BridgeState,
-) {
-    if !state.live_watches.contains_key(terminal) {
-        return;
-    }
-    handle_live_event(discord, terminal, state).await;
-    state.live_watches.remove(terminal);
-    state.live_errors_reported.remove(terminal);
-}
-
 /// Forgets a pane's tracked activity message, if any, so the next turn's first activity frame
-/// creates a fresh one instead of editing the settled turn's message.
+/// creates a fresh one instead of editing the previous turn's message.
 fn forget_activity_message(state: &mut BridgeState, pane_id: Option<&str>) {
     if let Some(pane_id) = pane_id {
         state.activity_messages.remove(pane_id);
