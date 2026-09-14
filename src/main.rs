@@ -4720,6 +4720,9 @@ mod tests {
         while let Ok(terminal_id) = live_events.try_recv() {
             handle_live_event(Some(&connection), &terminal_id, &mut state).await;
         }
+        // The persistent watch has no settle-time read of its own, so read once more here to
+        // deliver any assistant text written just before `done` that no `notify` tick reached.
+        handle_live_event(Some(&connection), &terminal, &mut state).await;
 
         let Some(session) = settled.session.clone() else {
             return Err("settled snapshot lost its session".to_owned());
@@ -5180,6 +5183,9 @@ mod tests {
         while let Ok(event_terminal) = live_events.try_recv() {
             handle_live_event(Some(connection), &event_terminal, state).await;
         }
+        // The persistent watch has no settle-time read of its own, so read once more here to
+        // deliver the reply written just before `done` that no `notify` tick reached.
+        handle_live_event(Some(connection), terminal, state).await;
         Ok(())
     }
 
