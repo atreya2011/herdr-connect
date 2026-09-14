@@ -14,9 +14,8 @@ mod real_guild {
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
         AgentLogCapture, PermissionVendor, TopologyRoute, Transition, create_transition_messages,
-        create_unsupported_blocked_card, deliver_permission_card, deliver_terminal_prompt,
-        deliver_transition_card, fetch_owner_identity, fetch_topology_lists, sync_topology,
-        transition_card_nonce,
+        deliver_permission_card, deliver_terminal_prompt, deliver_transition_card,
+        fetch_owner_identity, fetch_topology_lists, sync_topology, transition_card_nonce,
     };
 
     const TERMINAL_WEBHOOK_NAME: &str = "herdr-connect-rs-terminal-prompts";
@@ -162,66 +161,6 @@ mod real_guild {
             return Err("distinct cards reused one message".to_owned());
         }
         permission_card_exercise(guild).await?;
-        unsupported_blocked_card_exercise(guild).await?;
-        Ok(())
-    }
-
-    async fn unsupported_blocked_card_exercise(guild: &Guild) -> Result<(), String> {
-        let route = TopologyRoute {
-            workspace_id: "testrun-unsupported".to_owned(),
-            tab_id: "testrun-unsupported-tab".to_owned(),
-            pane_id: "testrun-unsupported-pane".to_owned(),
-            channel_name: "testrun-unsupported".to_owned(),
-            thread_name: "blocked [testrun-unsupported-tab]".to_owned(),
-        };
-        let (mut channels, mut active_threads) =
-            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
-        let thread = sync_topology(
-            guild.client.as_ref(),
-            guild.id,
-            &mut channels,
-            &mut active_threads,
-            &route,
-        )
-        .await?;
-        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
-        let card = create_unsupported_blocked_card(
-            "cursor",
-            "testrun-unsupported-pane",
-            "login prompt with ``` escaped",
-            &owner_id,
-            std::time::Duration::from_secs(7),
-        );
-        let message = deliver_transition_card(
-            guild.client.as_ref(),
-            thread,
-            &card,
-            &transition_card_nonce("testrun-unsupported-terminal", 1, 0),
-        )
-        .await?;
-        let delivered = fetch_message(guild, thread, message).await?;
-        if !delivered.components.is_empty() {
-            return Err("unsupported blocked card unexpectedly had components".to_owned());
-        }
-        let description = delivered
-            .embeds
-            .first()
-            .ok_or("unsupported blocked card had no embed")?
-            .description
-            .as_deref()
-            .ok_or("unsupported blocked card embed had no description")?;
-        if !description.contains("OPEN/FOCUS") || !description.contains("Vendor/agent") {
-            return Err(
-                "unsupported blocked card omitted required informational fields".to_owned(),
-            );
-        }
-        let expected_content = format!("<@{owner_id}>");
-        if delivered.content != expected_content {
-            return Err(format!(
-                "unsupported blocked card content was {:?}, expected {expected_content:?}",
-                delivered.content
-            ));
-        }
         Ok(())
     }
 

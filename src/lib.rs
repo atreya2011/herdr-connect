@@ -28,7 +28,7 @@ pub use broker::{
 };
 pub use cards::{
     AgentLogCapture, ThreadNameError, TransitionMessage, create_transition_messages,
-    create_unsupported_blocked_card, format_thread_name, split_live_message,
+    format_thread_name, split_live_message,
 };
 pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,

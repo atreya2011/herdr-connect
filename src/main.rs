@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use notify::Watcher;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,18 +25,17 @@ use herdr_connect_rs::{
     STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyRoute, Transition, TransitionMessage,
     UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, agent_read_detection,
     cached_route, claude_turn_start_position, codex_turn_start_position,
-    create_transition_messages, create_unsupported_blocked_card, cursor_turn_start_rowid,
-    delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
-    deliver_live_message, deliver_transition_card, drive_gateway_with_components,
-    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
-    fetch_topology_lists, format_detection_question, hook_timeout, is_postable_transition,
-    lifecycle_subscriptions, list_agents, live_message_nonce, load_discord_config,
-    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
-    reconcile_topology_cache, resolve_terminal_prompt_webhook, route_topology, split_live_message,
-    status_subscriptions, subscribe_herdr_events, sync_topology, tab_list_result,
-    take_owner_prompt_suppression, transition_card_nonce, workspace_channel_id,
-    workspace_list_result,
+    create_transition_messages, cursor_turn_start_rowid, delete_tab_thread,
+    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_live_message,
+    deliver_transition_card, drive_gateway_with_components, execute_terminal_prompt_webhook,
+    expire_informational_card, fetch_owner_identity, fetch_topology_lists,
+    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, live_message_nonce, load_discord_config, read_claude_incremental,
+    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
+    read_cursor_incremental, read_cursor_prompts_incremental, reconcile_topology_cache,
+    resolve_terminal_prompt_webhook, route_topology, split_live_message, status_subscriptions,
+    subscribe_herdr_events, sync_topology, tab_list_result, take_owner_prompt_suppression,
+    transition_card_nonce, workspace_channel_id, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -92,9 +91,7 @@ struct LiveWatch {
 struct BridgeState {
     previous: HashMap<String, (String, String)>,
     state_change_sequences: HashMap<String, u64>,
-    blocked_since: HashMap<String, Instant>,
     informational_cards: HashMap<String, InformationalCard>,
-    blocked_capture_attempts: HashMap<String, u32>,
     /// Tab ids waiting on a cold-start terminal title: `route_topology` reported
     /// [`RouteError::TitlePending`] for them. `discover_pending_and_unusable_tabs` inserts one on
     /// every snapshot pass, independent of any status transition; a resolved delivery-path route
@@ -180,18 +177,10 @@ struct BlockedCardContext<'a> {
     snapshot: &'a AgentSnapshot,
     terminal: &'a str,
     from_status: &'a str,
-    blocked_since: Option<&'a Instant>,
     state_change_seq: u64,
     informational_cards: &'a mut HashMap<String, InformationalCard>,
-    blocked_capture_attempts: &'a mut HashMap<String, u32>,
     search_root: Option<&'a Path>,
 }
-
-/// Bounded number of blocked-capture attempts before falling back to the
-/// informational card. The herdr "blocked" status can flip before the vendor log
-/// file is flushed with the pending question, so a single capture miss is not
-/// treated as "no question" — it is retried on the next few snapshots instead.
-const MAX_BLOCKED_CAPTURE_ATTEMPTS: u32 = 3;
 
 /// Bounded number of consecutive failed delivery ticks for the same stuck live-capture text
 /// before its terminal is marked [`BridgeState::live_unfollowable`] and its watch dropped. A
@@ -200,9 +189,6 @@ const MAX_BLOCKED_CAPTURE_ATTEMPTS: u32 = 3;
 /// once per `notify` tick for the rest of the turn.
 const LIVE_DELIVERY_ATTEMPTS: u32 = 3;
 
-/// Retries blocked-capture while a pane stays blocked without another status event.
-const BLOCKED_CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(1_500);
-
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 
@@ -210,34 +196,9 @@ const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 /// created under.
 const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
 
-#[derive(Debug, PartialEq, Eq)]
-enum BlockedResponse {
-    Question,
-    Retry,
-    Unsupported,
-}
-
 #[must_use]
 fn vendor_is_supported(agent: Option<&str>) -> bool {
     matches!(agent, Some(VENDOR_CLAUDE | VENDOR_CODEX))
-}
-
-const fn decide_blocked_response(
-    vendor_supported: bool,
-    question: Option<&str>,
-    attempts_so_far: u32,
-) -> BlockedResponse {
-    if !vendor_supported {
-        return BlockedResponse::Unsupported;
-    }
-    if question.is_some() {
-        return BlockedResponse::Question;
-    }
-    if attempts_so_far + 1 < MAX_BLOCKED_CAPTURE_ATTEMPTS {
-        BlockedResponse::Retry
-    } else {
-        BlockedResponse::Unsupported
-    }
 }
 
 async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), String> {
@@ -258,6 +219,11 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
     }
 }
 
+/// Posts one blocked card for a pane that just entered `blocked`, built from whatever context is
+/// available at that moment: a Claude pane's Herdr detection snapshot for the pending question, or
+/// the vendor log otherwise. A supported vendor whose broker already has a pending permission or
+/// question request for this session is left to that interactive card and posts nothing here. The
+/// card is posted once; there is no capture retry.
 async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let BlockedCardContext {
         client,
@@ -269,10 +235,8 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         snapshot,
         terminal,
         from_status,
-        blocked_since,
         state_change_seq,
         informational_cards,
-        blocked_capture_attempts,
         search_root,
     } = context;
     let target = match sync_route(client, guild, route, topology_cache).await {
@@ -282,8 +246,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
             return;
         }
     };
-    let vendor_supported = vendor_is_supported(snapshot.agent.as_deref());
-    let supported_broker_pending = vendor_supported
+    let supported_broker_pending = vendor_is_supported(snapshot.agent.as_deref())
         && snapshot
             .session
             .as_ref()
@@ -308,40 +271,13 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
             failure: None,
         },
     );
-    let attempts_so_far = blocked_capture_attempts.get(terminal).copied().unwrap_or(0);
-    let messages = match decide_blocked_response(
-        vendor_supported,
-        capture.question.as_deref(),
-        attempts_so_far,
-    ) {
-        BlockedResponse::Retry => {
-            blocked_capture_attempts.insert(terminal.to_owned(), attempts_so_far + 1);
-            return;
-        }
-        BlockedResponse::Question => {
-            blocked_capture_attempts.remove(terminal);
-            let transition = Transition {
-                from: from_status.to_owned(),
-                to: STATUS_BLOCKED.to_owned(),
-                terminal_id: terminal.to_owned(),
-                agent: snapshot.agent.clone().unwrap_or_default(),
-            };
-            create_transition_messages(&transition, &capture, owner_id)
-        }
-        BlockedResponse::Unsupported => {
-            blocked_capture_attempts.remove(terminal);
-            let blocked_age = blocked_since.map_or(Duration::ZERO, |started| {
-                Instant::now().saturating_duration_since(*started)
-            });
-            vec![create_unsupported_blocked_card(
-                snapshot.agent.as_deref().unwrap_or("none"),
-                &route.pane_id,
-                capture.question.as_deref().unwrap_or(&capture.message),
-                owner_id,
-                blocked_age,
-            )]
-        }
+    let transition = Transition {
+        from: from_status.to_owned(),
+        to: STATUS_BLOCKED.to_owned(),
+        terminal_id: terminal.to_owned(),
+        agent: snapshot.agent.clone().unwrap_or_default(),
     };
+    let messages = create_transition_messages(&transition, &capture, owner_id);
     deliver_blocked_messages(
         &BlockedDeliveryRoute {
             client,
@@ -524,47 +460,38 @@ async fn process_snapshot(
     maybe_establish_terminal_prompt_baseline(snapshot, state);
     maybe_start_live_watch(discord, snapshot, agents, tabs, state).await;
     maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
-    if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned() {
-        if old != status {
-            let old_was_working = old == STATUS_WORKING;
-            let seq = next_state_change_sequence(&mut state.state_change_sequences, &terminal);
-            let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
-            let transition = Transition {
-                from: old,
-                to: status.clone(),
-                terminal_id: terminal.clone(),
-                agent: prior_agent,
-            };
-            if old_was_working {
-                settle_live_watch(discord, &terminal, state).await;
-            }
-            update_blocked_lifecycle(
-                discord,
-                &terminal,
-                leaving_blocked,
-                status == STATUS_BLOCKED,
-                state,
-            )
-            .await;
-            deliver_transition_if_postable(
-                PostableTransitionContext {
-                    snapshot,
-                    agents,
-                    tabs,
-                    discord,
-                    terminal: &terminal,
-                    transition: &transition,
-                    state_change_seq: seq,
-                },
-                state,
-            )
-            .await;
-            if old_was_working {
-                forget_activity_message(state, snapshot.pane_id.as_deref());
-            }
+    if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned()
+        && old != status
+    {
+        let old_was_working = old == STATUS_WORKING;
+        let seq = next_state_change_sequence(&mut state.state_change_sequences, &terminal);
+        let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
+        let transition = Transition {
+            from: old,
+            to: status.clone(),
+            terminal_id: terminal.clone(),
+            agent: prior_agent,
+        };
+        if old_was_working {
+            settle_live_watch(discord, &terminal, state).await;
         }
-    } else if status == STATUS_BLOCKED && state.blocked_capture_attempts.contains_key(&terminal) {
-        retry_pending_blocked_capture(snapshot, agents, tabs, discord, &terminal, state).await;
+        update_blocked_lifecycle(discord, &terminal, leaving_blocked, state).await;
+        deliver_transition_if_postable(
+            PostableTransitionContext {
+                snapshot,
+                agents,
+                tabs,
+                discord,
+                terminal: &terminal,
+                transition: &transition,
+                state_change_seq: seq,
+            },
+            state,
+        )
+        .await;
+        if old_was_working {
+            forget_activity_message(state, snapshot.pane_id.as_deref());
+        }
     }
     remember_previous_status(state, &terminal, &status, snapshot.agent.as_deref());
 }
@@ -663,10 +590,8 @@ async fn deliver_postable_transition(
         snapshot,
         terminal,
         from_status: &transition.from,
-        blocked_since: state.blocked_since.get(terminal),
         state_change_seq,
         informational_cards: &mut state.informational_cards,
-        blocked_capture_attempts: &mut state.blocked_capture_attempts,
         search_root: None,
     })
     .await;
@@ -687,66 +612,11 @@ async fn update_blocked_lifecycle(
     discord: Option<&DiscordConnection>,
     terminal: &str,
     leaving_blocked: bool,
-    entering_blocked: bool,
     state: &mut BridgeState,
 ) {
     if leaving_blocked {
-        state.blocked_since.remove(terminal);
-        state.blocked_capture_attempts.remove(terminal);
         expire_blocked_card(discord, terminal, &mut state.informational_cards).await;
     }
-    if entering_blocked {
-        state
-            .blocked_since
-            .entry(terminal.to_owned())
-            .or_insert_with(Instant::now);
-    }
-}
-
-async fn retry_pending_blocked_capture(
-    snapshot: &AgentSnapshot,
-    agents: &[AgentSnapshot],
-    tabs: &[HerdrTab],
-    discord: Option<&DiscordConnection>,
-    terminal: &str,
-    state: &mut BridgeState,
-) {
-    if snapshot.session.is_none() {
-        bridge_println!("{terminal}: no reported session, not mirrored");
-        return;
-    }
-    let route = match route_topology(agents, tabs, terminal) {
-        Ok(route) => route,
-        Err(error) => {
-            report_route_error(error, state);
-            return;
-        }
-    };
-    let Some((client, guild, owner_id, responder)) = discord else {
-        return;
-    };
-    let state_change_seq = state
-        .state_change_sequences
-        .get(terminal)
-        .copied()
-        .unwrap_or(1);
-    handle_blocked_card(BlockedCardContext {
-        client: client.as_ref(),
-        guild: *guild,
-        owner_id,
-        responder: responder.as_ref(),
-        topology_cache: responder.topology_cache(),
-        route: &route,
-        snapshot,
-        terminal,
-        from_status: STATUS_BLOCKED,
-        blocked_since: state.blocked_since.get(terminal),
-        state_change_seq,
-        informational_cards: &mut state.informational_cards,
-        blocked_capture_attempts: &mut state.blocked_capture_attempts,
-        search_root: None,
-    })
-    .await;
 }
 
 fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
@@ -2017,13 +1887,7 @@ fn prune_departed_state(
     current_panes: &HashSet<String>,
 ) -> Vec<(String, InformationalCard)> {
     state
-        .blocked_since
-        .retain(|terminal, _| current_terminals.contains(terminal));
-    state
         .state_change_sequences
-        .retain(|terminal, _| current_terminals.contains(terminal));
-    state
-        .blocked_capture_attempts
         .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .live_watches
@@ -2581,7 +2445,6 @@ async fn bridge_event_loop(
     runtime: &mut BridgeRuntime,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let blocked_retry_pending = !runtime.state.blocked_capture_attempts.is_empty();
         tokio::select! {
             result = runtime.lifecycle.next_event() => {
                 if !handle_lifecycle_select_result(result, discord, stop, broker, runtime).await {
@@ -2590,20 +2453,6 @@ async fn bridge_event_loop(
             }
             result = next_status_event(&mut runtime.status) => {
                 if !handle_status_select_result(result, discord, stop, broker, runtime).await {
-                    break;
-                }
-            }
-            () = tokio::time::sleep(BLOCKED_CAPTURE_RETRY_INTERVAL), if blocked_retry_pending => {
-                if !doorbell_unless_shutdown(
-                    discord,
-                    &mut runtime.state,
-                    &mut runtime.pane_ids,
-                    &mut runtime.status,
-                    stop,
-                    broker,
-                )
-                .await
-                {
                     break;
                 }
             }
@@ -3078,12 +2927,11 @@ mod tests {
     };
 
     use super::{
-        BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
-        LIVE_DELIVERY_ATTEMPTS, LivePosition, LiveWatch, Membership, PermissionResponder,
-        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
-        capture_for_with_search_root, create_transition_messages, decide_blocked_response,
-        delete_closed_topology_batch, discover_pending_and_unusable_tabs,
-        fetch_startup_owner_identity, fetch_topology_lists, handle_blocked_card,
+        BridgeRuntime, BridgeState, BrokerTask, Client, LIVE_DELIVERY_ATTEMPTS, LivePosition,
+        LiveWatch, Membership, PermissionResponder, SessionPathError, TopologyClosure,
+        TopologyRoute, agent_read_detection, apply_membership, capture_for_with_search_root,
+        create_transition_messages, delete_closed_topology_batch,
+        discover_pending_and_unusable_tabs, fetch_startup_owner_identity, fetch_topology_lists,
         handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
         lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
         maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
@@ -3887,31 +3735,6 @@ mod tests {
     }
 
     #[test]
-    fn decide_blocked_response_follows_the_bounded_retry_spec() {
-        let cases = [
-            (false, None, 0, BlockedResponse::Unsupported),
-            (
-                false,
-                Some("pending question"),
-                0,
-                BlockedResponse::Unsupported,
-            ),
-            (true, Some("pending question"), 0, BlockedResponse::Question),
-            (true, Some("pending question"), 2, BlockedResponse::Question),
-            (true, None, 0, BlockedResponse::Retry),
-            (true, None, 1, BlockedResponse::Retry),
-            (true, None, 2, BlockedResponse::Unsupported),
-        ];
-        for (vendor_supported, question, attempts_so_far, expected) in cases {
-            assert_eq!(
-                decide_blocked_response(vendor_supported, question, attempts_so_far),
-                expected,
-                "vendor_supported={vendor_supported} question={question:?} attempts_so_far={attempts_so_far}"
-            );
-        }
-    }
-
-    #[test]
     fn claude_pending_question_fixture_yields_question_capture_and_card() {
         let snapshot = AgentSnapshot {
             agent: Some("claude".to_owned()),
@@ -3946,35 +3769,6 @@ mod tests {
             .expect("blocked transition produces a card");
         assert_eq!(card.description, expected_question);
         assert_eq!(card.mention.as_deref(), Some("<@42>"));
-    }
-
-    #[tokio::test]
-    async fn leaving_blocked_clears_capture_retry_bookkeeping() {
-        let terminal = "leaving-blocked-terminal".to_owned();
-        let snapshot = AgentSnapshot {
-            agent: Some("claude".to_owned()),
-            terminal_id: terminal.clone(),
-            agent_status: "idle".to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
-            cwd: None,
-            terminal_title_stripped: None,
-            session: None,
-            state_change_seq: 0,
-        };
-        let mut state = BridgeState::default();
-        state.previous.insert(
-            terminal.clone(),
-            ("blocked".to_owned(), "claude".to_owned()),
-        );
-        state.blocked_since.insert(terminal.clone(), Instant::now());
-        state.blocked_capture_attempts.insert(terminal.clone(), 1);
-
-        process_snapshot(&snapshot, &[], &[], None, &mut state).await;
-
-        assert!(!state.blocked_capture_attempts.contains_key(&terminal));
-        assert!(!state.blocked_since.contains_key(&terminal));
     }
 
     #[cfg(unix)]
@@ -4137,242 +3931,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200) * (attempt + 1)).await;
             attempt += 1;
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn blocked_capture_retries_before_fallback_and_posts_question_immediately() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        let result = blocked_capture_exercise(&guild).await;
-        let left = blocked_capture_cleanup(&guild).await.unwrap();
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
-    async fn blocked_capture_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
-        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
-        let responder = Arc::new(PermissionResponder::new(
-            guild.client.clone(),
-            guild.id,
-            owner_id.clone(),
-            Arc::new(tokio::sync::Mutex::new(None)),
-        ));
-        let route = TopologyRoute {
-            workspace_id: "testrun-blocked-capture-workspace".to_owned(),
-            tab_id: "testrun-blocked-capture-tab".to_owned(),
-            pane_id: "testrun-blocked-capture-pane".to_owned(),
-            channel_name: "testrun-blocked-capture".to_owned(),
-            thread_name: "testrun-blocked-capture [testrun-blocked-capture-tab]".to_owned(),
-        };
-        assert_blocked_capture_retries_then_falls_back(
-            guild,
-            &route,
-            responder.as_ref(),
-            &owner_id,
-        )
-        .await?;
-        assert_blocked_capture_posts_question_immediately(
-            guild,
-            &route,
-            responder.as_ref(),
-            &owner_id,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    async fn assert_blocked_capture_retries_then_falls_back(
-        guild: &BlockedCaptureGuild,
-        route: &TopologyRoute,
-        responder: &PermissionResponder,
-        owner_id: &str,
-    ) -> Result<(), String> {
-        let terminal = "testrun-blocked-capture-terminal".to_owned();
-        let no_question_snapshot = AgentSnapshot {
-            agent: Some("claude".to_owned()),
-            terminal_id: terminal.clone(),
-            agent_status: "blocked".to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
-            cwd: None,
-            terminal_title_stripped: None,
-            session: None,
-            state_change_seq: 0,
-        };
-        let mut informational_cards = HashMap::new();
-        let mut blocked_capture_attempts = HashMap::new();
-
-        for attempt in 0..2u32 {
-            handle_blocked_card(BlockedCardContext {
-                client: guild.client.as_ref(),
-                guild: guild.id,
-                owner_id,
-                responder,
-                topology_cache: responder.topology_cache(),
-                route,
-                snapshot: &no_question_snapshot,
-                terminal: &terminal,
-                from_status: "blocked",
-                blocked_since: None,
-                state_change_seq: 1,
-                informational_cards: &mut informational_cards,
-                blocked_capture_attempts: &mut blocked_capture_attempts,
-                search_root: None,
-            })
-            .await;
-            if blocked_capture_attempts.get(&terminal).copied() != Some(attempt + 1) {
-                return Err(format!(
-                    "attempt {attempt}: expected retry bookkeeping to advance to {}, got {:?}",
-                    attempt + 1,
-                    blocked_capture_attempts.get(&terminal)
-                ));
-            }
-            if informational_cards.contains_key(&terminal) {
-                return Err(format!("attempt {attempt}: retry must not post a card yet"));
-            }
-        }
-
-        handle_blocked_card(BlockedCardContext {
-            client: guild.client.as_ref(),
-            guild: guild.id,
-            owner_id,
-            responder,
-            topology_cache: responder.topology_cache(),
-            route,
-            snapshot: &no_question_snapshot,
-            terminal: &terminal,
-            from_status: "blocked",
-            blocked_since: None,
-            state_change_seq: 1,
-            informational_cards: &mut informational_cards,
-            blocked_capture_attempts: &mut blocked_capture_attempts,
-            search_root: None,
-        })
-        .await;
-        if blocked_capture_attempts.contains_key(&terminal) {
-            return Err("bookkeeping must clear once the fallback card posts".to_owned());
-        }
-        let fallback_card = informational_cards
-            .get(&terminal)
-            .ok_or("third attempt must post the informational fallback card")?;
-        let fallback_message =
-            fetch_message(guild, fallback_card.channel, fallback_card.message).await?;
-        if !fallback_message.components.is_empty() {
-            return Err("fallback card unexpectedly had components".to_owned());
-        }
-        let expected_owner_mention = format!("<@{owner_id}>");
-        if fallback_message.content != expected_owner_mention {
-            return Err(format!(
-                "fallback card content was {:?}, expected {expected_owner_mention:?}",
-                fallback_message.content
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    async fn assert_blocked_capture_posts_question_immediately(
-        guild: &BlockedCaptureGuild,
-        route: &TopologyRoute,
-        responder: &PermissionResponder,
-        owner_id: &str,
-    ) -> Result<(), String> {
-        let question_terminal = "testrun-blocked-capture-terminal-question".to_owned();
-        let question_snapshot = AgentSnapshot {
-            agent: Some("claude".to_owned()),
-            terminal_id: question_terminal.clone(),
-            agent_status: "blocked".to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
-            cwd: Some("/srv/bridge".to_owned()),
-            terminal_title_stripped: None,
-            session: Some(AgentSession {
-                agent: "claude".to_owned(),
-                value: "9a11cafe-affe-4f5c-8bda-b10cb6a5cafe".to_owned(),
-            }),
-            state_change_seq: 0,
-        };
-        let mut informational_cards = HashMap::new();
-        let mut blocked_capture_attempts = HashMap::new();
-        handle_blocked_card(BlockedCardContext {
-            client: guild.client.as_ref(),
-            guild: guild.id,
-            owner_id,
-            responder,
-            topology_cache: responder.topology_cache(),
-            route,
-            snapshot: &question_snapshot,
-            terminal: &question_terminal,
-            from_status: "working",
-            blocked_since: None,
-            state_change_seq: 2,
-            informational_cards: &mut informational_cards,
-            blocked_capture_attempts: &mut blocked_capture_attempts,
-            search_root: Some(Path::new("tests/fixtures")),
-        })
-        .await;
-        if blocked_capture_attempts.contains_key(&question_terminal) {
-            return Err("question path must not create retry bookkeeping".to_owned());
-        }
-        let question_card = informational_cards
-            .get(&question_terminal)
-            .ok_or("question path must post a card")?;
-        let question_message =
-            fetch_message(guild, question_card.channel, question_card.message).await?;
-        if !question_message.components.is_empty() {
-            return Err("question card unexpectedly had Allow/Deny components".to_owned());
-        }
-        let expected_question =
-            "Which environment should the fix target?\n1. staging\n2. production";
-        let description = question_message
-            .embeds
-            .first()
-            .ok_or("question card had no embed")?
-            .description
-            .as_deref()
-            .ok_or("question card embed had no description")?;
-        if description != expected_question {
-            return Err(format!(
-                "question card description was {description:?}, expected {expected_question:?}"
-            ));
-        }
-        let expected_owner_mention = format!("<@{owner_id}>");
-        if question_message.content != expected_owner_mention {
-            return Err(format!(
-                "question card content was {:?}, expected {expected_owner_mention:?}",
-                question_message.content
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    async fn fetch_message(
-        guild: &BlockedCaptureGuild,
-        channel: Id<ChannelMarker>,
-        message: Id<MessageMarker>,
-    ) -> Result<twilight_model::channel::Message, String> {
-        guild
-            .client
-            .message(channel, message)
-            .await
-            .map_err(|e| e.to_string())?
-            .model()
-            .await
-            .map_err(|e| e.to_string())
     }
 
     #[cfg(unix)]
