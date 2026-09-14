@@ -119,16 +119,16 @@ struct BridgeState {
     /// The owner's mirrored display name and avatar, fetched once at startup. `None` when Discord
     /// is not configured or the fetch failed; terminal-prompt mirroring drops silently without it.
     owner_identity: Option<OwnerIdentity>,
-    /// Per-terminal read path and position for terminal-prompt mirroring, established the first
-    /// time [`process_snapshot`] sees a session-carrying pane in any status. Existing prompts
-    /// already in the log at that first sight are never replayed, but every prompt recorded
-    /// afterward is. Keyed by terminal id but valued by the resolved log path alongside the
-    /// position, because a later session on the same terminal (`/clear`, resume, a relaunch, or a
-    /// vendor starting a fresh file or store) resolves a different path; [`process_snapshot`]
-    /// re-baselines against it rather than reusing a stale position from the old file. The live
-    /// text watch's own position is baselined against this same path at the same moment, so the
-    /// two readers agree on where "past everything already there" is.
-    terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition)>,
+    /// Per-terminal read baseline, established the first time [`process_snapshot`] sees a
+    /// session-carrying pane in any status: the resolved log path, the prompt reader's start
+    /// position, and the live text watch's start position, all captured at the same moment so the
+    /// two readers agree on where "past everything already there" is and no prompt written between
+    /// them is mirrored without its reply. Existing prompts and replies already in the log at that
+    /// first sight are never replayed, but everything recorded afterward is. Keyed by terminal id,
+    /// re-baselined when a later session on the same terminal (`/clear`, resume, a relaunch, or a
+    /// vendor starting a fresh file or store) resolves a different path, rather than reusing a stale
+    /// position from the old file.
+    terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition, LivePosition)>,
     /// Panes seen with a session whose [`live_log_path`] returned `Ok(None)` -- the log does not
     /// exist on disk yet -- keyed by terminal, valued by that session's identity. A fresh pane, a
     /// new session after `/clear`, or a relaunch before its first write records its own session
@@ -986,7 +986,8 @@ async fn ensure_live_watch_started(
     // The prompt baseline runs first on this snapshot and resolves the log path; the live watch
     // follows that same path. No entry means the log is not on disk yet (awaiting first log), so
     // there is nothing to follow until a later snapshot.
-    let Some((path, baseline_position)) = state.terminal_prompt_positions.get(&terminal).cloned()
+    let Some((path, _prompt_position, live_position)) =
+        state.terminal_prompt_positions.get(&terminal).cloned()
     else {
         return;
     };
@@ -1007,20 +1008,6 @@ async fn ensure_live_watch_started(
     if discord.is_none() {
         return;
     }
-    let position = if matches!(
-        baseline_position,
-        LivePosition::Bytes(0) | LivePosition::RowId(0)
-    ) {
-        zero_terminal_prompt_position(&session.agent)
-    } else {
-        match initial_live_position(&session.agent, &path) {
-            Ok(position) => position,
-            Err(error) => {
-                bridge_eprintln!("live capture watch error for {terminal}: {error}");
-                return;
-            }
-        }
-    };
     let watcher = match start_notify_watcher(&session.agent, &path, terminal.clone(), live_tx) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -1034,7 +1021,7 @@ async fn ensure_live_watch_started(
             _watcher: watcher,
             vendor: session.agent,
             path,
-            position,
+            position: live_position,
             route,
         },
     );
@@ -1260,18 +1247,30 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     }
     let was_awaiting_this_session = state
         .awaiting_first_log
-        .remove(terminal)
-        .is_some_and(|awaiting_session| awaiting_session == session.value);
-    let position = if was_awaiting_this_session {
-        Ok(zero_terminal_prompt_position(vendor))
+        .get(terminal)
+        .is_some_and(|awaiting_session| awaiting_session == &session.value);
+    // Capture the prompt reader's and the live text watch's start positions together, from the one
+    // log the pane resolves now, so no prompt written between two separate reads is mirrored
+    // without its reply. When this pane's own session log has only just appeared, both start at 0
+    // to catch everything the pane writes; otherwise both start past everything already there. A
+    // read that errors (Cursor creates its message table lazily on the first write) defers the
+    // whole baseline -- and with it the watch -- to the next snapshot rather than baselining a log
+    // that cannot be read yet.
+    let positions = if was_awaiting_this_session {
+        initial_live_position(vendor, &path).map(|_| {
+            let zero = zero_terminal_prompt_position(vendor);
+            (zero, zero)
+        })
     } else {
         initial_terminal_prompt_position(vendor, &path)
+            .and_then(|prompt| initial_live_position(vendor, &path).map(|live| (prompt, live)))
     };
-    match position {
-        Ok(position) => {
+    match positions {
+        Ok((prompt_position, live_position)) => {
+            state.awaiting_first_log.remove(terminal);
             state
                 .terminal_prompt_positions
-                .insert(terminal.clone(), (path, position));
+                .insert(terminal.clone(), (path, prompt_position, live_position));
         }
         Err(error) => bridge_eprintln!("terminal prompt baseline error for {terminal}: {error}"),
     }
@@ -1293,13 +1292,13 @@ fn zero_terminal_prompt_position(vendor: &str) -> LivePosition {
 /// against the new path rather than reuse the old file's position, which the new file may not even
 /// be as long as).
 fn terminal_prompt_baseline_is_current(
-    positions: &HashMap<String, (PathBuf, LivePosition)>,
+    positions: &HashMap<String, (PathBuf, LivePosition, LivePosition)>,
     terminal: &str,
     path: &Path,
 ) -> bool {
     positions
         .get(terminal)
-        .is_some_and(|(existing_path, _)| existing_path == path)
+        .is_some_and(|(existing_path, _, _)| existing_path == path)
 }
 
 /// Mirrors newly recorded owner prompts from one terminal's vendor log into its tab thread through
@@ -1327,10 +1326,12 @@ async fn mirror_terminal_prompts(
     if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR) {
         return;
     }
-    let Some((path, position)) = state.terminal_prompt_positions.get(terminal).cloned() else {
+    let Some((path, prompt_position, live_position)) =
+        state.terminal_prompt_positions.get(terminal).cloned()
+    else {
         return;
     };
-    let (prompts, new_position) = match read_new_terminal_prompts(vendor, &path, position) {
+    let (prompts, new_position) = match read_new_terminal_prompts(vendor, &path, prompt_position) {
         Ok(result) => result,
         Err(error) => {
             bridge_eprintln!("terminal prompt read error for {terminal}: {error}");
@@ -1339,7 +1340,7 @@ async fn mirror_terminal_prompts(
     };
     state
         .terminal_prompt_positions
-        .insert(terminal.to_owned(), (path, new_position));
+        .insert(terminal.to_owned(), (path, new_position, live_position));
     if prompts.is_empty() {
         return;
     }
@@ -1824,6 +1825,12 @@ fn prune_departed_state(
     state
         .live_errors_reported
         .retain(|terminal| current_terminals.contains(terminal));
+    state
+        .terminal_prompt_positions
+        .retain(|terminal, _| current_terminals.contains(terminal));
+    state
+        .awaiting_first_log
+        .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .title_pending
         .retain(|tab_id| current_tabs.contains(tab_id));
@@ -3046,7 +3053,11 @@ mod tests {
 
         positions.insert(
             terminal.to_owned(),
-            (first_path.clone(), LivePosition::Bytes(42)),
+            (
+                first_path.clone(),
+                LivePosition::Bytes(42),
+                LivePosition::Bytes(42),
+            ),
         );
         assert!(
             terminal_prompt_baseline_is_current(&positions, terminal, &first_path),
@@ -3136,15 +3147,20 @@ mod tests {
                 &snapshot_for("old-session"),
                 &mut replay_state,
             );
-            let (replay_path, replay_position) = replay_state
+            let (replay_path, replay_prompt_position, replay_live_position) = replay_state
                 .terminal_prompt_positions
                 .get("terminal-resume")
                 .expect("resumed session baselines once its log resolves");
             assert_eq!(replay_path, &old_session_path);
             assert_eq!(
-                *replay_position,
+                *replay_prompt_position,
                 LivePosition::Bytes(expected_discard_position),
                 "a resumed session with prior history must discard it, not replay it"
+            );
+            assert_eq!(
+                *replay_live_position,
+                LivePosition::Bytes(expected_discard_position),
+                "the live watch start must discard the resumed history too, not replay it"
             );
 
             // Control case c: the same existing session, discovered directly, with no intervening
@@ -3154,13 +3170,14 @@ mod tests {
                 &snapshot_for("old-session"),
                 &mut control_state,
             );
-            let (control_path, control_position) = control_state
+            let (control_path, control_prompt_position, control_live_position) = control_state
                 .terminal_prompt_positions
                 .get("terminal-resume")
                 .expect("baseline established for the control case");
             assert_eq!(control_path, &old_session_path);
             assert_eq!(
-                replay_position, control_position,
+                (replay_prompt_position, replay_live_position),
+                (control_prompt_position, control_live_position),
                 "case b and control case c must baseline identically"
             );
         });
