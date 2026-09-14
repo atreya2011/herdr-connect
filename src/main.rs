@@ -350,8 +350,6 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     deliver_blocked_messages(
         &BlockedDeliveryRoute {
             client,
-            guild,
-            route,
             topology_cache,
         },
         target,
@@ -363,23 +361,21 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     .await;
 }
 
-/// What [`deliver_blocked_messages`] needs to re-resolve its route on a stale-thread retry,
-/// bundled to keep the function under the argument-count lint.
+/// What [`deliver_blocked_messages`] needs to deliver a blocked card, bundled to keep the function
+/// under the argument-count lint.
 #[derive(Clone, Copy)]
 struct BlockedDeliveryRoute<'a> {
     client: &'a Client,
-    guild: Id<GuildMarker>,
-    route: &'a TopologyRoute,
     topology_cache: &'a TopologyCache,
 }
 
-/// Delivers each blocked-card message to `target`, applying the same invalidate-and-retry as
-/// [`deliver_to_route`] when a send finds the cached thread gone: the shared topology cache is
-/// cleared, the route is re-resolved once, and that message is retried at the recreated thread
-/// before later messages reuse it too.
+/// Delivers each blocked-card message to `target`. A send that finds the cached thread gone
+/// (unknown channel, deleted outside the bridge's own tracking) clears the shared topology cache
+/// and logs; the next blocked event resolves the route again through the cache-first path. It does
+/// not re-resolve and retry inside this call.
 async fn deliver_blocked_messages(
     delivery: &BlockedDeliveryRoute<'_>,
-    mut target: Id<ChannelMarker>,
+    target: Id<ChannelMarker>,
     terminal: &str,
     state_change_seq: u64,
     messages: &[TransitionMessage],
@@ -387,29 +383,17 @@ async fn deliver_blocked_messages(
 ) {
     let BlockedDeliveryRoute {
         client,
-        guild,
-        route,
         topology_cache,
     } = *delivery;
     let mut last = None;
     for (index, message) in messages.iter().enumerate() {
         let nonce = transition_card_nonce(terminal, state_change_seq, index);
-        let mut sent = deliver_transition_card(client, target, message, &nonce).await;
-        if let Err(error) = &sent
-            && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
-        {
-            *topology_cache.lock().await = None;
-            sent = match sync_route(client, guild, route, topology_cache).await {
-                Ok(resolved) => {
-                    target = resolved;
-                    deliver_transition_card(client, target, message, &nonce).await
-                }
-                Err(error) => Err(error),
-            };
-        }
-        match sent {
+        match deliver_transition_card(client, target, message, &nonce).await {
             Ok(id) => last = Some(id),
             Err(error) => {
+                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
+                    *topology_cache.lock().await = None;
+                }
                 bridge_eprintln!("discord delivery error: {error}");
                 return;
             }
@@ -1370,53 +1354,13 @@ async fn cached_terminal_prompt_webhook(
 }
 
 /// Everything [`mirror_one_terminal_prompt`] needs to deliver into one already-resolved route,
-/// bundled to stay under the argument-count lint; `workspace_channel`/`thread` are re-resolved and
-/// replaced on an unknown-channel retry, the rest stays fixed for the whole mirrored batch.
+/// bundled to stay under the argument-count lint; fixed for the whole mirrored batch.
 #[derive(Clone, Copy)]
 struct TerminalPromptTarget<'a> {
     client: &'a Client,
-    guild: Id<GuildMarker>,
-    route: &'a TopologyRoute,
     topology_cache: &'a TopologyCache,
     workspace_channel: Id<ChannelMarker>,
     thread: Id<ChannelMarker>,
-}
-
-/// Whether a terminal-prompt delivery failure is worth one retry against a freshly resolved
-/// workspace channel, thread, and webhook: the cached thread or the cached webhook is stale
-/// (deleted outside the bridge's own tracking -- deleting a channel deletes its webhooks with it,
-/// so either can go stale independently of the other).
-fn is_retriable_terminal_prompt_error(error: &str) -> bool {
-    error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
-        || error.starts_with(UNKNOWN_WEBHOOK_DELIVERY_ERROR)
-}
-
-/// Clears the shared topology cache and the cached webhook for `target`'s stale workspace channel,
-/// re-resolves both the route and the webhook, and returns the refreshed target.
-///
-/// # Errors
-///
-/// Returns [`sync_route_channels`]'s error.
-async fn refresh_terminal_prompt_target<'a>(
-    target: TerminalPromptTarget<'a>,
-    state: &mut BridgeState,
-) -> Result<TerminalPromptTarget<'a>, String> {
-    *target.topology_cache.lock().await = None;
-    state
-        .terminal_prompt_webhooks
-        .remove(&target.workspace_channel);
-    let (workspace_channel, thread) = sync_route_channels(
-        target.client,
-        target.guild,
-        target.route,
-        target.topology_cache,
-    )
-    .await?;
-    Ok(TerminalPromptTarget {
-        workspace_channel,
-        thread,
-        ..target
-    })
 }
 
 /// Resolves (from cache or fresh) the webhook for `target.workspace_channel` and executes one
@@ -1426,8 +1370,7 @@ async fn refresh_terminal_prompt_target<'a>(
 /// # Errors
 ///
 /// Returns [`cached_terminal_prompt_webhook`]'s or [`execute_terminal_prompt_webhook`]'s error --
-/// covering both webhook resolution and execution, so [`mirror_one_terminal_prompt`]'s retry runs
-/// the same [`is_retriable_terminal_prompt_error`] check against either failure.
+/// covering both webhook resolution and execution.
 async fn deliver_terminal_prompt_part<'a>(
     target: TerminalPromptTarget<'a>,
     identity: &OwnerIdentity,
@@ -1453,13 +1396,11 @@ async fn deliver_terminal_prompt_part<'a>(
 /// same way live text is so Discord's 2000-character message limit never silently drops it, one
 /// webhook message per part, in order.
 ///
-/// A retriable failure ([`is_retriable_terminal_prompt_error`]) resolving or executing any part --
-/// the cached thread or the cached webhook is stale -- invalidates the shared topology cache and
-/// the cached webhook, re-resolves both the route and the webhook, and retries that one part once
-/// against the fresh pair; any other failure, or a repeat failure after the retry, stops the batch
-/// there rather than sending later parts out of order. Returns the resolved target reached by the
-/// last part actually sent, so the caller carries a refreshed target forward to later prompts in
-/// the same batch instead of retrying each one from the stale pair independently.
+/// A delivery failure stops the batch there rather than sending later parts out of order. When the
+/// cached thread is gone (unknown channel) the shared topology cache is cleared, and when the
+/// cached webhook is gone (unknown webhook) that cached webhook is dropped; either way the next
+/// mirrored prompt resolves the route and webhook again through the cache-first path. It does not
+/// re-resolve and retry inside this call.
 ///
 /// # Errors
 ///
@@ -1472,14 +1413,19 @@ async fn mirror_one_terminal_prompt<'a>(
 ) -> Result<TerminalPromptTarget<'a>, String> {
     let mut current = target;
     for part in split_live_message(content) {
-        current = match deliver_terminal_prompt_part(current, identity, &part, state).await {
-            Ok(delivered) => delivered,
-            Err(error) if is_retriable_terminal_prompt_error(&error) => {
-                let refreshed = refresh_terminal_prompt_target(current, state).await?;
-                deliver_terminal_prompt_part(refreshed, identity, &part, state).await?
+        match deliver_terminal_prompt_part(current, identity, &part, state).await {
+            Ok(delivered) => current = delivered,
+            Err(error) => {
+                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
+                    *current.topology_cache.lock().await = None;
+                } else if error.starts_with(UNKNOWN_WEBHOOK_DELIVERY_ERROR) {
+                    state
+                        .terminal_prompt_webhooks
+                        .remove(&current.workspace_channel);
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
-        };
+        }
     }
     Ok(current)
 }
@@ -1642,8 +1588,6 @@ async fn mirror_terminal_prompts(
     };
     let mut target = TerminalPromptTarget {
         client: client.as_ref(),
-        guild: *guild,
-        route,
         topology_cache,
         workspace_channel,
         thread,
@@ -1819,34 +1763,20 @@ async fn cached_route_channel(
     channel
 }
 
-/// Re-resolves `route`'s tab thread from a fresh topology fetch, without creating anything: an
-/// activity frame's empty `channel_name`/`thread_name` (it has no agent/tab snapshot to derive a
-/// real name from) would corrupt a genuine create, so unlike [`sync_route`] a route the fresh
-/// fetch still does not resolve returns `None` rather than falling through to `sync_topology`.
-async fn refresh_activity_route_channel(
-    client: &Client,
-    guild: Id<GuildMarker>,
-    route: &TopologyRoute,
-    topology_cache: &TopologyCache,
-) -> Option<Id<ChannelMarker>> {
-    let fetched = fetch_topology_lists(client, guild).await.ok()?;
-    let mut guard = topology_cache.lock().await;
-    let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
-    cached_route(channels, active_threads, route).ok().flatten()
-}
-
 /// Applies one activity frame: routes it to its tab's thread purely from the cached topology, then
 /// posts or edits this turn's one activity message for the pane.
 ///
 /// A cache not yet populated, or a route the cache does not resolve, drops the frame silently, and
 /// so does a pane the latest snapshot does not report as `working` with a session -- the same
-/// no-session rule every other card follows.
+/// no-session rule every other card follows. A send that finds the cached thread gone (unknown
+/// channel) clears the shared topology cache and logs; the next frame drops until the cache-first
+/// route is repopulated by other traffic. It does not re-resolve and retry inside this call.
 async fn handle_activity_event(
     discord: Option<&DiscordConnection>,
     frame: ActivityFrame,
     state: &mut BridgeState,
 ) {
-    let Some((client, guild, _owner_id, responder)) = discord else {
+    let Some((client, _guild, _owner_id, responder)) = discord else {
         return;
     };
     let route = TopologyRoute {
@@ -1857,26 +1787,17 @@ async fn handle_activity_event(
         thread_name: String::new(),
     };
     let topology_cache = responder.topology_cache();
-    let Some(mut channel) = cached_route_channel(topology_cache, &route).await else {
+    let Some(channel) = cached_route_channel(topology_cache, &route).await else {
         return;
     };
     if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
         let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
-        let mut result =
-            update_activity_message(client.as_ref(), channel, existing.message, &text).await;
-        if let Err(error) = &result
-            && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
-            && let Some(resolved) =
-                refresh_activity_route_channel(client.as_ref(), *guild, &route, topology_cache)
-                    .await
-        {
-            channel = resolved;
-            result =
-                update_activity_message(client.as_ref(), channel, existing.message, &text).await;
-        }
-        match result {
+        match update_activity_message(client.as_ref(), channel, existing.message, &text).await {
             Ok(()) => existing.count += 1,
             Err(error) => {
+                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
+                    *topology_cache.lock().await = None;
+                }
                 bridge_eprintln!(
                     "activity edit delivery error for pane {}: {error}",
                     frame.pane_id
@@ -1889,22 +1810,16 @@ async fn handle_activity_event(
         return;
     }
     let text = activity_message_text(1, &frame.tool, &frame.summary);
-    let mut result = deliver_activity_message(client.as_ref(), channel, &text).await;
-    if let Err(error) = &result
-        && error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR)
-        && let Some(resolved) =
-            refresh_activity_route_channel(client.as_ref(), *guild, &route, topology_cache).await
-    {
-        channel = resolved;
-        result = deliver_activity_message(client.as_ref(), channel, &text).await;
-    }
-    match result {
+    match deliver_activity_message(client.as_ref(), channel, &text).await {
         Ok(message) => {
             state
                 .activity_messages
                 .insert(frame.pane_id, ActivityMessage { message, count: 1 });
         }
         Err(error) => {
+            if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
+                *topology_cache.lock().await = None;
+            }
             bridge_eprintln!(
                 "activity create delivery error for pane {}: {error}",
                 frame.pane_id
@@ -3284,28 +3199,26 @@ mod tests {
     };
 
     use super::{
-        BlockedCardContext, BlockedDeliveryRoute, BlockedResponse, BridgeRuntime, BridgeState,
-        BrokerTask, Client, LIVE_DELIVERY_ATTEMPTS, LivePosition, LiveWatch, Membership,
-        PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
-        agent_read_detection, apply_membership, capture_for, capture_for_with_search_root,
-        card_capture_for_delivery, create_transition_messages, decide_blocked_response,
-        delete_closed_topology_batch, deliver_blocked_messages, deliver_to_route,
+        BlockedCardContext, BlockedResponse, BridgeRuntime, BridgeState, BrokerTask, Client,
+        LIVE_DELIVERY_ATTEMPTS, LivePosition, LiveWatch, Membership, PermissionResponder,
+        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
+        capture_for, capture_for_with_search_root, card_capture_for_delivery,
+        create_transition_messages, decide_blocked_response, delete_closed_topology_batch,
         discover_pending_and_unusable_tabs, fetch_startup_owner_identity, fetch_topology_lists,
         handle_blocked_card, handle_lifecycle_select_result, handle_live_event,
-        initial_terminal_prompt_position, is_retriable_terminal_prompt_error, lifecycle_closure,
-        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
-        next_state_change_sequence, process_snapshot, read_new_terminal_prompts,
-        repeats_last_live_text, resolve_session_path, route_topology, start_notify_watcher,
-        subscribe_status, subscribe_status_with_backoff, sync_pending_titles, sync_route,
-        sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
-        unique_existing_path,
+        initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
+        live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
+        process_snapshot, read_new_terminal_prompts, repeats_last_live_text, resolve_session_path,
+        route_topology, start_notify_watcher, subscribe_status, subscribe_status_with_backoff,
+        sync_pending_titles, sync_route, sync_startup_topology, tab_list_result,
+        terminal_prompt_baseline_is_current, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentLogCapture, AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
-        Transition, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, VENDOR_CLAUDE,
-        VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions, read_claude_incremental,
-        read_codex_incremental, read_cursor_incremental, status_subscriptions, submit_owner_prompt,
-        subscribe_herdr_events, transition_card_nonce, workspace_list_result,
+        Transition, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions,
+        read_claude_incremental, read_codex_incremental, read_cursor_incremental,
+        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
+        workspace_list_result,
     };
 
     #[test]
@@ -3607,34 +3520,6 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_home);
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
-        }
-    }
-
-    #[test]
-    fn terminal_prompt_delivery_retries_on_unknown_channel_or_unknown_webhook_only() {
-        let cases = [
-            (
-                "the target channel or thread is gone",
-                format!("{UNKNOWN_CHANNEL_DELIVERY_ERROR}: response error: status code 404"),
-                true,
-            ),
-            (
-                "the target webhook is gone",
-                format!("{UNKNOWN_WEBHOOK_DELIVERY_ERROR}: response error: status code 404"),
-                true,
-            ),
-            (
-                "an unrelated failure",
-                "response error: status code 500".to_owned(),
-                false,
-            ),
-        ];
-        for (label, error, expected) in cases {
-            assert_eq!(
-                is_retriable_terminal_prompt_error(&error),
-                expected,
-                "{label}"
-            );
         }
     }
 
@@ -8714,279 +8599,6 @@ mod tests {
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
-    const CACHE_RECOVERY_LABEL: &str = "testrun-cache-recovery";
-
-    /// One row of [`sync_route_serves_cache_hits_and_recovers_from_a_stale_send`]: which of the
-    /// three `sync_route` callers delivers past a cache hit gone stale.
-    #[cfg(unix)]
-    enum CacheRecoveryCaller {
-        TransitionCard,
-        BlockedCard,
-        LiveMessage,
-    }
-
-    #[cfg(unix)]
-    struct CacheRecoveryCase {
-        name: &'static str,
-        caller: CacheRecoveryCaller,
-    }
-
-    /// Drives `sync_route`'s three refetch triggers against a real guild: a cache hit is served
-    /// without any Discord request (so deleting the channel directly, out from under the cache,
-    /// does not get noticed), and `caller`'s delivery then recovers by treating the resulting
-    /// unknown-channel send failure as a signal to invalidate the cache, resolve the route fresh,
-    /// and retry once.
-    #[cfg(unix)]
-    async fn sync_route_cache_recovery_exercise(
-        guild: &BlockedCaptureGuild,
-        tab: &Tab,
-        caller: &CacheRecoveryCaller,
-    ) -> Result<(), String> {
-        report_idle_with_session(&tab.pane_id)?;
-        let listed = snapshot_for_pane(&tab.pane_id)?;
-        let matching = matching_tab(&tab.tab_id)?;
-        let tabs = std::slice::from_ref(&matching);
-        let agents = std::slice::from_ref(&listed);
-        let route = route_topology(agents, tabs, &listed.terminal_id)?;
-        let topic = format!("herdr workspace [{}]", route.workspace_id);
-        let suffix = format!(" [{}]", route.tab_id);
-
-        let topology_cache: herdr_connect_rs::TopologyCache =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let created_thread =
-            sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
-        let workspace_channel = guild_channel_with_topic(guild, &topic).await?.id;
-
-        // Delete the real thread directly, bypassing the bridge entirely: the in-memory cache
-        // still references it, standing in for an owner deleting a tab thread out from under the
-        // bridge's own tracking. The workspace channel is untouched.
-        guild
-            .client
-            .delete_channel(created_thread)
-            .await
-            .map_err(|error| error.to_string())?;
-
-        // A cache hit is served without a Discord request: sync_route returns the same, now-gone
-        // thread id rather than refetching and discovering it is missing.
-        let cached_thread =
-            sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
-        if cached_thread != created_thread {
-            return Err(format!(
-                "expected the cache hit to return the original thread {created_thread}, got {cached_thread}"
-            ));
-        }
-        if thread_with_suffix_survives(guild, workspace_channel, &suffix).await? {
-            return Err("the cache hit must not have recreated the deleted thread".to_owned());
-        }
-
-        // A real send against the stale cached thread fails as unknown channel; the caller under
-        // test must recover by invalidating the cache, resolving the route fresh, and retrying
-        // once.
-        let connection = discord_tuple_with_cache(guild, Arc::clone(&topology_cache));
-        let transition = Transition {
-            from: STATUS_IDLE.to_owned(),
-            to: STATUS_DONE.to_owned(),
-            terminal_id: listed.terminal_id.clone(),
-            agent: VENDOR_CLAUDE.to_owned(),
-        };
-        let capture = AgentLogCapture {
-            message: "cache-recovery test reply".to_owned(),
-            question: None,
-            failure: None,
-        };
-        match caller {
-            CacheRecoveryCaller::TransitionCard => {
-                deliver_to_route(&connection, &route, &transition, &capture, 1).await?;
-            }
-            CacheRecoveryCaller::BlockedCard => {
-                recover_blocked_card_delivery(
-                    &connection,
-                    &route,
-                    &topology_cache,
-                    &transition,
-                    &capture,
-                    cached_thread,
-                    &listed.terminal_id,
-                )
-                .await?;
-            }
-            CacheRecoveryCaller::LiveMessage => {
-                recover_live_message_delivery(
-                    &connection,
-                    &route,
-                    cached_thread,
-                    &listed.terminal_id,
-                )
-                .await?;
-            }
-        }
-
-        if !thread_with_suffix_survives(guild, workspace_channel, &suffix).await? {
-            return Err("recovery must have created a fresh thread for the route".to_owned());
-        }
-        Ok(())
-    }
-
-    /// The [`CacheRecoveryCaller::BlockedCard`] arm of
-    /// [`sync_route_cache_recovery_exercise`], split out to keep that function under the
-    /// line-count lint: delivers a blocked-card message set to the stale `target` and asserts
-    /// [`deliver_blocked_messages`]'s invalidate-and-retry recorded an informational card.
-    #[cfg(unix)]
-    async fn recover_blocked_card_delivery(
-        connection: &super::DiscordConnection,
-        route: &TopologyRoute,
-        topology_cache: &herdr_connect_rs::TopologyCache,
-        transition: &Transition,
-        capture: &AgentLogCapture,
-        target: Id<ChannelMarker>,
-        terminal: &str,
-    ) -> Result<(), String> {
-        let (client, guild_id, owner_id, _responder) = connection;
-        let messages = create_transition_messages(transition, capture, owner_id);
-        let mut informational_cards = HashMap::new();
-        deliver_blocked_messages(
-            &BlockedDeliveryRoute {
-                client: client.as_ref(),
-                guild: *guild_id,
-                route,
-                topology_cache,
-            },
-            target,
-            terminal,
-            1,
-            &messages,
-            &mut informational_cards,
-        )
-        .await;
-        if informational_cards.is_empty() {
-            return Err("blocked card delivery did not record an informational card".to_owned());
-        }
-        Ok(())
-    }
-
-    /// The [`CacheRecoveryCaller::LiveMessage`] arm of [`sync_route_cache_recovery_exercise`],
-    /// split out to keep that function under the line-count lint: binds a live watch to a
-    /// synthetic one-record Claude log and the stale `target`, drives one [`handle_live_event`],
-    /// and asserts the recovered delivery landed.
-    #[cfg(unix)]
-    async fn recover_live_message_delivery(
-        connection: &super::DiscordConnection,
-        route: &TopologyRoute,
-        target: Id<ChannelMarker>,
-        terminal: &str,
-    ) -> Result<(), String> {
-        let live_path = std::env::temp_dir().join(format!(
-            "testrun-cache-recovery-live-{}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::write(
-            &live_path,
-            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\
-             [{\"type\":\"text\",\"text\":\"cache-recovery live text\"}]}}\n",
-        )
-        .map_err(|error| error.to_string())?;
-        let (live_tx, _live_rx) = tokio::sync::mpsc::unbounded_channel();
-        let watcher =
-            start_notify_watcher(VENDOR_CLAUDE, &live_path, terminal.to_owned(), live_tx)?;
-        let mut state = BridgeState::default();
-        state.live_watches.insert(
-            terminal.to_owned(),
-            LiveWatch {
-                _watcher: watcher,
-                vendor: VENDOR_CLAUDE.to_owned(),
-                path: live_path.clone(),
-                position: LivePosition::Bytes(0),
-                channel: target,
-                route: route.clone(),
-            },
-        );
-        handle_live_event(Some(connection), terminal, &mut state).await;
-        let _ = fs::remove_file(&live_path);
-        if !state.last_posted.contains_key(terminal) {
-            return Err("live message recovery did not deliver the pending text".to_owned());
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn sync_route_serves_cache_hits_and_recovers_from_a_stale_send() {
-        let cases = [
-            CacheRecoveryCase {
-                name: "transition card",
-                caller: CacheRecoveryCaller::TransitionCard,
-            },
-            CacheRecoveryCase {
-                name: "blocked card",
-                caller: CacheRecoveryCaller::BlockedCard,
-            },
-            CacheRecoveryCase {
-                name: "live message",
-                caller: CacheRecoveryCaller::LiveMessage,
-            },
-        ];
-
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-
-        for case in cases {
-            assert_eq!(
-                blocked_capture_cleanup(&guild).await.unwrap(),
-                0,
-                "named zero-leftover check: {}",
-                case.name
-            );
-            assert_eq!(
-                remaining_tabs(CACHE_RECOVERY_LABEL).expect("tab.list succeeds"),
-                0,
-                "named zero-leftover check: {}",
-                case.name
-            );
-
-            let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-                .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
-            let cwd_dir = std::env::temp_dir().join(format!(
-                "testrun-cache-recovery-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system clock is after unix epoch")
-                    .as_nanos()
-            ));
-            fs::create_dir_all(&cwd_dir).expect("create cache-recovery test cwd");
-            let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
-
-            let created = create_tab(CACHE_RECOVERY_LABEL, &workspace_id, cwd);
-            let (tab_id, result) = match created {
-                Ok(tab) => {
-                    let outcome =
-                        sync_route_cache_recovery_exercise(&guild, &tab, &case.caller).await;
-                    (Some(tab.tab_id), outcome)
-                }
-                Err(error) => (None, Err(error)),
-            };
-            if let Some(tab_id) = &tab_id {
-                close_tab(tab_id);
-            }
-            let _ = fs::remove_dir_all(&cwd_dir);
-
-            let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-            let tabs_left = remaining_tabs(CACHE_RECOVERY_LABEL)
-                .expect("tab.list succeeds for the zero-leftover check");
-            assert!(result.is_ok(), "{}: {result:?}", case.name);
-            assert_eq!(channels_left, 0, "named zero-leftover check: {}", case.name);
-            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
-        }
     }
 
     #[cfg(unix)]
