@@ -14,9 +14,9 @@ use twilight_model::id::{
 };
 
 use herdr_connect_rs::{
-    ACTIVITY_KIND, ActivityFrame, activity_message_text, decode_claude_activity_request,
-    decode_codex_activity_request, decode_cursor_activity_request, deliver_activity_message,
-    send_activity_frame, update_activity_message,
+    ACTIVITY_KIND, ActivityFrame, activity_message_text, bridge_eprintln, bridge_println,
+    decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
+    deliver_activity_message, send_activity_frame, update_activity_message,
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
@@ -293,7 +293,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let target = match sync_route(client, guild, route, topology_cache).await {
         Ok(target) => target,
         Err(error) => {
-            eprintln!("{error}");
+            bridge_eprintln!("{error}");
             return;
         }
     };
@@ -420,7 +420,7 @@ async fn deliver_blocked_messages(
         match sent {
             Ok(id) => last = Some(id),
             Err(error) => {
-                eprintln!("discord delivery error: {error}");
+                bridge_eprintln!("discord delivery error: {error}");
                 return;
             }
         }
@@ -452,7 +452,7 @@ async fn expire_blocked_card(
         )
         .await
         {
-            eprintln!("discord blocked-card expiry error: {error}");
+            bridge_eprintln!("discord blocked-card expiry error: {error}");
         } else {
             informational_cards.remove(terminal);
         }
@@ -475,7 +475,7 @@ async fn expire_departed_card(
     )
     .await
     {
-        eprintln!("discord blocked-card expiry error for {terminal}: {error}");
+        bridge_eprintln!("discord blocked-card expiry error for {terminal}: {error}");
     }
 }
 
@@ -559,7 +559,7 @@ async fn maybe_sync_fresh_session_topology(
     if let Err(error) =
         sync_route(client.as_ref(), *guild, &route, responder.topology_cache()).await
     {
-        eprintln!("{error}");
+        bridge_eprintln!("{error}");
     }
 }
 
@@ -599,7 +599,7 @@ async fn process_snapshot(
     state: &mut BridgeState,
 ) {
     let (terminal, status) = (snapshot.terminal_id.clone(), snapshot.agent_status.clone());
-    println!(
+    bridge_println!(
         "{} {terminal}: {status}",
         snapshot.agent.as_deref().unwrap_or("none")
     );
@@ -728,12 +728,12 @@ fn report_route_error(error: RouteError, state: &mut BridgeState) -> bool {
         RouteError::Unusable { tab_id, message } => {
             let is_new = state.unusable_reported.insert(tab_id);
             if is_new {
-                eprintln!("{message}");
+                bridge_eprintln!("{message}");
             }
             is_new
         }
         RouteError::Other(message) => {
-            eprintln!("{message}");
+            bridge_eprintln!("{message}");
             true
         }
     }
@@ -765,7 +765,7 @@ async fn deliver_postable_transition(
         state_change_seq,
     } = context;
     if snapshot.session.is_none() {
-        println!("{terminal}: no reported session, not mirrored");
+        bridge_println!("{terminal}: no reported session, not mirrored");
         return Ok(());
     }
     let route = match route_topology(agents, tabs, terminal) {
@@ -807,7 +807,7 @@ async fn deliver_postable_transition(
     };
     let last_posted = state.last_posted.get(terminal).map(String::as_str);
     if capture.failure.is_none() && repeats_last_live_text(&capture, last_posted) {
-        println!("{terminal}: skipped duplicate reply card");
+        bridge_println!("{terminal}: skipped duplicate reply card");
         return Ok(());
     }
     let card_capture = card_capture_for_delivery(&capture, last_posted);
@@ -835,7 +835,7 @@ async fn deliver_transition_if_postable(
     if is_postable_transition(context.transition)
         && let Err(error) = deliver_postable_transition(context, state).await
     {
-        eprintln!("{error}");
+        bridge_eprintln!("{error}");
     }
 }
 
@@ -894,7 +894,7 @@ async fn retry_pending_blocked_capture(
     state: &mut BridgeState,
 ) {
     if snapshot.session.is_none() {
-        println!("{terminal}: no reported session, not mirrored");
+        bridge_println!("{terminal}: no reported session, not mirrored");
         return;
     }
     let route = match route_topology(agents, tabs, terminal) {
@@ -1334,7 +1334,7 @@ async fn ensure_live_watch_started(
         Ok(Some(path)) => path,
         Ok(None) => return,
         Err(error) => {
-            eprintln!("live capture unfollowable for {terminal}: {error}");
+            bridge_eprintln!("live capture unfollowable for {terminal}: {error}");
             state.live_unfollowable.insert(terminal);
             return;
         }
@@ -1345,14 +1345,14 @@ async fn ensure_live_watch_started(
     let position = match initial_live_position(&session.agent, &path) {
         Ok(position) => position,
         Err(error) => {
-            eprintln!("live capture watch error for {terminal}: {error}");
+            bridge_eprintln!("live capture watch error for {terminal}: {error}");
             return;
         }
     };
     let watcher = match start_notify_watcher(&session.agent, &path, terminal.clone(), live_tx) {
         Ok(watcher) => watcher,
         Err(error) => {
-            eprintln!("live capture watch error for {terminal}: {error}");
+            bridge_eprintln!("live capture watch error for {terminal}: {error}");
             return;
         }
     };
@@ -1635,7 +1635,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
             return;
         }
         Err(error) => {
-            eprintln!("terminal prompt baseline error for {terminal}: {error}");
+            bridge_eprintln!("terminal prompt baseline error for {terminal}: {error}");
             return;
         }
     };
@@ -1659,7 +1659,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
                 .terminal_prompt_positions
                 .insert(terminal.clone(), (path, position));
         }
-        Err(error) => eprintln!("terminal prompt baseline error for {terminal}: {error}"),
+        Err(error) => bridge_eprintln!("terminal prompt baseline error for {terminal}: {error}"),
     }
 }
 
@@ -1719,7 +1719,7 @@ async fn mirror_terminal_prompts(
     let (prompts, new_position) = match read_new_terminal_prompts(vendor, &path, position) {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("terminal prompt read error for {terminal}: {error}");
+            bridge_eprintln!("terminal prompt read error for {terminal}: {error}");
             return;
         }
     };
@@ -1755,7 +1755,9 @@ async fn mirror_terminal_prompts(
         }
         match mirror_one_terminal_prompt(target, &identity, &text, state).await {
             Ok(delivered) => target = delivered,
-            Err(error) => eprintln!("terminal prompt delivery error for {terminal}: {error}"),
+            Err(error) => {
+                bridge_eprintln!("terminal prompt delivery error for {terminal}: {error}");
+            }
         }
     }
 }
@@ -1814,7 +1816,7 @@ async fn handle_live_event(
         }
         Err(error) => {
             if state.live_read_errors_reported.insert(terminal.to_owned()) {
-                eprintln!("live capture read error for {terminal}: {error}");
+                bridge_eprintln!("live capture read error for {terminal}: {error}");
             }
             return;
         }
@@ -1840,7 +1842,7 @@ async fn handle_live_event(
                 };
             }
             if let Err(error) = sent {
-                eprintln!("live capture delivery error for {terminal}: {error}");
+                bridge_eprintln!("live capture delivery error for {terminal}: {error}");
                 posted_all = false;
                 break;
             }
@@ -1862,7 +1864,7 @@ async fn handle_live_event(
             .copied()
             .unwrap_or(0);
         if attempts_so_far + 1 >= LIVE_DELIVERY_ATTEMPTS {
-            eprintln!(
+            bridge_eprintln!(
                 "live capture unfollowable for {terminal}: delivery failed {LIVE_DELIVERY_ATTEMPTS} times in a row"
             );
             state.live_delivery_attempts.remove(terminal);
@@ -1976,7 +1978,7 @@ async fn handle_activity_event(
         match result {
             Ok(()) => existing.count += 1,
             Err(error) => {
-                eprintln!(
+                bridge_eprintln!(
                     "activity edit delivery error for pane {}: {error}",
                     frame.pane_id
                 );
@@ -2004,7 +2006,7 @@ async fn handle_activity_event(
                 .insert(frame.pane_id, ActivityMessage { message, count: 1 });
         }
         Err(error) => {
-            eprintln!(
+            bridge_eprintln!(
                 "activity create delivery error for pane {}: {error}",
                 frame.pane_id
             );
@@ -2016,7 +2018,7 @@ fn capture_for_or_report(snapshot: &AgentSnapshot) -> Option<AgentLogCapture> {
     match capture_for(snapshot) {
         Ok(capture) => Some(capture),
         Err(error) => {
-            eprintln!("agent log capture error: {error}");
+            bridge_eprintln!("agent log capture error: {error}");
             None
         }
     }
@@ -2040,7 +2042,7 @@ fn capture_for_blocked_with_search_root(
     match capture_for_with_search_root(snapshot, search_root) {
         Ok(capture) => capture,
         Err(error) => {
-            eprintln!("agent blocked-context capture error: {error}");
+            bridge_eprintln!("agent blocked-context capture error: {error}");
             AgentLogCapture {
                 message: format!("blocked context unavailable: {error}"),
                 failure: None,
@@ -2164,7 +2166,7 @@ async fn sync_startup_topology(
     let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
         Ok(lists) => lists,
         Err(error) => {
-            eprintln!("herdr startup topology error: {error}");
+            bridge_eprintln!("herdr startup topology error: {error}");
             return;
         }
     };
@@ -2185,7 +2187,7 @@ async fn sync_startup_topology(
             Ok(route) => route,
             Err(RouteError::TitlePending { .. }) => continue,
             Err(error) => {
-                eprintln!("herdr startup topology error: {error}");
+                bridge_eprintln!("herdr startup topology error: {error}");
                 continue;
             }
         };
@@ -2196,7 +2198,7 @@ async fn sync_startup_topology(
             let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
                 Ok(fetched) => fetched,
                 Err(error) => {
-                    eprintln!("herdr startup topology error: {error}");
+                    bridge_eprintln!("herdr startup topology error: {error}");
                     continue;
                 }
             };
@@ -2205,13 +2207,13 @@ async fn sync_startup_topology(
         let result = sync_topology(client.as_ref(), *guild, channels, active_threads, &route).await;
         drop(guard);
         if let Err(error) = result {
-            eprintln!("herdr startup topology error: {error}");
+            bridge_eprintln!("herdr startup topology error: {error}");
         }
     }
     let (workspaces, live_tabs) = match (workspace_list_result(), tab_list_result()) {
         (Ok(workspaces), Ok(live_tabs)) => (workspaces, live_tabs),
         (Err(error), _) | (_, Err(error)) => {
-            eprintln!("herdr startup topology reconciliation error: {error}");
+            bridge_eprintln!("herdr startup topology reconciliation error: {error}");
             return;
         }
     };
@@ -2227,7 +2229,7 @@ async fn sync_startup_topology(
         let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
             Ok(fetched) => fetched,
             Err(error) => {
-                eprintln!("herdr startup topology error: {error}");
+                bridge_eprintln!("herdr startup topology error: {error}");
                 return;
             }
         };
@@ -2243,7 +2245,7 @@ async fn sync_startup_topology(
     .await;
     drop(guard);
     if let Err(error) = result {
-        eprintln!("herdr startup topology reconciliation error: {error}");
+        bridge_eprintln!("herdr startup topology reconciliation error: {error}");
     }
 }
 
@@ -2291,7 +2293,7 @@ async fn delete_closed_topology_batch(
             }
         };
         if let Err(error) = result {
-            eprintln!("herdr topology closure error: {error}");
+            bridge_eprintln!("herdr topology closure error: {error}");
         }
     }
     Ok(())
@@ -2385,7 +2387,7 @@ fn discord_connection(
             let (notices_tx, notices_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 while let Ok(notice) = notices_rx.recv() {
-                    eprintln!("{notice}");
+                    bridge_eprintln!("{notice}");
                 }
             });
             let responder = Arc::new(PermissionResponder::new(
@@ -2988,7 +2990,7 @@ async fn apply_lifecycle_batch(
 
     let closures: Vec<TopologyClosure> = batch.iter().filter_map(lifecycle_closure).collect();
     if let Err(error) = delete_closed_topology_batch(discord, &closures).await {
-        eprintln!("herdr topology closure error: {error}");
+        bridge_eprintln!("herdr topology closure error: {error}");
     }
 
     let worth_doorbell = batch.iter().any(|event| {
@@ -3027,11 +3029,11 @@ fn spawn_startup_topology_sweep(discord: &DiscordConnection) {
                 tokio::spawn(async move { sync_startup_topology(&discord, &agents, &tabs).await });
             tokio::spawn(async move {
                 if let Err(error) = startup_task.await {
-                    eprintln!("herdr startup topology task error: {error}");
+                    bridge_eprintln!("herdr startup topology task error: {error}");
                 }
             });
         }
-        Err(error) => eprintln!("herdr startup topology snapshot error: {error}"),
+        Err(error) => bridge_eprintln!("herdr startup topology snapshot error: {error}"),
     }
 }
 
@@ -3042,7 +3044,7 @@ async fn handle_lifecycle_subscribe_error(
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime,
 ) -> bool {
-    eprintln!("herdr lifecycle subscribe error: {error}");
+    bridge_eprintln!("herdr lifecycle subscribe error: {error}");
     let Some(next_lifecycle) = unwrap_or_shutdown(
         subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), stop).await,
         broker,
@@ -3110,7 +3112,7 @@ async fn handle_status_select_result(
             .await
         }
         Err(error) => {
-            eprintln!("herdr status subscribe error: {error}");
+            bridge_eprintln!("herdr status subscribe error: {error}");
             let Some(next_status) = unwrap_or_shutdown(
                 subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
                 broker,
@@ -3140,7 +3142,7 @@ async fn subscribe_herdr_events_with_backoff(
         match subscribe_herdr_events(subscriptions).await {
             Ok(subscription) => return Ok(subscription),
             Err(error) => {
-                eprintln!("herdr subscribe error: {error}; retrying in {delay:?}");
+                bridge_eprintln!("herdr subscribe error: {error}; retrying in {delay:?}");
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {
                         delay = delay.saturating_mul(2).min(SUBSCRIBE_RETRY_MAX);
@@ -3175,7 +3177,7 @@ async fn subscribe_status_with_backoff(
         match outcome {
             Ok(result) => return Ok(result),
             Err(error) => {
-                eprintln!("herdr status subscribe error: {error}; retrying in {delay:?}");
+                bridge_eprintln!("herdr status subscribe error: {error}; retrying in {delay:?}");
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {
                         delay = delay.saturating_mul(2).min(SUBSCRIBE_RETRY_MAX);
@@ -3287,7 +3289,7 @@ async fn sync_pending_titles(
                 if let Err(error) =
                     sync_route(client.as_ref(), *guild, &route, responder.topology_cache()).await
                 {
-                    eprintln!("{error}");
+                    bridge_eprintln!("{error}");
                 }
             }
             Err(error) => {
@@ -3310,7 +3312,7 @@ async fn doorbell_snapshot(
                 *status = subscribe_status_with_backoff(pane_ids, stop).await?;
             }
         }
-        Err(error) => eprintln!("herdr snapshot error: {error}"),
+        Err(error) => bridge_eprintln!("herdr snapshot error: {error}"),
     }
     Ok(())
 }

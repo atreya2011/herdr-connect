@@ -77,3 +77,51 @@ pub use topology::{
     workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};
+
+/// UTC wall-clock timestamp for one bridge log line, so a later occurrence in the same log can be
+/// lined up against session-log times.
+#[must_use]
+pub fn log_timestamp() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "0000-00-00T00:00:00Z".to_owned())
+}
+
+/// Prefixes a bridge stdout line with [`log_timestamp`].
+///
+/// Use in place of `println!` for every line the bridge process emits, so `bridge_eprintln!` and
+/// this macro are the only sources of bridge log output.
+#[macro_export]
+macro_rules! bridge_println {
+    ($($arg:tt)*) => {
+        println!("{} {}", $crate::log_timestamp(), format!($($arg)*))
+    };
+}
+
+/// Prefixes a bridge stderr line with [`log_timestamp`]. Use in place of `eprintln!` for every line
+/// the bridge process emits.
+#[macro_export]
+macro_rules! bridge_eprintln {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", $crate::log_timestamp(), format!($($arg)*))
+    };
+}
+
+#[cfg(test)]
+mod log_timestamp_tests {
+    use super::log_timestamp;
+
+    #[test]
+    fn log_timestamp_is_rfc3339_utc() {
+        let stamp = log_timestamp();
+        assert!(
+            stamp.ends_with('Z'),
+            "expected an RFC 3339 UTC ('Z') timestamp, got {stamp}"
+        );
+        let mut parts = stamp.splitn(2, 'T');
+        let date = parts.next().expect("date component");
+        assert_eq!(date.len(), 10, "expected YYYY-MM-DD, got {date}");
+        assert_eq!(date.as_bytes()[4], b'-');
+        assert_eq!(date.as_bytes()[7], b'-');
+    }
+}

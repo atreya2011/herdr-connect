@@ -30,7 +30,7 @@ use crate::question::{
 };
 use crate::registry::{ApprovalRequest, InteractionRegistry, QuestionRegistry, ResolveError};
 use crate::{
-    TopologyCache, deliver_permission_card, deliver_question_button_card,
+    TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_button_card,
     deliver_question_select_card, expire_question_button_card, expire_question_select_card,
     fetch_topology_lists, list_agents, route_topology, sync_topology, tab_list_result,
 };
@@ -179,7 +179,7 @@ where
 {
     std::mem::drop(tokio::spawn(async move {
         if let Err(error) = card_edit.await {
-            eprintln!("card edit failed: {error}");
+            bridge_eprintln!("card edit failed: {error}");
         }
     }));
     value
@@ -331,7 +331,7 @@ impl PermissionResponder {
             result = route_task => result.ok().and_then(|result| match result {
                 Ok(route) => Some(route),
                 Err(error) => {
-                    eprintln!("{error}");
+                    bridge_eprintln!("{error}");
                     None
                 }
             }),
@@ -353,7 +353,7 @@ impl PermissionResponder {
         );
         let channel = tokio::select! {
             result = channel_task => result.map_err(|error| {
-                eprintln!("{error}");
+                bridge_eprintln!("{error}");
                 error
             }).ok(),
             () = liveness.wait_closed() => None,
@@ -589,7 +589,7 @@ impl PermissionResponder {
                 let message = match result {
                     Ok(message) => message,
                     Err(error) => {
-                        eprintln!("question card delivery failed: {error}");
+                        bridge_eprintln!("question card delivery failed: {error}");
                         self.question_registry.remove(token);
                         return None;
                     }
@@ -885,7 +885,7 @@ pub async fn request_decision(
         let mut stream = match UnixStream::connect(socket_path).await {
             Ok(stream) => stream,
             Err(error) => {
-                eprintln!(
+                bridge_eprintln!(
                     "broker request failed: connect to {}: {error}",
                     socket_path.display()
                 );
@@ -1077,11 +1077,11 @@ async fn handle_connection(
     {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(error)) => {
-            eprintln!("broker rejected initial frame: {error}");
+            bridge_eprintln!("broker rejected initial frame: {error}");
             return;
         }
         Err(_) => {
-            eprintln!("broker rejected initial frame: initial frame read timed out");
+            bridge_eprintln!("broker rejected initial frame: initial frame read timed out");
             return;
         }
     };
@@ -1093,7 +1093,7 @@ async fn handle_connection(
     }
     if is_question_frame(&bytes) {
         let Ok(frame) = serde_json::from_slice::<QuestionFrame>(&bytes) else {
-            eprintln!("broker rejected initial frame: malformed question frame");
+            bridge_eprintln!("broker rejected initial frame: malformed question frame");
             return;
         };
         let (read_half, mut write_half) = stream.into_split();
@@ -1115,7 +1115,7 @@ async fn handle_connection(
         Ok(interaction) if is_valid_interaction(&interaction) => interaction,
         Ok(_) => return,
         Err(error) => {
-            eprintln!("broker rejected initial frame: malformed broker frame: {error}");
+            bridge_eprintln!("broker rejected initial frame: malformed broker frame: {error}");
             return;
         }
     };
