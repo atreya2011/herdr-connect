@@ -5342,12 +5342,20 @@ mod tests {
         )
         .await?;
         let first_messages = thread_full_messages(guild, thread).await?;
-        assert_terminal_prompt_mirrored_before_reply(
-            &first_messages,
-            &first_prompt,
-            &first_reply,
-            &identity.display_name,
-        )?;
+        if vendor == VENDOR_CODEX {
+            // Codex reports its session only once the pane is already `working`, by which point its
+            // log already holds this first prompt. Per rule 1 a prompt already in the log at the
+            // bridge's first sight of the session is never replayed, so this first prompt is not
+            // mirrored; the baseline this turn establishes lets the next terminal prompt mirror.
+            assert_prompt_was_not_mirrored(&first_messages, &first_prompt)?;
+        } else {
+            assert_terminal_prompt_mirrored_before_reply(
+                &first_messages,
+                &first_prompt,
+                &first_reply,
+                &identity.display_name,
+            )?;
+        }
 
         let mirrored_reply = format!("terminal-origin-{vendor}-mirrored-{nonce}");
         let mirrored_prompt = format!("Reply with exactly: {mirrored_reply}");
@@ -5674,8 +5682,9 @@ mod tests {
     }
 
     /// Row 1: asserts `messages` (the thread right after turn one settles) holds exactly one
-    /// activity message naming `Bash`, no card (embed) at all, and that the activity message was
-    /// posted before the turn's live `done` text. Returns that message's id.
+    /// activity message naming `Bash` and no card (embed) at all -- a turn that does not block posts
+    /// no card. The exercise wires no live capture, so the turn's own reply text is not in the
+    /// thread; that live-text path is covered by the live-capture rows. Returns the message's id.
     #[cfg(unix)]
     fn assert_first_turn_activity(
         messages: &[(String, bool, Id<MessageMarker>)],
@@ -5691,20 +5700,6 @@ mod tests {
         };
         if !text.contains("Bash") {
             return Err(format!("activity message did not name Bash: {text}"));
-        }
-        // The turn's live text (the word `done`) is the only plain, non-activity message.
-        let Some(done_text_id) = messages
-            .iter()
-            .filter(|(content, embed, _)| !embed && !content.starts_with('⚙'))
-            .map(|(_, _, id)| *id)
-            .min()
-        else {
-            return Err(format!(
-                "no live text was posted for turn one, thread has {messages:?}"
-            ));
-        };
-        if *activity_id >= done_text_id {
-            return Err("activity message was not posted before the turn's live text".to_owned());
         }
         Ok(*activity_id)
     }
