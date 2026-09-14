@@ -100,11 +100,12 @@ struct BridgeState {
     live_watches: HashMap<String, LiveWatch>,
     /// `None` in tests that never wire live capture up.
     live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Terminals whose live-capture error -- an unfollowable log path, a read failure, a route
-    /// failure, or a failed post -- was already logged once, so it is not repeated on every later
-    /// event. Cleared once a full read-and-deliver for the terminal succeeds, so the next distinct
-    /// error is logged afresh.
-    live_errors_reported: HashSet<String>,
+    /// Live-capture errors -- a read failure, a route failure, or a failed post -- already logged
+    /// for a terminal, keyed by the terminal and the error text together so the same error is not
+    /// repeated on every later event while a different error still is. Every entry for a terminal
+    /// is cleared once a full read-and-deliver for it succeeds, so a recurring error after a
+    /// recovery is logged afresh.
+    live_errors_reported: HashSet<(String, String)>,
     /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
     /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
     /// Forgotten -- not deleted -- when the pane next reports `working`, so the new turn starts a
@@ -603,8 +604,8 @@ enum SessionPathError {
     /// snapshot.
     NotFoundYet(String),
     /// A real, non-transient problem — an ambiguous session (multiple candidate logs), an
-    /// unsupported vendor, or a search directory that cannot be read at all — that a caller should
-    /// stop retrying and mark unfollowable instead.
+    /// unsupported vendor, or a search directory that cannot be read at all — surfaced as an error
+    /// the caller logs, rather than silently awaited like a log that has simply not appeared yet.
     Permanent(String),
 }
 
@@ -1305,11 +1306,12 @@ fn terminal_prompt_baseline_is_current(
 /// the bridge-owned webhook, in log order, ahead of any assistant text the same `notify` tick
 /// delivers -- the caller runs this before reading live text.
 ///
-/// Reads forward from the path and position [`maybe_establish_terminal_prompt_baseline`] last left
-/// in [`BridgeState::terminal_prompt_positions`] -- independent of the live-text watch's own
-/// turn-scoped position, so a later turn's own initiating prompt is mirrored rather than treated as
-/// pre-existing. Does nothing if that baseline is not established yet: `process_snapshot` always
-/// runs it first, for every status, before this function ever has a `LiveWatch` to be called from.
+/// Reads forward from the path and prompt position [`maybe_establish_terminal_prompt_baseline`]
+/// last left in [`BridgeState::terminal_prompt_positions`] -- its own position, advanced only past
+/// prompts, distinct from the live-text watch's position advanced past assistant texts, so each
+/// reader tracks its own progress through the shared log. Does nothing if that baseline is not
+/// established yet: `process_snapshot` always runs it first, for every status, before this function
+/// ever has a `LiveWatch` to be called from.
 ///
 /// A prompt equal to a pending [`take_owner_prompt_suppression`] marker is dropped once instead of
 /// mirrored: it is the bridge's own Discord-originated prompt, already posted by the owner in the
@@ -1415,7 +1417,10 @@ async fn handle_live_event(
     let (texts, read_position) = match read_new_live_texts(watch) {
         Ok(result) => result,
         Err(error) => {
-            if state.live_errors_reported.insert(terminal.to_owned()) {
+            if state
+                .live_errors_reported
+                .insert((terminal.to_owned(), error.clone()))
+            {
                 bridge_eprintln!("live capture read error for {terminal}: {error}");
             }
             return;
@@ -1425,7 +1430,10 @@ async fn handle_live_event(
     let channel = match sync_route(client.as_ref(), *guild, &route, topology_cache).await {
         Ok(channel) => channel,
         Err(error) => {
-            if state.live_errors_reported.insert(terminal.to_owned()) {
+            if state
+                .live_errors_reported
+                .insert((terminal.to_owned(), error.clone()))
+            {
                 bridge_eprintln!("live capture route error for {terminal}: {error}");
             }
             return;
@@ -1442,7 +1450,10 @@ async fn handle_live_event(
                 if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
                     *topology_cache.lock().await = None;
                 }
-                if state.live_errors_reported.insert(terminal.to_owned()) {
+                if state
+                    .live_errors_reported
+                    .insert((terminal.to_owned(), error.clone()))
+                {
                     bridge_eprintln!("live capture delivery error for {terminal}: {error}");
                 }
                 posted_all = false;
@@ -1457,7 +1468,9 @@ async fn handle_live_event(
     }
     if all_delivered {
         delivered_position = read_position;
-        state.live_errors_reported.remove(terminal);
+        state
+            .live_errors_reported
+            .retain(|(reported_terminal, _)| reported_terminal != terminal);
     }
     if let Some(watch) = state.live_watches.get_mut(terminal) {
         watch.position = match watch.vendor.as_str() {
@@ -1819,7 +1832,7 @@ fn prune_departed_state(
         .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .live_errors_reported
-        .retain(|terminal| current_terminals.contains(terminal));
+        .retain(|(terminal, _)| current_terminals.contains(terminal));
     state
         .terminal_prompt_positions
         .retain(|terminal, _| current_terminals.contains(terminal));
