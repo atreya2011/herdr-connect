@@ -5649,11 +5649,15 @@ mod tests {
     }
 
     /// Row 1: asserts `messages` (the thread right after turn one settles) holds exactly one
-    /// activity message naming `Bash`, posted before the end card. Returns that message's id.
+    /// activity message naming `Bash`, no card (embed) at all, and that the activity message was
+    /// posted before the turn's live `done` text. Returns that message's id.
     #[cfg(unix)]
     fn assert_first_turn_activity(
         messages: &[(String, bool, Id<MessageMarker>)],
     ) -> Result<Id<MessageMarker>, String> {
+        if let Some((content, _, _)) = messages.iter().find(|(_, embed, _)| *embed) {
+            return Err(format!("a card was posted for turn one: {content:?}"));
+        }
         let rows = activity_message_rows(messages);
         let [(text, _, activity_id)] = rows.as_slice() else {
             return Err(format!(
@@ -5663,11 +5667,19 @@ mod tests {
         if !text.contains("Bash") {
             return Err(format!("activity message did not name Bash: {text}"));
         }
-        let Some((_, _, end_card_id)) = messages.iter().find(|(_, embed, _)| *embed) else {
-            return Err("no end card was posted for turn one".to_owned());
+        // The turn's live text (the word `done`) is the only plain, non-activity message.
+        let Some(done_text_id) = messages
+            .iter()
+            .filter(|(content, embed, _)| !embed && !content.starts_with('⚙'))
+            .map(|(_, _, id)| *id)
+            .min()
+        else {
+            return Err(format!(
+                "no live text was posted for turn one, thread has {messages:?}"
+            ));
         };
-        if activity_id >= end_card_id {
-            return Err("activity message was not posted before the end card".to_owned());
+        if *activity_id >= done_text_id {
+            return Err("activity message was not posted before the turn's live text".to_owned());
         }
         Ok(*activity_id)
     }
@@ -6748,31 +6760,6 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
-    }
-
-    #[cfg(unix)]
-    async fn thread_card_descriptions(
-        guild: &BlockedCaptureGuild,
-        thread: Id<ChannelMarker>,
-    ) -> Result<Vec<String>, String> {
-        let messages = guild
-            .client
-            .channel_messages(thread)
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(messages
-            .into_iter()
-            .filter_map(|message| {
-                message
-                    .embeds
-                    .into_iter()
-                    .next()
-                    .and_then(|embed| embed.description)
-            })
-            .collect())
     }
 
     /// Generates a session id shaped like a real Claude session UUID, unique enough for a single
@@ -8895,7 +8882,11 @@ mod tests {
         claude_workspace: &Workspace,
         agent_name: &str,
     ) -> Result<(), String> {
-        let mut state = BridgeState::default();
+        let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = BridgeState {
+            live_tx: Some(live_tx),
+            ..BridgeState::default()
+        };
         let connection = discord_tuple(guild);
         drive_idle_working_done(silent_workspace, &connection, &mut state).await?;
         let silent_matching = matching_tab(&silent_workspace.tab_id)?;
@@ -8963,6 +8954,12 @@ mod tests {
             &mut state,
         )
         .await;
+        while let Ok(terminal_id) = live_events.try_recv() {
+            handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+        }
+        // The persistent watch has no settle-time read of its own, so read once more to deliver the
+        // reply written just before `done`.
+        handle_live_event(Some(&connection), &claude_terminal, &mut state).await;
 
         let channel = guild_channel_with_topic(guild, &claude_topic)
             .await
@@ -8978,15 +8975,15 @@ mod tests {
                         .is_some_and(|name| name.ends_with(&claude_suffix))
             })
             .ok_or_else(|| "reporting a session did not create the tab thread".to_owned())?;
-        let messages = thread_card_descriptions(guild, thread.id).await?;
+        let messages = thread_messages(guild, thread.id).await?;
         if messages
             .iter()
-            .any(|description| description.to_lowercase().contains("ready"))
+            .any(|(content, embed, _)| !embed && content.to_lowercase().contains("ready"))
         {
             Ok(())
         } else {
             Err(format!(
-                "reporting a session did not post the new transition's card, thread has {messages:?}"
+                "reporting a session did not post the reply as live text, thread has {messages:?}"
             ))
         }
     }
