@@ -1510,6 +1510,12 @@ async fn handle_activity_event(
     let Some(channel) = cached_route_channel(topology_cache, &route).await else {
         return;
     };
+    // The eligibility gate covers both editing and creating: a frame that arrives after the pane
+    // left `working` (its activity message still lingering until the next turn) is dropped rather
+    // than editing the settled turn's message.
+    if !state.activity_eligible_panes.contains(&frame.pane_id) {
+        return;
+    }
     if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
         let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
         match update_activity_message(client.as_ref(), channel, existing.message, &text).await {
@@ -1524,9 +1530,6 @@ async fn handle_activity_event(
                 );
             }
         }
-        return;
-    }
-    if !state.activity_eligible_panes.contains(&frame.pane_id) {
         return;
     }
     let text = activity_message_text(1, &frame.tool, &frame.summary);
