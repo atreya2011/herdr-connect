@@ -269,6 +269,33 @@ pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&output).map_err(|error| error.to_string())
 }
 
+/// Returns whether a `cursor-agent` argv runs hands-off.
+///
+/// Cursor's `--force` and its aliases `-f` and `--yolo` allow every shell command unless a hook
+/// explicitly denies it, so the bridge answers those seats itself instead of asking the owner.
+/// Only exact tokens count.
+#[must_use]
+pub fn cursor_argv_forces_allow(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|arg| matches!(arg.as_str(), "--yolo" | "-f" | "--force"))
+}
+
+/// Returns whether an argv belongs to the `cursor-agent` CLI process.
+///
+/// The installed launcher execs node as `<invoked name> [--use-system-ca]
+/// <install>/cursor-agent/versions/<v>/index.js <flags>`, and the invoked name can be the `agent`
+/// symlink, so the process is recognised by the bundle argument: a path with a `cursor-agent`
+/// component whose file name is `index.js`. Wrappers such as `timeout 120 cursor-agent --yolo` or
+/// `zsh -c` carry `cursor-agent` only as a bare word or inside a string and do not match.
+#[must_use]
+pub fn is_cursor_agent_argv(argv: &[String]) -> bool {
+    argv.iter().any(|arg| {
+        let mut components = arg.split('/');
+        components.next_back() == Some("index.js")
+            && components.any(|component| component == "cursor-agent")
+    })
+}
+
 fn encode_permission_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&serde_json::json!({
         "hookSpecificOutput": {

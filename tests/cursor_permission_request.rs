@@ -3,7 +3,10 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-use herdr_connect_rs::{Decision, decode_cursor_permission_request, encode_cursor_decision};
+use herdr_connect_rs::{
+    Decision, cursor_argv_forces_allow, decode_cursor_permission_request, encode_cursor_decision,
+    is_cursor_agent_argv,
+};
 
 #[test]
 fn captured_cursor_permission_fixture_decodes_into_interaction() {
@@ -171,4 +174,50 @@ fn explicit_codex_vendor_preserves_empty_output_when_payload_is_undecodable() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn cursor_argv_force_flags_match_exact_tokens_only() {
+    let cases = [
+        (vec!["cursor-agent", "--yolo"], true),
+        (vec!["cursor-agent", "-f"], true),
+        (vec!["cursor-agent", "--force", "-p"], true),
+        (vec!["cursor-agent", "--trust", "-p"], false),
+        (vec!["cursor-agent", "--force-something"], false),
+    ];
+    for (argv, expected) in cases {
+        let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
+        assert_eq!(cursor_argv_forces_allow(&argv), expected, "argv: {argv:?}");
+    }
+}
+
+#[test]
+fn cursor_agent_process_is_recognised_by_its_bundle_path_not_by_wrappers() {
+    let bundle = "/home/user/.local/share/cursor-agent/versions/2026.09.18-9a7762b/index.js";
+    let cases = [
+        (
+            vec![
+                "/home/user/.local/bin/cursor-agent",
+                "--use-system-ca",
+                bundle,
+                "--yolo",
+            ],
+            true,
+        ),
+        (
+            vec![
+                "/home/user/.local/bin/agent",
+                "--use-system-ca",
+                bundle,
+                "--yolo",
+            ],
+            true,
+        ),
+        (vec!["timeout", "120", "cursor-agent", "--yolo"], false),
+        (vec!["/usr/bin/zsh", "-c", "cursor-agent --yolo"], false),
+    ];
+    for (argv, expected) in cases {
+        let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
+        assert_eq!(is_cursor_agent_argv(&argv), expected, "argv: {argv:?}");
+    }
 }

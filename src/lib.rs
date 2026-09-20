@@ -52,9 +52,10 @@ pub use herdr::{
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
-    PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, decode_claude_permission_request,
-    decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
-    encode_codex_decision, encode_cursor_decision,
+    PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, cursor_argv_forces_allow,
+    decode_claude_permission_request, decode_codex_permission_request,
+    decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
+    encode_cursor_decision, is_cursor_agent_argv,
 };
 pub use prompting::{
     maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,

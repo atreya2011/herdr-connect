@@ -38,10 +38,10 @@ use herdr_connect_rs::{
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
-    VENDOR_CURSOR, decode_claude_permission_request, decode_codex_permission_request,
-    decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
-    encode_cursor_decision, handle_component, request_decision,
-    run_broker as run_permission_broker,
+    VENDOR_CURSOR, cursor_argv_forces_allow, decode_claude_permission_request,
+    decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
+    encode_codex_decision, encode_cursor_decision, handle_component, is_cursor_agent_argv,
+    request_decision, run_broker as run_permission_broker,
 };
 use herdr_connect_rs::{
     decode_claude_ask_question, encode_claude_question_decision, question_hook_timeout,
@@ -1948,6 +1948,15 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     };
+    // Cursor fires beforeShellExecution even under --force/--yolo and its payload carries no
+    // run-mode field, so a card that times out would deny every command of a hands-off seat.
+    // The cursor-agent process's own flags are the only signal; anything unreadable falls
+    // through to the card.
+    if matches!(interaction.vendor, PermissionVendor::Cursor)
+        && cursor_agent_ancestor_argv().is_some_and(|argv| cursor_argv_forces_allow(&argv))
+    {
+        return write_hook_decision(PermissionVendor::Cursor, Some(&Decision::allow())).await;
+    }
     let socket_path = match requested_socket
         .or_else(|| std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET").map(std::path::PathBuf::from))
     {
@@ -1993,6 +2002,44 @@ async fn run_question_hook(
     stdout.write_all(&output).await?;
     stdout.flush().await?;
     Ok(())
+}
+
+/// Returns the argv of the nearest `cursor-agent` ancestor of this hook process, walking the
+/// `/proc` parent chain from the parent upward. Off Linux, at pid 1 or 0, on any `/proc` read
+/// error, or with no such ancestor this returns `None` so the caller keeps the card flow.
+fn cursor_agent_ancestor_argv() -> Option<Vec<String>> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let mut pid = proc_parent_pid("self")?;
+    while pid > 1 {
+        let entry = pid.to_string();
+        let argv = proc_argv(&entry)?;
+        if is_cursor_agent_argv(&argv) {
+            return Some(argv);
+        }
+        pid = proc_parent_pid(&entry)?;
+    }
+    None
+}
+
+fn proc_parent_pid(entry: &str) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{entry}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn proc_argv(entry: &str) -> Option<Vec<String>> {
+    let cmdline = std::fs::read(format!("/proc/{entry}/cmdline")).ok()?;
+    Some(
+        cmdline
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
 }
 
 async fn write_hook_decision(
