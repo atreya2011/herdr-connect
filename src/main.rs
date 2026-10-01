@@ -671,7 +671,13 @@ fn resolve_session_path(
                     &mut candidates,
                 )?;
             }
-            unique_existing_path(&candidates, "codex session log")
+            // Codex continues a session in a new rollout whose filename timestamp sorts later.
+            candidates
+                .into_iter()
+                .max_by(|left, right| left.file_name().cmp(&right.file_name()))
+                .ok_or_else(|| {
+                    SessionPathError::NotFoundYet("codex session log was not found".to_owned())
+                })
         }
         VENDOR_CURSOR => {
             let chats = search_root.join(".cursor/chats");
@@ -3400,6 +3406,90 @@ mod tests {
                 }
             }
             fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
+        }
+    }
+
+    #[test]
+    fn codex_session_rollouts_resolve_to_newest_filename_timestamp() {
+        const ORIGINAL: &str =
+            "rollout-2026-09-28T09-50-11-00000000-0000-7000-8000-000000000001.jsonl";
+        const CONTINUATION: &str = "rollout-2026-09-28T12-38-56-00000000-0000-7000-8000-000000000001_00000000-0000-7000-8000-000000000002.jsonl";
+        let cases = [
+            (
+                "single file",
+                vec![ORIGINAL],
+                ORIGINAL,
+                "original answer",
+                "original prompt",
+            ),
+            (
+                "original plus continuation",
+                vec![CONTINUATION, ORIGINAL],
+                CONTINUATION,
+                "continuation answer",
+                "continuation prompt",
+            ),
+            (
+                "continuation only",
+                vec![CONTINUATION],
+                CONTINUATION,
+                "continuation answer",
+                "continuation prompt",
+            ),
+        ];
+        for (index, (name, files, expected_file, expected_message, expected_prompt)) in
+            cases.into_iter().enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-connect-rs-codex-rollouts-{}-{index}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            let directory = root.join(".codex-one/sessions/2026/09/28");
+            fs::create_dir_all(&directory).expect("create synthetic Codex sessions directory");
+            for file in files {
+                fs::copy(
+                    Path::new("tests/fixtures/codex-rollouts").join(file),
+                    directory.join(file),
+                )
+                .expect("copy committed Codex rollout fixture");
+            }
+            let session = AgentSession {
+                agent: VENDOR_CODEX.to_owned(),
+                value: "00000000-0000-7000-8000-000000000001".to_owned(),
+            };
+            let snapshot = AgentSnapshot {
+                agent: Some(VENDOR_CODEX.to_owned()),
+                terminal_id: "codex-rollout-terminal".to_owned(),
+                agent_status: STATUS_DONE.to_owned(),
+                tab_id: None,
+                workspace_id: None,
+                pane_id: None,
+                cwd: Some("/srv/bridge".to_owned()),
+                session: Some(session.clone()),
+            };
+            let resolved = resolve_session_path(&root, &snapshot, &session);
+            let capture = capture_for_with_search_root(&snapshot, &root);
+            let prompts = resolved.as_ref().ok().map(|path| {
+                herdr_connect_rs::read_codex_prompts_incremental(path, 0)
+                    .expect("read selected Codex rollout prompts")
+                    .0
+                    .into_iter()
+                    .map(|(prompt, _)| prompt)
+                    .collect::<Vec<_>>()
+            });
+            fs::remove_dir_all(&root).expect("remove synthetic Codex HOME directory");
+            assert!(!root.exists(), "{name}: synthetic HOME cleanup");
+            assert_eq!(resolved, Ok(directory.join(expected_file)), "{name}");
+            assert_eq!(
+                capture.expect("selected Codex rollout resolves").message,
+                expected_message,
+                "{name}"
+            );
+            assert_eq!(prompts, Some(vec![expected_prompt.to_owned()]), "{name}");
         }
     }
 
