@@ -1,0 +1,19 @@
+# systemd user unit: copy to ~/.config/systemd/user/herdr-connect.service, then
+#   systemctl --user daemon-reload && systemctl --user enable --now herdr-connect
+#   loginctl enable-linger $USER   # keeps the service running without a login session
+# Logs: journalctl --user -u herdr-connect -f
+[Unit]
+Description=herdr-connect bridge (Herdr <-> Discord)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/herdr-connect-publish
+EnvironmentFile=%h/herdr-connect-publish/.env
+Environment=HERDR_SOCKET_PATH=%h/.config/herdr/herdr.sock
+ExecStart=%h/.cargo/bin/herdr-connect-rs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
