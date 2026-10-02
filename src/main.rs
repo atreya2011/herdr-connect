@@ -64,20 +64,29 @@ struct InformationalCard {
     message: Id<MessageMarker>,
 }
 
-/// Where an incremental vendor-log reader resumes from: a byte offset for the Claude JSONL log, a
-/// `rowid` for the Cursor sqlite store.
+/// A vendor-log reader and where it resumes from: a byte offset into the Claude or Codex JSONL
+/// log, a `rowid` of the Cursor sqlite store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LivePosition {
-    Bytes(u64),
-    RowId(i64),
+enum Follower {
+    Claude(u64),
+    Codex(u64),
+    Cursor(i64),
+}
+
+impl std::fmt::Display for Follower {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claude(offset) | Self::Codex(offset) => write!(formatter, "{offset}"),
+            Self::Cursor(rowid) => write!(formatter, "{rowid}"),
+        }
+    }
 }
 
 /// Dropping this stops its `notify` watcher.
 struct LiveWatch {
     _watcher: notify::RecommendedWatcher,
-    vendor: String,
     path: PathBuf,
-    position: LivePosition,
+    follower: Follower,
     /// Resolves the tab thread to post into on every event through the cache-first `sync_route`,
     /// so the live event loop needs no agent/tab snapshot in scope and a thread deleted outside the
     /// bridge's own tracking is re-resolved on the next event once the cache is cleared.
@@ -124,7 +133,7 @@ struct BridgeState {
     /// re-baselined when a later session on the same terminal (`/clear`, resume, a relaunch, or a
     /// vendor starting a fresh file or store) resolves a different path, rather than reusing a stale
     /// position from the old file.
-    terminal_prompt_positions: HashMap<String, (PathBuf, LivePosition, LivePosition)>,
+    terminal_prompt_positions: HashMap<String, (PathBuf, Follower, Follower)>,
     /// Panes seen with a session whose [`live_log_path`] returned `Ok(None)` -- the log does not
     /// exist on disk yet -- keyed by terminal, valued by that session's identity. A fresh pane, a
     /// new session after `/clear`, or a relaunch before its first write records its own session
@@ -813,7 +822,7 @@ fn live_log_path(
 /// file, set up before the sibling exists (the common case for a freshly started pane), would never
 /// see it appear.
 fn start_notify_watcher(
-    vendor: &str,
+    follower: Follower,
     path: &Path,
     terminal: String,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -832,7 +841,7 @@ fn start_notify_watcher(
             Err(error) => bridge_eprintln!("live capture watch error for {terminal}: {error}"),
         })
         .map_err(|error| error.to_string())?;
-    let target = if vendor == VENDOR_CURSOR {
+    let target = if matches!(follower, Follower::Cursor(_)) {
         path.parent()
             .ok_or_else(|| format!("cursor store {} has no parent", path.display()))?
     } else {
@@ -848,32 +857,31 @@ fn start_notify_watcher(
 /// first sight: past every assistant text currently in it, so a bridge that discovers a pane
 /// mid-conversation never replays its history. A follower whose log did not exist yet at first
 /// sight starts at 0 instead (see [`ensure_live_watch_started`]), so the whole log it later writes
-/// is posted.
-fn initial_live_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
+/// is posted. `vendor` selects the log format; its position is ignored.
+fn initial_live_position(vendor: Follower, path: &Path) -> Result<Follower, String> {
     match vendor {
-        VENDOR_CLAUDE => read_claude_incremental(path, 0).map(|(_, end)| LivePosition::Bytes(end)),
-        VENDOR_CODEX => read_codex_incremental(path, 0).map(|(_, end)| LivePosition::Bytes(end)),
-        VENDOR_CURSOR => read_cursor_incremental(path, 0).map(|(_, end)| LivePosition::RowId(end)),
-        other => Err(format!(
-            "live capture: unsupported vendor for initial position: {other}"
-        )),
+        Follower::Claude(_) => {
+            read_claude_incremental(path, 0).map(|(_, end)| Follower::Claude(end))
+        }
+        Follower::Codex(_) => read_codex_incremental(path, 0).map(|(_, end)| Follower::Codex(end)),
+        Follower::Cursor(_) => {
+            read_cursor_incremental(path, 0).map(|(_, end)| Follower::Cursor(end))
+        }
     }
 }
 
 /// The position a terminal's terminal-prompt mirroring starts from the first time it is ever
 /// established for that terminal: past every prompt already in the vendor log, so a bridge that
-/// discovers a pane mid-conversation never replays its history.
-fn initial_terminal_prompt_position(vendor: &str, path: &Path) -> Result<LivePosition, String> {
+/// discovers a pane mid-conversation never replays its history. `vendor` selects the log format;
+/// its position is ignored.
+fn initial_terminal_prompt_position(vendor: Follower, path: &Path) -> Result<Follower, String> {
     match vendor {
-        VENDOR_CLAUDE => read_claude_prompts_incremental(path, 0)
-            .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
-        VENDOR_CODEX => read_codex_prompts_incremental(path, 0)
-            .map(|(_, checkpoint)| LivePosition::Bytes(checkpoint)),
-        VENDOR_CURSOR => read_cursor_prompts_incremental(path, 0)
-            .map(|(_, checkpoint)| LivePosition::RowId(checkpoint)),
-        other => Err(format!(
-            "terminal prompt mirroring: unsupported vendor {other}"
-        )),
+        Follower::Claude(_) => read_claude_prompts_incremental(path, 0)
+            .map(|(_, checkpoint)| Follower::Claude(checkpoint)),
+        Follower::Codex(_) => read_codex_prompts_incremental(path, 0)
+            .map(|(_, checkpoint)| Follower::Codex(checkpoint)),
+        Follower::Cursor(_) => read_cursor_prompts_incremental(path, 0)
+            .map(|(_, checkpoint)| Follower::Cursor(checkpoint)),
     }
 }
 
@@ -882,33 +890,27 @@ fn initial_terminal_prompt_position(vendor: &str, path: &Path) -> Result<LivePos
 ///
 /// # Errors
 ///
-/// Returns the incremental reader's error for the follower's vendor, or a mismatch error when
-/// `position`'s shape does not match the vendor's own (Claude/Codex track a byte offset, Cursor a
-/// `rowid`).
+/// Returns the incremental reader's error for the follower's vendor.
 fn read_new_terminal_prompts(
-    vendor: &str,
     path: &Path,
-    position: LivePosition,
-) -> Result<(Vec<String>, LivePosition), String> {
-    match (vendor, position) {
-        (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
+    position: Follower,
+) -> Result<(Vec<String>, Follower), String> {
+    match position {
+        Follower::Claude(offset) => {
             let (prompts, checkpoint) = read_claude_prompts_incremental(path, offset)?;
             let prompts = prompts.into_iter().map(|(text, _)| text).collect();
-            Ok((prompts, LivePosition::Bytes(checkpoint)))
+            Ok((prompts, Follower::Claude(checkpoint)))
         }
-        (VENDOR_CODEX, LivePosition::Bytes(offset)) => {
+        Follower::Codex(offset) => {
             let (prompts, checkpoint) = read_codex_prompts_incremental(path, offset)?;
             let prompts = prompts.into_iter().map(|(text, _)| text).collect();
-            Ok((prompts, LivePosition::Bytes(checkpoint)))
+            Ok((prompts, Follower::Codex(checkpoint)))
         }
-        (VENDOR_CURSOR, LivePosition::RowId(last_rowid)) => {
+        Follower::Cursor(last_rowid) => {
             let (prompts, new_rowid) = read_cursor_prompts_incremental(path, last_rowid)?;
             let prompts = prompts.into_iter().map(|(text, _)| text).collect();
-            Ok((prompts, LivePosition::RowId(new_rowid)))
+            Ok((prompts, Follower::Cursor(new_rowid)))
         }
-        (vendor, position) => Err(format!(
-            "terminal prompt mirroring: unsupported vendor {vendor} with position {position:?}"
-        )),
     }
 }
 
@@ -978,7 +980,7 @@ async fn ensure_live_watch_started(
     if discord.is_none() {
         return;
     }
-    let watcher = match start_notify_watcher(&session.agent, &path, terminal.clone(), live_tx) {
+    let watcher = match start_notify_watcher(live_position, &path, terminal.clone(), live_tx) {
         Ok(watcher) => watcher,
         Err(error) => {
             bridge_eprintln!("live capture watch error for {terminal}: {error}");
@@ -989,9 +991,8 @@ async fn ensure_live_watch_started(
         terminal.clone(),
         LiveWatch {
             _watcher: watcher,
-            vendor: session.agent,
             path,
-            position: live_position,
+            follower: live_position,
             route,
         },
     );
@@ -1002,38 +1003,41 @@ async fn ensure_live_watch_started(
 
 /// Does not touch the watch's stored position: the caller advances it only past text it actually
 /// delivers, so a text this read returns but a later delivery attempt drops is re-read and
-/// re-sent rather than skipped.
+/// re-sent rather than skipped. Each text is paired with the position immediately after it, and
+/// the last element is the position after everything read.
 ///
 /// # Errors
 ///
 /// Returns the incremental reader's error for the follower's vendor.
-fn read_new_live_texts(watch: &LiveWatch) -> Result<(Vec<(String, i64)>, i64), String> {
-    match (watch.vendor.as_str(), watch.position) {
-        (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
-            let (texts, new_offset) = read_claude_incremental(&watch.path, offset)?;
-            Ok((
-                texts
-                    .into_iter()
-                    .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
-                    .collect(),
-                i64::try_from(new_offset).unwrap_or(i64::MAX),
-            ))
+fn read_new_live_texts(
+    path: &Path,
+    position: Follower,
+) -> Result<(Vec<(String, Follower)>, Follower), String> {
+    match position {
+        Follower::Claude(offset) => {
+            let (texts, new_offset) = read_claude_incremental(path, offset)?;
+            let texts = texts
+                .into_iter()
+                .map(|(text, end)| (text, Follower::Claude(end)))
+                .collect();
+            Ok((texts, Follower::Claude(new_offset)))
         }
-        (VENDOR_CODEX, LivePosition::Bytes(offset)) => {
-            let (texts, new_offset) = read_codex_incremental(&watch.path, offset)?;
-            Ok((
-                texts
-                    .into_iter()
-                    .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
-                    .collect(),
-                i64::try_from(new_offset).unwrap_or(i64::MAX),
-            ))
+        Follower::Codex(offset) => {
+            let (texts, new_offset) = read_codex_incremental(path, offset)?;
+            let texts = texts
+                .into_iter()
+                .map(|(text, end)| (text, Follower::Codex(end)))
+                .collect();
+            Ok((texts, Follower::Codex(new_offset)))
         }
-        (VENDOR_CURSOR, LivePosition::RowId(rowid)) => {
-            let (texts, new_rowid) = read_cursor_incremental(&watch.path, rowid)?;
-            Ok((texts, new_rowid))
+        Follower::Cursor(rowid) => {
+            let (texts, new_rowid) = read_cursor_incremental(path, rowid)?;
+            let texts = texts
+                .into_iter()
+                .map(|(text, end)| (text, Follower::Cursor(end)))
+                .collect();
+            Ok((texts, Follower::Cursor(new_rowid)))
         }
-        (vendor, _) => Err(format!("live capture: unsupported vendor {vendor}")),
     }
 }
 
@@ -1195,10 +1199,14 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     let Some(session) = snapshot.session.as_ref() else {
         return;
     };
-    let vendor = session.agent.as_str();
-    if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR) {
-        return;
-    }
+    // Claude, Codex, and Cursor are the vendors whose logs are followed; `zero` is the baseline for
+    // a log this terminal is only now seeing resolve for the first time.
+    let zero = match session.agent.as_str() {
+        VENDOR_CLAUDE => Follower::Claude(0),
+        VENDOR_CODEX => Follower::Codex(0),
+        VENDOR_CURSOR => Follower::Cursor(0),
+        _ => return,
+    };
     let path = match live_log_path(snapshot, session) {
         Ok(Some(path)) => path,
         Ok(None) => {
@@ -1227,13 +1235,10 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     // whole baseline -- and with it the watch -- to the next snapshot rather than baselining a log
     // that cannot be read yet.
     let positions = if was_awaiting_this_session {
-        initial_live_position(vendor, &path).map(|_| {
-            let zero = zero_terminal_prompt_position(vendor);
-            (zero, zero)
-        })
+        initial_live_position(zero, &path).map(|_| (zero, zero))
     } else {
-        initial_terminal_prompt_position(vendor, &path)
-            .and_then(|prompt| initial_live_position(vendor, &path).map(|live| (prompt, live)))
+        initial_terminal_prompt_position(zero, &path)
+            .and_then(|prompt| initial_live_position(zero, &path).map(|live| (prompt, live)))
     };
     match positions {
         Ok((prompt_position, live_position)) => {
@@ -1246,23 +1251,13 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     }
 }
 
-/// The terminal-prompt baseline for a log a terminal is only now seeing resolve for the first time:
-/// a byte offset for Claude and Codex, a `rowid` for Cursor.
-fn zero_terminal_prompt_position(vendor: &str) -> LivePosition {
-    if vendor == VENDOR_CURSOR {
-        LivePosition::RowId(0)
-    } else {
-        LivePosition::Bytes(0)
-    }
-}
-
 /// Whether `terminal` already has a terminal-prompt baseline for exactly `path`: `false` both when
 /// there is no baseline yet and when there is one for a different path (a session change -- a
 /// `/clear`, resume, relaunch, or a vendor starting a fresh file or store -- must re-baseline
 /// against the new path rather than reuse the old file's position, which the new file may not even
 /// be as long as).
 fn terminal_prompt_baseline_is_current(
-    positions: &HashMap<String, (PathBuf, LivePosition, LivePosition)>,
+    positions: &HashMap<String, (PathBuf, Follower, Follower)>,
     terminal: &str,
     path: &Path,
 ) -> bool {
@@ -1290,19 +1285,15 @@ fn terminal_prompt_baseline_is_current(
 async fn mirror_terminal_prompts(
     discord: Option<&DiscordConnection>,
     terminal: &str,
-    vendor: &str,
     route: &TopologyRoute,
     state: &mut BridgeState,
 ) {
-    if !matches!(vendor, VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR) {
-        return;
-    }
     let Some((path, prompt_position, live_position)) =
         state.terminal_prompt_positions.get(terminal).cloned()
     else {
         return;
     };
-    let (prompts, new_position) = match read_new_terminal_prompts(vendor, &path, prompt_position) {
+    let (prompts, new_position) = match read_new_terminal_prompts(&path, prompt_position) {
         Ok(result) => result,
         Err(error) => {
             bridge_eprintln!("terminal prompt read error for {terminal}: {error}");
@@ -1374,19 +1365,9 @@ async fn handle_live_event(
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
-    let start_position = match watch.position {
-        LivePosition::Bytes(offset) => i64::try_from(offset).unwrap_or(i64::MAX),
-        LivePosition::RowId(rowid) => rowid,
-    };
-    let route = watch.route.clone();
-    let vendor = watch.vendor.clone();
-    // `watch`'s borrow of `state.live_watches` ends here (its last use above); mirroring needs
-    // `&mut state`, so it runs before `state.live_watches` is borrowed again below for live text.
-    mirror_terminal_prompts(discord, terminal, &vendor, &route, state).await;
-    let Some(watch) = state.live_watches.get(terminal) else {
-        return;
-    };
-    let (texts, read_position) = match read_new_live_texts(watch) {
+    let (path, start_position, route) = (watch.path.clone(), watch.follower, watch.route.clone());
+    mirror_terminal_prompts(discord, terminal, &route, state).await;
+    let (texts, read_position) = match read_new_live_texts(&path, start_position) {
         Ok(result) => result,
         Err(error) => {
             if state
@@ -1445,10 +1426,7 @@ async fn handle_live_event(
             .retain(|(reported_terminal, _)| reported_terminal != terminal);
     }
     if let Some(watch) = state.live_watches.get_mut(terminal) {
-        watch.position = match watch.vendor.as_str() {
-            VENDOR_CURSOR => LivePosition::RowId(delivered_position),
-            _ => LivePosition::Bytes(u64::try_from(delivered_position).unwrap_or(u64::MAX)),
-        };
+        watch.follower = delivered_position;
     }
 }
 
@@ -2792,16 +2770,16 @@ mod tests {
     };
 
     use super::{
-        BridgeRuntime, BridgeState, BrokerTask, Client, LivePosition, Membership,
-        PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
-        agent_read_detection, apply_membership, capture_for_with_search_root,
-        create_transition_messages, delete_closed_topology, fetch_startup_owner_identity,
-        fetch_topology_lists, handle_lifecycle_select_result, handle_live_event,
-        initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
-        live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
-        process_snapshot, prune_departed_state, read_new_terminal_prompts, resolve_session_path,
-        route_topology, subscribe_status_with_backoff, sync_route, sync_startup_topology,
-        tab_list_result, terminal_prompt_baseline_is_current, unique_existing_path,
+        BridgeRuntime, BridgeState, BrokerTask, Client, Follower, Membership, PermissionResponder,
+        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
+        capture_for_with_search_root, create_transition_messages, delete_closed_topology,
+        fetch_startup_owner_identity, fetch_topology_lists, handle_lifecycle_select_result,
+        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
+        next_state_change_sequence, process_snapshot, prune_departed_state,
+        read_new_terminal_prompts, resolve_session_path, route_topology,
+        subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
+        terminal_prompt_baseline_is_current, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
@@ -2821,9 +2799,9 @@ mod tests {
             fs::copy("tests/fixtures/claude-session.jsonl", &path)
                 .expect("copy committed Claude fixture");
 
-            let initial_position = initial_terminal_prompt_position(VENDOR_CLAUDE, &path)
+            let initial_position = initial_terminal_prompt_position(Follower::Claude(0), &path)
                 .expect("initial Claude terminal prompt position resolves");
-            assert!(matches!(initial_position, LivePosition::Bytes(1_177)));
+            assert!(matches!(initial_position, Follower::Claude(1_177)));
 
             fs::OpenOptions::new()
                 .append(true)
@@ -2835,17 +2813,16 @@ mod tests {
                 })
                 .expect("append real-schema Claude user record");
 
-            let (prompts, checkpoint) =
-                read_new_terminal_prompts(VENDOR_CLAUDE, &path, initial_position)
-                    .expect("read appended Claude terminal prompt");
+            let (prompts, checkpoint) = read_new_terminal_prompts(&path, initial_position)
+                .expect("read appended Claude terminal prompt");
             assert_eq!(prompts, vec!["terminal-direct".to_owned()]);
-            assert!(matches!(checkpoint, LivePosition::Bytes(1_272)));
+            assert!(matches!(checkpoint, Follower::Claude(1_272)));
 
             let (repeated_prompts, repeated_checkpoint) =
-                read_new_terminal_prompts(VENDOR_CLAUDE, &path, checkpoint)
+                read_new_terminal_prompts(&path, checkpoint)
                     .expect("repeat Claude terminal prompt read");
             assert!(repeated_prompts.is_empty());
-            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(1_272)));
+            assert!(matches!(repeated_checkpoint, Follower::Claude(1_272)));
         });
         let cleanup = fs::remove_file(&path);
         assert!(
@@ -2867,9 +2844,9 @@ mod tests {
             fs::copy("tests/fixtures/codex-session-prompt-twin.jsonl", &path)
                 .expect("copy committed Codex fixture");
 
-            let initial_position = initial_terminal_prompt_position(VENDOR_CODEX, &path)
+            let initial_position = initial_terminal_prompt_position(Follower::Codex(0), &path)
                 .expect("initial Codex terminal prompt position resolves");
-            assert!(matches!(initial_position, LivePosition::Bytes(1_215)));
+            assert!(matches!(initial_position, Follower::Codex(1_215)));
 
             // Codex writes every typed prompt twice: a `response_item` user-message record and an
             // `event_msg`/`user_message` twin that follows it. Appending both and finding exactly
@@ -2886,17 +2863,16 @@ mod tests {
                 })
                 .expect("append real-schema Codex twin user record");
 
-            let (prompts, checkpoint) =
-                read_new_terminal_prompts(VENDOR_CODEX, &path, initial_position)
-                    .expect("read appended Codex terminal prompt");
+            let (prompts, checkpoint) = read_new_terminal_prompts(&path, initial_position)
+                .expect("read appended Codex terminal prompt");
             assert_eq!(prompts, vec!["terminal-direct".to_owned()]);
-            assert!(matches!(checkpoint, LivePosition::Bytes(1_425)));
+            assert!(matches!(checkpoint, Follower::Codex(1_425)));
 
             let (repeated_prompts, repeated_checkpoint) =
-                read_new_terminal_prompts(VENDOR_CODEX, &path, checkpoint)
+                read_new_terminal_prompts(&path, checkpoint)
                     .expect("repeat Codex terminal prompt read");
             assert!(repeated_prompts.is_empty());
-            assert!(matches!(repeated_checkpoint, LivePosition::Bytes(1_425)));
+            assert!(matches!(repeated_checkpoint, Follower::Codex(1_425)));
         });
         let cleanup = fs::remove_file(&path);
         assert!(
@@ -2934,9 +2910,9 @@ mod tests {
 
         let test_result =
             std::panic::catch_unwind(|| {
-                let initial_position = initial_terminal_prompt_position(VENDOR_CURSOR, &path)
+                let initial_position = initial_terminal_prompt_position(Follower::Cursor(0), &path)
                     .expect("initial Cursor terminal prompt position resolves");
-                assert!(matches!(initial_position, LivePosition::RowId(6)));
+                assert!(matches!(initial_position, Follower::Cursor(6)));
 
                 let connection = Connection::open(&path).expect("reopen cursor store");
                 connection
@@ -2948,17 +2924,16 @@ mod tests {
                 .expect("append real-schema Cursor user row");
                 drop(connection);
 
-                let (prompts, checkpoint) =
-                    read_new_terminal_prompts(VENDOR_CURSOR, &path, initial_position)
-                        .expect("read appended Cursor terminal prompt");
+                let (prompts, checkpoint) = read_new_terminal_prompts(&path, initial_position)
+                    .expect("read appended Cursor terminal prompt");
                 assert_eq!(prompts, vec!["terminal-direct".to_owned()]);
-                assert!(matches!(checkpoint, LivePosition::RowId(7)));
+                assert!(matches!(checkpoint, Follower::Cursor(7)));
 
                 let (repeated_prompts, repeated_checkpoint) =
-                    read_new_terminal_prompts(VENDOR_CURSOR, &path, checkpoint)
+                    read_new_terminal_prompts(&path, checkpoint)
                         .expect("repeat Cursor terminal prompt read");
                 assert!(repeated_prompts.is_empty());
-                assert!(matches!(repeated_checkpoint, LivePosition::RowId(7)));
+                assert!(matches!(repeated_checkpoint, Follower::Cursor(7)));
             });
         let cleanup = fs::remove_file(&path);
         assert!(
@@ -2986,8 +2961,8 @@ mod tests {
             terminal.to_owned(),
             (
                 first_path.clone(),
-                LivePosition::Bytes(42),
-                LivePosition::Bytes(42),
+                Follower::Claude(42),
+                Follower::Claude(42),
             ),
         );
         assert!(
@@ -3083,12 +3058,12 @@ mod tests {
             assert_eq!(replay_path, &old_session_path);
             assert_eq!(
                 *replay_prompt_position,
-                LivePosition::Bytes(expected_discard_position),
+                Follower::Claude(expected_discard_position),
                 "a resumed session with prior history must discard it, not replay it"
             );
             assert_eq!(
                 *replay_live_position,
-                LivePosition::Bytes(expected_discard_position),
+                Follower::Claude(expected_discard_position),
                 "the live watch start must discard the resumed history too, not replay it"
             );
 
