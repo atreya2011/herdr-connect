@@ -161,6 +161,7 @@ struct BlockedCardContext<'a> {
     topology_cache: &'a TopologyCache,
     route: &'a TopologyRoute,
     snapshot: &'a AgentSnapshot,
+    session: &'a AgentSession,
     terminal: &'a str,
     from_status: &'a str,
     state_change_seq: u64,
@@ -211,6 +212,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         topology_cache,
         route,
         snapshot,
+        session,
         terminal,
         from_status,
         state_change_seq,
@@ -224,10 +226,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         }
     };
     let supported_broker_pending = vendor_is_supported(snapshot.agent.as_deref())
-        && snapshot
-            .session
-            .as_ref()
-            .is_some_and(|session| responder.has_pending_session(&session.value));
+        && responder.has_pending_session(&session.value);
     if supported_broker_pending {
         return;
     }
@@ -242,7 +241,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         .flatten()
         .and_then(|text| format_detection_question(&text));
     let capture = detection_question.map_or_else(
-        || capture_for_blocked(snapshot),
+        || capture_for_blocked(snapshot, session),
         |question| AgentLogCapture {
             message: question.clone(),
             question: Some(question),
@@ -499,10 +498,10 @@ async fn deliver_postable_transition(
         transition,
         state_change_seq,
     } = context;
-    if snapshot.session.is_none() {
+    let Some(session) = snapshot.session.as_ref() else {
         bridge_println!("{terminal}: no reported session, not mirrored");
         return;
-    }
+    };
     let route = match route_topology(agents, tabs, terminal) {
         Ok(route) => route,
         Err(error) => {
@@ -522,6 +521,7 @@ async fn deliver_postable_transition(
         topology_cache: responder.topology_cache(),
         route: &route,
         snapshot,
+        session,
         terminal,
         from_status: &transition.from,
         state_change_seq,
@@ -583,14 +583,9 @@ impl std::fmt::Display for SessionPathError {
 
 fn capture_for_with_search_root(
     snapshot: &AgentSnapshot,
+    session: &AgentSession,
     search_root: &Path,
 ) -> Result<AgentLogCapture, String> {
-    let session = snapshot.session.as_ref().ok_or_else(|| {
-        format!(
-            "{}: no reported session, no log available",
-            snapshot.terminal_id
-        )
-    })?;
     let path =
         resolve_session_path(search_root, snapshot, session).map_err(|error| error.to_string())?;
     let log = herdr_connect_rs::read_agent_log(session, &path)?;
@@ -1563,22 +1558,23 @@ async fn handle_activity_event(
     }
 }
 
-fn capture_for_blocked(snapshot: &AgentSnapshot) -> AgentLogCapture {
+fn capture_for_blocked(snapshot: &AgentSnapshot, session: &AgentSession) -> AgentLogCapture {
     std::env::var_os(ENV_HOME).map_or_else(
         || AgentLogCapture {
             message: "blocked context unavailable: HOME is not configured".to_owned(),
             failure: None,
             question: None,
         },
-        |home| capture_for_blocked_with_search_root(snapshot, Path::new(&home)),
+        |home| capture_for_blocked_with_search_root(snapshot, session, Path::new(&home)),
     )
 }
 
 fn capture_for_blocked_with_search_root(
     snapshot: &AgentSnapshot,
+    session: &AgentSession,
     search_root: &Path,
 ) -> AgentLogCapture {
-    match capture_for_with_search_root(snapshot, search_root) {
+    match capture_for_with_search_root(snapshot, session, search_root) {
         Ok(capture) => capture,
         Err(error) => {
             bridge_eprintln!("agent blocked-context capture error: {error}");
@@ -3503,7 +3499,7 @@ mod tests {
             session: Some(session.clone()),
         };
         let resolved = resolve_session_path(&root, &snapshot, &session);
-        let capture = capture_for_with_search_root(&snapshot, &root);
+        let capture = capture_for_with_search_root(&snapshot, &session, &root);
         let prompts = resolved.as_ref().ok().map(|path| {
             herdr_connect_rs::read_codex_prompts_incremental(path, 0)
                 .expect("read selected Codex rollout prompts")
@@ -3581,7 +3577,7 @@ mod tests {
             };
 
             let resolved_path = resolve_session_path(&root, &snapshot, &session);
-            let capture = capture_for_with_search_root(&snapshot, &root);
+            let capture = capture_for_with_search_root(&snapshot, &session, &root);
 
             fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
 
@@ -3725,24 +3721,13 @@ mod tests {
     }
 
     #[test]
-    fn capture_for_with_search_root_errors_on_missing_session_or_log() {
+    fn capture_for_with_search_root_errors_on_missing_log() {
         let response: Value =
             serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
                 .expect("captured agent.list fixture is JSON");
         let agents: Vec<AgentSnapshot> =
             serde_json::from_value(response["result"]["agents"].clone())
                 .expect("captured agent.list fixture has typed agents");
-
-        let session_less = agents
-            .iter()
-            .find(|snapshot| snapshot.session.is_none())
-            .expect("fixture contains a session-less agent");
-        let error = capture_for_with_search_root(session_less, Path::new("tests/fixtures"))
-            .expect_err("a session-less snapshot must not resolve a capture");
-        assert!(
-            error.contains(&session_less.terminal_id),
-            "error must name the terminal missing its reported session: {error}"
-        );
 
         let mut missing_log = agents
             .iter()
@@ -3754,8 +3739,10 @@ mod tests {
             .as_mut()
             .expect("session fixture is present")
             .value = "missing-session.jsonl".to_owned();
+        let session = missing_log.session.as_ref().expect("session is present");
         assert!(
-            capture_for_with_search_root(&missing_log, Path::new("tests/fixtures")).is_err(),
+            capture_for_with_search_root(&missing_log, session, Path::new("tests/fixtures"))
+                .is_err(),
             "reader errors for a reported session whose log is missing must surface"
         );
     }
@@ -3775,7 +3762,8 @@ mod tests {
                 value: "9a11cafe-affe-4f5c-8bda-b10cb6a5cafe".to_owned(),
             }),
         };
-        let capture = capture_for_with_search_root(&snapshot, Path::new("tests/fixtures"))
+        let session = snapshot.session.as_ref().expect("snapshot has a session");
+        let capture = capture_for_with_search_root(&snapshot, session, Path::new("tests/fixtures"))
             .expect("fixture-backed claude session resolves");
         let expected_question =
             "Which environment should the fix target?\n1. staging\n2. production";
@@ -5219,6 +5207,27 @@ mod tests {
         terminal: &'a str,
     }
 
+    /// Cursor's `SQLite` write can commit well after Herdr itself reports `done`; waits for the
+    /// reply to actually be readable before the final live read, so live delivery does not race
+    /// the write and miss the reply.
+    #[cfg(unix)]
+    async fn wait_for_readable_capture(settled: &AgentSnapshot) -> Result<(), String> {
+        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
+        let capture_deadline = Instant::now() + Duration::from_secs(10);
+        let session = settled
+            .session
+            .as_ref()
+            .ok_or("settled pane has no session")?;
+        while let Err(error) = capture_for_with_search_root(settled, session, Path::new(&home)) {
+            if Instant::now() >= capture_deadline {
+                eprintln!("reply capture never became readable before settle: {error}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
     /// Drives one real turn to settle, submitting `prompt` through `submission`, then leaves
     /// `state` ready for the caller to inspect: the turn's own live-capture watch has run at least
     /// once more after settling, so any terminal prompt or assistant text it produced has already
@@ -5312,18 +5321,7 @@ mod tests {
         submit_task
             .await
             .map_err(|error| format!("prompt task failed: {error}"))??;
-        // Cursor's SQLite write can commit well after Herdr itself reports `done`; wait for the
-        // reply to actually be readable before the final live read, so live delivery does not race
-        // the write and miss the reply.
-        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
-        let capture_deadline = Instant::now() + Duration::from_secs(10);
-        while let Err(error) = capture_for_with_search_root(&settled, Path::new(&home)) {
-            if Instant::now() >= capture_deadline {
-                eprintln!("reply capture never became readable before settle: {error}");
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_readable_capture(&settled).await?;
         own(&settled, tabs, connection, state).await;
         while let Ok(event_terminal) = live_events.try_recv() {
             handle_live_event(Some(connection), &event_terminal, state).await;
