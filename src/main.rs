@@ -6973,19 +6973,22 @@ mod tests {
     #[cfg(unix)]
     async fn startup_topology_sync_exercise(
         guild: &BlockedCaptureGuild,
-        tab: &Tab,
+        workspace: &Workspace,
     ) -> Result<(), String> {
-        report_idle_with_session(&tab.pane_id)?;
-        let listed = snapshot_for_pane(&tab.pane_id)?;
-        let matching = matching_tab(&tab.tab_id)?;
+        report_idle_with_session(&workspace.pane_id)?;
+        let listed = snapshot_for_pane(&workspace.pane_id)?;
+        let matching = matching_tab(&workspace.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
         let agents = std::slice::from_ref(&listed);
 
+        let route = route_topology(agents, tabs, &listed.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        if !channel_with_topic_is_absent(guild, &topic).await? {
+            return Err("the workspace channel existed before the startup sync".to_owned());
+        }
         let connection = discord_tuple(guild);
         sync_startup_topology(&connection, agents, tabs).await;
 
-        let route = route_topology(agents, tabs, &listed.terminal_id)?;
-        let topic = format!("herdr workspace [{}]", route.workspace_id);
         let channel = guild
             .client
             .guild_channels(guild.id)
@@ -7025,7 +7028,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn startup_topology_sync_creates_channel_and_thread_before_event_loop() {
+    async fn startup_topology_sync_creates_channel_and_thread() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -7040,9 +7043,12 @@ mod tests {
             0,
             "named zero-leftover check"
         );
+        assert_eq!(
+            remaining_workspaces(STARTUP_TOPOLOGY_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
 
-        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
         let cwd_dir = std::env::temp_dir().join(format!(
             "testrun-cwd-{}-{}",
             std::process::id(),
@@ -7054,25 +7060,28 @@ mod tests {
         fs::create_dir_all(&cwd_dir).expect("create startup-topology test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let created = create_tab(STARTUP_TOPOLOGY_LABEL, &workspace_id, cwd);
-        let (tab_id, result) = match created {
-            Ok(tab) => {
-                let outcome = startup_topology_sync_exercise(&guild, &tab).await;
-                (Some(tab.tab_id), outcome)
+        let created = create_workspace(STARTUP_TOPOLOGY_LABEL, cwd);
+        let (workspace_id, result) = match created {
+            Ok(workspace) => {
+                let outcome = startup_topology_sync_exercise(&guild, &workspace).await;
+                (Some(workspace.id), outcome)
             }
             Err(error) => (None, Err(error)),
         };
-        if let Some(tab_id) = &tab_id {
-            close_tab(tab_id);
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
         }
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(STARTUP_TOPOLOGY_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(STARTUP_TOPOLOGY_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
@@ -7167,22 +7176,27 @@ mod tests {
     #[cfg(unix)]
     async fn startup_topology_prefetch_reuse_exercise(
         guild: &BlockedCaptureGuild,
-        tab_a: &Tab,
+        workspace: &Workspace,
         tab_b: &Tab,
     ) -> Result<(), String> {
-        report_idle_with_session(&tab_a.pane_id)?;
+        report_idle_with_session(&workspace.pane_id)?;
         report_idle_with_session(&tab_b.pane_id)?;
-        let agent_a = snapshot_for_pane(&tab_a.pane_id)?;
+        let agent_a = snapshot_for_pane(&workspace.pane_id)?;
         let agent_b = snapshot_for_pane(&tab_b.pane_id)?;
-        let tabs = [matching_tab(&tab_a.tab_id)?, matching_tab(&tab_b.tab_id)?];
+        let tabs = [
+            matching_tab(&workspace.tab_id)?,
+            matching_tab(&tab_b.tab_id)?,
+        ];
         let agents = [agent_a.clone(), agent_b.clone()];
-
-        let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
 
         let route_a = route_topology(&agents, &tabs, &agent_a.terminal_id)?;
         let route_b = route_topology(&agents, &tabs, &agent_b.terminal_id)?;
         let topic = format!("herdr workspace [{}]", route_a.workspace_id);
+        if !channel_with_topic_is_absent(guild, &topic).await? {
+            return Err("the workspace channel existed before the startup sync".to_owned());
+        }
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
         let matching_channels: Vec<_> = guild
             .client
             .guild_channels(guild.id)
@@ -7256,50 +7270,53 @@ mod tests {
             0,
             "named zero-leftover check"
         );
+        assert_eq!(
+            remaining_workspaces(PREFETCH_REUSE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
 
-        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
-        let make_cwd = |suffix: &str| {
-            let dir = std::env::temp_dir().join(format!(
-                "testrun-cwd-{}-{}-{suffix}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system clock is after unix epoch")
-                    .as_nanos()
-            ));
-            fs::create_dir_all(&dir).expect("create prefetch-reuse test cwd");
-            dir
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create prefetch-reuse test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = match create_workspace(PREFETCH_REUSE_LABEL, cwd) {
+            Ok(workspace) => match create_tab(PREFETCH_REUSE_LABEL, &workspace.id, cwd) {
+                Ok(tab_b) => Ok((workspace, tab_b)),
+                Err(error) => Err((Some(workspace.id), error)),
+            },
+            Err(error) => Err((None, error)),
         };
-        let cwd_a_dir = make_cwd("a");
-        let cwd_b_dir = make_cwd("b");
-        let cwd_a = cwd_a_dir.to_str().expect("temp cwd is valid UTF-8");
-        let cwd_b = cwd_b_dir.to_str().expect("temp cwd is valid UTF-8");
-
-        let created_a = create_tab(PREFETCH_REUSE_LABEL, &workspace_id, cwd_a);
-        let created_b = create_tab(PREFETCH_REUSE_LABEL, &workspace_id, cwd_b);
-        let (tab_ids, result) = match (created_a, created_b) {
-            (Ok(tab_a), Ok(tab_b)) => {
+        let (workspace_id, result) = match created {
+            Ok((workspace, tab_b)) => {
+                let workspace_id = workspace.id.clone();
                 let outcome =
-                    startup_topology_prefetch_reuse_exercise(&guild, &tab_a, &tab_b).await;
-                (vec![tab_a.tab_id, tab_b.tab_id], outcome)
+                    startup_topology_prefetch_reuse_exercise(&guild, &workspace, &tab_b).await;
+                (Some(workspace_id), outcome)
             }
-            (Ok(tab_a), Err(error)) => (vec![tab_a.tab_id], Err(error)),
-            (Err(error), Ok(tab_b)) => (vec![tab_b.tab_id], Err(error)),
-            (Err(error), Err(_)) => (vec![], Err(error)),
+            Err((workspace_id, error)) => (workspace_id, Err(error)),
         };
-        for tab_id in &tab_ids {
-            close_tab(tab_id);
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
         }
-        let _ = fs::remove_dir_all(&cwd_a_dir);
-        let _ = fs::remove_dir_all(&cwd_b_dir);
+        let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(PREFETCH_REUSE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(PREFETCH_REUSE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
     /// Creates a tab with no `--label`, so Herdr auto-assigns a numeric one. The tab has no
@@ -7581,14 +7598,18 @@ mod tests {
     #[cfg(unix)]
     async fn startup_sweep_stale_cache_exercise(
         guild: &BlockedCaptureGuild,
-        tab: &Tab,
+        workspace: &Workspace,
     ) -> Result<(), String> {
-        report_idle_with_session(&tab.pane_id)?;
-        let listed = snapshot_for_pane(&tab.pane_id)?;
-        let matching = matching_tab(&tab.tab_id)?;
+        report_idle_with_session(&workspace.pane_id)?;
+        let listed = snapshot_for_pane(&workspace.pane_id)?;
+        let matching = matching_tab(&workspace.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
         let agents = std::slice::from_ref(&listed);
         let route = route_topology(agents, tabs, &listed.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        if !channel_with_topic_is_absent(guild, &topic).await? {
+            return Err("the workspace channel existed before the stale fetch".to_owned());
+        }
 
         let stale = fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
         sync_route(
@@ -7607,7 +7628,6 @@ mod tests {
         )
         .await;
 
-        let topic = format!("herdr workspace [{}]", route.workspace_id);
         let matching_channels = guild
             .client
             .guild_channels(guild.id)
@@ -7651,7 +7671,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn startup_sweep_duplicates_thread_after_dropped_write_back() {
+    async fn startup_sweep_with_a_stale_cache_creates_one_channel_and_one_thread() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -7666,9 +7686,12 @@ mod tests {
             0,
             "named zero-leftover check"
         );
+        assert_eq!(
+            remaining_workspaces(STALE_CACHE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
 
-        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
         let cwd_dir = std::env::temp_dir().join(format!(
             "testrun-cwd-{}-{}",
             std::process::id(),
@@ -7680,25 +7703,28 @@ mod tests {
         fs::create_dir_all(&cwd_dir).expect("create stale-cache test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let created = create_tab(STALE_CACHE_LABEL, &workspace_id, cwd);
-        let (tab_id, result) = match created {
-            Ok(tab) => {
-                let outcome = startup_sweep_stale_cache_exercise(&guild, &tab).await;
-                (Some(tab.tab_id), outcome)
+        let created = create_workspace(STALE_CACHE_LABEL, cwd);
+        let (workspace_id, result) = match created {
+            Ok(workspace) => {
+                let outcome = startup_sweep_stale_cache_exercise(&guild, &workspace).await;
+                (Some(workspace.id), outcome)
             }
             Err(error) => (None, Err(error)),
         };
-        if let Some(tab_id) = &tab_id {
-            close_tab(tab_id);
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
         }
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left = remaining_tabs(STALE_CACHE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(STALE_CACHE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
