@@ -112,8 +112,8 @@ struct BridgeState {
     /// activity frame that outlives its turn, or that names a pane with no reported session, has
     /// nothing to gate its creation without it.
     activity_eligible_panes: HashSet<String>,
-    /// The owner's mirrored display name and avatar, fetched once at startup. `None` when Discord
-    /// is not configured or the fetch failed; terminal-prompt mirroring drops silently without it.
+    /// The owner's mirrored display name and avatar, fetched once at startup. `None` only in tests
+    /// that build a state without Discord; terminal-prompt mirroring drops silently without it.
     owner_identity: Option<OwnerIdentity>,
     /// Per-terminal read baseline, established the first time [`process_snapshot`] sees a
     /// session-carrying pane in any status: the resolved log path, the prompt reader's start
@@ -1827,48 +1827,40 @@ fn prune_departed_state(
 
 fn discord_connection(
     topology_cache: TopologyCache,
-) -> Result<Option<(DiscordConnection, GatewayTask)>, Box<dyn std::error::Error>> {
-    match (
-        std::env::var(ENV_DISCORD_TOKEN),
-        std::env::var(ENV_DISCORD_GUILD_ID),
-        std::env::var(ENV_DISCORD_OWNER_ID),
-    ) {
-        (Ok(token), Ok(guild_id), Ok(owner_id)) => {
-            let config = load_discord_config(&[
-                (ENV_DISCORD_TOKEN, &token),
-                (ENV_DISCORD_GUILD_ID, &guild_id),
-                (ENV_DISCORD_OWNER_ID, &owner_id),
-            ])?;
-            let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
-            let client = Arc::new(Client::builder().token(config.token.clone()).build());
-            let (notices_tx, notices_rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                while let Ok(notice) = notices_rx.recv() {
-                    bridge_eprintln!("{notice}");
-                }
-            });
-            let responder = Arc::new(PermissionResponder::new(
-                Arc::clone(&client),
-                guild,
-                config.owner_id.clone(),
-                topology_cache,
-            ));
-            let gateway = tokio::spawn(drive_gateway_with_components(
-                config.token,
-                None,
-                GatewayContext {
-                    client: Arc::clone(&client),
-                    guild,
-                    owner_id: config.owner_id.clone(),
-                    responder: Arc::clone(&responder),
-                },
-                notices_tx,
-                component_handler(Arc::clone(&responder)),
-            ));
-            Ok(Some(((client, guild, config.owner_id, responder), gateway)))
+) -> Result<(DiscordConnection, GatewayTask), Box<dyn std::error::Error>> {
+    let environment: Vec<(String, String)> = std::env::vars().collect();
+    let environment: Vec<(&str, &str)> = environment
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let config = load_discord_config(&environment)?;
+    let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
+    let client = Arc::new(Client::builder().token(config.token.clone()).build());
+    let (notices_tx, notices_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(notice) = notices_rx.recv() {
+            bridge_eprintln!("{notice}");
         }
-        _ => Ok(None),
-    }
+    });
+    let responder = Arc::new(PermissionResponder::new(
+        Arc::clone(&client),
+        guild,
+        config.owner_id.clone(),
+        topology_cache,
+    ));
+    let gateway = tokio::spawn(drive_gateway_with_components(
+        config.token,
+        None,
+        GatewayContext {
+            client: Arc::clone(&client),
+            guild,
+            owner_id: config.owner_id.clone(),
+            responder: Arc::clone(&responder),
+        },
+        notices_tx,
+        component_handler(Arc::clone(&responder)),
+    ));
+    Ok(((client, guild, config.owner_id, responder), gateway))
 }
 
 #[tokio::main]
@@ -2672,8 +2664,8 @@ async fn next_status_event(
     }
 }
 
-/// Fetches the owner's mirrored identity once at startup, when Discord is configured: `Ok(None)`
-/// when it is not, since the rest of the bridge runs perfectly well without Discord at all.
+/// Fetches the owner's mirrored identity once at startup: `Ok(None)` only when called without a
+/// connection, which the bridge never does.
 ///
 /// # Errors
 ///
@@ -2698,14 +2690,10 @@ async fn fetch_startup_owner_identity(
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-    let (discord, mut gateway, mut broker) = match discord_connection(Arc::clone(&topology_cache))?
-    {
-        Some((connection, gateway)) => {
-            let broker = start_broker(&connection, activity_tx);
-            (Some(connection), Some(gateway), broker)
-        }
-        None => (None, None, None),
-    };
+    let (connection, gateway) = discord_connection(Arc::clone(&topology_cache))?;
+    let mut broker = start_broker(&connection, activity_tx);
+    let discord = Some(connection);
+    let mut gateway = Some(gateway);
     let owner_identity = fetch_startup_owner_identity(discord.as_ref()).await?;
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
