@@ -250,7 +250,9 @@ fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
 /// Records a suppression marker for `(target, text)` before submitting, so a terminal-prompt
 /// mirror that observes this exact text land in the pane's vendor log drops it instead of
 /// mirroring the bridge's own Discord-originated prompt back into the thread it came from. The
-/// marker is withdrawn if submission ultimately fails, since the pane never received the text.
+/// marker is withdrawn only when the first `agent.prompt` fails, since only then the pane never
+/// received the text; once it was accepted, a later recovery failure keeps the marker because the
+/// text may already be submitted.
 ///
 /// A pane that reports a stalled submission (the composer received the text but never actually
 /// submitted it) is recovered with a two-rung ladder: an Enter key press first, since that alone
@@ -262,22 +264,20 @@ fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
 /// Returns Herdr submission, follow-up key press, or pane-state errors.
 pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
     record_owner_prompt_submission(target, text);
-    let result = (|| {
-        let result = agent_prompt(target, text);
-        if result.as_deref() != Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
-            return result;
-        }
-        agent_send_keys(target, &["enter"])?;
-        if pane_left_idle(target, STALL_RECOVERY_POLL_BOUND)? {
-            return result;
-        }
-        agent_send_keys(target, &["ctrl+u"])?;
-        agent_prompt(target, text)
-    })();
+    let result = agent_prompt(target, text);
     if result.is_err() {
         forget_owner_prompt_submission(target, text);
+        return result;
     }
-    result
+    if result.as_deref() != Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
+        return result;
+    }
+    agent_send_keys(target, &["enter"])?;
+    if pane_left_idle(target, STALL_RECOVERY_POLL_BOUND)? {
+        return result;
+    }
+    agent_send_keys(target, &["ctrl+u"])?;
+    agent_prompt(target, text)
 }
 
 fn record_owner_prompt_submission(pane_id: &str, text: &str) {
