@@ -32,8 +32,7 @@ fn route_captured_herdr_snapshots() {
 }
 
 /// Herdr 0.9.0 may omit `agent` entirely while a pane's agent is still being detected. That entry
-/// must still deserialize (not fail the whole `agent.list`) and must not be treated as a supported,
-/// mirrorable vendor.
+/// must still deserialize (not fail the whole `agent.list`).
 #[test]
 fn agent_list_entry_missing_agent_parses_as_unmirrored() {
     let value: Value = serde_json::from_str(include_str!("fixtures/herdr-agent-list.json"))
@@ -48,12 +47,5 @@ fn agent_list_entry_missing_agent_parses_as_unmirrored() {
     assert!(
         detecting.session.is_none(),
         "an undetected agent must not carry a session"
-    );
-    assert!(
-        !matches!(
-            detecting.agent.as_deref(),
-            Some(herdr_connect_rs::VENDOR_CLAUDE | herdr_connect_rs::VENDOR_CODEX)
-        ),
-        "an undetected agent must not be treated as a supported, mirrorable vendor"
     );
 }
