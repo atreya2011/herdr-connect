@@ -37,12 +37,8 @@ struct CodexPreToolUseRequest {
     session_id: String,
     hook_event_name: String,
     tool_name: String,
-    tool_input: CodexActivityToolInput,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexActivityToolInput {
-    command: String,
+    #[serde(default)]
+    tool_input: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +98,9 @@ pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
 
 /// Decodes one Codex `PreToolUse` hook payload into its activity essentials.
 ///
-/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`.
+/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`, else empty:
+/// Codex's hook schema declares `tool_input` as any JSON value, so non-Bash tools carry no
+/// `command`.
 ///
 /// # Errors
 ///
@@ -114,7 +112,13 @@ pub fn decode_codex_activity_request(input: &[u8]) -> Result<ClaudeActivityReque
     if request.hook_event_name != ACTIVITY_HOOK_EVENT {
         return Err("unexpected Codex hook event".to_owned());
     }
-    let summary = truncate_chars(&request.tool_input.command);
+    let summary = request
+        .tool_input
+        .as_object()
+        .and_then(|fields| fields.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .map(truncate_chars)
+        .unwrap_or_default();
     Ok(ClaudeActivityRequest {
         session_id: request.session_id,
         tool: request.tool_name,
@@ -216,16 +220,24 @@ mod tests {
 
     #[test]
     fn decodes_codex_command_from_tool_input() {
-        let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cmd","other":"zz"}}"#;
-        let request = decode_codex_activity_request(payload.as_bytes())
-            .unwrap_or_else(|error| panic!("{payload} decodes: {error}"));
-        assert_eq!(request.summary, "cmd");
-    }
-
-    #[test]
-    fn rejects_a_codex_payload_without_a_command() {
-        let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}"#;
-        assert!(decode_codex_activity_request(payload.as_bytes()).is_err());
+        let cases = [
+            (
+                r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cmd","other":"zz"}}"#,
+                "Bash",
+                "cmd",
+            ),
+            (
+                r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{"patch":"zz"}}"#,
+                "apply_patch",
+                "",
+            ),
+        ];
+        for (payload, tool, expected_summary) in cases {
+            let request = decode_codex_activity_request(payload.as_bytes())
+                .unwrap_or_else(|error| panic!("{payload} decodes: {error}"));
+            assert_eq!(request.tool, tool);
+            assert_eq!(request.summary, expected_summary);
+        }
     }
 
     #[test]

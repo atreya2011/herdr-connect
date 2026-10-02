@@ -5,4 +5,4 @@ live-captured [`codex-permission-request/default.json`](../codex-permission-requ
 fixture, with `hook_event_name` changed to `PreToolUse`: unlike that fixture, no live Codex
 `PreToolUse` payload has been captured under Herdr yet.
 
-No other Codex `tool_input` shape has live evidence, so no other fixture exists here.
+Codex's embedded hook schema declares `tool_input` as any JSON value, so non-Bash tools reach the hook without a `command`; the decoder gives such a payload an empty summary, covered by a unit test rather than a fixture.
