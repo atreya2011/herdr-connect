@@ -199,7 +199,6 @@ pub fn reconcile_topology_cache(
 }
 
 fn carry_over_recent(fetched: &mut Vec<Channel>, cached: Vec<Channel>) {
-    let known: HashSet<_> = fetched.iter().map(|entry| entry.id).collect();
     let watermark = fetched
         .iter()
         .map(|entry| entry.id.get())
@@ -208,33 +207,28 @@ fn carry_over_recent(fetched: &mut Vec<Channel>, cached: Vec<Channel>) {
     fetched.extend(
         cached
             .into_iter()
-            .filter(|entry| !known.contains(&entry.id) && entry.id.get() > watermark),
+            .filter(|entry| entry.id.get() > watermark),
     );
 }
 
-/// Resolves the one thread that identifies a tab, ignoring repeated entries for the same id.
+/// Resolves the one thread that identifies a tab.
 ///
 /// # Errors
 ///
-/// Returns an error when more than one distinct thread claims the tab.
+/// Returns an error when more than one thread claims the tab.
 fn single_matching_thread(
     threads: &[Channel],
     workspace_channel: Id<ChannelMarker>,
     thread_suffix: &str,
     tab_id: &str,
 ) -> Result<Option<Channel>, String> {
-    let mut seen = HashSet::new();
-    let mut matching = threads
-        .iter()
-        .rev()
-        .filter(|thread| seen.insert(thread.id))
-        .filter(|thread| {
-            thread.parent_id == Some(workspace_channel)
-                && thread
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.ends_with(thread_suffix))
-        });
+    let mut matching = threads.iter().filter(|thread| {
+        thread.parent_id == Some(workspace_channel)
+            && thread
+                .name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(thread_suffix))
+    });
     let resolved = matching.next();
     if matching.next().is_some() {
         return Err(format!(
@@ -293,19 +287,7 @@ pub async fn sync_topology(
         thread_name,
         ..
     } = route;
-    if workspace_id.trim().is_empty()
-        || channel_name.trim().is_empty()
-        || thread_name.trim().is_empty()
-        || tab_id.trim().is_empty()
-    {
-        return Err("herdr topology has unusable identity".to_owned());
-    }
     let thread_suffix = format!(" [{tab_id}]");
-    if !thread_name.ends_with(&thread_suffix) {
-        return Err(format!(
-            "herdr topology thread name does not identify tab {tab_id}"
-        ));
-    }
     let topic = format!("herdr workspace [{workspace_id}]");
     let matching_channels: Vec<_> = channels
         .iter()
@@ -425,7 +407,9 @@ pub async fn archived_threads(
         }
         .map_err(|error| error.to_string())?;
         let listing = response.model().await.map_err(|error| error.to_string())?;
-        let has_more = listing.has_more.unwrap_or(false);
+        let has_more = listing
+            .has_more
+            .ok_or_else(|| "Discord archived-thread listing has no has_more".to_owned())?;
         if has_more && listing.threads.is_empty() {
             return Err("Discord returned an empty archived-thread page with has_more".to_owned());
         }
@@ -490,13 +474,15 @@ static SELF_DELETIONS: LazyLock<std::sync::Mutex<HashSet<Id<ChannelMarker>>>> =
 pub fn take_self_deletion(id: Id<ChannelMarker>) -> bool {
     SELF_DELETIONS
         .lock()
-        .is_ok_and(|mut deletions| deletions.remove(&id))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id)
 }
 
 pub fn record_self_deletion(id: Id<ChannelMarker>) {
-    if let Ok(mut deletions) = SELF_DELETIONS.lock() {
-        deletions.insert(id);
-    }
+    SELF_DELETIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id);
 }
 
 /// Deletes one Discord channel or thread, treating an already-deleted target as done.
