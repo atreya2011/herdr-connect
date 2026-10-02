@@ -4713,6 +4713,69 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
+    /// After a bridge restart the workspace channel already holds the bridge's webhook: a second
+    /// bridge state with an empty cache must find and reuse it, not create another.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn restarted_bridge_reuses_the_workspace_webhook() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let result = async {
+            let channel = guild
+                .client
+                .create_guild_channel(guild.id, "testrun-webhook-reuse")
+                .await
+                .map_err(|error| error.to_string())?
+                .model()
+                .await
+                .map_err(|error| error.to_string())?;
+            let first = super::cached_terminal_prompt_webhook(
+                guild.client.as_ref(),
+                channel.id,
+                &mut BridgeState::default(),
+            )
+            .await?;
+            let second = super::cached_terminal_prompt_webhook(
+                guild.client.as_ref(),
+                channel.id,
+                &mut BridgeState::default(),
+            )
+            .await?;
+            if first.0 != second.0 {
+                return Err(format!("webhook was not reused: {first:?} then {second:?}"));
+            }
+            let owned = guild
+                .client
+                .channel_webhooks(channel.id)
+                .await
+                .map_err(|error| error.to_string())?
+                .model()
+                .await
+                .map_err(|error| error.to_string())?
+                .iter()
+                .filter(|webhook| {
+                    webhook.name.as_deref() == Some(super::TERMINAL_PROMPT_WEBHOOK_NAME)
+                })
+                .count();
+            if owned != 1 {
+                return Err(format!("expected one bridge-owned webhook, found {owned}"));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+    }
+
     #[cfg(unix)]
     struct StalePaneCase {
         name: &'static str,
