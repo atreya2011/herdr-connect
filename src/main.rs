@@ -49,11 +49,14 @@ use herdr_connect_rs::{
     request_question_answers,
 };
 
+/// The Discord client, the guild, the owner's id, the permission responder, and the owner's
+/// mirrored identity, fetched once at startup.
 type DiscordConnection = (
     Arc<Client>,
     Id<GuildMarker>,
     String,
     Arc<PermissionResponder>,
+    OwnerIdentity,
 );
 type GatewayTask = tokio::task::JoinHandle<Result<(), String>>;
 type BrokerTask = tokio::task::JoinHandle<Result<(), String>>;
@@ -121,9 +124,6 @@ struct BridgeState {
     /// activity frame that outlives its turn, or that names a pane with no reported session, has
     /// nothing to gate its creation without it.
     activity_eligible_panes: HashSet<String>,
-    /// The owner's mirrored display name and avatar, fetched once at startup. `None` only in tests
-    /// that build a state without Discord; terminal-prompt mirroring drops silently without it.
-    owner_identity: Option<OwnerIdentity>,
     /// Per-terminal read baseline, established the first time [`process_snapshot`] sees a
     /// session-carrying pane in any status: the resolved log path, the prompt reader's start
     /// position, and the live text watch's start position, all captured at the same moment so the
@@ -332,7 +332,7 @@ async fn expire_blocked_card(
     informational_cards: &mut HashMap<String, InformationalCard>,
 ) {
     if let Some(card) = informational_cards.get(terminal).copied()
-        && let Some((client, _guild, _owner_id, _responder)) = discord
+        && let Some((client, ..)) = discord
     {
         if let Err(error) = expire_informational_card(
             client.as_ref(),
@@ -354,7 +354,7 @@ async fn expire_departed_card(
     terminal: &str,
     card: InformationalCard,
 ) {
-    let Some((client, _guild, _owner_id, _responder)) = discord else {
+    let Some((client, ..)) = discord else {
         return;
     };
     if let Err(error) = expire_informational_card(
@@ -414,7 +414,7 @@ async fn maybe_sync_fresh_session_topology(
             return;
         }
     };
-    let Some((client, guild, _, responder)) = discord else {
+    let Some((client, guild, _, responder, _)) = discord else {
         return;
     };
     if let Err(error) =
@@ -521,7 +521,7 @@ async fn deliver_postable_transition(
     let Some(connection) = discord else {
         return;
     };
-    let (client, guild, owner_id, responder) = connection;
+    let (client, guild, owner_id, responder, _) = connection;
     handle_blocked_card(BlockedCardContext {
         client: client.as_ref(),
         guild: *guild,
@@ -1279,7 +1279,7 @@ fn terminal_prompt_baseline_is_current(
 ///
 /// A prompt equal to a pending [`take_owner_prompt_suppression`] marker is dropped once instead of
 /// mirrored: it is the bridge's own Discord-originated prompt, already posted by the owner in the
-/// thread it came from. No session, no route, or no owner identity: dropped silently. A delivery
+/// thread it came from. No session or no route: dropped silently. A delivery
 /// failure is logged once and the position still advances past it -- a stuck prompt does not block
 /// mirroring later ones.
 async fn mirror_terminal_prompts(
@@ -1306,10 +1306,7 @@ async fn mirror_terminal_prompts(
     if prompts.is_empty() {
         return;
     }
-    let (client, guild, _owner_id, responder) = connection;
-    let Some(identity) = state.owner_identity.clone() else {
-        return;
-    };
+    let (client, guild, _, responder, identity) = connection;
     let topology_cache = responder.topology_cache();
     let (workspace_channel, thread) =
         match sync_route_channels(client.as_ref(), *guild, route, topology_cache).await {
@@ -1329,7 +1326,7 @@ async fn mirror_terminal_prompts(
         if take_owner_prompt_suppression(&route.pane_id, &text) {
             continue;
         }
-        match mirror_one_terminal_prompt(target, &identity, &text, state).await {
+        match mirror_one_terminal_prompt(target, identity, &text, state).await {
             Ok(delivered) => target = delivered,
             Err(error) => {
                 bridge_eprintln!("terminal prompt delivery error for {terminal}: {error}");
@@ -1360,7 +1357,7 @@ async fn handle_live_event(
     let Some(connection) = discord else {
         return;
     };
-    let (client, guild, _owner_id, responder) = connection;
+    let (client, guild, _, responder, _) = connection;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
@@ -1470,7 +1467,7 @@ async fn handle_activity_event(
     frame: ActivityFrame,
     state: &mut BridgeState,
 ) {
-    let Some((client, _guild, _owner_id, responder)) = discord else {
+    let Some((client, _, _, responder, _)) = discord else {
         return;
     };
     let route = TopologyRoute {
@@ -1629,7 +1626,7 @@ async fn sync_startup_topology(
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
 ) {
-    let (client, guild, _, responder) = discord;
+    let (client, guild, _, responder, _) = discord;
     let topology_cache = responder.topology_cache();
     let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
         Ok(lists) => lists,
@@ -1725,7 +1722,7 @@ async fn delete_closed_topology(
     discord: Option<&DiscordConnection>,
     closure: &TopologyClosure,
 ) -> Result<(), String> {
-    let Some((client, guild, _, responder)) = discord else {
+    let Some((client, guild, _, responder, _)) = discord else {
         return Ok(());
     };
     let topology_cache = responder.topology_cache();
@@ -1816,7 +1813,7 @@ fn prune_departed_state(
     departed_cards
 }
 
-fn discord_connection(
+async fn discord_connection(
     topology_cache: TopologyCache,
 ) -> Result<(DiscordConnection, GatewayTask), Box<dyn std::error::Error>> {
     let environment: Vec<(String, String)> = std::env::vars().collect();
@@ -1827,6 +1824,7 @@ fn discord_connection(
     let config = load_discord_config(&environment)?;
     let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
     let client = Arc::new(Client::builder().token(config.token.clone()).build());
+    let identity = fetch_startup_owner_identity(&client, &config.owner_id).await?;
     let (notices_tx, notices_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while let Ok(notice) = notices_rx.recv() {
@@ -1851,7 +1849,10 @@ fn discord_connection(
         notices_tx,
         component_handler(Arc::clone(&responder)),
     ));
-    Ok(((client, guild, config.owner_id, responder), gateway))
+    Ok((
+        (client, guild, config.owner_id, responder, identity),
+        gateway,
+    ))
 }
 
 #[tokio::main]
@@ -2436,7 +2437,7 @@ async fn apply_lifecycle_event(
 /// Herdr and of the startup sweep, so an owner deletion of an archived thread whose tab has no
 /// session still resolves. A failure is logged loudly.
 fn spawn_archived_thread_registration(discord: &DiscordConnection) {
-    let (client, guild, _, _) = discord;
+    let (client, guild, ..) = discord;
     let (client, guild) = (client.clone(), *guild);
     tokio::spawn(async move {
         if let Err(error) = register_archived_tab_threads(client.as_ref(), guild).await {
@@ -2663,41 +2664,35 @@ async fn next_status_event(
     }
 }
 
-/// Fetches the owner's mirrored identity once at startup: `Ok(None)` only when called without a
-/// connection, which the bridge never does.
+/// Fetches the owner's mirrored identity once at startup.
 ///
 /// # Errors
 ///
-/// Returns an error when `DISCORD_OWNER_ID` is not numeric or the fetch itself fails. Terminal
-/// prompt mirroring has no fallback identity to mirror under, so [`run_bridge`] fails startup on
-/// this error rather than silently running the rest of the process without it.
+/// Returns an error when `owner_id` is not numeric or the fetch itself fails. Terminal prompt
+/// mirroring has no fallback identity to mirror under, so startup fails on this error rather than
+/// running the rest of the process without it.
 async fn fetch_startup_owner_identity(
-    discord: Option<&DiscordConnection>,
-) -> Result<Option<OwnerIdentity>, String> {
-    let Some((client, _guild, owner_id, _responder)) = discord else {
-        return Ok(None);
-    };
+    client: &Client,
+    owner_id: &str,
+) -> Result<OwnerIdentity, String> {
     let owner_id = owner_id.parse::<u64>().map_err(|error| {
         format!("owner identity fetch error: DISCORD_OWNER_ID is not numeric: {error}")
     })?;
-    fetch_owner_identity(client.as_ref(), Id::<UserMarker>::new(owner_id))
+    fetch_owner_identity(client, Id::<UserMarker>::new(owner_id))
         .await
-        .map(Some)
         .map_err(|error| format!("owner identity fetch error: {error}"))
 }
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-    let (connection, gateway) = discord_connection(Arc::clone(&topology_cache))?;
+    let (connection, gateway) = discord_connection(Arc::clone(&topology_cache)).await?;
     let mut broker = start_broker(&connection, activity_tx);
     let discord = Some(connection);
     let mut gateway = Some(gateway);
-    let owner_identity = fetch_startup_owner_identity(discord.as_ref()).await?;
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
         live_tx: Some(live_tx),
-        owner_identity,
         ..BridgeState::default()
     };
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -3096,23 +3091,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_identity_fetch_is_none_without_discord_configured() {
-        assert_eq!(fetch_startup_owner_identity(None).await, Ok(None));
-    }
-
-    #[tokio::test]
     async fn owner_identity_fetch_fails_startup_when_the_owner_id_is_not_numeric() {
-        let client = Arc::new(Client::builder().token("fake-token".to_owned()).build());
-        let guild = Id::<GuildMarker>::new(1);
-        let owner_id = "not-a-number".to_owned();
-        let responder = Arc::new(PermissionResponder::new(
-            Arc::clone(&client),
-            guild,
-            owner_id.clone(),
-            Arc::new(tokio::sync::Mutex::new(None)),
-        ));
-        let connection: super::DiscordConnection = (client, guild, owner_id, responder);
-        let result = fetch_startup_owner_identity(Some(&connection)).await;
+        let client = Client::builder().token("fake-token".to_owned()).build();
+        let result = fetch_startup_owner_identity(&client, "not-a-number").await;
         assert!(
             result.is_err(),
             "a non-numeric DISCORD_OWNER_ID must fail startup, not silently run without an \
@@ -4230,7 +4211,18 @@ mod tests {
             owner_id.clone(),
             topology_cache,
         ));
-        (Arc::clone(&guild.client), guild.id, owner_id, responder)
+        // Tests that mirror terminal prompts replace this with the owner's fetched identity.
+        let identity = herdr_connect_rs::OwnerIdentity {
+            display_name: owner_id.clone(),
+            avatar_url: None,
+        };
+        (
+            Arc::clone(&guild.client),
+            guild.id,
+            owner_id,
+            responder,
+            identity,
+        )
     }
 
     #[cfg(unix)]
@@ -5398,7 +5390,7 @@ mod tests {
             live_tx: Some(live_tx),
             ..BridgeState::default()
         };
-        let connection = discord_tuple(guild);
+        let mut connection = discord_tuple(guild);
         own(&idle, tabs, &connection, &mut state).await;
 
         let route = route_topology(std::slice::from_ref(&idle), tabs, &terminal)?;
@@ -5413,9 +5405,10 @@ mod tests {
         );
         let identity =
             herdr_connect_rs::fetch_owner_identity(guild.client.as_ref(), owner_id).await?;
-        // `mirror_terminal_prompts` reads `state.owner_identity`, which only the real startup path
-        // (`run_bridge`) populates; this harness builds its own `BridgeState` and must set it too.
-        state.owner_identity = Some(identity.clone());
+        // `mirror_terminal_prompts` mirrors under the connection's identity, which only the real
+        // startup path (`run_bridge`) fetches; this harness builds its own connection and must set
+        // it too.
+        connection.4 = identity.clone();
         let nonce = agent_name_nonce()?;
         let fixture = TerminalPromptFixture {
             tab,
