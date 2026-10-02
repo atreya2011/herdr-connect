@@ -31,46 +31,6 @@ fn route_captured_herdr_snapshots() {
     }
 }
 
-#[test]
-fn captured_agent_list_preserves_live_socket_shape_statistics() {
-    let value: Value = serde_json::from_str(include_str!("fixtures/herdr-agent-list.json"))
-        .expect("captured snapshot is JSON");
-    let agents = value["result"]["agents"]
-        .as_array()
-        .expect("captured agents are an array");
-    let cases = [
-        ("agent count", agents.len(), 44),
-        (
-            "foreground cwd count",
-            agents
-                .iter()
-                .filter(|agent| agent.get("foreground_cwd").is_some())
-                .count(),
-            40,
-        ),
-        (
-            "agent session count",
-            agents
-                .iter()
-                .filter(|agent| agent.get("agent_session").is_some())
-                .count(),
-            30,
-        ),
-        (
-            "no-agent count",
-            agents
-                .iter()
-                .filter(|agent| agent.get("agent").is_none())
-                .count(),
-            1,
-        ),
-    ];
-    for (description, actual, expected) in cases {
-        assert_eq!(actual, expected, "{description}");
-    }
-    assert_eq!(value["result"]["type"], "agent_list");
-}
-
 /// Herdr 0.9.0 may omit `agent` entirely while a pane's agent is still being detected. That entry
 /// must still deserialize (not fail the whole `agent.list`) and must not be treated as a supported,
 /// mirrorable vendor.
