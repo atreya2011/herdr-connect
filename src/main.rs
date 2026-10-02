@@ -5866,7 +5866,7 @@ mod tests {
                     {
                         "matcher": "AskUserQuestion",
                         "hooks": [
-                            {"type": "command", "command": command, "timeout": 600}
+                            {"type": "command", "command": command, "timeout": herdr_connect_rs::question_hook_timeout().as_secs()}
                         ]
                     }
                 ]
@@ -6163,8 +6163,12 @@ mod tests {
         run_question_hook_test().await;
     }
 
+    /// Slack over `question_hook_timeout()` for the expiry row's poll for the blocked fall-back.
+    #[cfg(unix)]
+    const QUESTION_EXPIRY_POLL_MARGIN: Duration = Duration::from_secs(15);
+
     /// Mirrors [`question_hook_exercise`] but never resolves the card: the hook's own
-    /// `QUESTION_TIMEOUT` window (five real minutes -- this test does not fake the clock, per the
+    /// `QUESTION_TIMEOUT` window (thirty real seconds -- this test does not fake the clock, per the
     /// real-services law) must elapse before the card reads `expired: no owner answer` and the pane
     /// falls back to blocking on Claude's own dialog.
     #[cfg(unix)]
@@ -6221,11 +6225,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // No resolution: wait out the real QUESTION_TIMEOUT window plus the card-edit margin.
-        let status = poll_snapshot(&tab.pane_id, Duration::from_secs(320), |snapshot| {
-            matches!(snapshot.agent_status.as_str(), "blocked")
-        })?
+        // No resolution: wait out the real QUESTION_TIMEOUT window. The hook's own timeout is that
+        // window plus a 5 s margin, so the fall-back must land inside `question_hook_timeout()`
+        // plus a poll margin, and not before the window itself has run (a 10 s allowance below the
+        // hook timeout covers the margin and the poll granularity).
+        let waiting_since = Instant::now();
+        let status = poll_snapshot(
+            &tab.pane_id,
+            herdr_connect_rs::question_hook_timeout() + QUESTION_EXPIRY_POLL_MARGIN,
+            |snapshot| matches!(snapshot.agent_status.as_str(), "blocked"),
+        )?
         .agent_status;
+        let waited = waiting_since.elapsed();
+        let earliest = herdr_connect_rs::question_hook_timeout() - Duration::from_secs(10);
+        if waited < earliest {
+            broker_task.abort();
+            return Err(format!(
+                "pane fell back after {waited:?}, before the question window of about {earliest:?}"
+            ));
+        }
         broker_task.abort();
         let _ = std::fs::remove_file(broker_socket);
 
@@ -6292,7 +6310,9 @@ mod tests {
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
                 let outcome = tokio::time::timeout(
-                    Duration::from_secs(360),
+                    herdr_connect_rs::question_hook_timeout()
+                        + QUESTION_EXPIRY_POLL_MARGIN
+                        + Duration::from_secs(60),
                     question_hook_expiry_exercise(
                         &guild,
                         &tab,
@@ -6335,7 +6355,7 @@ mod tests {
 
     /// Multi-threaded like [`startup_sweep_survives_a_concurrent_cache_clear`], for the same
     /// reason: this test's own `poll_snapshot` wait blocks its thread with `std::thread::sleep`
-    /// for the real ~300s `QUESTION_TIMEOUT` window, and on a single-threaded runtime that starves
+    /// for the real ~30s `QUESTION_TIMEOUT` window, and on a single-threaded runtime that starves
     /// the broker's own concurrently-awaited `request_one_question` task, delaying the card's
     /// `"expired: ..."` edit until after this test has already read the thread.
     #[cfg(unix)]
