@@ -89,7 +89,7 @@ pub use watcher::{Transition, is_postable_transition};
 pub fn log_timestamp() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "0000-00-00T00:00:00Z".to_owned())
+        .unwrap_or_else(|error| format!("<timestamp unavailable: {error}>"))
 }
 
 /// Prefixes a bridge stdout line with [`log_timestamp`].
