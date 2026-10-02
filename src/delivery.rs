@@ -256,35 +256,6 @@ pub async fn execute_terminal_prompt_webhook(
         .map_err(|error| error.to_string())
 }
 
-/// Delivers one terminal-origin prompt through the bridge-owned workspace webhook, resolving (or
-/// creating) it fresh on every call.
-///
-/// # Errors
-///
-/// Returns [`resolve_terminal_prompt_webhook`] or [`execute_terminal_prompt_webhook`] errors.
-pub async fn deliver_terminal_prompt(
-    client: &twilight_http::Client,
-    workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    thread: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    webhook_name: &str,
-    username: &str,
-    avatar_url: Option<&str>,
-    content: &str,
-) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    let (webhook_id, webhook_token) =
-        resolve_terminal_prompt_webhook(client, workspace_channel, webhook_name).await?;
-    execute_terminal_prompt_webhook(
-        client,
-        webhook_id,
-        &webhook_token,
-        thread,
-        username,
-        avatar_url,
-        content,
-    )
-    .await
-}
-
 /// Delivers one plain, content-only activity message: no embed, no nonce -- a turn's activity
 /// message is edited in place rather than deduplicated by nonce.
 ///
