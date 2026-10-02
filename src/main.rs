@@ -3279,9 +3279,9 @@ mod tests {
     /// [`claude_search_roots_cover_every_claude_config_directory_under_home`].
     struct ClaudeSearchRootCase {
         name: &'static str,
-        /// Builds the layout under a fresh temp `$HOME` and returns the session to resolve and,
-        /// when a log should be found there, the path it must resolve to.
-        build: fn(&Path) -> (AgentSnapshot, AgentSession, Option<PathBuf>),
+        /// Builds the layout under a fresh temp `$HOME` and returns the session to resolve and the
+        /// path it must resolve to.
+        build: fn(&Path) -> (AgentSnapshot, AgentSession, PathBuf),
     }
 
     #[test]
@@ -3298,7 +3298,7 @@ mod tests {
                     let expected_path = directory.join("two-roots-session.jsonl");
                     fs::write(&expected_path, "").expect("create Claude session file");
                     let (snapshot, session) = claude_session_snapshot(cwd, "two-roots-session");
-                    (snapshot, session, Some(expected_path))
+                    (snapshot, session, expected_path)
                 },
             },
             ClaudeSearchRootCase {
@@ -3314,7 +3314,7 @@ mod tests {
                     let expected_path = directory.join("three-roots-session.jsonl");
                     fs::write(&expected_path, "").expect("create Claude session file");
                     let (snapshot, session) = claude_session_snapshot(cwd, "three-roots-session");
-                    (snapshot, session, Some(expected_path))
+                    (snapshot, session, expected_path)
                 },
             },
             ClaudeSearchRootCase {
@@ -3331,7 +3331,7 @@ mod tests {
                     fs::hard_link(&primary_path, &secondary_path)
                         .expect("hard-link session log across roots");
                     let (snapshot, session) = claude_session_snapshot(cwd, "linked-session");
-                    (snapshot, session, Some(primary_path))
+                    (snapshot, session, primary_path)
                 },
             },
         ];
@@ -3346,20 +3346,9 @@ mod tests {
                     .as_nanos()
             ));
             fs::create_dir_all(&root).expect("create synthetic HOME directory");
-            let (snapshot, session, expected) = (case.build)(&root);
+            let (snapshot, session, expected_path) = (case.build)(&root);
             let result = resolve_session_path(&root, &snapshot, &session);
-            match expected {
-                Some(expected_path) => {
-                    assert_eq!(result, Ok(expected_path), "{}", case.name);
-                }
-                None => {
-                    assert!(
-                        matches!(result, Err(SessionPathError::NotFoundYet(_))),
-                        "{}: expected NotFoundYet, got {result:?}",
-                        case.name
-                    );
-                }
-            }
+            assert_eq!(result, Ok(expected_path), "{}", case.name);
             fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
         }
     }
