@@ -378,73 +378,30 @@ pub async fn sync_topology(
     Ok(id)
 }
 
-/// How many times a registration listing is tried before it is reported as failed.
-const REGISTRATION_ATTEMPTS: u32 = 4;
-/// Pause between registration attempts.
-const REGISTRATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Runs `operation` up to `attempts` times, pausing `delay` between tries, and returns the first
-/// success or the last error.
-async fn retry_listing<T, F, Fut>(
-    attempts: u32,
-    delay: std::time::Duration,
-    mut operation: F,
-) -> Result<T, String>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
-{
-    let mut attempt = 1;
-    loop {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(error) if attempt >= attempts => return Err(error),
-            Err(_) => {
-                attempt += 1;
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
-
 /// Registers the archived tab threads of every workspace channel, independent of any Herdr call
 /// and of the startup delete pass.
 ///
 /// A tab whose pane carries no session is not synced, so its auto-archived thread is found only
-/// by this listing. Each channel is listed on its own with bounded retries, and one channel's
-/// failure does not skip the rest.
+/// by this listing. It fetches the guild once and lists each workspace channel's archived threads
+/// once.
 ///
 /// # Errors
 ///
-/// Returns the Discord fetch error, or every channel listing that still failed after its retries.
+/// Returns the first Discord fetch or listing error.
 pub async fn register_archived_tab_threads(
     client: &twilight_http::Client,
     guild: Id<GuildMarker>,
 ) -> Result<(), String> {
-    let (channels, _) = retry_listing(REGISTRATION_ATTEMPTS, REGISTRATION_RETRY_DELAY, || {
-        fetch_topology_lists(client, guild)
-    })
-    .await?;
-    let workspace_channels: Vec<Id<ChannelMarker>> = channels
+    let (channels, _) = fetch_topology_lists(client, guild).await?;
+    for channel in channels
         .iter()
         .filter(|channel| workspace_topic_id(channel).is_some())
-        .map(|channel| channel.id)
-        .collect();
-    let mut errors = Vec::new();
-    for channel in workspace_channels {
-        if let Err(error) = retry_listing(REGISTRATION_ATTEMPTS, REGISTRATION_RETRY_DELAY, || {
-            archived_threads(client, channel)
-        })
-        .await
-        {
-            errors.push(format!("archived threads of channel {channel}: {error}"));
-        }
+    {
+        archived_threads(client, channel.id)
+            .await
+            .map_err(|error| format!("archived threads of channel {}: {error}", channel.id))?;
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
+    Ok(())
 }
 
 /// Lists one channel's public archived threads, following every pagination page.

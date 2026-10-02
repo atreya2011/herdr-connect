@@ -2439,7 +2439,7 @@ async fn apply_lifecycle_event(
 
 /// Registers every workspace channel's archived tab threads in a task of its own, independent of
 /// Herdr and of the startup sweep, so an owner deletion of an archived thread whose tab has no
-/// session still resolves. A failure that survives the bounded retries is logged loudly.
+/// session still resolves. A failure is logged loudly.
 fn spawn_archived_thread_registration(discord: &DiscordConnection) {
     let (client, guild, _, _) = discord;
     let (client, guild) = (client.clone(), *guild);
