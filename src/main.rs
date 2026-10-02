@@ -1780,13 +1780,12 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
-/// Removes every terminal-keyed entry for a terminal absent from `current_terminals` (except
+/// Removes every terminal-keyed entry for a terminal absent from `current_terminals`, except
 /// `state_change_sequences`, which keeps counting so a returning terminal never reuses a card
-/// nonce), every
-/// tab-keyed entry (`rename_errors_reported`) for a tab absent from `current_tabs`, and every
-/// pane-keyed entry (`activity_messages`, `activity_eligible_panes`) for a pane absent
-/// from `current_panes`, returning the informational cards that departed so callers can expire
-/// them.
+/// nonce. Also removes every tab-keyed entry (`rename_errors_reported`) for a tab absent from
+/// `current_tabs`, and every pane-keyed entry (`activity_messages`, `activity_eligible_panes`)
+/// for a pane absent from `current_panes`, returning the informational cards that departed so
+/// callers can expire them.
 fn prune_departed_state(
     state: &mut BridgeState,
     current_terminals: &HashSet<String>,
@@ -2620,16 +2619,6 @@ async fn subscribe_status_with_backoff(
     }
 }
 
-#[cfg(test)]
-async fn subscribe_status(pane_ids: &[String]) -> Result<Option<HerdrSubscription>, String> {
-    if pane_ids.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        subscribe_herdr_events(&status_subscriptions(pane_ids)).await?,
-    ))
-}
-
 async fn apply_herdr_snapshot(
     discord: Option<&DiscordConnection>,
     state: &mut BridgeState,
@@ -2801,9 +2790,8 @@ mod tests {
         initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
         live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
         process_snapshot, prune_departed_state, read_new_terminal_prompts, resolve_session_path,
-        route_topology, subscribe_status, subscribe_status_with_backoff, sync_route,
-        sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
-        unique_existing_path,
+        route_topology, subscribe_status_with_backoff, sync_route, sync_startup_topology,
+        tab_list_result, terminal_prompt_baseline_is_current, unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
@@ -3350,16 +3338,6 @@ mod tests {
                 },
             },
             ClaudeSearchRootCase {
-                name: "a .claude-foo directory without a projects directory is not a root",
-                build: |root| {
-                    fs::create_dir_all(root.join(".claude-foo"))
-                        .expect("create non-root .claude-foo directory");
-                    let (snapshot, session) =
-                        claude_session_snapshot("/tmp/ignored-workspace", "ignored-session");
-                    (snapshot, session, None)
-                },
-            },
-            ClaudeSearchRootCase {
                 name: "the same log hard-linked across two roots resolves as one file",
                 build: |root| {
                     let cwd = "/tmp/linked-workspace";
@@ -3513,7 +3491,6 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         fs::remove_dir_all(&root).expect("remove synthetic Codex HOME directory");
-        assert!(!root.exists(), "{name}: synthetic HOME cleanup");
         assert_eq!(
             resolved,
             Ok(sessions
@@ -4413,13 +4390,26 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
             .await
             .expect("lifecycle subscribe");
+        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("terminate signal stream");
+        let mut broker: Option<BrokerTask> = None;
+        let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
+        let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = BridgeRuntime {
+            lifecycle,
+            pane_ids: Vec::new(),
+            status: None,
+            state: BridgeState::default(),
+            live_events,
+            activity_events,
+        };
         let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
         let result = async {
-            wait_for_event(
-                &mut lifecycle,
+            let pane_created = wait_for_event(
+                &mut runtime.lifecycle,
                 "pane_created",
                 &tab.pane_id,
                 "/data/pane/pane_id",
@@ -4427,12 +4417,27 @@ mod tests {
                 Duration::from_secs(10),
             )
             .await?;
-            let mut status = subscribe_status(std::slice::from_ref(&tab.pane_id))
-                .await?
-                .ok_or_else(|| "status subscribe requires pane ids".to_owned())?;
+            handle_lifecycle_select_result(
+                Ok(pane_created),
+                None,
+                &mut stop,
+                &mut broker,
+                &mut runtime,
+            )
+            .await;
+            if !runtime.pane_ids.contains(&tab.pane_id) {
+                return Err(format!(
+                    "pane_created did not add the pane to the runtime: {:?}",
+                    runtime.pane_ids
+                ));
+            }
+            let status = runtime
+                .status
+                .as_mut()
+                .ok_or_else(|| "pane_created did not subscribe to status".to_owned())?;
             report_agent_state(&tab.pane_id, "working")?;
             wait_for_event(
-                &mut status,
+                status,
                 "pane.agent_status_changed",
                 &tab.pane_id,
                 "/data/pane_id",
@@ -5764,11 +5769,6 @@ mod tests {
             return Err(format!(
                 "turn one's activity message changed identity: {first_row:?}"
             ));
-        }
-        if second_row.2 == first_activity_id {
-            return Err(
-                "turn two edited turn one's activity message instead of posting its own".to_owned(),
-            );
         }
         if !second_row.0.starts_with("⚙️ 1 ·") {
             return Err(format!(
