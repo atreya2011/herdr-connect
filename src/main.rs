@@ -234,7 +234,13 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         return;
     }
     let detection_question = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
-        .then(|| agent_read_detection(&route.pane_id).ok())
+        .then(|| match agent_read_detection(&route.pane_id) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                bridge_eprintln!("agent detection read error for {terminal}: {error}");
+                None
+            }
+        })
         .flatten()
         .and_then(|text| format_detection_question(&text));
     let capture = detection_question.map_or_else(
@@ -382,7 +388,7 @@ async fn maybe_sync_fresh_session_topology(
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
     discord: Option<&DiscordConnection>,
-    state: &BridgeState,
+    state: &mut BridgeState,
 ) {
     let previous_status = state
         .previous
@@ -396,8 +402,17 @@ async fn maybe_sync_fresh_session_topology(
     {
         return;
     }
-    let Ok(route) = route_topology(agents, tabs, &snapshot.terminal_id) else {
-        return;
+    let route = match route_topology(agents, tabs, &snapshot.terminal_id) {
+        Ok(route) => route,
+        Err(error) => {
+            if state
+                .live_errors_reported
+                .insert((snapshot.terminal_id.clone(), error.clone()))
+            {
+                bridge_eprintln!("topology route error for {}: {error}", snapshot.terminal_id);
+            }
+            return;
+        }
     };
     let Some((client, guild, _, responder)) = discord else {
         return;
@@ -828,17 +843,20 @@ fn start_notify_watcher(
     terminal: String,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<notify::RecommendedWatcher, String> {
-    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        if let Ok(event) = result
-            && matches!(
-                event.kind,
-                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-            )
-        {
-            let _ = tx.send(terminal.clone());
-        }
-    })
-    .map_err(|error| error.to_string())?;
+    let mut watcher =
+        notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
+            Ok(event)
+                if matches!(
+                    event.kind,
+                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                ) =>
+            {
+                let _ = tx.send(terminal.clone());
+            }
+            Ok(_) => {}
+            Err(error) => bridge_eprintln!("live capture watch error for {terminal}: {error}"),
+        })
+        .map_err(|error| error.to_string())?;
     let target = if vendor == VENDOR_CURSOR {
         cursor_watch_target(path)
     } else {
@@ -965,8 +983,17 @@ async fn ensure_live_watch_started(
     };
     // Refresh the route on every snapshot, before the path check, so a pane moved to a different
     // tab or workspace mid-session posts to its new thread even though its log path is unchanged.
-    let Ok(route) = route_topology(agents, tabs, &terminal) else {
-        return;
+    let route = match route_topology(agents, tabs, &terminal) {
+        Ok(route) => route,
+        Err(error) => {
+            if state
+                .live_errors_reported
+                .insert((terminal.clone(), error.clone()))
+            {
+                bridge_eprintln!("topology route error for {terminal}: {error}");
+            }
+            return;
+        }
     };
     if let Some(watch) = state.live_watches.get_mut(&terminal)
         && watch.path == path
@@ -1324,11 +1351,14 @@ async fn mirror_terminal_prompts(
         return;
     };
     let topology_cache = responder.topology_cache();
-    let Ok((workspace_channel, thread)) =
-        sync_route_channels(client.as_ref(), *guild, route, topology_cache).await
-    else {
-        return;
-    };
+    let (workspace_channel, thread) =
+        match sync_route_channels(client.as_ref(), *guild, route, topology_cache).await {
+            Ok(channels) => channels,
+            Err(error) => {
+                bridge_eprintln!("terminal prompt route error for {terminal}: {error}");
+                return;
+            }
+        };
     let mut target = TerminalPromptTarget {
         client: client.as_ref(),
         topology_cache,
@@ -1459,15 +1489,21 @@ fn forget_activity_message(state: &mut BridgeState, pane_id: Option<&str>) {
     }
 }
 
-/// The route's tab thread from the cached topology only, issuing no Discord request. `None` when
-/// the cache is not yet populated or does not resolve the route.
+/// The route's tab thread from the cached topology only, issuing no Discord request. `Ok(None)`
+/// when the cache is not yet populated or does not resolve the route.
+///
+/// # Errors
+///
+/// Returns the cache's error when it lists duplicate threads for the route's tab.
 async fn cached_route_channel(
     topology_cache: &TopologyCache,
     route: &TopologyRoute,
-) -> Option<Id<ChannelMarker>> {
+) -> Result<Option<Id<ChannelMarker>>, String> {
     let guard = topology_cache.lock().await;
-    let (channels, active_threads) = guard.as_ref()?;
-    let channel = cached_route(channels, active_threads, route).ok().flatten();
+    let Some((channels, active_threads)) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let channel = cached_route(channels, active_threads, route);
     drop(guard);
     channel
 }
@@ -1475,7 +1511,8 @@ async fn cached_route_channel(
 /// Applies one activity frame: routes it to its tab's thread purely from the cached topology, then
 /// posts or edits this turn's one activity message for the pane.
 ///
-/// A cache not yet populated, or a route the cache does not resolve, drops the frame silently, and
+/// A cache not yet populated, or a route the cache does not resolve, drops the frame silently (a
+/// cache that lists duplicate threads for the tab drops it and logs), and
 /// so does a pane the latest snapshot does not report as `working` with a session -- the same
 /// no-session rule every other card follows. A send that finds the cached thread gone (unknown
 /// channel) clears the shared topology cache and logs; the next frame drops until the cache-first
@@ -1496,8 +1533,13 @@ async fn handle_activity_event(
         thread_name: String::new(),
     };
     let topology_cache = responder.topology_cache();
-    let Some(channel) = cached_route_channel(topology_cache, &route).await else {
-        return;
+    let channel = match cached_route_channel(topology_cache, &route).await {
+        Ok(Some(channel)) => channel,
+        Ok(None) => return,
+        Err(error) => {
+            bridge_eprintln!("activity route error for pane {}: {error}", frame.pane_id);
+            return;
+        }
     };
     // The eligibility gate covers both editing and creating: a frame that arrives after the pane
     // left `working` (its activity message still lingering until the next turn) is dropped rather
