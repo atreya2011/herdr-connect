@@ -27,8 +27,8 @@ pub use broker::{
     request_question_answers, run_broker, send_activity_frame,
 };
 pub use cards::{
-    AgentLogCapture, ThreadNameError, TransitionMessage, create_transition_messages,
-    format_thread_name, split_live_message,
+    AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,
+    split_live_message,
 };
 pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,
@@ -47,8 +47,9 @@ pub use gateway::{ComponentHandler, GatewayContext, drive_gateway_with_component
 pub use herdr::{
     AgentSession, AgentSnapshot, EVENT_KEY, HerdrSubscription, HerdrTab, HerdrWorkspace,
     STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, SubscribeError, agent_read_detection,
-    lifecycle_subscriptions, list_agents, request_rpc_result, status_subscriptions,
-    subscribe_herdr_events, tab_list_result, workspace_list_result,
+    generated_tab_name, is_numeric_label, lifecycle_subscriptions, list_agents,
+    name_unlabeled_tabs, request_rpc_result, status_subscriptions, subscribe_herdr_events,
+    tab_list_result, tabs_needing_names, workspace_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
@@ -71,7 +72,7 @@ pub use readers::{
     read_cursor_incremental, read_cursor_prompts_incremental,
 };
 pub use topology::{
-    RouteError, TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
+    TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
     reconcile_topology_cache, route_topology, sync_topology, workspace_channel_id,
     workspace_channel_name,

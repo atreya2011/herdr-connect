@@ -226,6 +226,93 @@ pub fn tab_list_result() -> Result<Vec<HerdrTab>, String> {
         .collect()
 }
 
+/// Words a generated tab name draws from; a power of two keeps the index arithmetic exact.
+const NAME_WORDS: [&str; 64] = [
+    "amber", "angle", "apple", "arrow", "aspen", "birch", "blaze", "bloom", "bridge", "brook",
+    "cedar", "cinder", "cloud", "coral", "crest", "dawn", "delta", "dune", "ember", "fern",
+    "field", "flint", "frost", "glade", "grove", "harbor", "hazel", "iris", "isle", "jade",
+    "juniper", "kelp", "lake", "lark", "lemon", "maple", "marsh", "meadow", "mist", "moss", "oak",
+    "olive", "opal", "orchid", "pearl", "pine", "pond", "quartz", "raven", "reed", "ridge",
+    "river", "sage", "slate", "spruce", "stone", "storm", "tide", "thorn", "willow", "wren",
+    "yarrow", "zephyr", "summit",
+];
+
+/// Whether a tab label is Herdr's auto-assigned number rather than an owner-given name.
+#[must_use]
+pub fn is_numeric_label(label: &str) -> bool {
+    let label = label.trim();
+    !label.is_empty() && label.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The readable `word-word-word` name for a tab, derived only from its id (FNV-1a), so the same
+/// tab always receives the same name.
+#[must_use]
+pub fn generated_tab_name(tab_id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in tab_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash.to_be_bytes()
+        .iter()
+        .take(3)
+        .map(|byte| NAME_WORDS[usize::from(byte % 64)])
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// The `(tab_id, name)` renames due.
+///
+/// Due tabs have a numeric label and carry a session-reporting agent. Owner-given labels, tabs
+/// that already carry a generated name, and tabs the bridge does not mirror are never listed.
+#[must_use]
+pub fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(String, String)> {
+    tabs.iter()
+        .filter(|tab| is_numeric_label(&tab.label))
+        .filter(|tab| {
+            agents.iter().any(|agent| {
+                agent.session.is_some() && agent.tab_id.as_deref() == Some(tab.tab_id.as_str())
+            })
+        })
+        .map(|tab| (tab.tab_id.clone(), generated_tab_name(&tab.tab_id)))
+        .collect()
+}
+
+/// Renames every tab [`tabs_needing_names`] lists and records the new label in `tabs`.
+///
+/// A tab whose rename fails keeps its numeric label, and its error is returned so the caller
+/// reports it.
+pub fn name_unlabeled_tabs(agents: &[AgentSnapshot], tabs: &mut [HerdrTab]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (tab_id, name) in tabs_needing_names(agents, tabs) {
+        match tab_rename(&tab_id, &name) {
+            Ok(()) => {
+                if let Some(tab) = tabs.iter_mut().find(|tab| tab.tab_id == tab_id) {
+                    tab.label = name;
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    errors
+}
+
+/// Renames a Herdr tab through the `herdr tab rename` command.
+fn tab_rename(tab_id: &str, label: &str) -> Result<(), String> {
+    let output = std::process::Command::new("herdr")
+        .args(["tab", "rename", tab_id, label])
+        .output()
+        .map_err(|error| format!("herdr tab rename {tab_id} failed to start: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "herdr tab rename {tab_id} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 #[derive(Clone, Deserialize, Debug)]
 pub struct AgentSnapshot {
     /// `None` while Herdr is still detecting the pane's agent (0.9.0 omits the key entirely).
@@ -289,18 +376,15 @@ pub fn workspace_list_result() -> Result<Vec<HerdrWorkspace>, String> {
 /// Session-wide pane-membership and tab/workspace-closure watches for the lifecycle subscribe
 /// socket.
 ///
-/// `pane.updated` has no `pane_id` filter in Herdr's subscription schema, so it is subscribed
-/// once here rather than once per tracked pane: one unfiltered subscription per pane would
-/// multiply every pane's update events by the tracked-pane count. The event loop reads each
-/// pushed event's own `data.pane.tab_id` and `data.pane.terminal_title_stripped` to decide
-/// whether it is worth a snapshot, rather than relying on the subscription to filter anything.
+/// Terminal titles no longer matter (every tab gets a readable label), so `pane.updated` is not
+/// subscribed. `tab.renamed` is not subscribed either: the bridge's own rename must not wake a
+/// pass, and thread names are frozen once created.
 #[must_use]
 pub fn lifecycle_subscriptions() -> Vec<Value> {
     vec![
         json!({SUBSCRIPTION_TYPE_KEY: "pane.created"}),
         json!({SUBSCRIPTION_TYPE_KEY: "pane.closed"}),
         json!({SUBSCRIPTION_TYPE_KEY: "pane.agent_detected"}),
-        json!({SUBSCRIPTION_TYPE_KEY: "pane.updated"}),
         json!({SUBSCRIPTION_TYPE_KEY: "tab.closed"}),
         json!({SUBSCRIPTION_TYPE_KEY: "workspace.closed"}),
     ]
@@ -486,7 +570,10 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::AsyncWriteExt;
 
-    use super::{HerdrSubscription, acknowledge_prompt_result};
+    use super::{
+        AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, NAME_WORDS,
+        acknowledge_prompt_result, generated_tab_name, tabs_needing_names,
+    };
 
     /// A real Unix domain socket, not the live Herdr daemon: reproducing a byte-level split-write
     /// race against the real daemon on demand is not practically controllable, but
@@ -560,5 +647,90 @@ mod tests {
                 expected.map(str::to_owned).map_err(str::to_owned)
             );
         }
+    }
+
+    #[test]
+    fn generated_tab_names_are_deterministic_three_word_names_from_the_word_list() {
+        for tab_id in ["w-1:1", "w-1:2", "w-9:14", "testrun-tab"] {
+            let name = generated_tab_name(tab_id);
+            assert_eq!(
+                name,
+                generated_tab_name(tab_id),
+                "{tab_id} is deterministic"
+            );
+            let words: Vec<&str> = name.split('-').collect();
+            assert_eq!(words.len(), 3, "{name} has three words");
+            for word in words {
+                assert!(NAME_WORDS.contains(&word), "{word} is in the word list");
+            }
+        }
+        assert_ne!(generated_tab_name("w-1:1"), generated_tab_name("w-1:2"));
+        let mut sorted = NAME_WORDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            NAME_WORDS.len(),
+            "word list has no duplicates"
+        );
+        assert!(
+            NAME_WORDS
+                .iter()
+                .all(|word| word.chars().all(|c| c.is_ascii_lowercase())),
+            "word list is lowercase letters only"
+        );
+    }
+
+    fn agent_in_tab(tab_id: &str, session: bool) -> AgentSnapshot {
+        AgentSnapshot {
+            agent: Some("claude".to_owned()),
+            terminal_id: format!("{tab_id}:terminal"),
+            agent_status: "idle".to_owned(),
+            tab_id: Some(tab_id.to_owned()),
+            workspace_id: Some("w-1".to_owned()),
+            pane_id: Some(format!("{tab_id}:pane")),
+            cwd: Some("/tmp/work".to_owned()),
+            terminal_title_stripped: None,
+            session: session.then(|| AgentSession {
+                agent: "claude".to_owned(),
+                value: "session".to_owned(),
+            }),
+        }
+    }
+
+    fn tab(tab_id: &str, label: &str) -> HerdrTab {
+        HerdrTab {
+            tab_id: tab_id.to_owned(),
+            workspace_id: "w-1".to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
+    #[test]
+    fn only_numeric_labelled_tabs_with_a_reported_session_are_named() {
+        let generated = generated_tab_name("w-1:5");
+        let agents = [
+            agent_in_tab("w-1:1", true),
+            agent_in_tab("w-1:2", true),
+            agent_in_tab("w-1:3", false),
+            agent_in_tab("w-1:5", true),
+        ];
+        let tabs = [
+            tab("w-1:1", "3"),
+            tab("w-1:2", "build"),
+            tab("w-1:3", "4"),
+            tab("w-1:4", "5"),
+            tab("w-1:5", &generated),
+        ];
+        assert_eq!(
+            tabs_needing_names(&agents, &tabs),
+            [("w-1:1".to_owned(), generated_tab_name("w-1:1"))],
+            "owner labels, session-less tabs, agentless tabs, and generated names are left alone"
+        );
+        let renamed = [tab("w-1:1", &generated_tab_name("w-1:1"))];
+        assert!(
+            tabs_needing_names(&agents, &renamed).is_empty(),
+            "a tab that already carries its generated name is not renamed again"
+        );
     }
 }

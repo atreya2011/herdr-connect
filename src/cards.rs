@@ -1,4 +1,4 @@
-use crate::herdr::STATUS_BLOCKED;
+use crate::herdr::{STATUS_BLOCKED, is_numeric_label};
 use crate::watcher::Transition;
 
 const MAX_PART_LENGTH: usize = 1_900;
@@ -152,53 +152,34 @@ fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
     out
 }
 
-/// Why [`format_thread_name`] could not produce a name.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ThreadNameError {
-    /// A numeric tab label has no terminal title yet. Not a failure: a cold-start tab is titled
-    /// by Herdr shortly after the pane starts, so the caller waits for a later snapshot.
-    TitlePending,
-    /// The name can never be produced from this tab's identity (empty label, or a tab id too
-    /// long for a Discord thread name).
-    Unusable(String),
-}
-
-/// Formats a bounded Discord thread name.
+/// Formats a bounded Discord thread name from a tab's label.
 ///
 /// # Errors
 ///
-/// Returns [`ThreadNameError::TitlePending`] when a numeric label has no terminal title yet, or
-/// [`ThreadNameError::Unusable`] when the label is empty or the suffix cannot fit.
-pub fn format_thread_name(
-    label: &str,
-    title: &str,
-    tab_id: &str,
-) -> Result<String, ThreadNameError> {
-    let label = label.trim();
-    let title = title.trim();
-    let numeric_label = !label.is_empty() && label.chars().all(|c| c.is_ascii_digit());
-    let base = if !label.is_empty() && !numeric_label {
-        label
-    } else if numeric_label && !title.is_empty() {
-        title
-    } else if numeric_label {
-        return Err(ThreadNameError::TitlePending);
-    } else {
-        return Err(ThreadNameError::Unusable(format!(
-            "herdr tab {tab_id} has no label"
-        )));
-    };
+/// Returns an error when the label is empty or still Herdr's auto-assigned number (the bridge
+/// renames such tabs before routing, so a numeric label here means that rename failed), or when
+/// the tab id suffix cannot fit.
+pub fn format_thread_name(label: &str, tab_id: &str) -> Result<String, String> {
+    let base = label.trim();
+    if base.is_empty() {
+        return Err(format!("herdr tab {tab_id} has no label"));
+    }
+    if is_numeric_label(base) {
+        return Err(format!(
+            "herdr tab {tab_id} still has the numeric label {base}"
+        ));
+    }
     let suffix = format!(" [{tab_id}]");
     if suffix.chars().count() > MAX_THREAD_NAME_LENGTH {
-        return Err(ThreadNameError::Unusable(format!(
+        return Err(format!(
             "herdr tab id {tab_id} is too long for a Discord thread"
-        )));
+        ));
     }
     let capacity = MAX_THREAD_NAME_LENGTH - suffix.chars().count();
     if capacity == 0 {
-        return Err(ThreadNameError::Unusable(format!(
+        return Err(format!(
             "herdr tab id {tab_id} is too long for a Discord thread"
-        )));
+        ));
     }
     Ok(format!(
         "{}{}",
