@@ -44,7 +44,8 @@ pub struct AgentLog {
 /// # Errors
 ///
 /// Returns the path and the underlying cause when the file cannot be read, is not valid UTF-8,
-/// holds a corrupt non-final record, or holds no assistant message.
+/// holds a corrupt non-final record, holds no assistant message, the Cursor store cannot be opened
+/// or read, or the vendor is unsupported.
 pub fn read_agent_log(session: &AgentSession, path: &Path) -> Result<AgentLog, String> {
     let failed = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
     if session.agent == VENDOR_CURSOR {
