@@ -5,7 +5,6 @@ pub struct Transition {
     pub from: String,
     pub to: String,
     pub terminal_id: String,
-    pub agent: String,
 }
 
 /// A `working` -> `blocked` transition: the only transition that posts a card. Done and idle post

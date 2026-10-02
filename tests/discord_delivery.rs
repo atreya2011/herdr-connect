@@ -86,7 +86,6 @@ mod real_guild {
                 from: "working".into(),
                 to: "blocked".into(),
                 terminal_id: test_terminal.clone(),
-                agent: "claude".into(),
             },
             &AgentLogCapture {
                 message: "blocked".into(),
@@ -114,7 +113,6 @@ mod real_guild {
                 from: "working".into(),
                 to: "blocked".into(),
                 terminal_id: test_terminal.clone(),
-                agent: "claude".into(),
             },
             &AgentLogCapture {
                 message: "blocked".into(),

@@ -86,7 +86,7 @@ struct LiveWatch {
 
 #[derive(Default)]
 struct BridgeState {
-    previous: HashMap<String, (String, String)>,
+    previous: HashMap<String, String>,
     state_change_sequences: HashMap<String, u64>,
     informational_cards: HashMap<String, InformationalCard>,
     live_watches: HashMap<String, LiveWatch>,
@@ -253,7 +253,6 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         from: from_status.to_owned(),
         to: STATUS_BLOCKED.to_owned(),
         terminal_id: terminal.to_owned(),
-        agent: snapshot.agent.clone().unwrap_or_default(),
     };
     let messages = create_transition_messages(&transition, &capture, owner_id);
     deliver_blocked_messages(
@@ -386,7 +385,7 @@ async fn maybe_sync_fresh_session_topology(
     let previous_status = state
         .previous
         .get(&snapshot.terminal_id)
-        .map(|(previous, _)| previous.as_str());
+        .map(String::as_str);
     if snapshot.session.is_none()
         || previous_status.is_some_and(|previous| {
             previous != "unknown"
@@ -433,7 +432,7 @@ async fn process_snapshot(
     maybe_establish_terminal_prompt_baseline(snapshot, state);
     ensure_live_watch_started(discord, snapshot, agents, tabs, state).await;
     maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
-    if let Some((old, prior_agent)) = state.previous.get(&terminal).cloned()
+    if let Some(old) = state.previous.get(&terminal).cloned()
         && old != status
     {
         let seq = next_state_change_sequence(&mut state.state_change_sequences, &terminal);
@@ -442,7 +441,6 @@ async fn process_snapshot(
             from: old,
             to: status.clone(),
             terminal_id: terminal.clone(),
-            agent: prior_agent,
         };
         update_blocked_lifecycle(discord, &terminal, leaving_blocked, state).await;
         deliver_transition_if_postable(
@@ -464,20 +462,14 @@ async fn process_snapshot(
             forget_activity_message(state, snapshot.pane_id.as_deref());
         }
     }
-    remember_previous_status(state, &terminal, &status, snapshot.agent.as_deref());
+    remember_previous_status(state, &terminal, &status);
 }
 
 /// Split out of [`process_snapshot`] to keep it under the line-count lint.
-fn remember_previous_status(
-    state: &mut BridgeState,
-    terminal: &str,
-    status: &str,
-    agent: Option<&str>,
-) {
-    state.previous.insert(
-        terminal.to_owned(),
-        (status.to_owned(), agent.unwrap_or_default().to_owned()),
-    );
+fn remember_previous_status(state: &mut BridgeState, terminal: &str, status: &str) {
+    state
+        .previous
+        .insert(terminal.to_owned(), status.to_owned());
 }
 
 struct PostableTransitionContext<'a> {
@@ -3793,7 +3785,6 @@ mod tests {
             from: "working".to_owned(),
             to: "blocked".to_owned(),
             terminal_id: snapshot.terminal_id,
-            agent: snapshot.agent.unwrap_or_default(),
         };
         let card = create_transition_messages(&transition, &capture, "42")
             .into_iter()
