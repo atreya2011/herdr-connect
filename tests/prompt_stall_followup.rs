@@ -54,19 +54,16 @@ fn stalled_prompt_submission_recovers_and_the_turn_starts() {
         if let Some(tab_id) = &tab_id {
             close_tab(tab_id);
         }
-        let status = result.unwrap_or_else(|error| panic!("case {}: {error}", case.kind));
-        assert_ne!(
-            status, "idle",
-            "case {}: pane must leave idle once the prompt is actually submitted",
-            case.kind
-        );
+        if let Err(error) = result {
+            panic!("case {}: {error}", case.kind);
+        }
     }
 
     let leftover = remaining_testrun_tabs().expect("tab.list succeeds for the zero-leftover check");
     assert_eq!(leftover, 0, "named zero-leftover check");
 }
 
-fn exercise(kind: &str, pane_id: &str) -> Result<String, String> {
+fn exercise(kind: &str, pane_id: &str) -> Result<(), String> {
     let text = prompt_text_for(kind);
     submit_owner_prompt(pane_id, &text)?;
     wait_until_not_idle(pane_id, Duration::from_secs(20))
@@ -158,7 +155,7 @@ fn close_tab(tab_id: &str) {
         .output();
 }
 
-fn wait_until_not_idle(pane_id: &str, bound: Duration) -> Result<String, String> {
+fn wait_until_not_idle(pane_id: &str, bound: Duration) -> Result<(), String> {
     let start = Instant::now();
     loop {
         let status = list_agents()?
@@ -166,7 +163,7 @@ fn wait_until_not_idle(pane_id: &str, bound: Duration) -> Result<String, String>
             .find(|agent| agent.pane_id.as_deref() == Some(pane_id))
             .map(|agent| agent.agent_status);
         match status {
-            Some(status) if status != "idle" => return Ok(status),
+            Some(status) if status != "idle" => return Ok(()),
             _ if start.elapsed() > bound => {
                 return Err(format!(
                     "pane {pane_id} did not leave idle within {bound:?}"
