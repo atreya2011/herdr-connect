@@ -827,16 +827,11 @@ fn live_log_path(
     }
 }
 
-/// The Cursor session's chat directory: the parent of `store.db`, watched instead of the file
-/// itself so both the creation of its `-wal` sibling and later writes to it wake the follower. A
-/// watch set up before the sibling exists (the common case for a freshly started pane) would
-/// otherwise never see it appear.
-fn cursor_watch_target(store_path: &Path) -> &Path {
-    store_path.parent().unwrap_or(store_path)
-}
-
 /// Registers a `notify` watch on a vendor log path, forwarding the terminal id on every modify
-/// event. Cursor watches its chat directory (see [`cursor_watch_target`]) instead of the file.
+/// event. Cursor watches the chat directory that holds `store.db` instead of the file itself, so
+/// both the creation of its `-wal` sibling and later writes to it wake the follower; a watch on the
+/// file, set up before the sibling exists (the common case for a freshly started pane), would never
+/// see it appear.
 fn start_notify_watcher(
     vendor: &str,
     path: &Path,
@@ -858,7 +853,8 @@ fn start_notify_watcher(
         })
         .map_err(|error| error.to_string())?;
     let target = if vendor == VENDOR_CURSOR {
-        cursor_watch_target(path)
+        path.parent()
+            .ok_or_else(|| format!("cursor store {} has no parent", path.display()))?
     } else {
         path
     };
