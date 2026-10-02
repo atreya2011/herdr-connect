@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{SocketAddr, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -35,13 +36,15 @@ const TARGET_KEY: &str = "target";
 static RPC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The Herdr socket path: `HERDR_SOCKET_PATH`, else `$HOME/.config/herdr/herdr.sock`.
-fn herdr_socket_path() -> Result<String, String> {
-    if let Ok(path) = std::env::var("HERDR_SOCKET_PATH") {
-        return Ok(path);
-    }
-    let home = std::env::var(ENV_HOME)
-        .map_err(|_| "HOME is not configured and HERDR_SOCKET_PATH is unset".to_owned())?;
-    Ok(format!("{home}/.config/herdr/herdr.sock"))
+fn herdr_socket_path() -> Result<PathBuf, String> {
+    std::env::var_os("HERDR_SOCKET_PATH").map_or_else(
+        || {
+            std::env::var_os(ENV_HOME)
+                .map(|home| Path::new(&home).join(".config/herdr/herdr.sock"))
+                .ok_or_else(|| "HOME is not configured and HERDR_SOCKET_PATH is unset".to_owned())
+        },
+        |path| Ok(PathBuf::from(path)),
+    )
 }
 
 fn next_rpc_id() -> String {
