@@ -9636,7 +9636,7 @@ mod tests {
         let messages = thread_messages(guild, thread.id).await?;
         if messages
             .iter()
-            .any(|(content, embed, _)| !embed && content.to_lowercase().contains("ready"))
+            .any(|(content, embed, _)| !embed && content.trim().eq_ignore_ascii_case("ready"))
         {
             Ok(())
         } else {
