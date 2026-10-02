@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{SocketAddr, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -282,37 +284,49 @@ pub fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(S
 
 /// Renames every tab [`tabs_needing_names`] lists and records the new label in `tabs`.
 ///
-/// A tab whose rename fails keeps its numeric label, and its error is returned so the caller
-/// reports it.
-pub fn name_unlabeled_tabs(agents: &[AgentSnapshot], tabs: &mut [HerdrTab]) -> Vec<String> {
+/// A tab whose rename fails keeps its numeric label and is retried on the next pass, but its error
+/// is returned only the first time: `reported` holds the tabs whose failure was already returned
+/// and forgets a tab once its rename succeeds.
+pub fn name_unlabeled_tabs<S: BuildHasher>(
+    agents: &[AgentSnapshot],
+    tabs: &mut [HerdrTab],
+    reported: &mut HashSet<String, S>,
+) -> Vec<String> {
     let mut errors = Vec::new();
     for (tab_id, name) in tabs_needing_names(agents, tabs) {
-        match tab_rename(&tab_id, &name) {
-            Ok(()) => {
-                if let Some(tab) = tabs.iter_mut().find(|tab| tab.tab_id == tab_id) {
-                    tab.label = name;
-                }
-            }
-            Err(error) => errors.push(error),
+        let outcome = tab_rename(&tab_id, &name);
+        if outcome.is_ok()
+            && let Some(tab) = tabs.iter_mut().find(|tab| tab.tab_id == tab_id)
+        {
+            tab.label = name;
         }
+        errors.extend(rename_failure_to_report(&tab_id, outcome, reported));
     }
     errors
 }
 
-/// Renames a Herdr tab through the `herdr tab rename` command.
-fn tab_rename(tab_id: &str, label: &str) -> Result<(), String> {
-    let output = std::process::Command::new("herdr")
-        .args(["tab", "rename", tab_id, label])
-        .output()
-        .map_err(|error| format!("herdr tab rename {tab_id} failed to start: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "herdr tab rename {tab_id} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+/// The message to report for one rename outcome, or `None` when it succeeded or the tab's failure
+/// was already reported.
+fn rename_failure_to_report(
+    tab_id: &str,
+    outcome: Result<(), String>,
+    reported: &mut HashSet<String, impl BuildHasher>,
+) -> Option<String> {
+    match outcome {
+        Ok(()) => {
+            reported.remove(tab_id);
+            None
+        }
+        Err(error) => reported
+            .insert(tab_id.to_owned())
+            .then(|| format!("herdr tab.rename {tab_id} failed: {error}")),
     }
+}
+
+/// Renames a Herdr tab through the bounded `tab.rename` socket request.
+fn tab_rename(tab_id: &str, label: &str) -> Result<(), String> {
+    request_rpc_result_with_params("tab.rename", &json!({"tab_id": tab_id, "label": label}))
+        .map(|_| ())
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -573,7 +587,8 @@ mod tests {
 
     use super::{
         AgentSession, AgentSnapshot, HerdrSubscription, HerdrTab, NAME_WORDS,
-        acknowledge_prompt_result, generated_tab_name, tabs_needing_names,
+        acknowledge_prompt_result, generated_tab_name, rename_failure_to_report,
+        tabs_needing_names,
     };
 
     /// A real Unix domain socket, not the live Herdr daemon: reproducing a byte-level split-write
@@ -746,5 +761,28 @@ mod tests {
             tabs_needing_names(&agents, &renamed).is_empty(),
             "a tab that already carries its generated name is not renamed again"
         );
+    }
+
+    #[test]
+    fn a_failing_rename_is_reported_once_per_tab_until_it_succeeds() {
+        let mut reported = std::collections::HashSet::new();
+        let failure = || Err("socket gone".to_owned());
+        let steps: [(&str, Result<(), String>, Option<&str>); 6] = [
+            ("w-1:1", failure(), Some("socket gone")),
+            ("w-1:1", failure(), None),
+            ("w-1:2", failure(), Some("socket gone")),
+            ("w-1:1", Ok(()), None),
+            ("w-1:1", failure(), Some("socket gone")),
+            ("w-1:2", failure(), None),
+        ];
+        for (tab_id, outcome, expected) in steps {
+            assert_eq!(
+                rename_failure_to_report(tab_id, outcome, &mut reported).as_deref(),
+                expected
+                    .map(|text| format!("herdr tab.rename {tab_id} failed: {text}"))
+                    .as_deref(),
+                "{tab_id}"
+            );
+        }
     }
 }

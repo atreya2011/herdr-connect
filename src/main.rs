@@ -97,6 +97,9 @@ struct BridgeState {
     /// is cleared once a full read-and-deliver for it succeeds, so a recurring error after a
     /// recovery is logged afresh.
     live_errors_reported: HashSet<(String, String)>,
+    /// Tabs whose generated-name rename failure was already logged, so a persistent failure is
+    /// logged once per tab rather than on every snapshot pass.
+    rename_errors_reported: HashSet<String>,
     /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
     /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
     /// Forgotten -- not deleted -- when the pane next reports `working`, so the new turn starts a
@@ -2434,7 +2437,7 @@ async fn apply_lifecycle_event(
 fn spawn_startup_topology_sweep(discord: &DiscordConnection) {
     match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
         Ok((agents, mut tabs)) => {
-            for error in name_unlabeled_tabs(&agents, &mut tabs) {
+            for error in name_unlabeled_tabs(&agents, &mut tabs, &mut HashSet::new()) {
                 bridge_eprintln!("herdr startup topology error: {error}");
             }
             let discord = discord.clone();
@@ -2603,7 +2606,7 @@ async fn apply_herdr_snapshot(
 ) -> Result<Vec<String>, String> {
     let agents = list_agents()?;
     let mut tabs = tab_list_result()?;
-    for error in name_unlabeled_tabs(&agents, &mut tabs) {
+    for error in name_unlabeled_tabs(&agents, &mut tabs, &mut state.rename_errors_reported) {
         bridge_eprintln!("{error}");
     }
     let current_terminals: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
@@ -7169,7 +7172,7 @@ mod tests {
         let agents = [snapshot.clone()];
         let mut tabs = vec![listed];
 
-        let errors = name_unlabeled_tabs(&agents, &mut tabs);
+        let errors = name_unlabeled_tabs(&agents, &mut tabs, &mut HashSet::new());
         if !errors.is_empty() {
             return Err(format!("renaming the unlabeled tab failed: {errors:?}"));
         }
@@ -7201,7 +7204,7 @@ mod tests {
         }
 
         let mut second_pass_tabs = vec![matching_tab(&tab.tab_id)?];
-        if !name_unlabeled_tabs(&agents, &mut second_pass_tabs).is_empty()
+        if !name_unlabeled_tabs(&agents, &mut second_pass_tabs, &mut HashSet::new()).is_empty()
             || matching_tab(&tab.tab_id)?.label != expected_name
         {
             return Err("a tab already carrying its generated name was renamed again".to_owned());
