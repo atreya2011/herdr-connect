@@ -3143,7 +3143,10 @@ mod tests {
             .expect("Cursor failures must produce output");
         let value: Value = serde_json::from_slice(&output).expect("Cursor failure output is JSON");
         assert_eq!(value["permission"], "deny");
-        assert!(value["agent_message"].as_str().is_some());
+        assert_eq!(
+            value["agent_message"],
+            "permission broker did not return a decision; denying by default"
+        );
     }
 
     #[test]
