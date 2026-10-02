@@ -3026,7 +3026,6 @@ mod tests {
                 workspace_id: None,
                 pane_id: None,
                 cwd: Some(cwd.clone()),
-                terminal_title_stripped: None,
                 session: Some(AgentSession {
                     agent: VENDOR_CLAUDE.to_owned(),
                     value: session_value.to_owned(),
@@ -3252,7 +3251,6 @@ mod tests {
             workspace_id: None,
             pane_id: None,
             cwd: Some(cwd.to_owned()),
-            terminal_title_stripped: None,
             session: Some(session.clone()),
         };
         (snapshot, session)
@@ -3423,7 +3421,6 @@ mod tests {
                 workspace_id: None,
                 pane_id: None,
                 cwd: Some("/srv/bridge".to_owned()),
-                terminal_title_stripped: None,
                 session: Some(session.clone()),
             };
 
@@ -3579,7 +3576,6 @@ mod tests {
             workspace_id: None,
             pane_id: None,
             cwd: Some("/srv/bridge".to_owned()),
-            terminal_title_stripped: None,
             session: Some(AgentSession {
                 agent: "claude".to_owned(),
                 value: "9a11cafe-affe-4f5c-8bda-b10cb6a5cafe".to_owned(),
@@ -6941,7 +6937,6 @@ mod tests {
                     workspace_id: Some(workspace_id.to_owned()),
                     pane_id: Some(pane_id),
                     cwd: Some(format!("/tmp/{FRESH_IDLE_SESSION_LABEL}")),
-                    terminal_title_stripped: Some("fresh".to_owned()),
                     session: Some(AgentSession {
                         agent: agent.to_owned(),
                         value: format!("{agent}-fresh-session"),

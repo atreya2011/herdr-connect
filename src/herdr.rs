@@ -244,8 +244,10 @@ pub fn is_numeric_label(label: &str) -> bool {
     !label.is_empty() && label.chars().all(|c| c.is_ascii_digit())
 }
 
-/// The readable `word-word-word` name for a tab, derived only from its id (FNV-1a), so the same
-/// tab always receives the same name.
+/// The readable `word-word-word` name for a tab, derived only from its id (FNV-1a).
+///
+/// The same tab always receives the same name. The low bytes are used because FNV-1a mixes each input byte
+/// into them first, so sibling ids that differ in the last character differ in the first word.
 #[must_use]
 pub fn generated_tab_name(tab_id: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -253,7 +255,7 @@ pub fn generated_tab_name(tab_id: &str) -> String {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
-    hash.to_be_bytes()
+    hash.to_le_bytes()
         .iter()
         .take(3)
         .map(|byte| NAME_WORDS[usize::from(byte % 64)])
@@ -323,7 +325,6 @@ pub struct AgentSnapshot {
     pub workspace_id: Option<String>,
     pub pane_id: Option<String>,
     pub cwd: Option<String>,
-    pub terminal_title_stripped: Option<String>,
     #[serde(alias = "agent_session")]
     pub session: Option<AgentSession>,
 }
@@ -664,7 +665,21 @@ mod tests {
                 assert!(NAME_WORDS.contains(&word), "{word} is in the word list");
             }
         }
-        assert_ne!(generated_tab_name("w-1:1"), generated_tab_name("w-1:2"));
+        for siblings in [
+            ["w-1:1", "w-1:2", "w-1:3"],
+            ["w25:t35", "w25:t36", "w25:t37"],
+            ["w1W:t1", "w1W:t2", "w1W:t4"],
+        ] {
+            let first_words: std::collections::HashSet<String> = siblings
+                .iter()
+                .map(|id| generated_tab_name(id).split('-').next().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                first_words.len(),
+                siblings.len(),
+                "sibling ids {siblings:?} differ in their first word"
+            );
+        }
         let mut sorted = NAME_WORDS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -690,7 +705,6 @@ mod tests {
             workspace_id: Some("w-1".to_owned()),
             pane_id: Some(format!("{tab_id}:pane")),
             cwd: Some("/tmp/work".to_owned()),
-            terminal_title_stripped: None,
             session: session.then(|| AgentSession {
                 agent: "claude".to_owned(),
                 value: "session".to_owned(),
