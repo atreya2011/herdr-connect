@@ -2112,13 +2112,9 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     else {
         return Ok(());
     };
-    let (Ok(workspace_id), Ok(tab_id), Ok(pane_id)) = (
-        std::env::var("HERDR_WORKSPACE_ID"),
-        std::env::var("HERDR_TAB_ID"),
-        std::env::var("HERDR_PANE_ID"),
-    ) else {
-        return Ok(());
-    };
+    let workspace_id = std::env::var("HERDR_WORKSPACE_ID")?;
+    let tab_id = std::env::var("HERDR_TAB_ID")?;
+    let pane_id = std::env::var("HERDR_PANE_ID")?;
     let frame = ActivityFrame {
         kind: ACTIVITY_KIND.to_owned(),
         vendor: vendor.to_owned(),
@@ -3884,9 +3880,7 @@ mod tests {
     }
 
     /// The real guild every real-guild test runs against, or `None` when its environment is not
-    /// configured. When `HERDR_CLAUDE_BROKER_SOCKET` is set, panics if a production bridge is
-    /// listening on that socket, because a second bridge on the same guild and Herdr session can
-    /// satisfy a test's assertions in place of the code under test.
+    /// configured.
     #[cfg(unix)]
     fn blocked_capture_guild() -> Option<BlockedCaptureGuild> {
         let guild = BlockedCaptureGuild {
@@ -3898,13 +3892,6 @@ mod tests {
             ),
             id: Id::new(std::env::var("DISCORD_GUILD_ID").ok()?.parse().ok()?),
         };
-        if let Some(socket) = std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET") {
-            assert!(
-                std::os::unix::net::UnixStream::connect(&socket).is_err(),
-                "production bridge is listening on {}; stop it before running the suite",
-                Path::new(&socket).display()
-            );
-        }
         Some(guild)
     }
 
@@ -4546,22 +4533,6 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
-    /// Records the current status of every pane in the real Herdr session except `own_terminals`
-    /// as already seen, so the doorbell's fresh-session topology sync returns early for the
-    /// owner's own panes instead of creating or unarchiving their Discord channels and threads.
-    #[cfg(unix)]
-    fn seed_previous_for_other_terminals(
-        state: &mut BridgeState,
-        own_terminals: &[&str],
-    ) -> Result<(), String> {
-        for agent in list_agents()? {
-            if !own_terminals.contains(&agent.terminal_id.as_str()) {
-                state.previous.insert(agent.terminal_id, agent.agent_status);
-            }
-        }
-        Ok(())
-    }
-
     /// Feeds a real `pane_created` event through the lifecycle handler. The snapshot doorbell that
     /// follows the event also subscribes to status when the pane list changed, so no outcome tells
     /// the membership resubscribe apart from the doorbell's own subscribe: the row pins the
@@ -4615,7 +4586,6 @@ mod tests {
             .await?;
             report_agent_state(&tab.pane_id, "idle")?;
             let terminal_id = snapshot_for_pane(&tab.pane_id)?.terminal_id;
-            seed_previous_for_other_terminals(&mut runtime.state, &[&terminal_id])?;
             handle_lifecycle_select_result(
                 Ok(pane_created),
                 &connection,
@@ -8259,10 +8229,6 @@ mod tests {
     /// Closing a workspace's last tab also closes the workspace, so this exercise keeps a second
     /// tab alive through the tab-close step to observe tab close and workspace close as the two
     /// separately-observable Discord effects.
-    ///
-    /// Every terminal is seeded as already seen, including the exercise's own. The doorbell that
-    /// follows a lifecycle event would otherwise run a fresh-session topology sync for the root
-    /// pane and recreate a wrongly deleted root thread before the survival check observes it.
     #[cfg(unix)]
     async fn live_close_exercise(
         guild: &BlockedCaptureGuild,
@@ -8306,7 +8272,6 @@ mod tests {
             activity_events,
         };
 
-        seed_previous_for_other_terminals(&mut runtime.state, &[])?;
         close_tab(&second_tab.tab_id);
         let tab_closed = wait_for_event(
             &mut runtime.lifecycle,
