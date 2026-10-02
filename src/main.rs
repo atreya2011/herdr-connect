@@ -1780,7 +1780,9 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
-/// Removes every terminal-keyed entry for a terminal absent from `current_terminals`, every
+/// Removes every terminal-keyed entry for a terminal absent from `current_terminals` (except
+/// `state_change_sequences`, which keeps counting so a returning terminal never reuses a card
+/// nonce), every
 /// tab-keyed entry (`rename_errors_reported`) for a tab absent from `current_tabs`, and every
 /// pane-keyed entry (`activity_messages`, `activity_eligible_panes`) for a pane absent
 /// from `current_panes`, returning the informational cards that departed so callers can expire
@@ -1791,9 +1793,6 @@ fn prune_departed_state(
     current_panes: &HashSet<String>,
     current_tabs: &HashSet<String>,
 ) -> Vec<(String, InformationalCard)> {
-    state
-        .state_change_sequences
-        .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .live_watches
         .retain(|terminal, _| current_terminals.contains(terminal));
@@ -2801,9 +2800,10 @@ mod tests {
         fetch_topology_lists, handle_lifecycle_select_result, handle_live_event,
         initial_terminal_prompt_position, lifecycle_closure, lifecycle_membership, list_agents,
         live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
-        process_snapshot, read_new_terminal_prompts, resolve_session_path, route_topology,
-        subscribe_status, subscribe_status_with_backoff, sync_route, sync_startup_topology,
-        tab_list_result, terminal_prompt_baseline_is_current, unique_existing_path,
+        process_snapshot, prune_departed_state, read_new_terminal_prompts, resolve_session_path,
+        route_topology, subscribe_status, subscribe_status_with_backoff, sync_route,
+        sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
+        unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
@@ -3149,38 +3149,35 @@ mod tests {
     }
 
     #[test]
-    fn cursor_broker_failures_emit_deny_objects() {
-        for failure in ["timeout", "malformed broker response", "unavailable"] {
-            let output = super::encode_hook_decision(super::PermissionVendor::Cursor, None)
-                .unwrap_or_else(|error| panic!("{failure} failure must encode: {error}"))
-                .expect("Cursor failures must produce output");
-            let value: Value =
-                serde_json::from_slice(&output).expect("Cursor failure output is JSON");
-            assert_eq!(value["permission"], "deny", "failure: {failure}");
-            assert!(
-                value["agent_message"].as_str().is_some(),
-                "failure: {failure}"
-            );
-        }
+    fn cursor_hook_without_a_decision_emits_a_deny_object() {
+        let output = super::encode_hook_decision(super::PermissionVendor::Cursor, None)
+            .expect("a missing decision must encode")
+            .expect("Cursor failures must produce output");
+        let value: Value = serde_json::from_slice(&output).expect("Cursor failure output is JSON");
+        assert_eq!(value["permission"], "deny");
+        assert!(value["agent_message"].as_str().is_some());
     }
 
     #[test]
     fn state_change_nonce_survives_terminal_departure_and_return() {
         let terminal = "terminal";
-        let mut state_change_sequences = HashMap::new();
-        let mut current_terminals = HashSet::from([terminal.to_owned()]);
+        let mut state = BridgeState::default();
 
         let pre_departure_nonce = transition_card_nonce(
             terminal,
-            next_state_change_sequence(&mut state_change_sequences, terminal),
+            next_state_change_sequence(&mut state.state_change_sequences, terminal),
             0,
         );
 
-        assert!(current_terminals.remove(terminal));
-        assert!(current_terminals.insert(terminal.to_owned()));
+        prune_departed_state(
+            &mut state,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         let returned_nonce = transition_card_nonce(
             terminal,
-            next_state_change_sequence(&mut state_change_sequences, terminal),
+            next_state_change_sequence(&mut state.state_change_sequences, terminal),
             0,
         );
 
