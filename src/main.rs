@@ -1795,7 +1795,9 @@ async fn discord_connection(
         match std::env::var(name) {
             Ok(value) => environment.push((name, value)),
             Err(std::env::VarError::NotPresent) => {}
-            Err(error) => return Err(format!("{name}: {error}").into()),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!("{name} is set but is not valid UTF-8").into());
+            }
         }
     }
     let environment: Vec<(&str, &str)> = environment
@@ -3081,7 +3083,7 @@ mod tests {
     }
 
     /// A `DISCORD_TOKEN` that is set but not valid UTF-8 fails startup naming the variable, not as
-    /// a missing variable. The error is raised before any Discord request is made.
+    /// a missing variable, and without printing its value. The error is raised before any Discord request is made.
     #[tokio::test]
     async fn non_utf8_discord_variable_fails_startup_naming_the_variable() {
         use std::os::unix::ffi::OsStringExt;
@@ -3092,7 +3094,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "DISCORD_TOKEN",
-                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+                std::ffi::OsString::from_vec(b"secret-token\xff".to_vec()),
             );
         }
         let result = super::discord_connection(Arc::new(tokio::sync::Mutex::new(None))).await;
@@ -3110,6 +3112,10 @@ mod tests {
         assert!(
             error.contains("DISCORD_TOKEN") && !error.contains("Missing required"),
             "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("secret-token"),
+            "the error must not print the variable's value: {error}"
         );
     }
 
