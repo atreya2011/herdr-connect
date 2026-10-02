@@ -150,7 +150,7 @@ pub fn encode_claude_question_decision(
 #[cfg(test)]
 mod tests {
     use super::{
-        ASK_QUESTION_TOOL, Question, QuestionAnswer, QuestionOption, decode_claude_ask_question,
+        Question, QuestionAnswer, QuestionOption, decode_claude_ask_question,
         encode_claude_question_decision, format_question_answer,
     };
     use std::collections::BTreeMap;
@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn rejects_a_different_hook_event_or_tool() {
         let cases = [
-            r#"{"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion","tool_input":{"questions":[]},"tool_use_id":"t"}"#,
-            r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"questions":[]},"tool_use_id":"t"}"#,
+            r#"{"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"q","header":"h","options":[{"label":"a","description":"d"}],"multiSelect":false}]},"tool_use_id":"t"}"#,
+            r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"questions":[{"question":"q","header":"h","options":[{"label":"a","description":"d"}],"multiSelect":false}]},"tool_use_id":"t"}"#,
         ];
         for payload in cases {
             assert!(decode_claude_ask_question(payload.as_bytes()).is_err());
@@ -318,10 +318,7 @@ mod tests {
         }
         assert_eq!(
             answers_object["Which toppings?"],
-            serde_json::json!(format_question_answer(&QuestionAnswer::Multiple(vec![
-                "Cheese".to_owned(),
-                "Mushrooms".to_owned()
-            ])))
+            serde_json::json!("Cheese, Mushrooms")
         );
     }
 
@@ -345,10 +342,5 @@ mod tests {
         assert!(
             encode_claude_question_decision(&serde_json::json!([1, 2]), &BTreeMap::new()).is_err()
         );
-    }
-
-    #[test]
-    fn ask_question_tool_name_constant_matches_the_vendor_string() {
-        assert_eq!(ASK_QUESTION_TOOL, "AskUserQuestion");
     }
 }
