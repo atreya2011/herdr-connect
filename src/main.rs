@@ -8070,6 +8070,38 @@ mod tests {
             .collect()
     }
 
+    /// Waits until the gateway logs `dispatch`, the notice it sends for every delete event it
+    /// handles, then keeps listening for `DELETION_ERROR_WINDOW` and returns the deletion
+    /// dispatch notices and the error notices seen. Errs when `dispatch` never arrives, so a
+    /// missing event is not mistaken for a suppressed one.
+    #[cfg(unix)]
+    async fn deletion_notices(
+        notices: std::sync::mpsc::Receiver<String>,
+        dispatch: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + DELETION_DISPATCH_WAIT;
+        while !seen.iter().any(|notice| notice == dispatch) {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("no `{dispatch}` notice arrived; saw {seen:?}"));
+            }
+            seen.extend(notices.try_iter());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        tokio::time::sleep(DELETION_ERROR_WINDOW).await;
+        seen.extend(notices.try_iter());
+        let dispatched = seen
+            .iter()
+            .filter(|notice| notice.starts_with("discord gateway deletion:"))
+            .cloned()
+            .collect();
+        let errors = seen
+            .into_iter()
+            .filter(|notice| notice.contains("error"))
+            .collect();
+        Ok((dispatched, errors))
+    }
+
     /// Deletes a tab's Discord thread as the owner would and asserts Herdr closes that tab, the
     /// sibling tab survives, and a later topology sync recreates no thread for the closed tab.
     #[cfg(unix)]
@@ -8528,20 +8560,25 @@ mod tests {
     #[cfg(unix)]
     const SELF_DELETE_LABEL: &str = "testrun-self";
 
-    /// How long the gateway is given to dispatch the delete event of a bridge deletion. A handler
-    /// that fails to recognise the deletion as the bridge's own logs an error within this window.
+    /// How long the gateway is given to dispatch the delete event of a bridge deletion.
     #[cfg(unix)]
-    const SELF_DELETE_EVENT_WAIT: Duration = Duration::from_secs(6);
+    const DELETION_DISPATCH_WAIT: Duration = Duration::from_secs(30);
+
+    /// How long after the dispatch notice a handler that fails to recognise the deletion as the
+    /// bridge's own is given to log its error.
+    #[cfg(unix)]
+    const DELETION_ERROR_WINDOW: Duration = Duration::from_secs(4);
 
     /// Deletes a testrun workspace channel, or one of its tab threads, through the production
-    /// delete path while the gateway runs, and returns the errors the gateway logged. The ids are
+    /// delete path while the gateway runs, and returns the delete-event dispatch notices and the
+    /// errors the gateway logged. The ids are
     /// testrun ids, so a deletion wrongly treated as the owner's makes Herdr refuse to close an id
     /// it never had; no real tab or workspace can be closed.
     #[cfg(unix)]
     async fn bridge_deletion_gateway_errors(
         guild: &BlockedCaptureGuild,
         delete_thread: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -8585,10 +8622,15 @@ mod tests {
             )
             .await
         };
-        tokio::time::sleep(SELF_DELETE_EVENT_WAIT).await;
+        let dispatch = if delete_thread {
+            "discord gateway deletion: THREAD_DELETE"
+        } else {
+            "discord gateway deletion: CHANNEL_DELETE"
+        };
+        let seen = deletion_notices(notices, dispatch).await;
         gateway.abort();
         deleted?;
-        Ok(deletion_errors(&notices))
+        seen
     }
 
     /// The bridge's own deletions of a tab thread and of a workspace channel come back through the
@@ -8606,19 +8648,29 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-        let mut outcomes = Vec::new();
-        for (name, delete_thread) in [
+        let cases = [
             ("the bridge's tab thread deletion", true),
             ("the bridge's workspace channel deletion", false),
-        ] {
+        ];
+        let mut outcomes = Vec::new();
+        for (name, delete_thread) in cases {
             outcomes.push((
                 name,
                 bridge_deletion_gateway_errors(&guild, delete_thread).await,
             ));
         }
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        for (name, outcome) in outcomes {
-            assert_eq!(outcome, Ok(Vec::new()), "{name}");
+        for ((name, delete_thread), (_, outcome)) in cases.into_iter().zip(outcomes) {
+            let dispatch = if delete_thread {
+                "discord gateway deletion: THREAD_DELETE"
+            } else {
+                "discord gateway deletion: CHANNEL_DELETE"
+            };
+            assert_eq!(
+                outcome,
+                Ok((vec![dispatch.to_owned()], Vec::new())),
+                "{name}"
+            );
         }
         assert_eq!(channels_left, 0, "named zero-leftover check");
     }
