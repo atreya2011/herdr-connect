@@ -2136,12 +2136,12 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     };
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
-    let Ok(request) = (match vendor {
-        VENDOR_CLAUDE => decode_claude_activity_request(&input),
-        VENDOR_CODEX => decode_codex_activity_request(&input),
-        VENDOR_CURSOR => decode_cursor_activity_request(&input),
-        _ => return Ok(()),
-    }) else {
+    let (decoded, vendor) = match vendor {
+        PermissionVendor::Claude => (decode_claude_activity_request(&input), VENDOR_CLAUDE),
+        PermissionVendor::Codex => (decode_codex_activity_request(&input), VENDOR_CODEX),
+        PermissionVendor::Cursor => (decode_cursor_activity_request(&input), VENDOR_CURSOR),
+    };
+    let Ok(request) = decoded else {
         return Ok(());
     };
     let Some(socket_path) = requested_socket
@@ -2172,7 +2172,7 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
 
 fn parse_activity_args(
     args: &[String],
-) -> Result<(&'static str, Option<std::path::PathBuf>), String> {
+) -> Result<(PermissionVendor, Option<std::path::PathBuf>), String> {
     let mut vendor = None;
     let mut socket = None;
     let mut index = 0;
@@ -2184,9 +2184,9 @@ fn parse_activity_args(
                     .get(index)
                     .ok_or("--vendor requires claude, codex, or cursor")?;
                 vendor = Some(match value.as_str() {
-                    VENDOR_CLAUDE => VENDOR_CLAUDE,
-                    VENDOR_CODEX => VENDOR_CODEX,
-                    VENDOR_CURSOR => VENDOR_CURSOR,
+                    VENDOR_CLAUDE => PermissionVendor::Claude,
+                    VENDOR_CODEX => PermissionVendor::Codex,
+                    VENDOR_CURSOR => PermissionVendor::Cursor,
                     _ => return Err("--vendor requires claude, codex, or cursor".to_owned()),
                 });
             }
