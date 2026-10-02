@@ -3745,9 +3745,9 @@ mod tests {
     }
 
     /// The real guild every real-guild test runs against, or `None` when its environment is not
-    /// configured. Panics when a production bridge is listening on its broker socket, because a
-    /// second bridge on the same guild and Herdr session can satisfy a test's assertions in place
-    /// of the code under test.
+    /// configured. When HERDR_CLAUDE_BROKER_SOCKET is set, panics if a production bridge is
+    /// listening on that socket, because a second bridge on the same guild and Herdr session can
+    /// satisfy a test's assertions in place of the code under test.
     #[cfg(unix)]
     fn blocked_capture_guild() -> Option<BlockedCaptureGuild> {
         let guild = BlockedCaptureGuild {
