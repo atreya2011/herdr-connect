@@ -76,15 +76,6 @@ enum Follower {
     Cursor(i64),
 }
 
-impl std::fmt::Display for Follower {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Claude(offset) | Self::Codex(offset) => write!(formatter, "{offset}"),
-            Self::Cursor(rowid) => write!(formatter, "{rowid}"),
-        }
-    }
-}
-
 /// Dropping this stops its `notify` watcher.
 struct LiveWatch {
     _watcher: notify::RecommendedWatcher,
@@ -1389,6 +1380,10 @@ async fn handle_live_event(
     for (text, position) in texts {
         let mut posted_all = true;
         for (part_index, part) in split_live_message(&text).into_iter().enumerate() {
+            let position = match position {
+                Follower::Claude(offset) | Follower::Codex(offset) => i128::from(offset),
+                Follower::Cursor(rowid) => i128::from(rowid),
+            };
             let nonce = live_message_nonce(terminal, position, part_index);
             if let Err(error) = deliver_live_message(client.as_ref(), channel, &part, &nonce).await
             {

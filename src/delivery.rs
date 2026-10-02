@@ -69,11 +69,7 @@ pub fn transition_card_nonce(
 /// reposted. Distinct in shape (no dash) from [`transition_card_nonce`] so the two can never
 /// collide.
 #[must_use]
-pub fn live_message_nonce(
-    terminal_id: &str,
-    position: impl std::fmt::Display,
-    part_index: usize,
-) -> String {
+pub fn live_message_nonce(terminal_id: &str, position: i128, part_index: usize) -> String {
     let payload = format!("{terminal_id}-live-{position}-{part_index}");
     let payload_component = payload.bytes().fold(0_u64, |value, byte| {
         value.wrapping_mul(257).wrapping_add(u64::from(byte))
