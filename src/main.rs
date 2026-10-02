@@ -3741,9 +3741,13 @@ mod tests {
         id: Id<GuildMarker>,
     }
 
+    /// The real guild every real-guild test runs against, or `None` when its environment is not
+    /// configured. Panics when a production bridge is listening on its broker socket, because a
+    /// second bridge on the same guild and Herdr session can satisfy a test's assertions in place
+    /// of the code under test.
     #[cfg(unix)]
     fn blocked_capture_guild() -> Option<BlockedCaptureGuild> {
-        Some(BlockedCaptureGuild {
+        let guild = BlockedCaptureGuild {
             client: Arc::new(
                 Client::builder()
                     .token(std::env::var("DISCORD_TOKEN").ok()?)
@@ -3751,7 +3755,12 @@ mod tests {
                     .build(),
             ),
             id: Id::new(std::env::var("DISCORD_GUILD_ID").ok()?.parse().ok()?),
-        })
+        };
+        assert!(
+            std::os::unix::net::UnixStream::connect(CODEX_ACTIVITY_BROKER_SOCKET).is_err(),
+            "production bridge is listening on {CODEX_ACTIVITY_BROKER_SOCKET}; stop it before running the suite"
+        );
+        Some(guild)
     }
 
     #[cfg(unix)]
@@ -6645,13 +6654,6 @@ mod tests {
         agent_name: &str,
         broker_socket: &Path,
     ) -> Result<(), String> {
-        if std::os::unix::net::UnixStream::connect(broker_socket).is_ok() {
-            return Err(format!(
-                "production bridge is listening on {}; stop it before running this exercise",
-                broker_socket.display()
-            ));
-        }
-
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
         let mut state = BridgeState::default();
