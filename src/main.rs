@@ -5218,14 +5218,28 @@ mod tests {
         while let Ok(terminal_id) = live_events.try_recv() {
             handle_live_event(&connection, &terminal_id, &mut state).await;
         }
-        // One more read so any text written just before `done` is delivered before the baseline
-        // count is taken, isolating the post-settle append as the only new message.
-        handle_live_event(&connection, &terminal, &mut state).await;
-        let live_before = thread_messages(guild, thread)
-            .await?
-            .into_iter()
-            .filter(|(_, embed, _)| !embed)
-            .count();
+        // The agent's final text can reach the log after Herdr reports `done`, so the baseline is
+        // taken only once the reply the prompt asks for is in the thread, isolating the
+        // post-settle append as the only new message.
+        let reply_deadline = Instant::now() + Duration::from_secs(30);
+        let live_before = loop {
+            handle_live_event(&connection, &terminal, &mut state).await;
+            let live: Vec<_> = thread_messages(guild, thread)
+                .await?
+                .into_iter()
+                .filter(|(_, embed, _)| !embed)
+                .collect();
+            if live.iter().any(|(content, _, _)| {
+                content.to_lowercase().contains("gamma")
+                    && !content.contains(LIVE_CAPTURE_FORCE_PROMPT)
+            }) {
+                break live.len();
+            }
+            if Instant::now() >= reply_deadline {
+                return Err(format!("the reply never reached the thread: {live:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
 
         let Some(session) = settled.session.clone() else {
             return Err("settled snapshot lost its session".to_owned());
