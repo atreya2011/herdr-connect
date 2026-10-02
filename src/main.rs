@@ -5747,20 +5747,12 @@ mod tests {
         )
         .await?;
         let first_messages = thread_full_messages(guild, thread).await?;
-        if vendor == VENDOR_CODEX {
-            // Codex reports its session only once the pane is already `working`, by which point its
-            // log already holds this first prompt. Per rule 1 a prompt already in the log at the
-            // bridge's first sight of the session is never replayed, so this first prompt is not
-            // mirrored; the baseline this turn establishes lets the next terminal prompt mirror.
-            assert_prompt_was_not_mirrored(&first_messages, &first_prompt)?;
-        } else {
-            assert_terminal_prompt_mirrored_before_reply(
-                &first_messages,
-                &first_prompt,
-                &first_reply,
-                &identity.display_name,
-            )?;
-        }
+        assert_terminal_prompt_mirrored_before_reply(
+            &first_messages,
+            &first_prompt,
+            &first_reply,
+            &identity.display_name,
+        )?;
 
         let mirrored_reply = format!("terminal-origin-{vendor}-mirrored-{nonce}");
         let mirrored_prompt = format!("Reply with exactly: {mirrored_reply}");
