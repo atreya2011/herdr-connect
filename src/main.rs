@@ -844,30 +844,32 @@ fn start_notify_watcher(
 /// first sight: past every assistant text currently in it, so a bridge that discovers a pane
 /// mid-conversation never replays its history. A follower whose log did not exist yet at first
 /// sight starts at 0 instead (see [`ensure_live_watch_started`]), so the whole log it later writes
-/// is posted. `vendor` selects the log format; its position is ignored.
-fn initial_live_position(vendor: Follower, path: &Path) -> Result<Follower, String> {
-    match vendor {
-        Follower::Claude(_) => {
-            read_claude_incremental(path, 0).map(|(_, end)| Follower::Claude(end))
+/// is posted. `start` selects the log format and the position the read starts from.
+fn initial_live_position(start: Follower, path: &Path) -> Result<Follower, String> {
+    match start {
+        Follower::Claude(offset) => {
+            read_claude_incremental(path, offset).map(|(_, end)| Follower::Claude(end))
         }
-        Follower::Codex(_) => read_codex_incremental(path, 0).map(|(_, end)| Follower::Codex(end)),
-        Follower::Cursor(_) => {
-            read_cursor_incremental(path, 0).map(|(_, end)| Follower::Cursor(end))
+        Follower::Codex(offset) => {
+            read_codex_incremental(path, offset).map(|(_, end)| Follower::Codex(end))
+        }
+        Follower::Cursor(rowid) => {
+            read_cursor_incremental(path, rowid).map(|(_, end)| Follower::Cursor(end))
         }
     }
 }
 
 /// The position a terminal's terminal-prompt mirroring starts from the first time it is ever
 /// established for that terminal: past every prompt already in the vendor log, so a bridge that
-/// discovers a pane mid-conversation never replays its history. `vendor` selects the log format;
-/// its position is ignored.
-fn initial_terminal_prompt_position(vendor: Follower, path: &Path) -> Result<Follower, String> {
-    match vendor {
-        Follower::Claude(_) => read_claude_prompts_incremental(path, 0)
+/// discovers a pane mid-conversation never replays its history. `start` selects the log format and
+/// the position the read starts from.
+fn initial_terminal_prompt_position(start: Follower, path: &Path) -> Result<Follower, String> {
+    match start {
+        Follower::Claude(offset) => read_claude_prompts_incremental(path, offset)
             .map(|(_, checkpoint)| Follower::Claude(checkpoint)),
-        Follower::Codex(_) => read_codex_prompts_incremental(path, 0)
+        Follower::Codex(offset) => read_codex_prompts_incremental(path, offset)
             .map(|(_, checkpoint)| Follower::Codex(checkpoint)),
-        Follower::Cursor(_) => read_cursor_prompts_incremental(path, 0)
+        Follower::Cursor(rowid) => read_cursor_prompts_incremental(path, rowid)
             .map(|(_, checkpoint)| Follower::Cursor(checkpoint)),
     }
 }
