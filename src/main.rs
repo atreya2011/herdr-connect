@@ -1773,7 +1773,8 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
-/// Removes every terminal-keyed entry for a terminal absent from `current_terminals` and every
+/// Removes every terminal-keyed entry for a terminal absent from `current_terminals`, every
+/// tab-keyed entry (`rename_errors_reported`) for a tab absent from `current_tabs`, and every
 /// pane-keyed entry (`activity_messages`, `activity_eligible_panes`) for a pane absent
 /// from `current_panes`, returning the informational cards that departed so callers can expire
 /// them.
@@ -1781,6 +1782,7 @@ fn prune_departed_state(
     state: &mut BridgeState,
     current_terminals: &HashSet<String>,
     current_panes: &HashSet<String>,
+    current_tabs: &HashSet<String>,
 ) -> Vec<(String, InformationalCard)> {
     state
         .state_change_sequences
@@ -1797,6 +1799,9 @@ fn prune_departed_state(
     state
         .awaiting_first_log
         .retain(|terminal, _| current_terminals.contains(terminal));
+    state
+        .rename_errors_reported
+        .retain(|tab_id| current_tabs.contains(tab_id));
     state
         .activity_messages
         .retain(|pane_id, _| current_panes.contains(pane_id));
@@ -2433,11 +2438,15 @@ async fn apply_lifecycle_event(
 
 /// Spawns the startup topology sweep (one `list_agents`/`tab_list_result` snapshot, then
 /// `sync_startup_topology`) beside the caller rather than blocking it. Runs once, at process
-/// start.
-fn spawn_startup_topology_sweep(discord: &DiscordConnection) {
+/// start, after the first doorbell, so it shares that pass's `rename_errors_reported` and logs
+/// no rename failure twice.
+fn spawn_startup_topology_sweep(
+    discord: &DiscordConnection,
+    rename_errors_reported: &mut HashSet<String>,
+) {
     match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
         Ok((agents, mut tabs)) => {
-            for error in name_unlabeled_tabs(&agents, &mut tabs, &mut HashSet::new()) {
+            for error in name_unlabeled_tabs(&agents, &mut tabs, rename_errors_reported) {
                 bridge_eprintln!("herdr startup topology error: {error}");
             }
             let discord = discord.clone();
@@ -2610,11 +2619,13 @@ async fn apply_herdr_snapshot(
         bridge_eprintln!("{error}");
     }
     let current_terminals: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
+    let current_tabs: HashSet<String> = tabs.iter().map(|tab| tab.tab_id.clone()).collect();
     let current_panes: HashSet<String> = agents.iter().filter_map(|s| s.pane_id.clone()).collect();
     state
         .previous
         .retain(|terminal, _| current_terminals.contains(terminal));
-    let departed_cards = prune_departed_state(state, &current_terminals, &current_panes);
+    let departed_cards =
+        prune_departed_state(state, &current_terminals, &current_panes, &current_tabs);
     for (terminal, card) in departed_cards {
         expire_departed_card(discord, &terminal, card).await;
     }
@@ -2727,7 +2738,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(discord) = discord.as_ref() {
-        spawn_startup_topology_sweep(discord);
+        spawn_startup_topology_sweep(discord, &mut runtime.state.rename_errors_reported);
     }
     bridge_event_loop(
         discord.as_ref(),
@@ -7230,6 +7241,22 @@ mod tests {
             return Err("a tab already carrying its generated name was renamed again".to_owned());
         }
         Ok(())
+    }
+
+    /// A tab's recorded rename failure is dropped once Herdr no longer lists the tab, and kept
+    /// while it does.
+    #[test]
+    fn rename_errors_are_pruned_with_their_closed_tab() {
+        let mut state = BridgeState::default();
+        state.rename_errors_reported.insert("w-1:3".to_owned());
+        state.rename_errors_reported.insert("w-1:4".to_owned());
+        let current_tabs = HashSet::from(["w-1:4".to_owned()]);
+        let none = HashSet::new();
+        super::prune_departed_state(&mut state, &none, &none, &current_tabs);
+        assert_eq!(
+            state.rename_errors_reported,
+            HashSet::from(["w-1:4".to_owned()])
+        );
     }
 
     #[cfg(unix)]
