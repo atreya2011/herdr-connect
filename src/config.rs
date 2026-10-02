@@ -22,28 +22,21 @@ pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig
         ENV_DISCORD_GUILD_ID,
         ENV_DISCORD_OWNER_ID,
     ];
-    let missing: Vec<_> = names
-        .into_iter()
-        .filter(|n| value(n).is_none_or(|v| v.trim().is_empty()))
-        .collect();
-    if !missing.is_empty() {
+    let resolved = names.map(|name| value(name).map(str::trim).filter(|v| !v.is_empty()));
+    let [Some(token), Some(guild_id), Some(owner_id)] = resolved else {
+        let missing: Vec<_> = names
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|(name, value)| value.is_none().then_some(name))
+            .collect();
         return Err(format!(
             "Missing required environment variables: {}",
             missing.join(", ")
         ));
-    }
+    };
     Ok(DiscordConfig {
-        guild_id: value(ENV_DISCORD_GUILD_ID)
-            .ok_or_else(|| "DISCORD_GUILD_ID missing".to_owned())?
-            .trim()
-            .into(),
-        owner_id: value(ENV_DISCORD_OWNER_ID)
-            .ok_or_else(|| "DISCORD_OWNER_ID missing".to_owned())?
-            .trim()
-            .into(),
-        token: value(ENV_DISCORD_TOKEN)
-            .ok_or_else(|| "DISCORD_TOKEN missing".to_owned())?
-            .trim()
-            .into(),
+        guild_id: guild_id.into(),
+        owner_id: owner_id.into(),
+        token: token.into(),
     })
 }
