@@ -2771,11 +2771,11 @@ mod tests {
         BridgeRuntime, BridgeState, BrokerTask, Client, Follower, Membership, PermissionResponder,
         SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
         capture_for_with_search_root, create_transition_messages, delete_closed_topology,
-        fetch_startup_owner_identity, fetch_topology_lists, handle_lifecycle_select_result,
-        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
-        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
-        next_state_change_sequence, process_snapshot, prune_departed_state,
-        read_new_terminal_prompts, resolve_session_path, route_topology,
+        doorbell_snapshot, fetch_startup_owner_identity, fetch_topology_lists,
+        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
+        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
+        prune_departed_state, read_new_terminal_prompts, resolve_session_path, route_topology,
         subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
         terminal_prompt_baseline_is_current, unique_existing_path,
     };
@@ -4644,6 +4644,18 @@ mod tests {
             live_events,
             activity_events,
         };
+        // One production doorbell before the fixture tab exists records every live pane as seen
+        // through production code, so the event handler's doorbell does not run a fresh-session
+        // topology sync for the owner's own panes.
+        doorbell_snapshot(
+            &connection,
+            &mut runtime.state,
+            &mut runtime.pane_ids,
+            &mut runtime.status,
+            &mut stop,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("snapshot doorbell was interrupted"));
         let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
         let result = async {
             let pane_created = wait_for_event(
@@ -8343,6 +8355,18 @@ mod tests {
             activity_events,
         };
 
+        // One production doorbell on the fresh runtime records every live pane as seen through
+        // production code, so a later doorbell cannot recreate the root tab's thread and satisfy the
+        // survival check below.
+        doorbell_snapshot(
+            &connection,
+            &mut runtime.state,
+            &mut runtime.pane_ids,
+            &mut runtime.status,
+            &mut stop,
+        )
+        .await
+        .map_err(|_| "snapshot doorbell was interrupted".to_owned())?;
         close_tab(&second_tab.tab_id);
         let tab_closed = wait_for_event(
             &mut runtime.lifecycle,
