@@ -41,7 +41,7 @@ const CURSOR_PERMISSION_TIMEOUT: Duration = PERMISSION_TIMEOUT;
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one question card stays open for an owner answer before the hook falls through to
 /// Claude's own dialog.
-const QUESTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const QUESTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[must_use]
 pub const fn hook_timeout() -> Duration {
@@ -1266,8 +1266,8 @@ mod tests {
 
     #[test]
     fn question_hook_margin_matches_the_question_timeout() {
-        assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(300));
-        assert_eq!(question_hook_timeout(), Duration::from_secs(305));
+        assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(question_hook_timeout(), Duration::from_secs(35));
     }
 
     fn question_interaction() -> QuestionInteraction {

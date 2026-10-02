@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "herdr-connect-rs hook --vendor claude",
-            "timeout": 600
+            "timeout": 35
           }
         ]
       }
