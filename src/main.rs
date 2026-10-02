@@ -1803,10 +1803,17 @@ fn prune_departed_state(
 async fn discord_connection(
     topology_cache: TopologyCache,
 ) -> Result<(DiscordConnection, GatewayTask), Box<dyn std::error::Error>> {
-    let environment: Vec<(String, String)> = std::env::vars().collect();
+    let environment: Vec<(&str, String)> = [
+        ENV_DISCORD_TOKEN,
+        ENV_DISCORD_GUILD_ID,
+        ENV_DISCORD_OWNER_ID,
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
+    .collect();
     let environment: Vec<(&str, &str)> = environment
         .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .map(|(name, value)| (*name, value.as_str()))
         .collect();
     let config = load_discord_config(&environment)?;
     let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
