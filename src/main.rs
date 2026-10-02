@@ -877,8 +877,8 @@ fn initial_terminal_prompt_position(vendor: &str, path: &Path) -> Result<LivePos
     }
 }
 
-/// Reads new complete owner prompts appended to a terminal's vendor log since `position`, paired
-/// with the byte offset (Claude) or `rowid` (Cursor) immediately after each.
+/// Reads new complete owner prompts appended to a terminal's vendor log since `position`, and the
+/// position immediately after the last one read.
 ///
 /// # Errors
 ///
@@ -889,26 +889,21 @@ fn read_new_terminal_prompts(
     vendor: &str,
     path: &Path,
     position: LivePosition,
-) -> Result<(Vec<(String, i64)>, LivePosition), String> {
+) -> Result<(Vec<String>, LivePosition), String> {
     match (vendor, position) {
         (VENDOR_CLAUDE, LivePosition::Bytes(offset)) => {
             let (prompts, checkpoint) = read_claude_prompts_incremental(path, offset)?;
-            let prompts = prompts
-                .into_iter()
-                .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
-                .collect();
+            let prompts = prompts.into_iter().map(|(text, _)| text).collect();
             Ok((prompts, LivePosition::Bytes(checkpoint)))
         }
         (VENDOR_CODEX, LivePosition::Bytes(offset)) => {
             let (prompts, checkpoint) = read_codex_prompts_incremental(path, offset)?;
-            let prompts = prompts
-                .into_iter()
-                .map(|(text, position)| (text, i64::try_from(position).unwrap_or(i64::MAX)))
-                .collect();
+            let prompts = prompts.into_iter().map(|(text, _)| text).collect();
             Ok((prompts, LivePosition::Bytes(checkpoint)))
         }
         (VENDOR_CURSOR, LivePosition::RowId(last_rowid)) => {
             let (prompts, new_rowid) = read_cursor_prompts_incremental(path, last_rowid)?;
+            let prompts = prompts.into_iter().map(|(text, _)| text).collect();
             Ok((prompts, LivePosition::RowId(new_rowid)))
         }
         (vendor, position) => Err(format!(
@@ -1341,7 +1336,7 @@ async fn mirror_terminal_prompts(
         workspace_channel,
         thread,
     };
-    for (text, _position) in prompts {
+    for text in prompts {
         if take_owner_prompt_suppression(&route.pane_id, &text) {
             continue;
         }
@@ -2843,7 +2838,7 @@ mod tests {
             let (prompts, checkpoint) =
                 read_new_terminal_prompts(VENDOR_CLAUDE, &path, initial_position)
                     .expect("read appended Claude terminal prompt");
-            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_272_i64)]);
+            assert_eq!(prompts, vec!["terminal-direct".to_owned()]);
             assert!(matches!(checkpoint, LivePosition::Bytes(1_272)));
 
             let (repeated_prompts, repeated_checkpoint) =
@@ -2894,7 +2889,7 @@ mod tests {
             let (prompts, checkpoint) =
                 read_new_terminal_prompts(VENDOR_CODEX, &path, initial_position)
                     .expect("read appended Codex terminal prompt");
-            assert_eq!(prompts, vec![("terminal-direct".to_owned(), 1_342_i64)]);
+            assert_eq!(prompts, vec!["terminal-direct".to_owned()]);
             assert!(matches!(checkpoint, LivePosition::Bytes(1_425)));
 
             let (repeated_prompts, repeated_checkpoint) =
@@ -2956,7 +2951,7 @@ mod tests {
                 let (prompts, checkpoint) =
                     read_new_terminal_prompts(VENDOR_CURSOR, &path, initial_position)
                         .expect("read appended Cursor terminal prompt");
-                assert_eq!(prompts, vec![("terminal-direct".to_owned(), 7_i64)]);
+                assert_eq!(prompts, vec!["terminal-direct".to_owned()]);
                 assert!(matches!(checkpoint, LivePosition::RowId(7)));
 
                 let (repeated_prompts, repeated_checkpoint) =
