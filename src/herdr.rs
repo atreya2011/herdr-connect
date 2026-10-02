@@ -270,7 +270,7 @@ pub fn generated_tab_name(tab_id: &str) -> String {
 /// Due tabs have a numeric label and carry a session-reporting agent. Owner-given labels, tabs
 /// that already carry a generated name, and tabs the bridge does not mirror are never listed.
 #[must_use]
-pub fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(String, String)> {
+fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(String, String)> {
     tabs.iter()
         .filter(|tab| is_numeric_label(&tab.label))
         .filter(|tab| {

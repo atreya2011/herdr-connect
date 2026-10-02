@@ -49,7 +49,7 @@ pub use herdr::{
     STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, SubscribeError, agent_read_detection,
     generated_tab_name, is_numeric_label, lifecycle_subscriptions, list_agents,
     name_unlabeled_tabs, request_rpc_result, status_subscriptions, subscribe_herdr_events,
-    tab_list_result, tabs_needing_names, workspace_list_result,
+    tab_list_result, workspace_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
