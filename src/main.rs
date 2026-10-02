@@ -1366,12 +1366,12 @@ async fn handle_live_event(
     let mut all_delivered = true;
     for (text, position) in texts {
         let mut posted_all = true;
+        let nonce_position = match position {
+            Follower::Claude(offset) | Follower::Codex(offset) => i128::from(offset),
+            Follower::Cursor(rowid) => i128::from(rowid),
+        };
         for (part_index, part) in split_live_message(&text).into_iter().enumerate() {
-            let position = match position {
-                Follower::Claude(offset) | Follower::Codex(offset) => i128::from(offset),
-                Follower::Cursor(rowid) => i128::from(rowid),
-            };
-            let nonce = live_message_nonce(terminal, position, part_index);
+            let nonce = live_message_nonce(terminal, nonce_position, part_index);
             if let Err(error) = deliver_live_message(client.as_ref(), channel, &part, &nonce).await
             {
                 if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
