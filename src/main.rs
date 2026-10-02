@@ -2283,12 +2283,8 @@ enum Membership {
     Remove(String),
 }
 
-fn canonical_event_name(event: &str) -> String {
-    event.replace('.', "_")
-}
-
 fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
-    match canonical_event_name(event.get(EVENT_KEY)?.as_str()?).as_str() {
+    match event.get(EVENT_KEY)?.as_str()? {
         "pane_created" => event
             .pointer("/data/pane/pane_id")
             .and_then(serde_json::Value::as_str)
@@ -2328,7 +2324,7 @@ enum TopologyClosure {
 }
 
 fn lifecycle_closure(event: &serde_json::Value) -> Option<TopologyClosure> {
-    match canonical_event_name(event.get(EVENT_KEY)?.as_str()?).as_str() {
+    match event.get(EVENT_KEY)?.as_str()? {
         "tab_closed" => Some(TopologyClosure::Tab {
             workspace_id: event.pointer("/data/workspace_id")?.as_str()?.to_owned(),
             tab_id: event.pointer("/data/tab_id")?.as_str()?.to_owned(),
