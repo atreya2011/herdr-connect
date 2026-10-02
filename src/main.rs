@@ -5141,6 +5141,38 @@ mod tests {
         writeln!(file, "{record}").map_err(|error| error.to_string())
     }
 
+    /// The agent's final text can reach the log after Herdr reports `done`. Reads live text until
+    /// the reply the force prompt asks for is in the thread, then returns the thread's live message
+    /// count, so the caller's baseline excludes that late reply.
+    #[cfg(unix)]
+    async fn live_count_once_reply_is_posted(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+        connection: &super::DiscordConnection,
+        terminal: &str,
+        state: &mut BridgeState,
+    ) -> Result<usize, String> {
+        let reply_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            handle_live_event(connection, terminal, state).await;
+            let live: Vec<_> = thread_messages(guild, thread)
+                .await?
+                .into_iter()
+                .filter(|(_, embed, _)| !embed)
+                .collect();
+            if live.iter().any(|(content, _, _)| {
+                content.to_lowercase().contains("gamma")
+                    && !content.contains(LIVE_CAPTURE_FORCE_PROMPT)
+            }) {
+                return Ok(live.len());
+            }
+            if Instant::now() >= reply_deadline {
+                return Err(format!("the reply never reached the thread: {live:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Rule 2 past settle: drives one real Claude turn to `done`/`idle`, then appends a fresh
     /// assistant record to the pane's session log while it stays settled. The still-open watcher
     /// posts that text -- status plays no part -- and the turn's own live texts are not reposted.
@@ -5218,28 +5250,9 @@ mod tests {
         while let Ok(terminal_id) = live_events.try_recv() {
             handle_live_event(&connection, &terminal_id, &mut state).await;
         }
-        // The agent's final text can reach the log after Herdr reports `done`, so the baseline is
-        // taken only once the reply the prompt asks for is in the thread, isolating the
-        // post-settle append as the only new message.
-        let reply_deadline = Instant::now() + Duration::from_secs(30);
-        let live_before = loop {
-            handle_live_event(&connection, &terminal, &mut state).await;
-            let live: Vec<_> = thread_messages(guild, thread)
-                .await?
-                .into_iter()
-                .filter(|(_, embed, _)| !embed)
-                .collect();
-            if live.iter().any(|(content, _, _)| {
-                content.to_lowercase().contains("gamma")
-                    && !content.contains(LIVE_CAPTURE_FORCE_PROMPT)
-            }) {
-                break live.len();
-            }
-            if Instant::now() >= reply_deadline {
-                return Err(format!("the reply never reached the thread: {live:?}"));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        };
+        let live_before =
+            live_count_once_reply_is_posted(guild, thread, &connection, &terminal, &mut state)
+                .await?;
 
         let Some(session) = settled.session.clone() else {
             return Err("settled snapshot lost its session".to_owned());
