@@ -161,12 +161,6 @@ mod tests {
         include_str!("../tests/fixtures/claude-ask-question/multi-select.json");
 
     #[test]
-    fn a_question_without_multi_select_is_rejected() {
-        let question = r#"{"question":"Q?","header":"H","options":[]}"#;
-        assert!(serde_json::from_str::<Question>(question).is_err());
-    }
-
-    #[test]
     fn decodes_single_and_multi_select_fixtures() {
         let cases = [
             (

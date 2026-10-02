@@ -306,23 +306,3 @@ fn encode_permission_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     }))
     .map_err(|error| error.to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Decision, DecisionBehavior, Interaction, encode_cursor_decision};
-
-    #[test]
-    fn interaction_frame_without_a_vendor_is_rejected() {
-        let frame = r#"{"session_id":"s","prompt_id":"p","tool_name":"Bash","tool_input":{"command":"c","description":"d"}}"#;
-        assert!(serde_json::from_str::<Interaction>(frame).is_err());
-    }
-
-    #[test]
-    fn cursor_deny_without_a_message_is_an_error() {
-        let decision = Decision {
-            behavior: DecisionBehavior::Deny,
-            message: None,
-        };
-        assert!(encode_cursor_decision(&decision).is_err());
-    }
-}

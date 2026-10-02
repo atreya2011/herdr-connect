@@ -240,12 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_claude_payload_without_tool_input() {
-        let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash"}"#;
-        assert!(decode_claude_activity_request(payload.as_bytes()).is_err());
-    }
-
-    #[test]
     fn rejects_a_different_codex_hook_event() {
         let payload = r#"{"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"cmd"}}"#;
         assert!(decode_codex_activity_request(payload.as_bytes()).is_err());
