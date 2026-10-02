@@ -160,7 +160,7 @@ fn wait_until_not_idle(pane_id: &str, bound: Duration) -> Result<(), String> {
     loop {
         let status = list_agents()?
             .into_iter()
-            .find(|agent| agent.pane_id.as_deref() == Some(pane_id))
+            .find(|agent| agent.pane_id == pane_id)
             .map(|agent| agent.agent_status);
         match status {
             Some(status) if status != "idle" => return Ok(()),

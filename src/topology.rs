@@ -42,10 +42,9 @@ pub fn route_topology(
             "herdr topology has duplicate or missing terminal {terminal_id}"
         ));
     };
-    let tab_id = usable_agent_identity(agent.tab_id.as_deref(), "tab", terminal_id)?;
-    let workspace_id =
-        usable_agent_identity(agent.workspace_id.as_deref(), "workspace", terminal_id)?;
-    let pane_id = usable_agent_identity(agent.pane_id.as_deref(), "pane", terminal_id)?;
+    let tab_id = usable_agent_identity(&agent.tab_id, "tab", terminal_id)?;
+    let workspace_id = usable_agent_identity(&agent.workspace_id, "workspace", terminal_id)?;
+    let pane_id = usable_agent_identity(&agent.pane_id, "pane", terminal_id)?;
     let matching_tabs: Vec<&HerdrTab> = tabs.iter().filter(|tab| tab.tab_id == tab_id).collect();
     let [tab] = matching_tabs.as_slice() else {
         return Err(if matching_tabs.is_empty() {
@@ -66,13 +65,8 @@ pub fn route_topology(
         .collect();
     let cwds: Vec<String> = agents
         .iter()
-        .filter(|candidate| candidate.workspace_id.as_deref() == Some(workspace_id))
-        .filter(|candidate| {
-            candidate
-                .tab_id
-                .as_deref()
-                .is_some_and(|candidate_tab| workspace_tabs.contains(candidate_tab))
-        })
+        .filter(|candidate| candidate.workspace_id == workspace_id)
+        .filter(|candidate| workspace_tabs.contains(candidate.tab_id.as_str()))
         .filter_map(|candidate| candidate.cwd.clone())
         .collect();
     let channel_name = workspace_channel_name(workspace_id, &cwds)?;
@@ -87,11 +81,11 @@ pub fn route_topology(
 }
 
 fn usable_agent_identity<'a>(
-    value: Option<&'a str>,
+    value: &'a str,
     identity: &str,
     terminal_id: &str,
 ) -> Result<&'a str, String> {
-    value
+    Some(value)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("herdr topology error: agent {terminal_id} has no {identity} id"))
 }

@@ -294,9 +294,9 @@ fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(usize
         .enumerate()
         .filter(|(_, tab)| is_numeric_label(&tab.label))
         .filter(|(_, tab)| {
-            agents.iter().any(|agent| {
-                agent.session.is_some() && agent.tab_id.as_deref() == Some(tab.tab_id.as_str())
-            })
+            agents
+                .iter()
+                .any(|agent| agent.session.is_some() && agent.tab_id == tab.tab_id)
         })
         .map(|(index, tab)| (index, generated_tab_name(&tab.tab_id)))
         .collect()
@@ -354,9 +354,9 @@ pub struct AgentSnapshot {
     pub agent: Option<String>,
     pub terminal_id: String,
     pub agent_status: String,
-    pub tab_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub pane_id: Option<String>,
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub pane_id: String,
     pub cwd: Option<String>,
     #[serde(alias = "agent_session")]
     pub session: Option<AgentSession>,
@@ -730,9 +730,9 @@ mod tests {
             agent: Some("claude".to_owned()),
             terminal_id: format!("{tab_id}:terminal"),
             agent_status: "idle".to_owned(),
-            tab_id: Some(tab_id.to_owned()),
-            workspace_id: Some("w-1".to_owned()),
-            pane_id: Some(format!("{tab_id}:pane")),
+            tab_id: tab_id.to_owned(),
+            workspace_id: "w-1".to_owned(),
+            pane_id: format!("{tab_id}:pane"),
             cwd: Some("/tmp/work".to_owned()),
             session: session.then(|| AgentSession {
                 agent: "claude".to_owned(),

@@ -12,22 +12,19 @@ fn route_captured_herdr_snapshots() {
         .iter()
         .take(2)
         .map(|agent| HerdrTab {
-            tab_id: agent.tab_id.clone().expect("captured tab id"),
-            workspace_id: agent.workspace_id.clone().expect("captured workspace id"),
+            tab_id: agent.tab_id.clone(),
+            workspace_id: agent.workspace_id.clone(),
             label: "bridge".to_owned(),
         })
         .collect();
     let cases = agents.iter().take(2).collect::<Vec<_>>();
     for agent in cases {
         let route = route_topology(&agents, &tabs, &agent.terminal_id).unwrap();
-        assert_eq!(route.workspace_id, agent.workspace_id.as_deref().unwrap());
-        assert_eq!(route.tab_id, agent.tab_id.as_deref().unwrap());
-        assert_eq!(route.pane_id, agent.pane_id.as_deref().unwrap());
+        assert_eq!(route.workspace_id, agent.workspace_id);
+        assert_eq!(route.tab_id, agent.tab_id);
+        assert_eq!(route.pane_id, agent.pane_id);
         assert_eq!(route.channel_name, "project-4-wc");
-        assert_eq!(
-            route.thread_name,
-            format!("bridge [{}]", agent.tab_id.as_deref().unwrap())
-        );
+        assert_eq!(route.thread_name, format!("bridge [{}]", agent.tab_id));
     }
 }
 

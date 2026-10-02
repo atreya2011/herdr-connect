@@ -371,9 +371,7 @@ async fn expire_departed_card(
 /// `state.activity_eligible_panes` in step with this snapshot's pane: eligible while it reports
 /// `working` with a session, not otherwise.
 fn update_activity_eligibility(state: &mut BridgeState, snapshot: &AgentSnapshot, status: &str) {
-    let Some(pane_id) = snapshot.pane_id.as_deref() else {
-        return;
-    };
+    let pane_id = snapshot.pane_id.as_str();
     if status == STATUS_WORKING && snapshot.session.is_some() {
         state.activity_eligible_panes.insert(pane_id.to_owned());
     } else {
@@ -465,7 +463,7 @@ async fn process_snapshot(
         // The activity message is forgotten when the pane next reports `working`, so the new turn's
         // first tool call starts a fresh message instead of editing the previous turn's.
         if status == STATUS_WORKING {
-            forget_activity_message(state, snapshot.pane_id.as_deref());
+            forget_activity_message(state, &snapshot.pane_id);
         }
     }
     remember_previous_status(state, &terminal, &status);
@@ -1426,10 +1424,8 @@ async fn handle_live_event(
 
 /// Forgets a pane's tracked activity message, if any, so the next turn's first activity frame
 /// creates a fresh one instead of editing the previous turn's message.
-fn forget_activity_message(state: &mut BridgeState, pane_id: Option<&str>) {
-    if let Some(pane_id) = pane_id {
-        state.activity_messages.remove(pane_id);
-    }
+fn forget_activity_message(state: &mut BridgeState, pane_id: &str) {
+    state.activity_messages.remove(pane_id);
 }
 
 /// The route's tab thread from the cached topology only, issuing no Discord request. `Ok(None)`
@@ -1639,9 +1635,7 @@ async fn sync_startup_topology(
         if agent.session.is_none() {
             continue;
         }
-        if let Some(tab_id) = agent.tab_id.as_deref()
-            && !synced_tabs.insert(tab_id.to_owned())
-        {
+        if !synced_tabs.insert(agent.tab_id.clone()) {
             continue;
         }
         let route = match route_topology(agents, tabs, &agent.terminal_id) {
@@ -2211,10 +2205,7 @@ fn abort_broker(broker: &mut Option<BrokerTask>) {
 }
 
 fn pane_ids_from_agents(agents: &[AgentSnapshot]) -> Vec<String> {
-    let mut ids: Vec<String> = agents
-        .iter()
-        .filter_map(|agent| agent.pane_id.clone())
-        .collect();
+    let mut ids: Vec<String> = agents.iter().map(|agent| agent.pane_id.clone()).collect();
     ids.sort();
     ids.dedup();
     ids
@@ -2618,7 +2609,7 @@ async fn apply_herdr_snapshot(
     }
     let current_terminals: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
     let current_tabs: HashSet<String> = tabs.iter().map(|tab| tab.tab_id.clone()).collect();
-    let current_panes: HashSet<String> = agents.iter().filter_map(|s| s.pane_id.clone()).collect();
+    let current_panes: HashSet<String> = agents.iter().map(|s| s.pane_id.clone()).collect();
     state
         .previous
         .retain(|terminal, _| current_terminals.contains(terminal));
@@ -3021,9 +3012,9 @@ mod tests {
                 agent: Some(VENDOR_CLAUDE.to_owned()),
                 terminal_id: "terminal-resume".to_owned(),
                 agent_status: STATUS_IDLE.to_owned(),
-                tab_id: None,
-                workspace_id: None,
-                pane_id: None,
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                pane_id: "w1:p1".to_owned(),
                 cwd: Some(cwd.clone()),
                 session: Some(AgentSession {
                     agent: VENDOR_CLAUDE.to_owned(),
@@ -3232,9 +3223,9 @@ mod tests {
             agent: Some("claude".to_owned()),
             terminal_id: "claude-search-root-terminal".to_owned(),
             agent_status: "done".to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            pane_id: "w1:p1".to_owned(),
             cwd: Some(cwd.to_owned()),
             session: Some(session.clone()),
         };
@@ -3437,9 +3428,9 @@ mod tests {
             agent: Some(VENDOR_CODEX.to_owned()),
             terminal_id: "codex-rollout-terminal".to_owned(),
             agent_status: STATUS_DONE.to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            pane_id: "w1:p1".to_owned(),
             cwd: Some("/srv/bridge".to_owned()),
             session: Some(session.clone()),
         };
@@ -3514,9 +3505,9 @@ mod tests {
                 agent: Some(VENDOR_CODEX.to_owned()),
                 terminal_id: "codex-custom-home-terminal".to_owned(),
                 agent_status: STATUS_DONE.to_owned(),
-                tab_id: None,
-                workspace_id: None,
-                pane_id: None,
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                pane_id: "w1:p1".to_owned(),
                 cwd: Some("/srv/bridge".to_owned()),
                 session: Some(session.clone()),
             };
@@ -3560,9 +3551,9 @@ mod tests {
             agent: Some(VENDOR_CODEX.to_owned()),
             terminal_id: "codex-no-home-terminal".to_owned(),
             agent_status: STATUS_DONE.to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            pane_id: "w1:p1".to_owned(),
             cwd: Some("/srv/bridge".to_owned()),
             session: Some(session.clone()),
         };
@@ -3698,9 +3689,9 @@ mod tests {
             agent: Some("claude".to_owned()),
             terminal_id: "question-terminal".to_owned(),
             agent_status: "blocked".to_owned(),
-            tab_id: None,
-            workspace_id: None,
-            pane_id: None,
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            pane_id: "w1:p1".to_owned(),
             cwd: Some("/srv/bridge".to_owned()),
             session: Some(AgentSession {
                 agent: "claude".to_owned(),
@@ -4132,7 +4123,7 @@ mod tests {
     fn snapshot_for_pane(pane_id: &str) -> Result<AgentSnapshot, String> {
         list_agents()?
             .into_iter()
-            .find(|agent| agent.pane_id.as_deref() == Some(pane_id))
+            .find(|agent| agent.pane_id == pane_id)
             .ok_or_else(|| format!("agent.list has no entry for pane {pane_id}"))
     }
 
@@ -7148,9 +7139,9 @@ mod tests {
                     agent: Some(agent.to_owned()),
                     terminal_id: terminal_id.clone(),
                     agent_status: STATUS_IDLE.to_owned(),
-                    tab_id: Some(tab_id.to_owned()),
-                    workspace_id: Some(workspace_id.to_owned()),
-                    pane_id: Some(pane_id),
+                    tab_id: tab_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    pane_id,
                     cwd: Some(format!("/tmp/{FRESH_IDLE_SESSION_LABEL}")),
                     session: Some(AgentSession {
                         agent: agent.to_owned(),

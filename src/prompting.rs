@@ -220,8 +220,8 @@ fn matching_agent<'agents>(
 ) -> Result<&'agents AgentSnapshot, String> {
     let matches: Vec<&AgentSnapshot> = agents
         .iter()
-        .filter(|agent| agent.tab_id.as_deref() == Some(tab_id))
-        .filter(|agent| agent.workspace_id.as_deref() == Some(workspace_id))
+        .filter(|agent| agent.tab_id == tab_id)
+        .filter(|agent| agent.workspace_id == workspace_id)
         .collect();
     match matches.as_slice() {
         [] => Err("refused: unmapped pane".to_owned()),
@@ -231,9 +231,7 @@ fn matching_agent<'agents>(
 }
 
 fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
-    let pane_id = agent
-        .pane_id
-        .as_deref()
+    let pane_id = Some(agent.pane_id.as_str())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "refused: unmapped pane".to_owned())?;
     match agent.agent_status.trim() {
@@ -337,9 +335,9 @@ pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
 fn pane_left_idle(target: &str, bound: Duration) -> Result<bool, String> {
     let start = Instant::now();
     loop {
-        let left_idle = list_agents()?.iter().any(|agent| {
-            agent.pane_id.as_deref() == Some(target) && agent.agent_status.trim() != STATUS_IDLE
-        });
+        let left_idle = list_agents()?
+            .iter()
+            .any(|agent| agent.pane_id == target && agent.agent_status.trim() != STATUS_IDLE);
         if left_idle {
             return Ok(true);
         }
@@ -395,9 +393,9 @@ async fn pane_still_working(pane_id: &str) -> Result<bool, String> {
 
 #[must_use]
 fn pane_status_is_working(agents: &[AgentSnapshot], pane_id: &str) -> bool {
-    agents.iter().any(|agent| {
-        agent.pane_id.as_deref() == Some(pane_id) && agent.agent_status.trim() == STATUS_WORKING
-    })
+    agents
+        .iter()
+        .any(|agent| agent.pane_id == pane_id && agent.agent_status.trim() == STATUS_WORKING)
 }
 
 fn agent_list_failure_reply(error: &str) -> String {
@@ -522,16 +520,8 @@ mod tests {
         let captured: Vec<AgentSnapshot> =
             serde_json::from_value(value["result"]["agents"].clone())
                 .expect("captured agent snapshot has the expected shape");
-        let workspace_id = captured[0]
-            .workspace_id
-            .as_deref()
-            .expect("captured agent has a workspace id");
-        let tab_id = captured[0]
-            .tab_id
-            .as_deref()
-            .expect("captured agent has a tab id");
-        let mut missing_pane = captured[0].clone();
-        missing_pane.pane_id = None;
+        let workspace_id = captured[0].workspace_id.as_str();
+        let tab_id = captured[0].tab_id.as_str();
         let mut working = captured[0].clone();
         working.agent_status = "working".to_owned();
         let mut blocked = captured[0].clone();
@@ -556,13 +546,6 @@ mod tests {
                 workspace_id,
                 ambiguous,
                 "refused: ambiguous pane mapping",
-            ),
-            (
-                "matching pane has no pane id",
-                tab_id,
-                workspace_id,
-                vec![missing_pane],
-                "refused: unmapped pane",
             ),
             (
                 "working pane",
@@ -613,16 +596,8 @@ mod tests {
         let captured: Vec<AgentSnapshot> =
             serde_json::from_value(value["result"]["agents"].clone())
                 .expect("captured agent snapshot has the expected shape");
-        let workspace_id = captured[0]
-            .workspace_id
-            .as_deref()
-            .expect("captured agent has a workspace id")
-            .to_owned();
-        let tab_id = captured[0]
-            .tab_id
-            .as_deref()
-            .expect("captured agent has a tab id")
-            .to_owned();
+        let workspace_id = captured[0].workspace_id.clone();
+        let tab_id = captured[0].tab_id.clone();
         let mut working = captured[0].clone();
         working.agent_status = "working".to_owned();
         let pane_id = working.pane_id.clone();
@@ -640,17 +615,13 @@ mod tests {
         let captured: Vec<AgentSnapshot> =
             serde_json::from_value(value["result"]["agents"].clone())
                 .expect("captured agent snapshot has the expected shape");
-        let pane_id = captured[0]
-            .pane_id
-            .as_deref()
-            .expect("captured agent has a pane id")
-            .to_owned();
+        let pane_id = captured[0].pane_id.clone();
         let mut working = captured[0].clone();
         working.agent_status = "working".to_owned();
         let mut idle = captured[0].clone();
         idle.agent_status = "idle".to_owned();
         let mut other_pane_working = captured[0].clone();
-        other_pane_working.pane_id = Some("other-pane".to_owned());
+        other_pane_working.pane_id = "other-pane".to_owned();
         other_pane_working.agent_status = "working".to_owned();
         let cases = [
             ("working pane matches", vec![working], true),
