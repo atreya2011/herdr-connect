@@ -1,5 +1,7 @@
 use std::{fs, path::Path};
 
+use rusqlite::Connection;
+
 use herdr_connect_rs::{
     AgentSession, read_agent_log, read_claude_prompts_incremental, read_codex_prompts_incremental,
 };
@@ -31,20 +33,10 @@ fn read_captured_vendor_logs() {
             "tests/fixtures/codex-session-response-item.jsonl",
             "gamma",
         ),
-        (
-            AgentSession {
-                agent: "cursor".into(),
-                value: "session".into(),
-            },
-            "tests/fixtures/cursor-session.json",
-            "final cursor",
-        ),
     ];
     for (session, path, expected) in cases {
         assert_eq!(
-            read_agent_log(Some(&session), Path::new(path))
-                .unwrap()
-                .message,
+            read_agent_log(&session, Path::new(path)).unwrap().message,
             expected
         );
     }
@@ -191,7 +183,7 @@ fn read_agent_log_tolerates_one_incomplete_trailing_line() {
     ];
     for (session, path) in cases {
         let agent = session.agent.clone();
-        let result = read_agent_log(Some(&session), Path::new(path));
+        let result = read_agent_log(&session, Path::new(path));
         assert!(
             result.is_ok(),
             "{agent}: expected a truncated trailing line to be tolerated, got {result:?}"
@@ -199,10 +191,10 @@ fn read_agent_log_tolerates_one_incomplete_trailing_line() {
     }
 
     let claude = read_agent_log(
-        Some(&AgentSession {
+        &AgentSession {
             agent: "claude".into(),
             value: "session".into(),
-        }),
+        },
         Path::new("tests/fixtures/claude-session-mid-write.jsonl"),
     )
     .unwrap();
@@ -215,15 +207,90 @@ fn read_agent_log_tolerates_one_incomplete_trailing_line() {
 #[test]
 fn read_agent_log_rejects_non_trailing_corruption() {
     let result = read_agent_log(
-        Some(&AgentSession {
+        &AgentSession {
             agent: "claude".into(),
             value: "session".into(),
-        }),
+        },
         Path::new("tests/fixtures/claude-session-mid-corrupt.jsonl"),
     );
+    let error = result.expect_err("a malformed non-final line must still fail the whole read");
+    assert!(
+        error.contains("tests/fixtures/claude-session-mid-corrupt.jsonl") && error.contains("line"),
+        "the error must name the file and the JSON parse failure, got {error:?}"
+    );
+}
+
+#[test]
+fn read_captured_cursor_store() {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-connect-rs-captured-cursor-store-{}.db",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&path);
+    let connection = Connection::open(&path).expect("create cursor store");
+    connection
+        .execute("CREATE TABLE blobs (data BLOB)", [])
+        .expect("create blobs table");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string("tests/fixtures/cursor-session.json").expect("read Cursor fixture"),
+    )
+    .expect("parse Cursor fixture");
+    for row in rows {
+        connection
+            .execute(
+                "INSERT INTO blobs (data) VALUES (?1)",
+                [serde_json::to_vec(&row).expect("encode Cursor row")],
+            )
+            .expect("insert Cursor row");
+    }
+    drop(connection);
+
+    let log = read_agent_log(
+        &AgentSession {
+            agent: "cursor".into(),
+            value: "session".into(),
+        },
+        &path,
+    );
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(log.expect("read Cursor store").message, "final cursor");
+}
+
+#[test]
+fn unreadable_cursor_row_fails_the_read() {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-connect-rs-unreadable-cursor-row-{}.db",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&path);
+    let connection = Connection::open(&path).expect("create cursor store");
+    connection
+        .execute("CREATE TABLE blobs (data BLOB)", [])
+        .expect("create blobs table");
+    connection
+        .execute(
+            "INSERT INTO blobs (data) VALUES (?1)",
+            [br#"{"role":"assistant","content":[{"type":"text","text":"answer"}]}"#.as_slice()],
+        )
+        .expect("insert Cursor row");
+    connection
+        .execute("INSERT INTO blobs (data) VALUES ('not a blob')", [])
+        .expect("insert text row");
+    drop(connection);
+
+    let result = read_agent_log(
+        &AgentSession {
+            agent: "cursor".into(),
+            value: "session".into(),
+        },
+        &path,
+    );
+    let _ = fs::remove_file(&path);
+
     assert!(
         result.is_err(),
-        "a malformed non-final line must still fail the whole read"
+        "a row that cannot be read must fail the read, got {result:?}"
     );
 }
 
@@ -238,16 +305,21 @@ fn missing_cursor_store_is_not_created() {
         let _ = fs::remove_file(&path);
 
         let result = read_agent_log(
-            Some(&AgentSession {
+            &AgentSession {
                 agent: agent.into(),
                 value: "session".into(),
-            }),
+            },
             &path,
         );
         let created = path.exists();
         let _ = fs::remove_file(&path);
 
-        assert!(result.is_err(), "{agent} missing store should fail");
+        let error = result.expect_err("a missing store should fail");
+        assert!(
+            error.contains(path.to_str().expect("utf-8 temp path"))
+                && error.contains("unable to open database file"),
+            "{agent}: the error must name the store and the SQLite failure, got {error:?}"
+        );
         assert!(!created, "{agent} missing store should not be created");
     }
 }

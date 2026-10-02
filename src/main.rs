@@ -594,7 +594,7 @@ fn capture_for_with_search_root(
     })?;
     let path =
         resolve_session_path(search_root, snapshot, session).map_err(|error| error.to_string())?;
-    let log = herdr_connect_rs::read_agent_log(Some(session), &path)?;
+    let log = herdr_connect_rs::read_agent_log(session, &path)?;
     Ok(AgentLogCapture {
         message: log.message,
         failure: log.failure,

@@ -1,8 +1,8 @@
 [
-  {"id":"current","data":{"role":"user","content":[{"type":"text","text":"current"}]}},
-  {"id":"glob","data":{"role":"assistant","content":[{"type":"tool-call","toolCallId":"glob-1","toolName":"Glob","args":{"pattern":"**/*.rs"}}]}},
-  {"id":"edit","data":{"role":"assistant","content":[{"type":"tool-call","toolCallId":"edit-1","toolName":"StrReplace","args":{"path":"src/lib.rs"}}]}},
-  {"id":"shell","data":{"role":"assistant","content":[{"type":"tool-call","toolCallId":"shell-1","toolName":"Shell","args":{"command":"cargo test"}}]}},
-  {"id":"task","data":{"role":"assistant","content":[{"type":"tool-call","toolCallId":"task-1","toolName":"Task","args":{"description":"inspect"}}]}},
-  {"id":"answer","data":{"role":"assistant","content":[{"type":"text","text":"final cursor"}]}}
+  {"id":"current","role":"user","content":[{"type":"text","text":"current"}]},
+  {"id":"glob","role":"assistant","content":[{"type":"tool-call","toolCallId":"glob-1","toolName":"Glob","args":{"pattern":"**/*.rs"}}]},
+  {"id":"edit","role":"assistant","content":[{"type":"tool-call","toolCallId":"edit-1","toolName":"StrReplace","args":{"path":"src/lib.rs"}}]},
+  {"id":"shell","role":"assistant","content":[{"type":"tool-call","toolCallId":"shell-1","toolName":"Shell","args":{"command":"cargo test"}}]},
+  {"id":"task","role":"assistant","content":[{"type":"tool-call","toolCallId":"task-1","toolName":"Task","args":{"description":"inspect"}}]},
+  {"id":"answer","role":"assistant","content":[{"type":"text","text":"final cursor"}]}
 ]
