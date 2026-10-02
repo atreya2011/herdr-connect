@@ -3414,83 +3414,122 @@ mod tests {
         const ORIGINAL: &str =
             "rollout-2026-09-28T09-50-11-00000000-0000-7000-8000-000000000001.jsonl";
         const CONTINUATION: &str = "rollout-2026-09-28T12-38-56-00000000-0000-7000-8000-000000000001_00000000-0000-7000-8000-000000000002.jsonl";
+        const THIRD_CONTINUATION: &str = "rollout-2026-09-28T18-20-05-00000000-0000-7000-8000-000000000001_00000000-0000-7000-8000-000000000004.jsonl";
+        const SECOND_CONTINUATION: &str = "rollout-2026-09-29T15-43-21-00000000-0000-7000-8000-000000000001_00000000-0000-7000-8000-000000000003.jsonl";
         let cases = [
-            (
-                "single file",
-                vec![ORIGINAL],
-                ORIGINAL,
-                "original answer",
-                "original prompt",
-            ),
+            ("single file", vec![ORIGINAL], ORIGINAL, "original"),
             (
                 "original plus continuation",
                 vec![CONTINUATION, ORIGINAL],
                 CONTINUATION,
-                "continuation answer",
-                "continuation prompt",
+                "continuation",
             ),
             (
                 "continuation only",
                 vec![CONTINUATION],
                 CONTINUATION,
-                "continuation answer",
-                "continuation prompt",
+                "continuation",
+            ),
+            (
+                "original plus two continuations across days",
+                vec![ORIGINAL, CONTINUATION, SECOND_CONTINUATION],
+                SECOND_CONTINUATION,
+                "second continuation",
+            ),
+            (
+                "original plus later-day continuation",
+                vec![ORIGINAL, SECOND_CONTINUATION],
+                SECOND_CONTINUATION,
+                "second continuation",
+            ),
+            (
+                "original plus two continuations in one day",
+                vec![ORIGINAL, CONTINUATION, THIRD_CONTINUATION],
+                THIRD_CONTINUATION,
+                "third continuation",
+            ),
+            (
+                "two continuations in one day",
+                vec![CONTINUATION, THIRD_CONTINUATION],
+                THIRD_CONTINUATION,
+                "third continuation",
+            ),
+            (
+                "two continuations",
+                vec![SECOND_CONTINUATION, CONTINUATION],
+                SECOND_CONTINUATION,
+                "second continuation",
             ),
         ];
-        for (index, (name, files, expected_file, expected_message, expected_prompt)) in
-            cases.into_iter().enumerate()
-        {
-            let root = std::env::temp_dir().join(format!(
-                "herdr-connect-rs-codex-rollouts-{}-{index}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system clock is after unix epoch")
-                    .as_nanos()
-            ));
-            let directory = root.join(".codex-one/sessions/2026/09/28");
-            fs::create_dir_all(&directory).expect("create synthetic Codex sessions directory");
-            for file in files {
-                fs::copy(
-                    Path::new("tests/fixtures/codex-rollouts").join(file),
-                    directory.join(file),
-                )
-                .expect("copy committed Codex rollout fixture");
-            }
-            let session = AgentSession {
-                agent: VENDOR_CODEX.to_owned(),
-                value: "00000000-0000-7000-8000-000000000001".to_owned(),
-            };
-            let snapshot = AgentSnapshot {
-                agent: Some(VENDOR_CODEX.to_owned()),
-                terminal_id: "codex-rollout-terminal".to_owned(),
-                agent_status: STATUS_DONE.to_owned(),
-                tab_id: None,
-                workspace_id: None,
-                pane_id: None,
-                cwd: Some("/srv/bridge".to_owned()),
-                session: Some(session.clone()),
-            };
-            let resolved = resolve_session_path(&root, &snapshot, &session);
-            let capture = capture_for_with_search_root(&snapshot, &root);
-            let prompts = resolved.as_ref().ok().map(|path| {
-                herdr_connect_rs::read_codex_prompts_incremental(path, 0)
-                    .expect("read selected Codex rollout prompts")
-                    .0
-                    .into_iter()
-                    .map(|(prompt, _)| prompt)
-                    .collect::<Vec<_>>()
-            });
-            fs::remove_dir_all(&root).expect("remove synthetic Codex HOME directory");
-            assert!(!root.exists(), "{name}: synthetic HOME cleanup");
-            assert_eq!(resolved, Ok(directory.join(expected_file)), "{name}");
-            assert_eq!(
-                capture.expect("selected Codex rollout resolves").message,
-                expected_message,
-                "{name}"
-            );
-            assert_eq!(prompts, Some(vec![expected_prompt.to_owned()]), "{name}");
+        for (index, (name, files, expected_file, label)) in cases.into_iter().enumerate() {
+            assert_codex_rollout_choice(index, name, &files, expected_file, label);
         }
+    }
+
+    fn assert_codex_rollout_choice(
+        index: usize,
+        name: &str,
+        files: &[&str],
+        expected_file: &str,
+        label: &str,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-codex-rollouts-{}-{index}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        let sessions = root.join(".codex-one/sessions");
+        for file in files {
+            let day = sessions.join(file[8..18].replace('-', "/"));
+            fs::create_dir_all(&day).expect("create synthetic Codex date directory");
+            fs::copy(
+                Path::new("tests/fixtures/codex-rollouts").join(file),
+                day.join(file),
+            )
+            .expect("copy committed Codex rollout fixture");
+        }
+        let session = AgentSession {
+            agent: VENDOR_CODEX.to_owned(),
+            value: "00000000-0000-7000-8000-000000000001".to_owned(),
+        };
+        let snapshot = AgentSnapshot {
+            agent: Some(VENDOR_CODEX.to_owned()),
+            terminal_id: "codex-rollout-terminal".to_owned(),
+            agent_status: STATUS_DONE.to_owned(),
+            tab_id: None,
+            workspace_id: None,
+            pane_id: None,
+            cwd: Some("/srv/bridge".to_owned()),
+            session: Some(session.clone()),
+        };
+        let resolved = resolve_session_path(&root, &snapshot, &session);
+        let capture = capture_for_with_search_root(&snapshot, &root);
+        let prompts = resolved.as_ref().ok().map(|path| {
+            herdr_connect_rs::read_codex_prompts_incremental(path, 0)
+                .expect("read selected Codex rollout prompts")
+                .0
+                .into_iter()
+                .map(|(prompt, _)| prompt)
+                .collect::<Vec<_>>()
+        });
+        fs::remove_dir_all(&root).expect("remove synthetic Codex HOME directory");
+        assert!(!root.exists(), "{name}: synthetic HOME cleanup");
+        assert_eq!(
+            resolved,
+            Ok(sessions
+                .join(expected_file[8..18].replace('-', "/"))
+                .join(expected_file)),
+            "{name}"
+        );
+        assert_eq!(
+            capture.expect("selected Codex rollout resolves").message,
+            format!("{label} answer"),
+            "{name}"
+        );
+        assert_eq!(prompts, Some(vec![format!("{label} prompt")]), "{name}");
     }
 
     struct CodexSearchRootCase {

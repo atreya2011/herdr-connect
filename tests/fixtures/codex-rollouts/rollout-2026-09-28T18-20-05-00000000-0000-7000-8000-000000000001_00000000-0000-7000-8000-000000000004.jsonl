@@ -1,0 +1,3 @@
+{"timestamp":"2026-09-28T18:20:05.000Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","timestamp":"2026-09-28T18:20:05.000Z","cwd":"/srv/bridge","originator":"codex_cli_rs","cli_version":"0.157.0","source":"cli"}}
+{"timestamp":"2026-09-28T18:20:06.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third continuation prompt"}]}}
+{"timestamp":"2026-09-28T18:20:07.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"third continuation answer"}],"phase":"final_answer"}}
