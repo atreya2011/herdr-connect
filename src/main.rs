@@ -8526,6 +8526,104 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const SELF_DELETE_LABEL: &str = "testrun-self";
+
+    /// How long the gateway is given to dispatch the delete event of a bridge deletion. A handler
+    /// that fails to recognise the deletion as the bridge's own logs an error within this window.
+    #[cfg(unix)]
+    const SELF_DELETE_EVENT_WAIT: Duration = Duration::from_secs(6);
+
+    /// Deletes a testrun workspace channel, or one of its tab threads, through the production
+    /// delete path while the gateway runs, and returns the errors the gateway logged. The ids are
+    /// testrun ids, so a deletion wrongly treated as the owner's makes Herdr refuse to close an id
+    /// it never had; no real tab or workspace can be closed.
+    #[cfg(unix)]
+    async fn bridge_deletion_gateway_errors(
+        guild: &BlockedCaptureGuild,
+        delete_thread: bool,
+    ) -> Result<Vec<String>, String> {
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        let workspace_id = format!("{SELF_DELETE_LABEL}-{nonce}");
+        let tab_id = format!("{workspace_id}:t1");
+        let channel = guild
+            .client
+            .create_guild_channel(guild.id, &workspace_id)
+            .topic(&format!("herdr workspace [{workspace_id}]"))
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        create_guild_thread(guild, channel.id, &format!("bridge [{tab_id}]")).await?;
+        let (mut channels, mut threads) =
+            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
+
+        let connection = discord_tuple(guild);
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let deleted = if delete_thread {
+            herdr_connect_rs::delete_tab_thread(
+                guild.client.as_ref(),
+                &channels,
+                &mut threads,
+                &mut HashMap::new(),
+                &workspace_id,
+                &tab_id,
+            )
+            .await
+        } else {
+            herdr_connect_rs::delete_workspace_channel(
+                guild.client.as_ref(),
+                &mut channels,
+                &workspace_id,
+            )
+            .await
+        };
+        tokio::time::sleep(SELF_DELETE_EVENT_WAIT).await;
+        gateway.abort();
+        deleted?;
+        Ok(deletion_errors(&notices))
+    }
+
+    /// The bridge's own deletions of a tab thread and of a workspace channel come back through the
+    /// gateway as delete events and must not be forwarded to Herdr as owner deletions.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn bridge_deletions_are_not_forwarded_to_herdr_as_owner_deletions() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let mut outcomes = Vec::new();
+        for (name, delete_thread) in [
+            ("the bridge's tab thread deletion", true),
+            ("the bridge's workspace channel deletion", false),
+        ] {
+            outcomes.push((
+                name,
+                bridge_deletion_gateway_errors(&guild, delete_thread).await,
+            ));
+        }
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        for (name, outcome) in outcomes {
+            assert_eq!(outcome, Ok(Vec::new()), "{name}");
+        }
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
     const STARTUP_RECONCILE_LABEL: &str = "testrun-startup-reconcile";
 
     /// Creates an orphan channel/thread pair and an orphan thread under a live workspace channel,
