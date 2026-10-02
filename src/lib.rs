@@ -51,7 +51,7 @@ pub use herdr::{
     STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, SubscribeError, agent_read_detection,
     generated_tab_name, is_numeric_label, lifecycle_subscriptions, list_agents,
     name_unlabeled_tabs, request_rpc_result, status_subscriptions, subscribe_herdr_events,
-    tab_list_result, workspace_list_result,
+    tab_close, tab_list_result, workspace_close, workspace_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
@@ -76,8 +76,9 @@ pub use readers::{
 pub use topology::{
     TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
-    reconcile_topology_cache, route_topology, sync_topology, take_owner_deleted_tab,
-    take_owner_deleted_workspace, take_self_deletion, workspace_channel_id, workspace_channel_name,
+    forget_owned, reconcile_topology_cache, remember_tab_threads, remember_workspace_channels,
+    resolve_owner_deleted_tab, resolve_owner_deleted_workspace, route_topology, sync_topology,
+    take_self_deletion, workspace_channel_id, workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};
 

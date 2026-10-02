@@ -174,6 +174,8 @@ pub async fn fetch_topology_lists(
         .await
         .map_err(|error| error.to_string())?
         .threads;
+    remember_workspace_channels(&channels);
+    remember_tab_threads(&active_threads);
     Ok((channels, active_threads))
 }
 
@@ -327,6 +329,7 @@ pub async fn sync_topology(
             .await
             .map_err(|error| error.to_string())?;
         let id = created.id;
+        remember_workspace_channels(std::slice::from_ref(&created));
         channels.push(created);
         id
     };
@@ -370,6 +373,7 @@ pub async fn sync_topology(
         .await
         .map_err(|error| error.to_string())?;
     let id = created.id;
+    remember_tab_threads(std::slice::from_ref(&created));
     active_threads.push(created);
     Ok(id)
 }
@@ -404,6 +408,7 @@ pub async fn archived_threads(
             .last()
             .and_then(|thread| thread.thread_metadata.as_ref())
             .map(|metadata| metadata.archive_timestamp.iso_8601().to_string());
+        remember_tab_threads(&listing.threads);
         threads.extend(listing.threads);
         if !has_more {
             return Ok(threads);
@@ -478,10 +483,14 @@ async fn delete_channel_if_present(
 ) -> Result<(), String> {
     record_self_deletion(id);
     match client.delete_channel(id).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            forget_owned(id);
+            Ok(())
+        }
         Err(error) => {
             let _ = take_self_deletion(id);
             if is_unknown_channel_error(&error) {
+                forget_owned(id);
                 Ok(())
             } else {
                 Err(error.to_string())
@@ -515,42 +524,103 @@ fn thread_tab_suffix(name: &str) -> Option<&str> {
     trimmed.rfind(" [").map(|start| &trimmed[start + 2..])
 }
 
-/// Removes the owner-deleted thread `thread_id` from the cached active threads and returns the
-/// Herdr tab id its name ends with, when it is a bridge-owned tab thread.
+/// Bridge-owned topology the gateway's delete events are resolved against.
 ///
-/// A gateway thread-delete event carries no name, so the cached listing is the only record of what
-/// the thread was. A thread is bridge-owned when its parent is a cached channel whose topic is
-/// `herdr workspace [id]` and its trailing ` [tab_id]` suffix starts with that workspace id, the
-/// same rule the startup sweep applies. Anything else, and a thread the cache never held, returns
-/// `None`.
-pub fn take_owner_deleted_tab(
-    channels: &[Channel],
-    active_threads: &mut Vec<Channel>,
-    thread_id: Id<ChannelMarker>,
-) -> Option<String> {
-    let index = active_threads
-        .iter()
-        .position(|thread| thread.id == thread_id)?;
-    let thread = active_threads.swap_remove(index);
-    let parent = channels
-        .iter()
-        .find(|channel| Some(channel.id) == thread.parent_id)?;
-    let workspace_id = workspace_topic_id(parent)?;
-    let tab_id = thread.name.as_deref().and_then(thread_tab_suffix)?;
-    tab_id
-        .starts_with(&format!("{workspace_id}:t"))
-        .then(|| tab_id.to_owned())
+/// A gateway thread-delete event carries only ids, so the thread's tab cannot be read from the
+/// event. This registry is filled wherever a workspace channel or tab thread is fetched, created,
+/// or found archived, and it is never cleared by cache invalidation or reconcile: a thread that
+/// left the topology cache (an auto-archive, a failed delivery, a refetch) is still resolvable.
+/// An entry leaves only when its deletion is resolved.
+#[derive(Default)]
+struct OwnedTopology {
+    workspaces: HashMap<Id<ChannelMarker>, String>,
+    threads: HashMap<Id<ChannelMarker>, OwnedThread>,
 }
 
-/// Removes the owner-deleted channel from the cached lists, with the cached threads it parented,
-/// and returns the Herdr workspace id its `herdr workspace [id]` topic named, if it had one.
-pub fn take_owner_deleted_workspace(
-    channels: &mut Vec<Channel>,
-    active_threads: &mut Vec<Channel>,
-    deleted: &Channel,
-) -> Option<String> {
-    channels.retain(|channel| channel.id != deleted.id);
-    active_threads.retain(|thread| thread.parent_id != Some(deleted.id));
+struct OwnedThread {
+    tab_id: String,
+    parent: Id<ChannelMarker>,
+}
+
+static OWNED_TOPOLOGY: LazyLock<std::sync::Mutex<OwnedTopology>> =
+    LazyLock::new(|| std::sync::Mutex::new(OwnedTopology::default()));
+
+fn owned_topology() -> std::sync::MutexGuard<'static, OwnedTopology> {
+    OWNED_TOPOLOGY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records every channel whose topic is `herdr workspace [id]` as a bridge-owned workspace channel.
+pub fn remember_workspace_channels(channels: &[Channel]) {
+    let mut owned = owned_topology();
+    for channel in channels {
+        if let Some(workspace_id) = workspace_topic_id(channel) {
+            owned.workspaces.insert(channel.id, workspace_id.to_owned());
+        }
+    }
+}
+
+/// Records every thread under a remembered workspace channel whose trailing ` [tab_id]` suffix
+/// starts with that workspace id, the same ownership rule the startup sweep applies.
+pub fn remember_tab_threads(threads: &[Channel]) {
+    let mut owned = owned_topology();
+    for thread in threads {
+        let Some(parent) = thread.parent_id else {
+            continue;
+        };
+        let Some(workspace_id) = owned.workspaces.get(&parent) else {
+            continue;
+        };
+        let Some(tab_id) = thread.name.as_deref().and_then(thread_tab_suffix) else {
+            continue;
+        };
+        if tab_id.starts_with(&format!("{workspace_id}:t")) {
+            let tab_id = tab_id.to_owned();
+            owned
+                .threads
+                .insert(thread.id, OwnedThread { tab_id, parent });
+        }
+    }
+}
+
+/// Forgets a resolved or bridge-made deletion: the thread, or the workspace channel with every
+/// thread it parented.
+pub fn forget_owned(id: Id<ChannelMarker>) {
+    let mut owned = owned_topology();
+    owned.threads.remove(&id);
+    if owned.workspaces.remove(&id).is_some() {
+        owned.threads.retain(|_, thread| thread.parent != id);
+    }
+}
+
+/// The Herdr tab id behind a deleted thread, from the durable registry.
+///
+/// `parent_id` is the thread's parent from the gateway event. `Ok(None)` means the thread is not
+/// under a bridge workspace channel and is not the bridge's concern.
+///
+/// # Errors
+///
+/// Returns an error when the thread is under a bridge workspace channel but was never recorded as
+/// a bridge tab thread: the tab cannot be identified, so it would stay open unnoticed.
+pub fn resolve_owner_deleted_tab(
+    thread_id: Id<ChannelMarker>,
+    parent_id: Id<ChannelMarker>,
+) -> Result<Option<String>, String> {
+    let owned = owned_topology();
+    if let Some(thread) = owned.threads.get(&thread_id) {
+        return Ok(Some(thread.tab_id.clone()));
+    }
+    owned.workspaces.get(&parent_id).map_or(Ok(None), |workspace_id| {
+        Err(format!(
+            "deleted thread {thread_id} under workspace {workspace_id} was never recorded as a tab thread; its Herdr tab is unresolved"
+        ))
+    })
+}
+
+/// The Herdr workspace id a deleted channel's `herdr workspace [id]` topic named, if it had one.
+#[must_use]
+pub fn resolve_owner_deleted_workspace(deleted: &Channel) -> Option<String> {
     workspace_topic_id(deleted).map(ToOwned::to_owned)
 }
 
@@ -684,8 +754,8 @@ pub mod owner_deletion_tests {
     use twilight_model::id::{Id, marker::ChannelMarker};
 
     use super::{
-        record_self_deletion, take_owner_deleted_tab, take_owner_deleted_workspace,
-        take_self_deletion,
+        forget_owned, record_self_deletion, remember_tab_threads, remember_workspace_channels,
+        resolve_owner_deleted_tab, resolve_owner_deleted_workspace, take_self_deletion,
     };
 
     pub fn channel(id: u64, name: &str, topic: Option<&str>, parent: Option<u64>) -> Channel {
@@ -709,43 +779,92 @@ pub mod owner_deletion_tests {
     }
 
     #[test]
-    fn owner_deleted_thread_resolves_to_a_bridge_owned_tab_only() {
-        let channels = vec![
-            channel(10, "work", Some("herdr workspace [w1]"), None),
-            channel(11, "chat", Some("just talking"), None),
-        ];
+    fn owner_deleted_thread_resolves_from_the_registry_not_the_cache() {
+        remember_workspace_channels(&[
+            channel(8_010, "work", Some("herdr workspace [w1]"), None),
+            channel(8_011, "chat", Some("just talking"), None),
+        ]);
+        remember_tab_threads(&[
+            channel(8_020, "build [w1:t2]", None, Some(8_010)),
+            channel(8_021, "build [w1:t2]", None, Some(8_011)),
+            channel(8_022, "build [w9:t2]", None, Some(8_010)),
+            channel(8_023, "plain thread", None, Some(8_010)),
+        ]);
         let cases = [
-            ("bridge tab thread", 20, Some("w1:t2")),
-            ("thread under a non-workspace channel", 21, None),
-            ("suffix from another workspace", 22, None),
-            ("name without a tab suffix", 23, None),
-            ("thread the cache never held", 99, None),
+            ("bridge tab thread", 8_020, 8_010, Ok(Some("w1:t2"))),
+            (
+                "thread under a non-workspace channel",
+                8_021,
+                8_011,
+                Ok(None),
+            ),
+            (
+                "unknown thread under an unknown parent",
+                8_099,
+                8_098,
+                Ok(None),
+            ),
         ];
-        for (name, thread_id, expected) in cases {
-            let mut threads = vec![
-                channel(20, "build [w1:t2]", None, Some(10)),
-                channel(21, "build [w1:t2]", None, Some(11)),
-                channel(22, "build [w9:t2]", None, Some(10)),
-                channel(23, "plain thread", None, Some(10)),
-            ];
-            let resolved = take_owner_deleted_tab(&channels, &mut threads, id(thread_id));
-            assert_eq!(resolved.as_deref(), expected, "{name}");
+        for (name, thread_id, parent, expected) in cases {
+            let resolved = resolve_owner_deleted_tab(id(thread_id), id(parent));
+            assert_eq!(
+                resolved,
+                expected.map(|tab| tab.map(str::to_owned)),
+                "{name}"
+            );
+        }
+        let unresolved = [
+            ("suffix from another workspace", 8_022),
+            ("name without a tab suffix", 8_023),
+            ("thread never recorded", 8_024),
+        ];
+        for (name, thread_id) in unresolved {
+            let error = resolve_owner_deleted_tab(id(thread_id), id(8_010))
+                .expect_err("an unrecorded thread under a workspace channel is an error");
+            assert!(error.contains("unresolved"), "{name}: {error}");
         }
     }
 
     #[test]
-    fn owner_deleted_tab_thread_leaves_the_cache() {
-        let channels = vec![channel(10, "work", Some("herdr workspace [w1]"), None)];
-        let mut threads = vec![
-            channel(20, "a [w1:t1]", None, Some(10)),
-            channel(21, "b [w1:t2]", None, Some(10)),
-        ];
+    fn a_thread_dropped_by_reconcile_still_resolves() {
+        let workspace = channel(8_210, "work", Some("herdr workspace [w3]"), None);
+        let thread = channel(8_220, "a [w3:t1]", None, Some(8_210));
+        let newer = channel(8_230, "b [w3:t2]", None, Some(8_210));
+        remember_workspace_channels(std::slice::from_ref(&workspace));
+        remember_tab_threads(&[thread.clone(), newer.clone()]);
+        let mut cache = Some((vec![workspace.clone()], vec![thread]));
+        super::reconcile_topology_cache(&mut cache, (vec![workspace], vec![newer]));
+        let cached: Vec<_> = cache
+            .as_ref()
+            .map(|(_, threads)| threads.iter().map(|entry| entry.id).collect())
+            .unwrap_or_default();
         assert_eq!(
-            take_owner_deleted_tab(&channels, &mut threads, id(20)).as_deref(),
-            Some("w1:t1")
+            cached,
+            vec![id(8_230)],
+            "the refetch dropped the older thread"
         );
-        let remaining: Vec<_> = threads.iter().map(|thread| thread.id).collect();
-        assert_eq!(remaining, vec![id(21)]);
+        assert_eq!(
+            resolve_owner_deleted_tab(id(8_220), id(8_210)),
+            Ok(Some("w3:t1".to_owned())),
+            "after reconcile"
+        );
+    }
+
+    #[test]
+    fn a_forgotten_thread_no_longer_resolves_and_a_forgotten_channel_takes_its_threads() {
+        remember_workspace_channels(&[channel(8_110, "work", Some("herdr workspace [w2]"), None)]);
+        remember_tab_threads(&[
+            channel(8_120, "a [w2:t1]", None, Some(8_110)),
+            channel(8_121, "b [w2:t2]", None, Some(8_110)),
+        ]);
+        forget_owned(id(8_120));
+        assert!(resolve_owner_deleted_tab(id(8_120), id(8_110)).is_err());
+        assert_eq!(
+            resolve_owner_deleted_tab(id(8_121), id(8_110)),
+            Ok(Some("w2:t2".to_owned()))
+        );
+        forget_owned(id(8_110));
+        assert_eq!(resolve_owner_deleted_tab(id(8_121), id(8_110)), Ok(None));
     }
 
     #[test]
@@ -761,22 +880,10 @@ pub mod owner_deletion_tests {
         ];
         for (name, topic, expected) in cases {
             let deleted = channel(10, "work", topic, None);
-            let mut channels = vec![deleted.clone(), channel(12, "other", None, None)];
-            let mut threads = vec![
-                channel(20, "a [w1:t1]", None, Some(10)),
-                channel(21, "b [w2:t1]", None, Some(12)),
-            ];
-            let resolved = take_owner_deleted_workspace(&mut channels, &mut threads, &deleted);
-            assert_eq!(resolved.as_deref(), expected, "{name}");
             assert_eq!(
-                channels.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-                vec![id(12)],
-                "{name}: deleted channel leaves the cache"
-            );
-            assert_eq!(
-                threads.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-                vec![id(21)],
-                "{name}: its threads leave the cache"
+                resolve_owner_deleted_workspace(&deleted).as_deref(),
+                expected,
+                "{name}"
             );
         }
     }

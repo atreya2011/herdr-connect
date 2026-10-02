@@ -127,7 +127,14 @@ async fn drive_gateway(
                 "discord gateway interaction: INTERACTION_CREATE".to_owned()
             }
             Ok(Event::ThreadDelete(thread)) if thread.guild_id == context.guild => {
-                spawn_deletion(&context, &notices, GuildDeletion::Thread(thread.id));
+                spawn_deletion(
+                    &context,
+                    &notices,
+                    GuildDeletion::Thread {
+                        id: thread.id,
+                        parent_id: thread.parent_id,
+                    },
+                );
                 "discord gateway deletion: THREAD_DELETE".to_owned()
             }
             Ok(Event::ChannelDelete(channel)) if channel.guild_id == Some(context.guild) => {

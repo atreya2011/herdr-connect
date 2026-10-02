@@ -186,6 +186,24 @@ pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
     )
 }
 
+/// Closes one Herdr tab, ending its pane processes, through the bounded RPC socket.
+///
+/// # Errors
+///
+/// Returns connection, timeout, protocol, or Herdr-declared errors.
+pub fn tab_close(tab_id: &str) -> Result<String, String> {
+    request_rpc_result_with_params("tab.close", &json!({"tab_id": tab_id}))
+}
+
+/// Closes one Herdr workspace through the bounded RPC socket.
+///
+/// # Errors
+///
+/// Returns connection, timeout, protocol, or Herdr-declared errors.
+pub fn workspace_close(workspace_id: &str) -> Result<String, String> {
+    request_rpc_result_with_params("workspace.close", &json!({"workspace_id": workspace_id}))
+}
+
 /// Reads a pane's Herdr detection snapshot: the TUI-state detector's own screen render, distinct
 /// from the vendor's on-disk session log.
 ///

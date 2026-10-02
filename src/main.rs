@@ -8095,6 +8095,9 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        // A delivery that met Unknown Channel clears the topology cache before the gateway
+        // handler runs; the handler must still resolve the tab without any cache.
+        *connection.3.topology_cache().lock().await = None;
         let deleted = guild
             .client
             .delete_channel(thread.id)
@@ -8127,9 +8130,19 @@ mod tests {
             return Err(format!("gateway reported errors: {errors:?}"));
         }
 
-        let remaining_agents = [root_agent];
-        let remaining_tabs = [matching_tab(&workspace.tab_id)?];
-        sync_startup_topology(&connection, &remaining_agents, &remaining_tabs).await;
+        let workspace_id = second_route.workspace_id.as_str();
+        let fresh_agents: Vec<_> = list_agents()?
+            .into_iter()
+            .filter(|agent| agent.workspace_id.as_deref() == Some(workspace_id))
+            .collect();
+        let fresh_tabs: Vec<_> = tab_list_result()?
+            .into_iter()
+            .filter(|tab| tab.workspace_id == workspace_id)
+            .collect();
+        if route_topology(&fresh_agents, &fresh_tabs, &second_agent.terminal_id).is_ok() {
+            return Err("Herdr still routes the closed tab's pane".to_owned());
+        }
+        sync_startup_topology(&connection, &fresh_agents, &fresh_tabs).await;
         if thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
             return Err("a thread was recreated for the closed tab".to_owned());
         }
