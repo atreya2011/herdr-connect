@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex;
 use twilight_model::channel::Channel;
@@ -446,15 +446,47 @@ pub fn is_unknown_webhook_error(error: &twilight_http::Error) -> bool {
     )
 }
 
+/// Ids of channels and threads the bridge itself is deleting, so the gateway's matching delete
+/// event is recognised as the bridge's own doing and not forwarded to Herdr as an owner deletion.
+static SELF_DELETIONS: LazyLock<std::sync::Mutex<HashSet<Id<ChannelMarker>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Consumes the self-deletion marker for `id`, if one is pending.
+///
+/// `true` means the bridge deleted this channel or thread itself and its gateway delete event must
+/// be ignored; the marker is cleared, so a later event for the same id is not suppressed.
+#[must_use]
+pub fn take_self_deletion(id: Id<ChannelMarker>) -> bool {
+    SELF_DELETIONS
+        .lock()
+        .is_ok_and(|mut deletions| deletions.remove(&id))
+}
+
+pub fn record_self_deletion(id: Id<ChannelMarker>) {
+    if let Ok(mut deletions) = SELF_DELETIONS.lock() {
+        deletions.insert(id);
+    }
+}
+
 /// Deletes one Discord channel or thread, treating an already-deleted target as done.
+///
+/// The id is recorded as a self-deletion before the request, because the gateway event can arrive
+/// before the response; a failed or already-gone delete forgets the record again.
 async fn delete_channel_if_present(
     client: &twilight_http::Client,
     id: Id<ChannelMarker>,
 ) -> Result<(), String> {
+    record_self_deletion(id);
     match client.delete_channel(id).await {
         Ok(_) => Ok(()),
-        Err(error) if is_unknown_channel_error(&error) => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            let _ = take_self_deletion(id);
+            if is_unknown_channel_error(&error) {
+                Ok(())
+            } else {
+                Err(error.to_string())
+            }
+        }
     }
 }
 
@@ -481,6 +513,45 @@ fn workspace_topic_id(channel: &Channel) -> Option<&str> {
 fn thread_tab_suffix(name: &str) -> Option<&str> {
     let trimmed = name.strip_suffix(']')?;
     trimmed.rfind(" [").map(|start| &trimmed[start + 2..])
+}
+
+/// Removes the owner-deleted thread `thread_id` from the cached active threads and returns the
+/// Herdr tab id its name ends with, when it is a bridge-owned tab thread.
+///
+/// A gateway thread-delete event carries no name, so the cached listing is the only record of what
+/// the thread was. A thread is bridge-owned when its parent is a cached channel whose topic is
+/// `herdr workspace [id]` and its trailing ` [tab_id]` suffix starts with that workspace id, the
+/// same rule the startup sweep applies. Anything else, and a thread the cache never held, returns
+/// `None`.
+pub fn take_owner_deleted_tab(
+    channels: &[Channel],
+    active_threads: &mut Vec<Channel>,
+    thread_id: Id<ChannelMarker>,
+) -> Option<String> {
+    let index = active_threads
+        .iter()
+        .position(|thread| thread.id == thread_id)?;
+    let thread = active_threads.swap_remove(index);
+    let parent = channels
+        .iter()
+        .find(|channel| Some(channel.id) == thread.parent_id)?;
+    let workspace_id = workspace_topic_id(parent)?;
+    let tab_id = thread.name.as_deref().and_then(thread_tab_suffix)?;
+    tab_id
+        .starts_with(&format!("{workspace_id}:t"))
+        .then(|| tab_id.to_owned())
+}
+
+/// Removes the owner-deleted channel from the cached lists, with the cached threads it parented,
+/// and returns the Herdr workspace id its `herdr workspace [id]` topic named, if it had one.
+pub fn take_owner_deleted_workspace(
+    channels: &mut Vec<Channel>,
+    active_threads: &mut Vec<Channel>,
+    deleted: &Channel,
+) -> Option<String> {
+    channels.retain(|channel| channel.id != deleted.id);
+    active_threads.retain(|thread| thread.parent_id != Some(deleted.id));
+    workspace_topic_id(deleted).map(ToOwned::to_owned)
 }
 
 /// Deletes the Discord thread identifying one closed Herdr tab.
@@ -604,4 +675,117 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub mod owner_deletion_tests {
+    use serde_json::json;
+    use twilight_model::channel::Channel;
+    use twilight_model::id::{Id, marker::ChannelMarker};
+
+    use super::{
+        record_self_deletion, take_owner_deleted_tab, take_owner_deleted_workspace,
+        take_self_deletion,
+    };
+
+    pub fn channel(id: u64, name: &str, topic: Option<&str>, parent: Option<u64>) -> Channel {
+        let mut value = json!({
+            "id": id.to_string(),
+            "type": if parent.is_some() { 11 } else { 0 },
+            "name": name,
+            "guild_id": "1",
+        });
+        if let Some(topic) = topic {
+            value["topic"] = json!(topic);
+        }
+        if let Some(parent) = parent {
+            value["parent_id"] = json!(parent.to_string());
+        }
+        serde_json::from_value(value).expect("synthetic channel deserializes")
+    }
+
+    fn id(raw: u64) -> Id<ChannelMarker> {
+        Id::new(raw)
+    }
+
+    #[test]
+    fn owner_deleted_thread_resolves_to_a_bridge_owned_tab_only() {
+        let channels = vec![
+            channel(10, "work", Some("herdr workspace [w1]"), None),
+            channel(11, "chat", Some("just talking"), None),
+        ];
+        let cases = [
+            ("bridge tab thread", 20, Some("w1:t2")),
+            ("thread under a non-workspace channel", 21, None),
+            ("suffix from another workspace", 22, None),
+            ("name without a tab suffix", 23, None),
+            ("thread the cache never held", 99, None),
+        ];
+        for (name, thread_id, expected) in cases {
+            let mut threads = vec![
+                channel(20, "build [w1:t2]", None, Some(10)),
+                channel(21, "build [w1:t2]", None, Some(11)),
+                channel(22, "build [w9:t2]", None, Some(10)),
+                channel(23, "plain thread", None, Some(10)),
+            ];
+            let resolved = take_owner_deleted_tab(&channels, &mut threads, id(thread_id));
+            assert_eq!(resolved.as_deref(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn owner_deleted_tab_thread_leaves_the_cache() {
+        let channels = vec![channel(10, "work", Some("herdr workspace [w1]"), None)];
+        let mut threads = vec![
+            channel(20, "a [w1:t1]", None, Some(10)),
+            channel(21, "b [w1:t2]", None, Some(10)),
+        ];
+        assert_eq!(
+            take_owner_deleted_tab(&channels, &mut threads, id(20)).as_deref(),
+            Some("w1:t1")
+        );
+        let remaining: Vec<_> = threads.iter().map(|thread| thread.id).collect();
+        assert_eq!(remaining, vec![id(21)]);
+    }
+
+    #[test]
+    fn owner_deleted_channel_resolves_only_a_workspace_topic() {
+        let cases = [
+            (
+                "workspace channel",
+                Some("herdr workspace [w1]"),
+                Some("w1"),
+            ),
+            ("channel with another topic", Some("lounge"), None),
+            ("channel without a topic", None, None),
+        ];
+        for (name, topic, expected) in cases {
+            let deleted = channel(10, "work", topic, None);
+            let mut channels = vec![deleted.clone(), channel(12, "other", None, None)];
+            let mut threads = vec![
+                channel(20, "a [w1:t1]", None, Some(10)),
+                channel(21, "b [w2:t1]", None, Some(12)),
+            ];
+            let resolved = take_owner_deleted_workspace(&mut channels, &mut threads, &deleted);
+            assert_eq!(resolved.as_deref(), expected, "{name}");
+            assert_eq!(
+                channels.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+                vec![id(12)],
+                "{name}: deleted channel leaves the cache"
+            );
+            assert_eq!(
+                threads.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+                vec![id(21)],
+                "{name}: its threads leave the cache"
+            );
+        }
+    }
+
+    #[test]
+    fn a_self_deletion_is_ignored_once() {
+        record_self_deletion(id(7_000_001));
+        assert!(take_self_deletion(id(7_000_001)));
+        assert!(!take_self_deletion(id(7_000_001)));
+        assert!(!take_self_deletion(id(7_000_002)));
+    }
 }

@@ -7,6 +7,7 @@ mod activity;
 mod broker;
 mod cards;
 mod config;
+mod deletion;
 mod delivery;
 mod gateway;
 mod herdr;
@@ -34,6 +35,7 @@ pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,
     load_discord_config,
 };
+pub use deletion::{GuildDeletion, handle_guild_deletion};
 pub use delivery::{
     OwnerIdentity, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR,
     deliver_activity_message, deliver_live_message, deliver_permission_card,
@@ -74,8 +76,8 @@ pub use readers::{
 pub use topology::{
     TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, fetch_topology_lists,
-    reconcile_topology_cache, route_topology, sync_topology, workspace_channel_id,
-    workspace_channel_name,
+    reconcile_topology_cache, route_topology, sync_topology, take_owner_deleted_tab,
+    take_owner_deleted_workspace, take_self_deletion, workspace_channel_id, workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};
 
