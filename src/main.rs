@@ -6761,11 +6761,22 @@ mod tests {
         };
         herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
             .await;
-        let received = tokio::time::timeout(Duration::from_secs(2), activity_rx.recv())
-            .await
-            .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
-            .ok_or_else(|| "activity channel closed before the late frame arrived".to_owned())?;
-        super::handle_activity_event(&connection, received, &mut state).await;
+        // The production socket is shared with the owner's other live panes, so foreign frames
+        // can queue ahead of the synthetic one: handle each, until the synthetic frame arrives.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let received = tokio::time::timeout_at(deadline, activity_rx.recv())
+                .await
+                .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
+                .ok_or_else(|| {
+                    "activity channel closed before the late frame arrived".to_owned()
+                })?;
+            let is_synthetic = received.session_id == "late-frame-synthetic";
+            super::handle_activity_event(&connection, received, &mut state).await;
+            if is_synthetic {
+                break;
+            }
+        }
         let after_late_frame = thread_messages(guild, thread).await?;
         if after_late_frame != after_first_turn {
             return Err(format!(
