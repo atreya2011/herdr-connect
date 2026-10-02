@@ -4377,6 +4377,22 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
+    /// Records the current status of every pane in the real Herdr session except `own_terminals`
+    /// as already seen, so the doorbell's fresh-session topology sync returns early for the
+    /// owner's own panes instead of creating or unarchiving their Discord channels and threads.
+    #[cfg(unix)]
+    fn seed_previous_for_other_terminals(
+        state: &mut BridgeState,
+        own_terminals: &[&str],
+    ) -> Result<(), String> {
+        for agent in list_agents()? {
+            if !own_terminals.contains(&agent.terminal_id.as_str()) {
+                state.previous.insert(agent.terminal_id, agent.agent_status);
+            }
+        }
+        Ok(())
+    }
+
     /// Feeds a real `pane_created` event through the lifecycle handler. The snapshot doorbell that
     /// follows the event also subscribes to status when the pane list changed, so no outcome tells
     /// the membership resubscribe apart from the doorbell's own subscribe: the row pins the
@@ -4391,6 +4407,11 @@ mod tests {
             return;
         };
         let connection = discord_tuple(&guild);
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
         assert_eq!(
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
             0,
@@ -4425,6 +4446,7 @@ mod tests {
             .await?;
             report_agent_state(&tab.pane_id, "idle")?;
             let terminal_id = snapshot_for_pane(&tab.pane_id)?.terminal_id;
+            seed_previous_for_other_terminals(&mut runtime.state, &[&terminal_id])?;
             handle_lifecycle_select_result(
                 Ok(pane_created),
                 &connection,
@@ -4461,9 +4483,11 @@ mod tests {
         .await;
         close_tab(&tab.tab_id);
         let _ = clear_directory_contents(&cwd_dir);
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left =
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
@@ -8073,6 +8097,10 @@ mod tests {
             activity_events,
         };
 
+        seed_previous_for_other_terminals(
+            &mut runtime.state,
+            &[&root_agent.terminal_id, &second_agent.terminal_id],
+        )?;
         close_tab(&second_tab.tab_id);
         let tab_closed = wait_for_event(
             &mut runtime.lifecycle,
