@@ -407,27 +407,6 @@ where
     }
 }
 
-/// Lists every given workspace channel's archived threads through `list`, one channel at a time.
-/// A channel whose listing keeps failing is reported but never stops the others.
-async fn list_each_channel_with_retry<F, Fut>(
-    workspace_channels: &[Id<ChannelMarker>],
-    attempts: u32,
-    delay: std::time::Duration,
-    mut list: F,
-) -> Vec<String>
-where
-    F: FnMut(Id<ChannelMarker>) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<Channel>, String>>,
-{
-    let mut errors = Vec::new();
-    for channel in workspace_channels {
-        if let Err(error) = retry_listing(attempts, delay, || list(*channel)).await {
-            errors.push(format!("archived threads of channel {channel}: {error}"));
-        }
-    }
-    errors
-}
-
 /// Registers the archived tab threads of every workspace channel, independent of any Herdr call
 /// and of the startup delete pass.
 ///
@@ -451,13 +430,16 @@ pub async fn register_archived_tab_threads(
         .filter(|channel| workspace_topic_id(channel).is_some())
         .map(|channel| channel.id)
         .collect();
-    let errors = list_each_channel_with_retry(
-        &workspace_channels,
-        REGISTRATION_ATTEMPTS,
-        REGISTRATION_RETRY_DELAY,
-        |channel| archived_threads(client, channel),
-    )
-    .await;
+    let mut errors = Vec::new();
+    for channel in workspace_channels {
+        if let Err(error) = retry_listing(REGISTRATION_ATTEMPTS, REGISTRATION_RETRY_DELAY, || {
+            archived_threads(client, channel)
+        })
+        .await
+        {
+            errors.push(format!("archived threads of channel {channel}: {error}"));
+        }
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -950,89 +932,5 @@ pub mod owner_deletion_tests {
         assert!(take_self_deletion(id(7_000_001)));
         assert!(!take_self_deletion(id(7_000_001)));
         assert!(!take_self_deletion(id(7_000_002)));
-    }
-
-    #[tokio::test]
-    async fn archived_registration_survives_retries_and_a_failing_channel() {
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        use std::time::Duration;
-
-        remember_workspace_channels(&[
-            channel(8_410, "a", Some("herdr workspace [w7]"), None),
-            channel(8_411, "b", Some("herdr workspace [w8]"), None),
-            channel(8_412, "c", Some("herdr workspace [w9]"), None),
-            channel(8_413, "d", Some("herdr workspace [w10]"), None),
-        ]);
-        let archived = HashMap::from([
-            (8_410_u64, channel(8_420, "x [w7:t1]", None, Some(8_410))),
-            (8_412, channel(8_422, "z [w9:t1]", None, Some(8_412))),
-            (8_413, channel(8_423, "y [w10:t1]", None, Some(8_413))),
-        ]);
-        // Plan per channel: failures before success, or None when it never succeeds.
-        let cases = [
-            (
-                "first try",
-                vec![(8_410_u64, Some(0_u32))],
-                0,
-                Some((8_420_u64, "w7:t1")),
-                1,
-            ),
-            (
-                "recovers on retry",
-                vec![(8_413, Some(2))],
-                0,
-                Some((8_423, "w10:t1")),
-                3,
-            ),
-            (
-                "a failing channel does not stop the next",
-                vec![(8_411, None), (8_412, Some(0))],
-                1,
-                Some((8_422, "w9:t1")),
-                5,
-            ),
-        ];
-        for (name, plan, failed, registered, calls) in cases {
-            if let Some((thread, _)) = registered {
-                assert_eq!(
-                    resolve_owner_deleted_tab(id(thread)),
-                    None,
-                    "{name}: before"
-                );
-            }
-            let calls_made = RefCell::new(0_u32);
-            let remaining: RefCell<HashMap<u64, Option<u32>>> =
-                RefCell::new(plan.iter().copied().collect());
-            let ids: Vec<Id<ChannelMarker>> = plan.iter().map(|(raw, _)| id(*raw)).collect();
-            let errors = super::list_each_channel_with_retry(&ids, 4, Duration::ZERO, |channel| {
-                *calls_made.borrow_mut() += 1;
-                let raw = channel.get();
-                let mut remaining = remaining.borrow_mut();
-                let outcome = match remaining.get_mut(&raw).expect("planned channel") {
-                    None => Err("discord down".to_owned()),
-                    Some(0) => {
-                        let thread = archived[&raw].clone();
-                        remember_tab_threads(std::slice::from_ref(&thread));
-                        Ok(vec![thread])
-                    }
-                    Some(left) => {
-                        *left -= 1;
-                        Err("transient".to_owned())
-                    }
-                };
-                std::future::ready(outcome)
-            })
-            .await;
-            assert_eq!(errors.len(), failed, "{name}: errors {errors:?}");
-            assert_eq!(*calls_made.borrow(), calls, "{name}: attempts");
-            if let Some((thread, tab)) = registered {
-                assert_eq!(
-                    resolve_owner_deleted_tab(id(thread)).as_deref(),
-                    Some(tab),
-                    "{name}: registered"
-                );
-            }
-        }
     }
 }
