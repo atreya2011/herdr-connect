@@ -1387,13 +1387,10 @@ mod tests {
             sender
                 .send(Decision::allow())
                 .expect("send resolved decision");
+            let expiry = tokio::time::sleep(Duration::ZERO);
+            tokio::time::sleep(Duration::from_millis(2)).await;
             assert_eq!(
-                PermissionResponder::wait_decision(
-                    receiver,
-                    &HookLiveness::new(),
-                    tokio::time::sleep(Duration::ZERO),
-                )
-                .await,
+                PermissionResponder::wait_decision(receiver, &HookLiveness::new(), expiry).await,
                 Some(Decision::allow())
             );
         }
