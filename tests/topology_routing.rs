@@ -31,7 +31,7 @@ fn route_captured_herdr_snapshots() {
 /// Herdr 0.9.0 may omit `agent` entirely while a pane's agent is still being detected. That entry
 /// must still deserialize (not fail the whole `agent.list`).
 #[test]
-fn agent_list_entry_missing_agent_parses_as_unmirrored() {
+fn agent_list_entry_missing_agent_parses_without_a_session() {
     let value: Value = serde_json::from_str(include_str!("fixtures/herdr-agent-list.json"))
         .expect("captured snapshot is JSON");
     let agents: Vec<AgentSnapshot> =
