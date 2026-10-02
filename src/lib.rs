@@ -48,7 +48,7 @@ pub use delivery::{
 pub use gateway::{ComponentHandler, GatewayContext, drive_gateway_with_components};
 pub use herdr::{
     AgentSession, AgentSnapshot, EVENT_KEY, HerdrSubscription, HerdrTab, HerdrWorkspace,
-    STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, SubscribeError, agent_read_detection,
+    STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, agent_read_detection,
     generated_tab_name, is_numeric_label, lifecycle_subscriptions, list_agents,
     name_unlabeled_tabs, request_rpc_result, status_subscriptions, subscribe_herdr_events,
     tab_close, tab_list_result, workspace_close, workspace_list_result,

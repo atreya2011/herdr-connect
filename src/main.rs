@@ -8090,9 +8090,7 @@ mod tests {
             return Err("sync did not create the second tab's thread".to_owned());
         }
 
-        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-            .await
-            .map_err(|error| error.to_string())?;
+        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|error| error.to_string())?;
         let mut broker: Option<BrokerTask> = None;
@@ -8342,9 +8340,7 @@ mod tests {
             })
             .ok_or("sync did not create the second tab's thread")?;
 
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         // A delivery that met Unknown Channel clears the topology cache before the gateway
         // handler runs; the handler must still resolve the tab without any cache.
@@ -8490,9 +8486,7 @@ mod tests {
         }
 
         let connection = discord_tuple(guild);
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = guild
             .client
@@ -8612,9 +8606,7 @@ mod tests {
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
 
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = guild
             .client

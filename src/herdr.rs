@@ -450,38 +450,13 @@ pub struct HerdrSubscription {
     line_buffer: Vec<u8>,
 }
 
-/// Error from [`subscribe_herdr_events`], distinguishing a Herdr-declared `pane_not_found` from
-/// every other connect, timeout, protocol, or Herdr-declared failure.
-#[derive(Debug)]
-pub enum SubscribeError {
-    PaneNotFound,
-    Other(String),
-}
-
-impl std::fmt::Display for SubscribeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PaneNotFound => write!(formatter, "pane_not_found"),
-            Self::Other(message) => write!(formatter, "{message}"),
-        }
-    }
-}
-
-impl From<SubscribeError> for String {
-    fn from(error: SubscribeError) -> Self {
-        error.to_string()
-    }
-}
-
 /// Opens `events.subscribe` and consumes the ack. The connection stays open for [`HerdrSubscription::next_event`].
 ///
 /// # Errors
 ///
 /// Returns connect, timeout, protocol, or Herdr-declared errors.
-pub async fn subscribe_herdr_events(
-    subscriptions: &[Value],
-) -> Result<HerdrSubscription, SubscribeError> {
-    let path = herdr_socket_path().map_err(SubscribeError::Other)?;
+pub async fn subscribe_herdr_events(subscriptions: &[Value]) -> Result<HerdrSubscription, String> {
+    let path = herdr_socket_path()?;
     let id = next_rpc_id();
     let request = json!({
         RPC_ID_KEY: id,
@@ -491,60 +466,49 @@ pub async fn subscribe_herdr_events(
     tokio::time::timeout(Duration::from_secs(4), async {
         let mut stream = tokio::net::UnixStream::connect(&path)
             .await
-            .map_err(|error| {
-                SubscribeError::Other(format!("herdr subscribe connect failed: {error}"))
-            })?;
+            .map_err(|error| format!("herdr subscribe connect failed: {error}"))?;
         stream
             .write_all(format!("{request}\n").as_bytes())
             .await
-            .map_err(|error| SubscribeError::Other(error.to_string()))?;
-        stream
-            .flush()
-            .await
-            .map_err(|error| SubscribeError::Other(error.to_string()))?;
+            .map_err(|error| error.to_string())?;
+        stream.flush().await.map_err(|error| error.to_string())?;
         let mut reader = tokio::io::BufReader::new(stream);
         let mut line = String::new();
         let read = reader
             .read_line(&mut line)
             .await
-            .map_err(|error| SubscribeError::Other(error.to_string()))?;
+            .map_err(|error| error.to_string())?;
         if read == 0 {
-            return Err(SubscribeError::Other(
-                "herdr subscribe stream closed before ack".to_owned(),
-            ));
+            return Err("herdr subscribe stream closed before ack".to_owned());
         }
-        let response: Value = serde_json::from_str(&line)
-            .map_err(|error| SubscribeError::Other(error.to_string()))?;
+        let response: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
         if let Some(error) = response.get(ERROR_KEY) {
-            if error.get(ERROR_CODE_KEY).and_then(Value::as_str) == Some("pane_not_found") {
-                return Err(SubscribeError::PaneNotFound);
-            }
-            return Err(SubscribeError::Other(format!(
+            return Err(format!(
                 "herdr events.subscribe failed: {} {}",
                 error.get(ERROR_CODE_KEY).unwrap_or(&Value::Null),
                 error
                     .get(ERROR_MESSAGE_KEY)
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
-            )));
+            ));
         }
         let returned_id = response
             .get(RPC_ID_KEY)
             .and_then(Value::as_str)
             .unwrap_or("<missing>");
         if returned_id != id {
-            return Err(SubscribeError::Other(format!(
+            return Err(format!(
                 "herdr returned response id {returned_id} for request {id}"
-            )));
+            ));
         }
         let started = response
             .pointer("/result/type")
             .and_then(Value::as_str)
             .unwrap_or("");
         if started != "subscription_started" {
-            return Err(SubscribeError::Other(format!(
+            return Err(format!(
                 "herdr events.subscribe ack was not subscription_started: {response}"
-            )));
+            ));
         }
         Ok(HerdrSubscription {
             reader,
@@ -552,7 +516,7 @@ pub async fn subscribe_herdr_events(
         })
     })
     .await
-    .map_err(|_| SubscribeError::Other("herdr subscribe connect timed out".to_owned()))?
+    .map_err(|_| "herdr subscribe connect timed out".to_owned())?
 }
 
 impl HerdrSubscription {
