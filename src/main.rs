@@ -1786,14 +1786,18 @@ fn prune_departed_state(
 async fn discord_connection(
     topology_cache: TopologyCache,
 ) -> Result<(DiscordConnection, GatewayTask), Box<dyn std::error::Error>> {
-    let environment: Vec<(&str, String)> = [
+    let mut environment: Vec<(&str, String)> = Vec::new();
+    for name in [
         ENV_DISCORD_TOKEN,
         ENV_DISCORD_GUILD_ID,
         ENV_DISCORD_OWNER_ID,
-    ]
-    .into_iter()
-    .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
-    .collect();
+    ] {
+        match std::env::var(name) {
+            Ok(value) => environment.push((name, value)),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => return Err(format!("{name}: {error}").into()),
+        }
+    }
     let environment: Vec<(&str, &str)> = environment
         .iter()
         .map(|(name, value)| (*name, value.as_str()))
@@ -3073,6 +3077,39 @@ mod tests {
             result.is_err(),
             "a non-numeric DISCORD_OWNER_ID must fail startup, not silently run without an \
              identity: {result:?}"
+        );
+    }
+
+    /// A `DISCORD_TOKEN` that is set but not valid UTF-8 fails startup naming the variable, not as
+    /// a missing variable. The error is raised before any Discord request is made.
+    #[tokio::test]
+    async fn non_utf8_discord_variable_fails_startup_naming_the_variable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let original = std::env::var_os("DISCORD_TOKEN");
+        // SAFETY: `cargo test -- --test-threads=1` (this crate's mandated invocation) serializes
+        // every test in this binary, so no other test observes the variable mid-mutation.
+        unsafe {
+            std::env::set_var(
+                "DISCORD_TOKEN",
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            );
+        }
+        let result = super::discord_connection(Arc::new(tokio::sync::Mutex::new(None))).await;
+        // SAFETY: as above.
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("DISCORD_TOKEN", value),
+                None => std::env::remove_var("DISCORD_TOKEN"),
+            }
+        }
+        let error = result
+            .err()
+            .expect("a non-UTF-8 token must fail startup")
+            .to_string();
+        assert!(
+            error.contains("DISCORD_TOKEN") && !error.contains("Missing required"),
+            "unexpected error: {error}"
         );
     }
 
