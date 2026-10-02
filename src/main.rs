@@ -180,13 +180,10 @@ fn vendor_is_supported(agent: Option<&str>) -> bool {
     matches!(agent, Some(VENDOR_CLAUDE | VENDOR_CODEX))
 }
 
-async fn wait_for_gateway(gateway: Option<&mut GatewayTask>) -> Result<(), String> {
-    match gateway {
-        Some(gateway) => gateway
-            .await
-            .map_err(|error| format!("discord gateway task failed: {error}"))?,
-        None => std::future::pending().await,
-    }
+async fn wait_for_gateway(gateway: &mut GatewayTask) -> Result<(), String> {
+    gateway
+        .await
+        .map_err(|error| format!("discord gateway task failed: {error}"))?
 }
 
 async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> {
@@ -2340,7 +2337,7 @@ struct BridgeRuntime {
 }
 
 async fn doorbell_unless_shutdown(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     state: &mut BridgeState,
     pane_ids: &mut Vec<String>,
     status: &mut Option<HerdrSubscription>,
@@ -2356,7 +2353,7 @@ async fn doorbell_unless_shutdown(
 
 async fn bridge_event_loop(
     discord: &DiscordConnection,
-    gateway: &mut Option<GatewayTask>,
+    gateway: &mut GatewayTask,
     broker: &mut Option<BrokerTask>,
     stop: &mut tokio::signal::unix::Signal,
     runtime: &mut BridgeRuntime,
@@ -2364,12 +2361,12 @@ async fn bridge_event_loop(
     loop {
         tokio::select! {
             result = runtime.lifecycle.next_event() => {
-                if !handle_lifecycle_select_result(result, Some(discord), stop, broker, runtime).await {
+                if !handle_lifecycle_select_result(result, discord, stop, broker, runtime).await {
                     break;
                 }
             }
             result = next_status_event(&mut runtime.status) => {
-                if !handle_status_select_result(result, Some(discord), stop, broker, runtime).await {
+                if !handle_status_select_result(result, discord, stop, broker, runtime).await {
                     break;
                 }
             }
@@ -2381,7 +2378,7 @@ async fn bridge_event_loop(
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = stop.recv() => break,
-            result = wait_for_gateway(gateway.as_mut()) => {
+            result = wait_for_gateway(gateway) => {
                 return result.map_err(Into::into);
             }
             result = wait_for_broker(broker.as_mut()) => {
@@ -2396,7 +2393,7 @@ async fn bridge_event_loop(
 /// or left), then its closure if it is one (deleting that tab or workspace), then one doorbell.
 async fn apply_lifecycle_event(
     event: &serde_json::Value,
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime,
@@ -2414,7 +2411,7 @@ async fn apply_lifecycle_event(
     }
 
     if let Some(closure) = lifecycle_closure(event)
-        && let Err(error) = delete_closed_topology(discord, &closure).await
+        && let Err(error) = delete_closed_topology(Some(discord), &closure).await
     {
         bridge_eprintln!("herdr topology closure error: {error}");
     }
@@ -2473,7 +2470,7 @@ fn spawn_startup_topology_sweep(
 
 async fn handle_lifecycle_subscribe_error(
     error: String,
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime,
@@ -2499,7 +2496,7 @@ async fn handle_lifecycle_subscribe_error(
 
 async fn handle_lifecycle_select_result(
     result: Result<serde_json::Value, String>,
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime,
@@ -2512,7 +2509,7 @@ async fn handle_lifecycle_select_result(
 
 async fn handle_status_select_result(
     result: Result<serde_json::Value, String>,
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime,
@@ -2609,7 +2606,7 @@ async fn subscribe_status_with_backoff(
 }
 
 async fn apply_herdr_snapshot(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     state: &mut BridgeState,
 ) -> Result<Vec<String>, String> {
     let agents = list_agents()?;
@@ -2625,19 +2622,17 @@ async fn apply_herdr_snapshot(
         .retain(|terminal, _| current_terminals.contains(terminal));
     let departed_cards =
         prune_departed_state(state, &current_terminals, &current_panes, &current_tabs);
-    if let Some(discord) = discord {
-        for (terminal, card) in departed_cards {
-            expire_departed_card(discord, &terminal, card).await;
-        }
+    for (terminal, card) in departed_cards {
+        expire_departed_card(discord, &terminal, card).await;
     }
     for snapshot in &agents {
-        process_snapshot(snapshot, &agents, &tabs, discord, state).await;
+        process_snapshot(snapshot, &agents, &tabs, Some(discord), state).await;
     }
     Ok(pane_ids_from_agents(&agents))
 }
 
 async fn doorbell_snapshot(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     state: &mut BridgeState,
     pane_ids: &mut Vec<String>,
     status: &mut Option<HerdrSubscription>,
@@ -2685,9 +2680,8 @@ async fn fetch_startup_owner_identity(
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-    let (connection, gateway) = discord_connection(Arc::clone(&topology_cache)).await?;
+    let (connection, mut gateway) = discord_connection(Arc::clone(&topology_cache)).await?;
     let mut broker = start_broker(&connection, activity_tx);
-    let mut gateway = Some(gateway);
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
         live_tx: Some(live_tx),
@@ -2716,7 +2710,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         activity_events,
     };
     if !doorbell_unless_shutdown(
-        Some(&connection),
+        &connection,
         &mut runtime.state,
         &mut runtime.pane_ids,
         &mut runtime.status,
@@ -4406,6 +4400,11 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn lifecycle_created_subscribes_status_and_records_the_pane_snapshot() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        let connection = discord_tuple(&guild);
         assert_eq!(
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
             0,
@@ -4442,7 +4441,7 @@ mod tests {
             let terminal_id = snapshot_for_pane(&tab.pane_id)?.terminal_id;
             handle_lifecycle_select_result(
                 Ok(pane_created),
-                None,
+                &connection,
                 &mut stop,
                 &mut broker,
                 &mut runtime,
@@ -8100,7 +8099,7 @@ mod tests {
         .await?;
         handle_lifecycle_select_result(
             Ok(tab_closed),
-            Some(&connection),
+            &connection,
             &mut stop,
             &mut broker,
             &mut runtime,
@@ -8126,7 +8125,7 @@ mod tests {
         .await?;
         handle_lifecycle_select_result(
             Ok(workspace_closed),
-            Some(&connection),
+            &connection,
             &mut stop,
             &mut broker,
             &mut runtime,
