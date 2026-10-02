@@ -165,7 +165,6 @@ struct BlockedCardContext<'a> {
     from_status: &'a str,
     state_change_seq: u64,
     informational_cards: &'a mut HashMap<String, InformationalCard>,
-    search_root: Option<&'a Path>,
 }
 
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
@@ -216,7 +215,6 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         from_status,
         state_change_seq,
         informational_cards,
-        search_root,
     } = context;
     let target = match sync_route(client, guild, route, topology_cache).await {
         Ok(target) => target,
@@ -244,12 +242,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         .flatten()
         .and_then(|text| format_detection_question(&text));
     let capture = detection_question.map_or_else(
-        || {
-            search_root.map_or_else(
-                || capture_for_blocked(snapshot),
-                |root| capture_for_blocked_with_search_root(snapshot, root),
-            )
-        },
+        || capture_for_blocked(snapshot),
         |question| AgentLogCapture {
             message: question.clone(),
             question: Some(question),
@@ -541,7 +534,6 @@ async fn deliver_postable_transition(
         from_status: &transition.from,
         state_change_seq,
         informational_cards: &mut state.informational_cards,
-        search_root: None,
     })
     .await;
 }
