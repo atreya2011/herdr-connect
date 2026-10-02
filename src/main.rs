@@ -9661,15 +9661,17 @@ mod tests {
                         .is_some_and(|name| name.ends_with(&claude_suffix))
             })
             .ok_or_else(|| "reporting a session did not create the tab thread".to_owned())?;
-        let messages = thread_messages(guild, thread.id).await?;
-        if messages
-            .iter()
-            .any(|(content, embed, _)| !embed && content.trim().eq_ignore_ascii_case("ready"))
-        {
+        let messages = thread_full_messages(guild, thread.id).await?;
+        if messages.iter().any(|message| {
+            message.webhook_id.is_none()
+                && message.embeds.is_empty()
+                && message.content.to_lowercase().contains("ready")
+        }) {
             Ok(())
         } else {
+            let contents: Vec<_> = messages.iter().map(|message| &message.content).collect();
             Err(format!(
-                "reporting a session did not post the reply as live text, thread has {messages:?}"
+                "reporting a session did not post the reply as live text, thread has {contents:?}"
             ))
         }
     }
