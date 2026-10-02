@@ -1878,14 +1878,20 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
-    if matches!(explicit_vendor, None | Some(PermissionVendor::Claude))
-        && let Ok(question) = decode_claude_ask_question(&input)
-    {
-        return run_question_hook(&question, requested_socket).await;
-    }
+    let question_error = if matches!(explicit_vendor, None | Some(PermissionVendor::Claude)) {
+        match decode_claude_ask_question(&input) {
+            Ok(question) => return run_question_hook(&question, requested_socket).await,
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
     let interaction = match decode_hook_request(&input, explicit_vendor) {
         Ok(interaction) => interaction,
         Err(error) => {
+            if let Some(question_error) = question_error {
+                bridge_eprintln!("hook question decode error: {question_error}");
+            }
             bridge_eprintln!("hook payload decode error: {error}");
             if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
                 write_hook_decision(PermissionVendor::Cursor, None).await?;
