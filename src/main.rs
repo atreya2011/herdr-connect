@@ -4542,7 +4542,7 @@ mod tests {
     fn start_live_capture_agent(kind: &str, agent_name: &str, pane_id: &str) -> Result<(), String> {
         let vendor_args: &[&str] = match kind {
             "claude" => &["--model", "haiku"],
-            "codex" => &["--model", "gpt-5.6-luna"],
+            "codex" => &["--no-daemon", "--model", "gpt-5.6-luna"],
             "cursor" => &["--yolo"],
             other => return Err(format!("unsupported live-capture test kind: {other}")),
         };
@@ -6584,7 +6584,7 @@ mod tests {
         }
     }
 
-    /// Codex counterpart to `activity_hook_exercise`: drives one real `codex --model gpt-5.6-luna`
+    /// Codex counterpart to `activity_hook_exercise`: drives one real `codex --no-daemon --model gpt-5.6-luna`
     /// agent, started (via the already vendor-generic `start_live_capture_agent`) in a pane on the
     /// real Codex account, through the same turn-boundary table -- reusing `drive_one_activity_turn`,
     /// `assert_first_turn_activity`, and `assert_second_turn_activity` verbatim, since none of them
