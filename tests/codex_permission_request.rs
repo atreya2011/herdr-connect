@@ -26,7 +26,7 @@ fn codex_permission_fixture_decodes_and_encodes_allow_and_deny() {
     let cases = [
         (Decision::allow(), "allow", None),
         (
-            Decision::deny(Some("operator denied this request".to_owned())),
+            Decision::deny("operator denied this request".to_owned()),
             "deny",
             Some("operator denied this request"),
         ),

@@ -115,14 +115,12 @@ pub struct Interaction {
     pub prompt_id: String,
     pub tool_name: String,
     pub tool_input: ClaudePermissionToolInput,
-    #[serde(default)]
     pub vendor: PermissionVendor,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionVendor {
-    #[default]
     Claude,
     Codex,
     Cursor,
@@ -152,10 +150,10 @@ impl Decision {
     }
 
     #[must_use]
-    pub const fn deny(message: Option<String>) -> Self {
+    pub const fn deny(message: String) -> Self {
         Self {
             behavior: DecisionBehavior::Deny,
-            message,
+            message: Some(message),
         }
     }
 }
@@ -257,13 +255,16 @@ pub fn encode_codex_decision(decision: &Decision) -> Result<Vec<u8>, String> {
 ///
 /// # Errors
 ///
-/// Returns an error if the response cannot be serialized.
+/// Returns an error if a deny decision carries no message or the response cannot be serialized.
 pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     let output = match decision.behavior {
         DecisionBehavior::Allow => serde_json::json!({"permission": "allow"}),
         DecisionBehavior::Deny => serde_json::json!({
             "permission": "deny",
-            "agent_message": decision.message.as_deref().unwrap_or("permission denied"),
+            "agent_message": decision
+                .message
+                .as_deref()
+                .ok_or("deny decision has no message")?,
         }),
     };
     serde_json::to_vec(&output).map_err(|error| error.to_string())
@@ -304,4 +305,24 @@ fn encode_permission_decision(decision: &Decision) -> Result<Vec<u8>, String> {
         },
     }))
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Decision, DecisionBehavior, Interaction, encode_cursor_decision};
+
+    #[test]
+    fn interaction_frame_without_a_vendor_is_rejected() {
+        let frame = r#"{"session_id":"s","prompt_id":"p","tool_name":"Bash","tool_input":{"command":"c","description":"d"}}"#;
+        assert!(serde_json::from_str::<Interaction>(frame).is_err());
+    }
+
+    #[test]
+    fn cursor_deny_without_a_message_is_an_error() {
+        let decision = Decision {
+            behavior: DecisionBehavior::Deny,
+            message: None,
+        };
+        assert!(encode_cursor_decision(&decision).is_err());
+    }
 }

@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::delivery::{
     MAX_QUESTION_CARD_CONTENT_LENGTH, expire_permission_card, truncate_with_ellipsis,
 };
-use crate::permission::{Decision, DecisionBehavior, Interaction, PermissionVendor};
+use crate::permission::{Decision, DecisionBehavior, Interaction};
 use crate::question::{
     QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction, format_question_answer,
 };
@@ -37,7 +37,6 @@ use crate::{
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
-const CURSOR_PERMISSION_TIMEOUT: Duration = PERMISSION_TIMEOUT;
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one question card stays open for an owner answer before the hook falls through to
 /// Claude's own dialog.
@@ -244,10 +243,6 @@ impl PermissionResponder {
         let route = self.route(&interaction.session_id, &liveness).await?;
         let channel = self.sync_channel(&route, &liveness).await?;
         let created_at = std::time::Instant::now();
-        let permission_timeout = match interaction.vendor {
-            PermissionVendor::Cursor => CURSOR_PERMISSION_TIMEOUT,
-            PermissionVendor::Claude | PermissionVendor::Codex => PERMISSION_TIMEOUT,
-        };
         let issued = self
             .registry
             .issue_with_liveness(
@@ -255,10 +250,10 @@ impl PermissionResponder {
                     channel_id: channel.get(),
                     session_id: interaction.session_id.clone(),
                 },
-                created_at,
-                created_at + permission_timeout,
+                created_at + PERMISSION_TIMEOUT,
                 Arc::clone(&liveness.alive),
             )
+            .map_err(|error| bridge_eprintln!("{error}"))
             .ok()?;
         let message = self
             .deliver_card(
@@ -328,13 +323,17 @@ impl PermissionResponder {
             route_topology(&agents, &tabs, &agent.terminal_id)
         });
         let route = tokio::select! {
-            result = route_task => result.ok().and_then(|result| match result {
-                Ok(route) => Some(route),
-                Err(error) => {
+            result = route_task => match result {
+                Ok(Ok(route)) => Some(route),
+                Ok(Err(error)) => {
                     bridge_eprintln!("{error}");
                     None
                 }
-            }),
+                Err(error) => {
+                    bridge_eprintln!("permission route task failed: {error}");
+                    None
+                }
+            },
             () = liveness.wait_closed() => None,
         }?;
         liveness.is_alive().then_some(route)
@@ -387,9 +386,13 @@ impl PermissionResponder {
         tokio::pin!(delivery);
         tokio::select! {
             result = &mut delivery => {
-                let Some(message) = result.ok() else {
-                    self.registry.remove(token);
-                    return None;
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => {
+                        bridge_eprintln!("permission card delivery failed: {error}");
+                        self.registry.remove(token);
+                        return None;
+                    }
                 };
                 if liveness.is_alive() {
                     Some(message)
@@ -432,8 +435,11 @@ impl PermissionResponder {
         content: &str,
     ) {
         self.registry.remove(token);
-        let _ =
-            expire_permission_card(self.client.as_ref(), channel, message, token, content).await;
+        if let Err(error) =
+            expire_permission_card(self.client.as_ref(), channel, message, token, content).await
+        {
+            bridge_eprintln!("card edit failed: {error}");
+        }
     }
 
     /// Answers one `AskUserQuestion` request by posting its questions as Discord cards, in order,
@@ -492,6 +498,7 @@ impl PermissionResponder {
                 call_deadline,
                 Arc::clone(&liveness.alive),
             )
+            .map_err(|error| bridge_eprintln!("{error}"))
             .ok()?;
         let message = self
             .deliver_question_card(channel, question, &issued.token, liveness)
@@ -635,7 +642,7 @@ impl PermissionResponder {
         token: &str,
     ) {
         self.question_registry.remove(token);
-        let _ = if question.multi_select {
+        let result = if question.multi_select {
             expire_question_select_card(
                 self.client.as_ref(),
                 channel,
@@ -656,6 +663,9 @@ impl PermissionResponder {
             )
             .await
         };
+        if let Err(error) = result {
+            bridge_eprintln!("card edit failed: {error}");
+        }
     }
 
     /// Resolves the pending single-select question card `token` with the option chosen by button
@@ -743,11 +753,14 @@ pub async fn handle_component(
     let Some(response) = response else {
         return;
     };
-    let _ = responder
+    if let Err(error) = responder
         .client
         .interaction(interaction.application_id)
         .create_response(interaction.id, &interaction.token, &response)
-        .await;
+        .await
+    {
+        bridge_eprintln!("interaction response failed: {error}");
+    }
 }
 
 fn permission_component_response(
@@ -756,12 +769,9 @@ fn permission_component_response(
     token: &str,
     channel_id: u64,
 ) -> Option<InteractionResponse> {
-    if !responder.registry.has_pending(token) {
-        return Some(ephemeral_response("expired"));
-    }
     let decision = match action {
         "allow" => Decision::allow(),
-        "deny" => Decision::deny(Some("operator denied this request".to_owned())),
+        "deny" => Decision::deny("operator denied this request".to_owned()),
         _ => return None,
     };
     Some(
@@ -877,11 +887,7 @@ pub async fn request_decision(
     socket_path: &Path,
     timeout_duration: Duration,
 ) -> Option<Decision> {
-    let timeout_duration = match interaction.vendor {
-        PermissionVendor::Cursor => timeout_duration.min(CURSOR_PERMISSION_TIMEOUT),
-        PermissionVendor::Claude | PermissionVendor::Codex => timeout_duration,
-    };
-    tokio::time::timeout(timeout_duration, async {
+    let result = tokio::time::timeout(timeout_duration, async {
         let mut stream = match UnixStream::connect(socket_path).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -889,18 +895,33 @@ pub async fn request_decision(
                     "broker request failed: connect to {}: {error}",
                     socket_path.display()
                 );
-                return Err(());
+                return None;
             }
         };
-        write_json_line(&mut stream, interaction)
-            .await
-            .map_err(|_| ())?;
-        let response: BrokerResponse = read_json_line(&mut stream).await.map_err(|_| ())?;
-        correlate_decision(interaction, response).map_err(|_| ())
+        if let Err(error) = write_json_line(&mut stream, interaction).await {
+            bridge_eprintln!("broker request failed: write: {error}");
+            return None;
+        }
+        let response: BrokerResponse = match read_json_line(&mut stream).await {
+            Ok(response) => response,
+            Err(error) => {
+                bridge_eprintln!("broker request failed: read: {error}");
+                return None;
+            }
+        };
+        match correlate_decision(interaction, response) {
+            Ok(decision) => Some(decision),
+            Err(error) => {
+                bridge_eprintln!("broker request failed: {error:?}");
+                None
+            }
+        }
     })
-    .await
-    .ok()
-    .and_then(Result::ok)
+    .await;
+    result.unwrap_or_else(|_| {
+        bridge_eprintln!("broker request failed: no decision within {timeout_duration:?}");
+        None
+    })
 }
 
 /// Sends one activity frame to the broker socket and returns without waiting for a reply.
@@ -921,43 +942,16 @@ pub async fn send_activity_frame(
 
 #[derive(Default)]
 struct PendingRequests {
-    state: Mutex<PendingState>,
+    fingerprints: Mutex<HashSet<RequestFingerprint>>,
 }
 
 impl PendingRequests {
-    async fn register(&self, key: PendingKey) -> bool {
-        let mut state = self.state.lock().await;
-        if !state.fingerprints.insert(key.fingerprint.clone()) {
-            return false;
-        }
-        state.keys.insert(key)
+    async fn register(&self, fingerprint: RequestFingerprint) -> bool {
+        self.fingerprints.lock().await.insert(fingerprint)
     }
 
-    async fn remove(&self, key: &PendingKey) {
-        let mut state = self.state.lock().await;
-        state.keys.remove(key);
-        state.fingerprints.remove(&key.fingerprint);
-    }
-}
-
-#[derive(Default)]
-struct PendingState {
-    keys: HashSet<PendingKey>,
-    fingerprints: HashSet<RequestFingerprint>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PendingKey {
-    fingerprint: RequestFingerprint,
-    connection_id: u64,
-}
-
-impl PendingKey {
-    fn new(interaction: &Interaction, connection_id: u64) -> Self {
-        Self {
-            fingerprint: RequestFingerprint::from(interaction),
-            connection_id,
-        }
+    async fn remove(&self, fingerprint: &RequestFingerprint) {
+        self.fingerprints.lock().await.remove(fingerprint);
     }
 }
 
@@ -992,7 +986,6 @@ async fn serve_broker(
     activity_tx: mpsc::UnboundedSender<ActivityFrame>,
 ) -> io::Result<()> {
     let pending = Arc::new(PendingRequests::default());
-    let next_connection_id = AtomicU64::new(0);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -1000,9 +993,8 @@ async fn serve_broker(
                 let pending = Arc::clone(&pending);
                 let responder = Arc::clone(&responder);
                 let activity_tx = activity_tx.clone();
-                let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    handle_connection(stream, pending, responder, activity_tx, connection_id).await;
+                    handle_connection(stream, pending, responder, activity_tx).await;
                 });
             }
             _ = &mut shutdown => break,
@@ -1070,7 +1062,6 @@ async fn handle_connection(
     pending: Arc<PendingRequests>,
     responder: Arc<PermissionResponder>,
     activity_tx: mpsc::UnboundedSender<ActivityFrame>,
-    connection_id: u64,
 ) {
     let bytes = match tokio::time::timeout(INITIAL_FRAME_TIMEOUT, read_json_line_bytes(&mut stream))
         .await
@@ -1086,8 +1077,15 @@ async fn handle_connection(
         }
     };
     if is_activity_frame(&bytes) {
-        if let Ok(frame) = serde_json::from_slice::<ActivityFrame>(&bytes) {
-            let _ = activity_tx.send(frame);
+        match serde_json::from_slice::<ActivityFrame>(&bytes) {
+            Ok(frame) => {
+                let _ = activity_tx.send(frame);
+            }
+            Err(error) => {
+                bridge_eprintln!(
+                    "broker rejected initial frame: malformed activity frame: {error}"
+                );
+            }
         }
         return;
     }
@@ -1113,7 +1111,10 @@ async fn handle_connection(
     }
     let interaction = match serde_json::from_slice::<Interaction>(&bytes) {
         Ok(interaction) if is_valid_interaction(&interaction) => interaction,
-        Ok(_) => return,
+        Ok(_) => {
+            bridge_eprintln!("broker rejected initial frame: permission frame has an empty field");
+            return;
+        }
         Err(error) => {
             bridge_eprintln!("broker rejected initial frame: malformed broker frame: {error}");
             return;
@@ -1122,8 +1123,8 @@ async fn handle_connection(
     let (read_half, mut write_half) = stream.into_split();
     let liveness = HookLiveness::new();
     let monitor = spawn_hook_monitor(read_half, liveness.clone());
-    let key = PendingKey::new(&interaction, connection_id);
-    if !pending.register(key.clone()).await {
+    let fingerprint = RequestFingerprint::from(&interaction);
+    if !pending.register(fingerprint.clone()).await {
         monitor.abort();
         return;
     }
@@ -1138,7 +1139,7 @@ async fn handle_connection(
         let _ = write_json_line(&mut write_half, &response).await;
     }
     monitor.abort();
-    pending.remove(&key).await;
+    pending.remove(&fingerprint).await;
 }
 
 const fn is_valid_interaction(interaction: &Interaction) -> bool {
@@ -1235,10 +1236,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        BrokerResponse, CURSOR_PERMISSION_TIMEOUT, HookLiveness, PERMISSION_TIMEOUT, PendingKey,
-        PendingRequests, PermissionResponder, QUESTION_TIMEOUT, QuestionBrokerResponse,
-        correlate_decision, correlate_question_answers, hook_timeout, question_hook_timeout,
-        read_json_line, return_value_before_card_edit, spawn_hook_monitor,
+        BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingRequests, PermissionResponder,
+        QUESTION_TIMEOUT, QuestionBrokerResponse, RequestFingerprint, correlate_decision,
+        correlate_question_answers, hook_timeout, question_hook_timeout, read_json_line,
+        return_value_before_card_edit, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
@@ -1259,8 +1260,8 @@ mod tests {
     }
 
     #[test]
-    fn cursor_permission_window_matches_generic_hook_margin() {
-        assert_eq!(CURSOR_PERMISSION_TIMEOUT, PERMISSION_TIMEOUT);
+    fn permission_hook_margin_matches_the_permission_timeout() {
+        assert_eq!(PERMISSION_TIMEOUT, Duration::from_secs(45));
         assert_eq!(hook_timeout(), Duration::from_secs(50));
     }
 
@@ -1360,14 +1361,13 @@ mod tests {
         let mut second = interaction();
         second.tool_input.command = "touch other-proof".to_owned();
         second.tool_input.description = "Create other proof".to_owned();
-        let first_key = PendingKey::new(&first, 1);
-        let replay_key = PendingKey::new(&first, 2);
-        let second_key = PendingKey::new(&second, 3);
+        let first_fingerprint = RequestFingerprint::from(&first);
+        let second_fingerprint = RequestFingerprint::from(&second);
 
-        assert!(pending.register(first_key.clone()).await);
-        assert!(!pending.register(replay_key).await);
-        assert!(pending.register(second_key).await);
-        pending.remove(&first_key).await;
+        assert!(pending.register(first_fingerprint.clone()).await);
+        assert!(!pending.register(first_fingerprint.clone()).await);
+        assert!(pending.register(second_fingerprint).await);
+        pending.remove(&first_fingerprint).await;
     }
 
     #[tokio::test]
@@ -1576,7 +1576,6 @@ mod tests {
                     channel_id: 7,
                     session_id: "session".to_owned(),
                 },
-                now,
                 now + Duration::from_secs(30),
                 Arc::new(AtomicBool::new(true)),
             )

@@ -36,7 +36,7 @@ fn cursor_decisions_encode_as_native_objects() {
     let cases = [
         (Decision::allow(), "allow", None),
         (
-            Decision::deny(Some("operator denied this request".to_owned())),
+            Decision::deny("operator denied this request".to_owned()),
             "deny",
             Some("operator denied this request"),
         ),

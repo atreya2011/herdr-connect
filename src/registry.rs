@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use tokio::sync::oneshot;
@@ -43,7 +44,6 @@ pub struct IssuedApproval {
 #[derive(Debug)]
 struct Entry {
     request: ApprovalRequest,
-    created_at: Instant,
     expiry: Instant,
     hook_alive: Arc<AtomicBool>,
     sender: oneshot::Sender<Decision>,
@@ -58,72 +58,55 @@ pub struct InteractionRegistry {
     entries: Mutex<HashMap<String, Entry>>,
 }
 impl InteractionRegistry {
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Issues one token for a pending permission card.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a token cannot be generated.
     pub fn issue_with_liveness(
         &self,
         request: ApprovalRequest,
-        created_at: Instant,
         expiry: Instant,
         hook_alive: Arc<AtomicBool>,
     ) -> Result<IssuedApproval, String> {
         let token = generate_token()?;
-        self.issue_with_token_and_liveness(token, request, created_at, expiry, hook_alive)
+        Ok(self.issue_with_token_and_liveness(token, request, expiry, hook_alive))
     }
     /// Inserts a supplied token for deterministic state-machine tests.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid lifetimes, empty tokens, or collisions.
     #[cfg(test)]
     fn issue_with_token(
         &self,
         token: String,
         request: ApprovalRequest,
-        created_at: Instant,
         expiry: Instant,
-    ) -> Result<IssuedApproval, String> {
-        self.issue_with_token_and_liveness(
-            token,
-            request,
-            created_at,
-            expiry,
-            Arc::new(AtomicBool::new(true)),
-        )
+    ) -> IssuedApproval {
+        self.issue_with_token_and_liveness(token, request, expiry, Arc::new(AtomicBool::new(true)))
     }
     fn issue_with_token_and_liveness(
         &self,
         token: String,
         request: ApprovalRequest,
-        created_at: Instant,
         expiry: Instant,
         hook_alive: Arc<AtomicBool>,
-    ) -> Result<IssuedApproval, String> {
-        if token.is_empty() || expiry <= created_at {
-            return Err("invalid interaction registry entry".to_owned());
-        }
+    ) -> IssuedApproval {
         let (sender, receiver) = oneshot::channel();
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| "interaction registry lock poisoned".to_owned())?;
-        if entries.contains_key(&token) {
-            return Err("interaction token collision".to_owned());
-        }
-        entries.insert(
+        self.lock_entries().insert(
             token.clone(),
             Entry {
                 request,
-                created_at,
                 expiry,
                 hook_alive,
                 sender,
             },
         );
-        drop(entries);
-        Ok(IssuedApproval {
+        IssuedApproval {
             token,
             receiver,
             expiry,
-        })
+        }
     }
     /// Resolves one pending token exactly once.
     ///
@@ -137,53 +120,29 @@ impl InteractionRegistry {
         decision: Decision,
         now: Instant,
     ) -> Result<(), ResolveError> {
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| ResolveError::UnknownOrExpired)?;
-        let Some(entry) = entries.get(token) else {
+        let mut entries = self.lock_entries();
+        let MapEntry::Occupied(occupied) = entries.entry(token.to_owned()) else {
             return Err(ResolveError::UnknownOrExpired);
         };
-        if now < entry.created_at
-            || now >= entry.expiry
-            || !entry.hook_alive.load(Ordering::Acquire)
-        {
+        let entry = occupied.get();
+        if now >= entry.expiry || !entry.hook_alive.load(Ordering::Acquire) {
             return Err(ResolveError::UnknownOrExpired);
         }
         if channel_id != entry.request.channel_id {
             return Err(ResolveError::WrongChannel);
         }
-        let entry = entries
-            .remove(token)
-            .ok_or(ResolveError::UnknownOrExpired)?;
-        if !entry.hook_alive.load(Ordering::Acquire) {
-            return Err(ResolveError::UnknownOrExpired);
-        }
-        let sender = entry.sender;
+        let sender = occupied.remove().sender;
         drop(entries);
         let _ = sender.send(decision);
         Ok(())
     }
-    pub fn has_pending(&self, token: &str) -> bool {
-        self.entries.lock().ok().is_some_and(|entries| {
-            entries
-                .get(token)
-                .is_some_and(|entry| entry.hook_alive.load(Ordering::Acquire))
-        })
-    }
     pub fn has_pending_session(&self, session_id: &str) -> bool {
-        self.entries.lock().ok().is_some_and(|entries| {
-            entries.values().any(|entry| {
-                entry.request.session_id == session_id && entry.hook_alive.load(Ordering::Acquire)
-            })
+        self.lock_entries().values().any(|entry| {
+            entry.request.session_id == session_id && entry.hook_alive.load(Ordering::Acquire)
         })
     }
     pub fn remove(&self, token: &str) -> bool {
-        self.entries
-            .lock()
-            .ok()
-            .and_then(|mut entries| entries.remove(token))
-            .is_some()
+        self.lock_entries().remove(token).is_some()
     }
 }
 
@@ -199,7 +158,6 @@ struct QuestionEntry {
     /// The card's own options, so a component tap naming an option by index can be resolved back
     /// to its label without the caller re-supplying the question.
     options: Vec<QuestionOption>,
-    created_at: Instant,
     expiry: Instant,
     hook_alive: Arc<AtomicBool>,
     sender: oneshot::Sender<QuestionAnswer>,
@@ -212,6 +170,9 @@ pub struct QuestionRegistry {
     entries: Mutex<HashMap<String, QuestionEntry>>,
 }
 impl QuestionRegistry {
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, QuestionEntry>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     /// Issues one token for a pending question card.
     ///
     /// # Errors
@@ -230,25 +191,16 @@ impl QuestionRegistry {
             return Err("invalid question registry entry".to_owned());
         }
         let (sender, receiver) = oneshot::channel();
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| "question registry lock poisoned".to_owned())?;
-        if entries.contains_key(&token) {
-            return Err("question token collision".to_owned());
-        }
-        entries.insert(
+        self.lock_entries().insert(
             token.clone(),
             QuestionEntry {
                 request,
                 options,
-                created_at,
                 expiry,
                 hook_alive,
                 sender,
             },
         );
-        drop(entries);
         Ok(IssuedQuestion {
             token,
             receiver,
@@ -257,12 +209,10 @@ impl QuestionRegistry {
     }
     /// The label of `index` among the token's own options, if the token is still pending.
     pub fn option_label(&self, token: &str, index: usize) -> Option<String> {
-        self.entries.lock().ok().and_then(|entries| {
-            entries
-                .get(token)
-                .and_then(|entry| entry.options.get(index))
-                .map(|option| option.label.clone())
-        })
+        self.lock_entries()
+            .get(token)
+            .and_then(|entry| entry.options.get(index))
+            .map(|option| option.label.clone())
     }
     /// Resolves one pending token exactly once.
     ///
@@ -276,29 +226,18 @@ impl QuestionRegistry {
         answer: QuestionAnswer,
         now: Instant,
     ) -> Result<(), ResolveError> {
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| ResolveError::UnknownOrExpired)?;
-        let Some(entry) = entries.get(token) else {
+        let mut entries = self.lock_entries();
+        let MapEntry::Occupied(occupied) = entries.entry(token.to_owned()) else {
             return Err(ResolveError::UnknownOrExpired);
         };
-        if now < entry.created_at
-            || now >= entry.expiry
-            || !entry.hook_alive.load(Ordering::Acquire)
-        {
+        let entry = occupied.get();
+        if now >= entry.expiry || !entry.hook_alive.load(Ordering::Acquire) {
             return Err(ResolveError::UnknownOrExpired);
         }
         if channel_id != entry.request.channel_id {
             return Err(ResolveError::WrongChannel);
         }
-        let entry = entries
-            .remove(token)
-            .ok_or(ResolveError::UnknownOrExpired)?;
-        if !entry.hook_alive.load(Ordering::Acquire) {
-            return Err(ResolveError::UnknownOrExpired);
-        }
-        let sender = entry.sender;
+        let sender = occupied.remove().sender;
         drop(entries);
         let _ = sender.send(answer);
         Ok(())
@@ -307,22 +246,15 @@ impl QuestionRegistry {
     /// card a thread reply can be consumed against as a free-text answer, single-select or
     /// multiSelect alike.
     pub fn pending_question_token(&self, session_id: &str) -> Option<String> {
-        self.entries.lock().ok().and_then(|entries| {
-            entries
-                .iter()
-                .find(|(_, entry)| {
-                    entry.request.session_id == session_id
-                        && entry.hook_alive.load(Ordering::Acquire)
-                })
-                .map(|(token, _)| token.clone())
-        })
+        self.lock_entries()
+            .iter()
+            .find(|(_, entry)| {
+                entry.request.session_id == session_id && entry.hook_alive.load(Ordering::Acquire)
+            })
+            .map(|(token, _)| token.clone())
     }
     pub fn remove(&self, token: &str) -> bool {
-        self.entries
-            .lock()
-            .ok()
-            .and_then(|mut entries| entries.remove(token))
-            .is_some()
+        self.lock_entries().remove(token).is_some()
     }
 }
 
@@ -346,14 +278,11 @@ mod tests {
         let cases = [("wrong channel", 8, ResolveError::WrongChannel)];
         for (_, channel, expected) in cases {
             let registry = InteractionRegistry::default();
-            let issued = registry
-                .issue_with_token(
-                    "token".to_owned(),
-                    request(7, "session"),
-                    now,
-                    now + Duration::from_secs(30),
-                )
-                .expect("issue token");
+            let issued = registry.issue_with_token(
+                "token".to_owned(),
+                request(7, "session"),
+                now + Duration::from_secs(30),
+            );
             assert_eq!(
                 registry.resolve(&issued.token, channel, Decision::allow(), now,),
                 Err(expected)
@@ -364,14 +293,11 @@ mod tests {
     fn pending_lookup_is_scoped_to_the_vendor_session() {
         let now = Instant::now();
         let registry = InteractionRegistry::default();
-        registry
-            .issue_with_token(
-                "session-scoped-token".to_owned(),
-                request(7, "session-a"),
-                now,
-                now + Duration::from_secs(30),
-            )
-            .expect("issue token");
+        registry.issue_with_token(
+            "session-scoped-token".to_owned(),
+            request(7, "session-a"),
+            now + Duration::from_secs(30),
+        );
 
         for (session_id, expected) in [("session-a", true), ("session-b", false)] {
             assert_eq!(registry.has_pending_session(session_id), expected);
@@ -381,21 +307,15 @@ mod tests {
     async fn registry_issues_and_resolves_exactly_once() {
         let now = Instant::now();
         let registry = InteractionRegistry::default();
-        let issued = registry
-            .issue_with_token(
-                "opaque-token".to_owned(),
-                request(7, "session"),
-                now,
-                now + Duration::from_secs(30),
-            )
-            .expect("issue token");
-        registry
-            .resolve(&issued.token, 7, Decision::deny(Some("no".to_owned())), now)
-            .expect("first tap resolves");
-        assert_eq!(
-            issued.receiver.await,
-            Ok(Decision::deny(Some("no".to_owned())))
+        let issued = registry.issue_with_token(
+            "opaque-token".to_owned(),
+            request(7, "session"),
+            now + Duration::from_secs(30),
         );
+        registry
+            .resolve(&issued.token, 7, Decision::deny("no".to_owned()), now)
+            .expect("first tap resolves");
+        assert_eq!(issued.receiver.await, Ok(Decision::deny("no".to_owned())));
         assert_eq!(
             registry.resolve("opaque-token", 7, Decision::allow(), now,),
             Err(ResolveError::UnknownOrExpired)
@@ -406,15 +326,12 @@ mod tests {
         let now = Instant::now();
         let hook_alive = Arc::new(AtomicBool::new(true));
         let registry = InteractionRegistry::default();
-        let issued = registry
-            .issue_with_token_and_liveness(
-                "disconnected-token".to_owned(),
-                request(7, "session"),
-                now,
-                now + Duration::from_secs(30),
-                Arc::clone(&hook_alive),
-            )
-            .expect("issue token");
+        let issued = registry.issue_with_token_and_liveness(
+            "disconnected-token".to_owned(),
+            request(7, "session"),
+            now + Duration::from_secs(30),
+            Arc::clone(&hook_alive),
+        );
 
         hook_alive.store(false, Ordering::Release);
         assert_eq!(

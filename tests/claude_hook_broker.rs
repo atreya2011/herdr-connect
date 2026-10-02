@@ -160,7 +160,7 @@ fn permission_fixtures_decode_and_encode_allow_and_deny() {
         (
             "allow",
             ALLOW_FIXTURE,
-            Decision::deny(Some("operator denied this request".to_owned())),
+            Decision::deny("operator denied this request".to_owned()),
             Some("operator denied this request"),
         ),
     ];

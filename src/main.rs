@@ -2036,9 +2036,9 @@ fn encode_hook_decision(
     let Some(decision) = decision else {
         return match vendor {
             PermissionVendor::Claude | PermissionVendor::Codex => Ok(None),
-            PermissionVendor::Cursor => encode_cursor_decision(&Decision::deny(Some(
+            PermissionVendor::Cursor => encode_cursor_decision(&Decision::deny(
                 "permission broker did not return a decision; denying by default".to_owned(),
-            )))
+            ))
             .map(Some),
         };
     };
