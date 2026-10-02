@@ -7419,7 +7419,7 @@ mod tests {
 
     /// Real-Herdr exercise for an unlabeled tab whose agent has reported a session: the bridge's
     /// first pass renames the tab to its generated name in Herdr and creates the thread under that
-    /// same name; a second pass renames nothing.
+    /// same name.
     #[cfg(unix)]
     async fn unlabeled_tab_gets_a_generated_name_exercise(
         guild: &BlockedCaptureGuild,
@@ -8330,7 +8330,7 @@ mod tests {
     }
 
     /// Deletes a tab's Discord thread as the owner would and asserts Herdr closes that tab, the
-    /// sibling tab survives, and a later topology sync recreates no thread for the closed tab.
+    /// sibling tab survives.
     #[cfg(unix)]
     async fn owner_thread_delete_exercise(
         guild: &BlockedCaptureGuild,
@@ -8475,7 +8475,7 @@ mod tests {
 
     /// Registers an archived tab thread through the production archived registration alone, then
     /// deletes it as the owner would. The thread and its channel are created straight through the
-    /// Discord API, so no sync registers them, and the Herdr tab must close and stay closed.
+    /// Discord API, so no sync registers them, and the Herdr tab must close.
     #[cfg(unix)]
     async fn owner_archived_thread_delete_exercise(
         guild: &BlockedCaptureGuild,
@@ -8616,7 +8616,7 @@ mod tests {
     }
 
     /// Deletes a workspace's Discord channel as the owner would and asserts Herdr closes that
-    /// workspace and no channel is recreated for it.
+    /// workspace.
     #[cfg(unix)]
     async fn owner_channel_delete_exercise(
         guild: &BlockedCaptureGuild,
@@ -9574,7 +9574,7 @@ mod tests {
     /// session-less shell pane drives idle -> working -> done (mirroring `session_less_pane_exercise`)
     /// to prove silence, while a separate, never-synthetically-reported pane starts a real
     /// `claude --model haiku` agent and drives one real turn to prove that a session-carrying
-    /// pane's next qualifying transition creates the topology and posts a card. The two halves
+    /// pane's next qualifying transition creates the topology and posts its reply as live text. The two halves
     /// cannot share one pane: Herdr treats a pane it has been told carries a synthetic agent (via
     /// `report-agent`/`report-agent-session`) as occupied and rejects a real `agent start` on it
     /// with `agent_pane_busy`. Status on the Claude pane comes only from its own live
