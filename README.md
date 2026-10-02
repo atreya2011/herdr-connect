@@ -50,6 +50,10 @@ Identity is the topic and the `[tab_id]` suffix. Existing names are not renamed.
 set -a; . ./.env >/dev/null 2>&1; set +a; cargo run
 ```
 
+## Codex panes
+
+Start Codex panes with `codex --no-daemon`. Without it, Codex runs one shared background server per `CODEX_HOME` that executes hooks with the environment of the pane that started it, so sessions and activity from every Codex pane are attributed to that one pane.
+
 ## Docs
 
 - [AGENTS.md](AGENTS.md) — how to work in this repo
