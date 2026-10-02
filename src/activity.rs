@@ -29,7 +29,6 @@ struct ClaudePreToolUseRequest {
     session_id: String,
     hook_event_name: String,
     tool_name: String,
-    #[serde(default)]
     tool_input: ClaudeToolUseInput,
 }
 
@@ -38,8 +37,12 @@ struct CodexPreToolUseRequest {
     session_id: String,
     hook_event_name: String,
     tool_name: String,
-    #[serde(default)]
-    tool_input: serde_json::Value,
+    tool_input: CodexActivityToolInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexActivityToolInput {
+    command: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,15 +53,11 @@ struct CursorPreToolUseRequest {
     agent_message: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ClaudeToolUseInput {
-    #[serde(default)]
     command: Option<String>,
-    #[serde(default)]
     file_path: Option<String>,
-    #[serde(default)]
     pattern: Option<String>,
-    #[serde(default)]
     description: Option<String>,
 }
 
@@ -103,7 +102,7 @@ pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
 
 /// Decodes one Codex `PreToolUse` hook payload into its activity essentials.
 ///
-/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`, else empty.
+/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`.
 ///
 /// # Errors
 ///
@@ -115,13 +114,7 @@ pub fn decode_codex_activity_request(input: &[u8]) -> Result<ClaudeActivityReque
     if request.hook_event_name != ACTIVITY_HOOK_EVENT {
         return Err("unexpected Codex hook event".to_owned());
     }
-    let summary = request
-        .tool_input
-        .as_object()
-        .and_then(|fields| fields.get("command"))
-        .and_then(serde_json::Value::as_str)
-        .map(truncate_chars)
-        .unwrap_or_default();
+    let summary = truncate_chars(&request.tool_input.command);
     Ok(ClaudeActivityRequest {
         session_id: request.session_id,
         tool: request.tool_name,
@@ -227,6 +220,18 @@ mod tests {
         let request = decode_codex_activity_request(payload.as_bytes())
             .unwrap_or_else(|error| panic!("{payload} decodes: {error}"));
         assert_eq!(request.summary, "cmd");
+    }
+
+    #[test]
+    fn rejects_a_codex_payload_without_a_command() {
+        let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}"#;
+        assert!(decode_codex_activity_request(payload.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_a_claude_payload_without_tool_input() {
+        let payload = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash"}"#;
+        assert!(decode_claude_activity_request(payload.as_bytes()).is_err());
     }
 
     #[test]
