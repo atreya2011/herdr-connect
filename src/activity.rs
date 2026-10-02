@@ -37,7 +37,6 @@ struct CodexPreToolUseRequest {
     session_id: String,
     hook_event_name: String,
     tool_name: String,
-    #[serde(default)]
     tool_input: serde_json::Value,
 }
 
