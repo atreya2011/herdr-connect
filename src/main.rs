@@ -2089,9 +2089,9 @@ fn parse_hook_args(
 }
 
 /// Reads one harness `PreToolUse` hook payload from stdin and forwards it to the broker as an
-/// activity frame, always exiting 0 with no output: activity display is best-effort and must
-/// never fail the tool call it rides on. A hook run outside a Herdr pane has no workspace, tab or
-/// pane id to name, so it sends nothing.
+/// activity frame, exiting 0 with no output. Activity display is best-effort, so an undecodable
+/// payload, an unparsable argument list, or an unset broker socket sends nothing. A missing
+/// `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` or `HERDR_PANE_ID` is an error and exits 1.
 async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let Ok((vendor, requested_socket)) = parse_activity_args(args) else {
         return Ok(());
@@ -3094,6 +3094,77 @@ mod tests {
         }
     }
 
+    struct FirstTurnCase {
+        name: &'static str,
+        log_predates_first_sighting: bool,
+        another_terminal_follows_the_log: bool,
+        expect_mirrored: bool,
+    }
+
+    fn first_turn_cases() -> [FirstTurnCase; 3] {
+        [
+            FirstTurnCase {
+                name: "log created after the sessionless sighting",
+                log_predates_first_sighting: false,
+                another_terminal_follows_the_log: false,
+                expect_mirrored: true,
+            },
+            FirstTurnCase {
+                name: "log created before the sessionless sighting",
+                log_predates_first_sighting: true,
+                another_terminal_follows_the_log: false,
+                expect_mirrored: false,
+            },
+            FirstTurnCase {
+                name: "log created after the sighting but followed by another terminal",
+                log_predates_first_sighting: false,
+                another_terminal_follows_the_log: true,
+                expect_mirrored: false,
+            },
+        ]
+    }
+
+    /// Reads every prompt and assistant text from the given positions of a Codex rollout.
+    fn read_both(
+        path: &Path,
+        prompt_position: Follower,
+        live_position: Follower,
+    ) -> (Vec<String>, Vec<String>) {
+        let (prompts, _) = read_new_terminal_prompts(path, prompt_position).expect("read prompts");
+        let (texts, _) = super::read_new_live_texts(path, live_position).expect("read texts");
+        (prompts, texts.into_iter().map(|(text, _)| text).collect())
+    }
+
+    /// Creates the continuation rollout of the first-turn fixture, feeds `later` (a snapshot for the
+    /// second session) to the baseline, and asserts the history already in that rollout is discarded.
+    fn assert_later_codex_session_discards_history(
+        state: &mut BridgeState,
+        temp_home: &Path,
+        later: &AgentSnapshot,
+        name: &str,
+    ) {
+        let continuation = "rollout-2026-09-28T12-38-56-00000000-0000-7000-8000-000000000001_00000000-0000-7000-8000-000000000002.jsonl";
+        let continuation_path = temp_home
+            .join(".codex-one/sessions/2026/09/28")
+            .join(continuation);
+        fs::copy(
+            Path::new("tests/fixtures/codex-rollouts").join(continuation),
+            &continuation_path,
+        )
+        .expect("copy committed Codex continuation fixture");
+        maybe_establish_terminal_prompt_baseline(later, state);
+        let (path, prompt_position, live_position) = state
+            .terminal_prompt_positions
+            .get(&later.terminal_id)
+            .unwrap_or_else(|| panic!("{name}: second baseline established"));
+        assert_eq!(path, &continuation_path, "{name}");
+        let (prompts, texts) = read_both(path, *prompt_position, *live_position);
+        assert!(
+            prompts.is_empty() && texts.is_empty(),
+            "{name}: a later session must discard its history: {prompts:?} {texts:?}"
+        );
+    }
+
     /// Codex creates its rollout and reports its session only when the first prompt is submitted,
     /// so the bridge first sees the pane with no session and later sees a session whose log
     /// already holds the prompt. A log created after that first sighting is the pane's own and is
@@ -3102,32 +3173,7 @@ mod tests {
     /// session on the terminal is discarded too.
     #[test]
     fn codex_log_created_after_the_pane_was_first_seen_without_a_session_is_read_from_zero() {
-        struct Case {
-            name: &'static str,
-            log_predates_first_sighting: bool,
-            another_terminal_follows_the_log: bool,
-            expect_mirrored: bool,
-        }
-        let cases = [
-            Case {
-                name: "log created after the sessionless sighting",
-                log_predates_first_sighting: false,
-                another_terminal_follows_the_log: false,
-                expect_mirrored: true,
-            },
-            Case {
-                name: "log created before the sessionless sighting",
-                log_predates_first_sighting: true,
-                another_terminal_follows_the_log: false,
-                expect_mirrored: false,
-            },
-            Case {
-                name: "log created after the sighting but followed by another terminal",
-                log_predates_first_sighting: false,
-                another_terminal_follows_the_log: true,
-                expect_mirrored: false,
-            },
-        ];
+        let cases = first_turn_cases();
         let original_home = std::env::var_os("HOME");
         let temp_home = std::env::temp_dir().join(format!(
             "herdr-connect-rs-codex-first-turn-{}",
@@ -3197,11 +3243,7 @@ mod tests {
                     .get("terminal-codex-first-turn")
                     .unwrap_or_else(|| panic!("{}: baseline established", case.name));
                 assert_eq!(path, &log_path, "{}", case.name);
-                let (prompts, _) = read_new_terminal_prompts(path, *prompt_position)
-                    .unwrap_or_else(|error| panic!("{}: {error}", case.name));
-                let (texts, _) = super::read_new_live_texts(path, *live_position)
-                    .unwrap_or_else(|error| panic!("{}: {error}", case.name));
-                let texts: Vec<String> = texts.into_iter().map(|(text, _)| text).collect();
+                let (prompts, texts) = read_both(path, *prompt_position, *live_position);
                 let (expected_prompts, expected_texts) = if case.expect_mirrored {
                     (vec!["original prompt"], vec!["original answer"])
                 } else {
@@ -3213,35 +3255,14 @@ mod tests {
                 // A later session on the same terminal, whose log is also created after the
                 // first sighting, is not the pane's own fresh log: the sighting was forgotten.
                 std::thread::sleep(tick);
-                let continuation = "rollout-2026-09-28T12-38-56-00000000-0000-7000-8000-000000000001_00000000-0000-7000-8000-000000000002.jsonl";
-                let continuation_path = temp_home
-                    .join(".codex-one/sessions/2026/09/28")
-                    .join(continuation);
-                fs::copy(
-                    Path::new("tests/fixtures/codex-rollouts").join(continuation),
-                    &continuation_path,
-                )
-                .expect("copy committed Codex continuation fixture");
-                maybe_establish_terminal_prompt_baseline(
+                assert_later_codex_session_discards_history(
+                    &mut state,
+                    &temp_home,
                     &snapshot(Some(AgentSession {
                         agent: VENDOR_CODEX.to_owned(),
                         value: "00000000-0000-7000-8000-000000000002".to_owned(),
                     })),
-                    &mut state,
-                );
-                let (path, prompt_position, live_position) = state
-                    .terminal_prompt_positions
-                    .get("terminal-codex-first-turn")
-                    .unwrap_or_else(|| panic!("{}: second baseline established", case.name));
-                assert_eq!(path, &continuation_path, "{}", case.name);
-                let (prompts, _) = read_new_terminal_prompts(path, *prompt_position)
-                    .unwrap_or_else(|error| panic!("{}: {error}", case.name));
-                let (texts, _) = super::read_new_live_texts(path, *live_position)
-                    .unwrap_or_else(|error| panic!("{}: {error}", case.name));
-                assert!(
-                    prompts.is_empty() && texts.is_empty(),
-                    "{}: a later session must discard its history: {prompts:?} {texts:?}",
-                    case.name
+                    case.name,
                 );
             }
         });

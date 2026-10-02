@@ -10,7 +10,7 @@ cargo clippy --all-targets -- -D warnings
 set -a; . ./.env >/dev/null 2>&1; set +a; cargo test -- --test-threads=1
 ```
 
-Stop the bridge service before running the suite: real-guild tests refuse to start while a bridge listens on its broker socket. Never print or commit `.env`. Real-guild tests create only `testrun-` channels, clean up on every path, and end with a named zero-leftover check.
+Stop the bridge service before running the suite. Never print or commit `.env`. Real-guild tests create only `testrun-` channels, clean up on every path, and end with a named zero-leftover check.
 
 ## Laws (locked by the owner)
 
