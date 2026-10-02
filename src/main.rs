@@ -104,11 +104,11 @@ struct BridgeState {
     live_watches: HashMap<String, LiveWatch>,
     /// `None` in tests that never wire live capture up.
     live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Live-capture errors -- a read failure, a route failure, or a failed post -- already logged
-    /// for a terminal, keyed by the terminal and the error text together so the same error is not
-    /// repeated on every later event while a different error still is. Every entry for a terminal
-    /// is cleared once a full read-and-deliver for it succeeds, so a recurring error after a
-    /// recovery is logged afresh.
+    /// Live-capture errors -- a read failure, a route failure, or a failed post -- and topology
+    /// route errors already logged for a terminal, keyed by the terminal and the error text
+    /// together so the same error is not repeated on every later event while a different error
+    /// still is. Every entry for a terminal is cleared once a full read-and-deliver for it
+    /// succeeds, so a recurring error after a recovery is logged afresh.
     live_errors_reported: HashSet<(String, String)>,
     /// Tabs whose generated-name rename failure was already logged, so a persistent failure is
     /// logged once per tab rather than on every snapshot pass.
