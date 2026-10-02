@@ -315,13 +315,12 @@ async fn deliver_blocked_messages(
 }
 
 async fn expire_blocked_card(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     terminal: &str,
     informational_cards: &mut HashMap<String, InformationalCard>,
 ) {
-    if let Some(card) = informational_cards.get(terminal).copied()
-        && let Some((client, ..)) = discord
-    {
+    if let Some(card) = informational_cards.get(terminal).copied() {
+        let (client, ..) = discord;
         if let Err(error) = expire_informational_card(
             client.as_ref(),
             card.channel,
@@ -371,7 +370,7 @@ async fn maybe_sync_fresh_session_topology(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     state: &mut BridgeState,
 ) {
     let previous_status = state
@@ -398,9 +397,7 @@ async fn maybe_sync_fresh_session_topology(
             return;
         }
     };
-    let Some((client, guild, _, responder, _)) = discord else {
-        return;
-    };
+    let (client, guild, _, responder, _) = discord;
     if let Err(error) =
         sync_route(client.as_ref(), *guild, &route, responder.topology_cache()).await
     {
@@ -412,7 +409,7 @@ async fn process_snapshot(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     state: &mut BridgeState,
 ) {
     let (terminal, status) = (snapshot.terminal_id.clone(), snapshot.agent_status.clone());
@@ -468,7 +465,7 @@ struct PostableTransitionContext<'a> {
     snapshot: &'a AgentSnapshot,
     agents: &'a [AgentSnapshot],
     tabs: &'a [HerdrTab],
-    discord: Option<&'a DiscordConnection>,
+    discord: &'a DiscordConnection,
     terminal: &'a str,
     transition: &'a Transition,
     state_change_seq: u64,
@@ -502,10 +499,7 @@ async fn deliver_postable_transition(
             return;
         }
     };
-    let Some(connection) = discord else {
-        return;
-    };
-    let (client, guild, owner_id, responder, _) = connection;
+    let (client, guild, owner_id, responder, _) = discord;
     handle_blocked_card(BlockedCardContext {
         client: client.as_ref(),
         guild: *guild,
@@ -535,7 +529,7 @@ async fn deliver_transition_if_postable(
 }
 
 async fn update_blocked_lifecycle(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     terminal: &str,
     leaving_blocked: bool,
     state: &mut BridgeState,
@@ -915,7 +909,7 @@ fn read_new_terminal_prompts(
 /// A bridge restart re-follows from the current end and so reposts nothing; a log that grows before
 /// the restart's first read is still picked up from that end.
 async fn ensure_live_watch_started(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
@@ -963,9 +957,6 @@ async fn ensure_live_watch_started(
     let Some(live_tx) = state.live_tx.clone() else {
         return;
     };
-    if discord.is_none() {
-        return;
-    }
     let watcher = match start_notify_watcher(live_position, &path, terminal.clone(), live_tx) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -1336,13 +1327,10 @@ async fn mirror_terminal_prompts(
 /// re-sent on the next log change. A send that finds the thread gone (unknown channel) also clears
 /// the shared topology cache, so that next event re-resolves the route.
 async fn handle_live_event(
-    discord: Option<&DiscordConnection>,
+    connection: &DiscordConnection,
     terminal: &str,
     state: &mut BridgeState,
 ) {
-    let Some(connection) = discord else {
-        return;
-    };
     let (client, guild, _, responder, _) = connection;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
@@ -1703,12 +1691,10 @@ async fn sync_startup_topology(
 /// further Discord request. The delete error is logged; only a failure of the fetch itself is
 /// returned.
 async fn delete_closed_topology(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     closure: &TopologyClosure,
 ) -> Result<(), String> {
-    let Some((client, guild, _, responder, _)) = discord else {
-        return Ok(());
-    };
+    let (client, guild, _, responder, _) = discord;
     let topology_cache = responder.topology_cache();
     let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
     let mut guard = topology_cache.lock().await;
@@ -2371,7 +2357,7 @@ async fn bridge_event_loop(
                 }
             }
             Some(terminal) = runtime.live_events.recv() => {
-                handle_live_event(Some(discord), &terminal, &mut runtime.state).await;
+                handle_live_event(discord, &terminal, &mut runtime.state).await;
             }
             Some(frame) = runtime.activity_events.recv() => {
                 handle_activity_event(discord, frame, &mut runtime.state).await;
@@ -2411,7 +2397,7 @@ async fn apply_lifecycle_event(
     }
 
     if let Some(closure) = lifecycle_closure(event)
-        && let Err(error) = delete_closed_topology(Some(discord), &closure).await
+        && let Err(error) = delete_closed_topology(discord, &closure).await
     {
         bridge_eprintln!("herdr topology closure error: {error}");
     }
@@ -2626,7 +2612,7 @@ async fn apply_herdr_snapshot(
         expire_departed_card(discord, &terminal, card).await;
     }
     for snapshot in &agents {
-        process_snapshot(snapshot, &agents, &tabs, Some(discord), state).await;
+        process_snapshot(snapshot, &agents, &tabs, discord, state).await;
     }
     Ok(pane_ids_from_agents(&agents))
 }
@@ -4716,7 +4702,7 @@ mod tests {
             snapshot,
             std::slice::from_ref(snapshot),
             tabs,
-            Some(connection),
+            connection,
             state,
         )
         .await;
@@ -4783,7 +4769,7 @@ mod tests {
         let settled = loop {
             tokio::select! {
                 Some(terminal_id) = live_events.recv() => {
-                    handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+                    handle_live_event(&connection, &terminal_id, &mut state).await;
                     if !alpha_before_settle {
                         alpha_before_settle = has_alpha(&thread_messages(guild, thread).await?);
                     }
@@ -4807,11 +4793,11 @@ mod tests {
         }
         own(&settled, tabs, &connection, &mut state).await;
         while let Ok(terminal_id) = live_events.try_recv() {
-            handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+            handle_live_event(&connection, &terminal_id, &mut state).await;
         }
         // The persistent watch has no settle-time read of its own, so read once more here to
         // deliver any assistant text written just before `done` that no `notify` tick reached.
-        handle_live_event(Some(&connection), &terminal, &mut state).await;
+        handle_live_event(&connection, &terminal, &mut state).await;
 
         let Some(session) = settled.session.clone() else {
             return Err("settled snapshot lost its session".to_owned());
@@ -5019,7 +5005,7 @@ mod tests {
         let settled = loop {
             tokio::select! {
                 Some(terminal_id) = live_events.recv() => {
-                    handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+                    handle_live_event(&connection, &terminal_id, &mut state).await;
                 }
                 event = wait_for_event(
                     &mut sub, "pane.agent_status_changed", &tab.pane_id, "/data/pane_id", None,
@@ -5037,11 +5023,11 @@ mod tests {
         };
         own(&settled, tabs, &connection, &mut state).await;
         while let Ok(terminal_id) = live_events.try_recv() {
-            handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+            handle_live_event(&connection, &terminal_id, &mut state).await;
         }
         // One more read so any text written just before `done` is delivered before the baseline
         // count is taken, isolating the post-settle append as the only new message.
-        handle_live_event(Some(&connection), &terminal, &mut state).await;
+        handle_live_event(&connection, &terminal, &mut state).await;
         let live_before = thread_messages(guild, thread)
             .await?
             .into_iter()
@@ -5055,7 +5041,7 @@ mod tests {
         let marker = format!("post-settle-{agent_name}");
         append_claude_assistant_record(&log_path, &marker)?;
         // The pane is settled; rule 2 still posts the appended text through the open watcher.
-        handle_live_event(Some(&connection), &terminal, &mut state).await;
+        handle_live_event(&connection, &terminal, &mut state).await;
 
         let messages = thread_messages(guild, thread).await?;
         let live: Vec<_> = messages.iter().filter(|(_, embed, _)| !embed).collect();
@@ -5253,7 +5239,7 @@ mod tests {
         loop {
             tokio::select! {
                 Some(event_terminal) = live_events.recv() => {
-                    handle_live_event(Some(connection), &event_terminal, state).await;
+                    handle_live_event(connection, &event_terminal, state).await;
                 }
                 event = wait_for_event(
                     &mut sub,
@@ -5280,11 +5266,11 @@ mod tests {
         wait_for_readable_capture(&settled).await?;
         own(&settled, tabs, connection, state).await;
         while let Ok(event_terminal) = live_events.try_recv() {
-            handle_live_event(Some(connection), &event_terminal, state).await;
+            handle_live_event(connection, &event_terminal, state).await;
         }
         // The persistent watch has no settle-time read of its own, so read once more here to
         // deliver the reply written just before `done` that no `notify` tick reached.
-        handle_live_event(Some(connection), terminal, state).await;
+        handle_live_event(connection, terminal, state).await;
         Ok(())
     }
 
@@ -7166,7 +7152,7 @@ mod tests {
                 let connection = discord_tuple(&guild);
                 let mut state = BridgeState::default();
 
-                process_snapshot(&snapshot, &agents, &tabs, Some(&connection), &mut state).await;
+                process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
 
                 let route = route_topology(&agents, &tabs, &terminal_id)?;
                 let topic = format!("herdr workspace [{}]", route.workspace_id);
@@ -7406,7 +7392,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let mut state = BridgeState::default();
-        process_snapshot(&snapshot, &agents, &tabs, Some(&connection), &mut state).await;
+        process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
         let topic = format!("herdr workspace [{}]", renamed.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
         let expected_thread = format!("{expected_name} [{}]", tab.tab_id);
@@ -7994,7 +7980,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         for closure in &closures {
-            delete_closed_topology(Some(&connection), closure).await?;
+            delete_closed_topology(&connection, closure).await?;
         }
 
         for (case, suffix) in cases.iter().zip(suffixes.iter()) {
@@ -9107,7 +9093,7 @@ mod tests {
             &working,
             std::slice::from_ref(&working),
             tabs,
-            Some(connection),
+            connection,
             state,
         )
         .await;
@@ -9123,7 +9109,7 @@ mod tests {
             &settled,
             std::slice::from_ref(&settled),
             tabs,
-            Some(connection),
+            connection,
             state,
         )
         .await;
@@ -9145,14 +9131,7 @@ mod tests {
         let matching = matching_tab(&workspace.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
         let route = route_topology(std::slice::from_ref(&idle), tabs, &idle.terminal_id)?;
-        process_snapshot(
-            &idle,
-            std::slice::from_ref(&idle),
-            tabs,
-            Some(connection),
-            state,
-        )
-        .await;
+        process_snapshot(&idle, std::slice::from_ref(&idle), tabs, connection, state).await;
 
         let settled = drive_working_then_settled(workspace, tabs, connection, state).await?;
         Ok((route, settled))
@@ -9435,7 +9414,7 @@ mod tests {
                         &unknown,
                         std::slice::from_ref(&unknown),
                         tabs,
-                        Some(&connection),
+                        &connection,
                         &mut state,
                     )
                     .await;
@@ -9471,7 +9450,7 @@ mod tests {
                         &idle,
                         std::slice::from_ref(&idle),
                         tabs,
-                        Some(&connection),
+                        &connection,
                         &mut state,
                     )
                     .await;
@@ -9515,7 +9494,7 @@ mod tests {
                         &idle,
                         std::slice::from_ref(&idle),
                         tabs,
-                        Some(&connection),
+                        &connection,
                         &mut state,
                     )
                     .await;
@@ -9618,7 +9597,7 @@ mod tests {
             &with_session,
             std::slice::from_ref(&with_session),
             claude_tabs,
-            Some(&connection),
+            &connection,
             &mut state,
         )
         .await;
@@ -9629,16 +9608,16 @@ mod tests {
             &settled,
             std::slice::from_ref(&settled),
             claude_tabs,
-            Some(&connection),
+            &connection,
             &mut state,
         )
         .await;
         while let Ok(terminal_id) = live_events.try_recv() {
-            handle_live_event(Some(&connection), &terminal_id, &mut state).await;
+            handle_live_event(&connection, &terminal_id, &mut state).await;
         }
         // The persistent watch has no settle-time read of its own, so read once more to deliver the
         // reply written just before `done`.
-        handle_live_event(Some(&connection), &claude_terminal, &mut state).await;
+        handle_live_event(&connection, &claude_terminal, &mut state).await;
 
         let channel = guild_channel_with_topic(guild, &claude_topic)
             .await
