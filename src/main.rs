@@ -235,13 +235,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         return;
     }
     let detection_question = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
-        .then(|| match agent_read_detection(&route.pane_id) {
-            Ok(text) => Some(text),
-            Err(error) => {
-                bridge_eprintln!("agent detection read error for {terminal}: {error}");
-                None
-            }
-        })
+        .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten()
         .and_then(|text| format_detection_question(&text));
     let capture = detection_question.map_or_else(
@@ -1894,26 +1888,16 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
-    let question_error = if matches!(explicit_vendor, None | Some(PermissionVendor::Claude)) {
-        match decode_claude_ask_question(&input) {
-            Ok(question) => return run_question_hook(&question, requested_socket).await,
-            Err(error) => Some(error),
+    if matches!(explicit_vendor, None | Some(PermissionVendor::Claude))
+        && let Ok(question) = decode_claude_ask_question(&input)
+    {
+        return run_question_hook(&question, requested_socket).await;
+    }
+    let Ok(interaction) = decode_hook_request(&input, explicit_vendor) else {
+        if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
+            write_hook_decision(PermissionVendor::Cursor, None).await?;
         }
-    } else {
-        None
-    };
-    let interaction = match decode_hook_request(&input, explicit_vendor) {
-        Ok(interaction) => interaction,
-        Err(error) => {
-            if let Some(question_error) = question_error {
-                bridge_eprintln!("hook question decode error: {question_error}");
-            }
-            bridge_eprintln!("hook payload decode error: {error}");
-            if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
-                write_hook_decision(PermissionVendor::Cursor, None).await?;
-            }
-            return Ok(());
-        }
+        return Ok(());
     };
     // Cursor fires beforeShellExecution even under --force/--yolo and its payload carries no
     // run-mode field, so a card that times out would deny every command of a hands-off seat.

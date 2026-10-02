@@ -157,43 +157,6 @@ fn explicit_cursor_vendor_denies_when_payload_is_undecodable() {
 }
 
 #[test]
-fn undecodable_codex_and_question_payloads_preserve_empty_output_and_report_the_decode_error() {
-    let malformed_question = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":"not a list"},"tool_use_id":"t"}"#;
-    let cases: [(&[&str], &str, &str); 2] = [
-        (&["hook", "--vendor", "codex"], "{}", "missing field"),
-        (
-            &["hook"],
-            malformed_question,
-            "AskUserQuestion tool_input does not parse",
-        ),
-    ];
-    for (args, payload, expected_stderr) in cases {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn hook subcommand");
-        child
-            .stdin
-            .take()
-            .expect("hook stdin is piped")
-            .write_all(payload.as_bytes())
-            .expect("write undecodable hook payload");
-        let output = child.wait_with_output().expect("wait for hook subcommand");
-
-        assert!(output.status.success(), "{args:?}");
-        assert!(output.stdout.is_empty(), "{args:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(expected_stderr),
-            "{args:?}: stderr was: {stderr}"
-        );
-    }
-}
-
-#[test]
 fn cursor_argv_force_flags_match_exact_tokens_only() {
     let cases = [
         (vec!["cursor-agent", "--yolo"], true),

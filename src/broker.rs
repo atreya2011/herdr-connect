@@ -253,7 +253,6 @@ impl PermissionResponder {
                 created_at + PERMISSION_TIMEOUT,
                 Arc::clone(&liveness.alive),
             )
-            .map_err(|error| bridge_eprintln!("{error}"))
             .ok()?;
         let message = self
             .deliver_card(
@@ -323,17 +322,13 @@ impl PermissionResponder {
             route_topology(&agents, &tabs, &agent.terminal_id)
         });
         let route = tokio::select! {
-            result = route_task => match result {
-                Ok(Ok(route)) => Some(route),
-                Ok(Err(error)) => {
+            result = route_task => result.ok().and_then(|result| match result {
+                Ok(route) => Some(route),
+                Err(error) => {
                     bridge_eprintln!("{error}");
                     None
                 }
-                Err(error) => {
-                    bridge_eprintln!("permission route task failed: {error}");
-                    None
-                }
-            },
+            }),
             () = liveness.wait_closed() => None,
         }?;
         liveness.is_alive().then_some(route)
@@ -435,11 +430,8 @@ impl PermissionResponder {
         content: &str,
     ) {
         self.registry.remove(token);
-        if let Err(error) =
-            expire_permission_card(self.client.as_ref(), channel, message, token, content).await
-        {
-            bridge_eprintln!("card edit failed: {error}");
-        }
+        let _ =
+            expire_permission_card(self.client.as_ref(), channel, message, token, content).await;
     }
 
     /// Answers one `AskUserQuestion` request by posting its questions as Discord cards, in order,
@@ -498,7 +490,6 @@ impl PermissionResponder {
                 call_deadline,
                 Arc::clone(&liveness.alive),
             )
-            .map_err(|error| bridge_eprintln!("{error}"))
             .ok()?;
         let message = self
             .deliver_question_card(channel, question, &issued.token, liveness)
@@ -642,7 +633,7 @@ impl PermissionResponder {
         token: &str,
     ) {
         self.question_registry.remove(token);
-        let result = if question.multi_select {
+        let _ = if question.multi_select {
             expire_question_select_card(
                 self.client.as_ref(),
                 channel,
@@ -663,9 +654,6 @@ impl PermissionResponder {
             )
             .await
         };
-        if let Err(error) = result {
-            bridge_eprintln!("card edit failed: {error}");
-        }
     }
 
     /// Resolves the pending single-select question card `token` with the option chosen by button
@@ -887,7 +875,7 @@ pub async fn request_decision(
     socket_path: &Path,
     timeout_duration: Duration,
 ) -> Option<Decision> {
-    let result = tokio::time::timeout(timeout_duration, async {
+    tokio::time::timeout(timeout_duration, async {
         let mut stream = match UnixStream::connect(socket_path).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -898,30 +886,13 @@ pub async fn request_decision(
                 return None;
             }
         };
-        if let Err(error) = write_json_line(&mut stream, interaction).await {
-            bridge_eprintln!("broker request failed: write: {error}");
-            return None;
-        }
-        let response: BrokerResponse = match read_json_line(&mut stream).await {
-            Ok(response) => response,
-            Err(error) => {
-                bridge_eprintln!("broker request failed: read: {error}");
-                return None;
-            }
-        };
-        match correlate_decision(interaction, response) {
-            Ok(decision) => Some(decision),
-            Err(error) => {
-                bridge_eprintln!("broker request failed: {error:?}");
-                None
-            }
-        }
+        write_json_line(&mut stream, interaction).await.ok()?;
+        let response: BrokerResponse = read_json_line(&mut stream).await.ok()?;
+        correlate_decision(interaction, response).ok()
     })
-    .await;
-    result.unwrap_or_else(|_| {
-        bridge_eprintln!("broker request failed: no decision within {timeout_duration:?}");
-        None
-    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Sends one activity frame to the broker socket and returns without waiting for a reply.
@@ -1111,10 +1082,7 @@ async fn handle_connection(
     }
     let interaction = match serde_json::from_slice::<Interaction>(&bytes) {
         Ok(interaction) if is_valid_interaction(&interaction) => interaction,
-        Ok(_) => {
-            bridge_eprintln!("broker rejected initial frame: permission frame has an empty field");
-            return;
-        }
+        Ok(_) => return,
         Err(error) => {
             bridge_eprintln!("broker rejected initial frame: malformed broker frame: {error}");
             return;
