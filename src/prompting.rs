@@ -231,9 +231,7 @@ fn matching_agent<'agents>(
 }
 
 fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
-    let pane_id = Some(agent.pane_id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "refused: unmapped pane".to_owned())?;
+    let pane_id = agent.pane_id.as_str();
     match agent.agent_status.trim() {
         STATUS_IDLE | STATUS_DONE => Ok(pane_id.to_owned()),
         STATUS_WORKING => Err("refused: agent state is working".to_owned()),
