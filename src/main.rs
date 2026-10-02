@@ -1939,11 +1939,15 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     {
         return run_question_hook(&question, requested_socket).await;
     }
-    let Some(interaction) = decode_hook_request(&input, explicit_vendor) else {
-        if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
-            write_hook_decision(PermissionVendor::Cursor, None).await?;
+    let interaction = match decode_hook_request(&input, explicit_vendor) {
+        Ok(interaction) => interaction,
+        Err(error) => {
+            bridge_eprintln!("hook payload decode error: {error}");
+            if matches!(explicit_vendor, Some(PermissionVendor::Cursor)) {
+                write_hook_decision(PermissionVendor::Cursor, None).await?;
+            }
+            return Ok(());
         }
-        return Ok(());
     };
     // Cursor fires beforeShellExecution even under --force/--yolo and its payload carries no
     // run-mode field, so a card that times out would deny every command of a hands-off seat.
@@ -2052,15 +2056,17 @@ async fn write_hook_decision(
     Ok(())
 }
 
-fn decode_hook_request(input: &[u8], vendor: Option<PermissionVendor>) -> Option<Interaction> {
+fn decode_hook_request(
+    input: &[u8],
+    vendor: Option<PermissionVendor>,
+) -> Result<Interaction, String> {
     match vendor {
-        Some(PermissionVendor::Claude) => decode_claude_permission_request(input).ok(),
-        Some(PermissionVendor::Codex) => decode_codex_permission_request(input).ok(),
-        Some(PermissionVendor::Cursor) => decode_cursor_permission_request(input).ok(),
+        Some(PermissionVendor::Claude) => decode_claude_permission_request(input),
+        Some(PermissionVendor::Codex) => decode_codex_permission_request(input),
+        Some(PermissionVendor::Cursor) => decode_cursor_permission_request(input),
         None => decode_claude_permission_request(input)
             .or_else(|_| decode_codex_permission_request(input))
-            .or_else(|_| decode_cursor_permission_request(input))
-            .ok(),
+            .or_else(|_| decode_cursor_permission_request(input)),
     }
 }
 

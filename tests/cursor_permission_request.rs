@@ -162,6 +162,7 @@ fn explicit_codex_vendor_preserves_empty_output_when_payload_is_undecodable() {
         .args(["hook", "--vendor", "codex"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hook subcommand");
     child
@@ -174,6 +175,8 @@ fn explicit_codex_vendor_preserves_empty_output_when_payload_is_undecodable() {
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing field"), "stderr was: {stderr}");
 }
 
 #[test]
