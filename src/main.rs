@@ -3745,7 +3745,7 @@ mod tests {
     }
 
     /// The real guild every real-guild test runs against, or `None` when its environment is not
-    /// configured. When HERDR_CLAUDE_BROKER_SOCKET is set, panics if a production bridge is
+    /// configured. When `HERDR_CLAUDE_BROKER_SOCKET` is set, panics if a production bridge is
     /// listening on that socket, because a second bridge on the same guild and Herdr session can
     /// satisfy a test's assertions in place of the code under test.
     #[cfg(unix)]
