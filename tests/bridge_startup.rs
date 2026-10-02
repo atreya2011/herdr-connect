@@ -43,3 +43,14 @@ fn bridge_fails_at_startup_when_discord_variables_are_missing() {
         "stderr was: {stderr}"
     );
 }
+
+#[test]
+fn unknown_subcommand_is_an_error_and_starts_no_bridge() {
+    let output = run_with_empty_environment(&["bogus"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown subcommand: bogus"),
+        "stderr was: {stderr}"
+    );
+}

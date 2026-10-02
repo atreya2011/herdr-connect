@@ -1881,7 +1881,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args: Vec<String> = args.collect();
             return run_broker(&args).await;
         }
-        _ => {}
+        None => {}
+        Some(other) => return Err(format!("unknown subcommand: {other}").into()),
     }
     run_bridge().await
 }
