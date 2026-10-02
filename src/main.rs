@@ -3759,10 +3759,13 @@ mod tests {
             ),
             id: Id::new(std::env::var("DISCORD_GUILD_ID").ok()?.parse().ok()?),
         };
-        assert!(
-            std::os::unix::net::UnixStream::connect(CODEX_ACTIVITY_BROKER_SOCKET).is_err(),
-            "production bridge is listening on {CODEX_ACTIVITY_BROKER_SOCKET}; stop it before running the suite"
-        );
+        if let Some(socket) = std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET") {
+            assert!(
+                std::os::unix::net::UnixStream::connect(&socket).is_err(),
+                "production bridge is listening on {}; stop it before running the suite",
+                Path::new(&socket).display()
+            );
+        }
         Some(guild)
     }
 
