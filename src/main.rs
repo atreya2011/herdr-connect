@@ -1283,7 +1283,7 @@ fn terminal_prompt_baseline_is_current(
 /// failure is logged once and the position still advances past it -- a stuck prompt does not block
 /// mirroring later ones.
 async fn mirror_terminal_prompts(
-    discord: Option<&DiscordConnection>,
+    connection: &DiscordConnection,
     terminal: &str,
     route: &TopologyRoute,
     state: &mut BridgeState,
@@ -1306,9 +1306,7 @@ async fn mirror_terminal_prompts(
     if prompts.is_empty() {
         return;
     }
-    let Some((client, guild, _owner_id, responder)) = discord else {
-        return;
-    };
+    let (client, guild, _owner_id, responder) = connection;
     let Some(identity) = state.owner_identity.clone() else {
         return;
     };
@@ -1359,14 +1357,15 @@ async fn handle_live_event(
     terminal: &str,
     state: &mut BridgeState,
 ) {
-    let Some((client, guild, _owner_id, responder)) = discord else {
+    let Some(connection) = discord else {
         return;
     };
+    let (client, guild, _owner_id, responder) = connection;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
     let (path, start_position, route) = (watch.path.clone(), watch.follower, watch.route.clone());
-    mirror_terminal_prompts(discord, terminal, &route, state).await;
+    mirror_terminal_prompts(connection, terminal, &route, state).await;
     let (texts, read_position) = match read_new_live_texts(&path, start_position) {
         Ok(result) => result,
         Err(error) => {
