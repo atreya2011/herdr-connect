@@ -8,7 +8,7 @@ const MAX_THREAD_NAME_LENGTH: usize = 100;
 pub struct TransitionMessage {
     pub description: String,
     pub color: u32,
-    pub mention: Option<String>,
+    pub mention_user: Option<String>,
 }
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentLogCapture {
@@ -52,7 +52,7 @@ pub fn create_transition_messages(
         .map(|(i, description)| TransitionMessage {
             description,
             color,
-            mention: (transition.to == STATUS_BLOCKED && i == 0).then(|| format!("<@{owner}>")),
+            mention_user: (transition.to == STATUS_BLOCKED && i == 0).then(|| owner.to_owned()),
         })
         .collect()
 }
@@ -76,26 +76,22 @@ fn split_body(body: &str) -> Vec<String> {
                 end += 1;
             }
             let inner = lines[index + 1..end].join("\n");
-            let limit = PART_BUDGET.saturating_sub(open.len() + 7);
             if open.len() + 7 >= PART_BUDGET {
                 atoms.extend(chars_chunks(
                     &body_without_fences(open, &inner, end < lines.len()),
                     PART_BUDGET,
                 ));
             } else if end >= lines.len() || format!("{open}\n{inner}\n```").len() > PART_BUDGET {
+                let limit = PART_BUDGET - (open.len() + 7);
                 atoms.extend(
-                    chars_chunks(&inner, limit.max(1))
+                    chars_chunks(&inner, limit)
                         .into_iter()
                         .map(|part| format!("{open}\n{part}\n```")),
                 );
             } else {
                 atoms.push(format!("{open}\n{inner}\n```"));
             }
-            index = if end < lines.len() {
-                end + 1
-            } else {
-                lines.len()
-            };
+            index = end + 1;
         } else {
             atoms.push(lines[index].to_owned());
             index += 1;
@@ -170,17 +166,12 @@ pub fn format_thread_name(label: &str, tab_id: &str) -> Result<String, String> {
         ));
     }
     let suffix = format!(" [{tab_id}]");
-    if suffix.chars().count() > MAX_THREAD_NAME_LENGTH {
+    if suffix.chars().count() >= MAX_THREAD_NAME_LENGTH {
         return Err(format!(
             "herdr tab id {tab_id} is too long for a Discord thread"
         ));
     }
     let capacity = MAX_THREAD_NAME_LENGTH - suffix.chars().count();
-    if capacity == 0 {
-        return Err(format!(
-            "herdr tab id {tab_id} is too long for a Discord thread"
-        ));
-    }
     Ok(format!(
         "{}{}",
         base.chars().take(capacity).collect::<String>(),

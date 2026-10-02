@@ -23,7 +23,6 @@ pub const UNKNOWN_CHANNEL_DELIVERY_ERROR: &str = "discord unknown channel";
 /// retrying the same, permanently-invalid webhook.
 pub const UNKNOWN_WEBHOOK_DELIVERY_ERROR: &str = "discord unknown webhook";
 
-const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
 /// Discord's select-option description and select-option label length limits
 /// (`twilight-validate`'s `SELECT_OPTION_DESCRIPTION_LENGTH`/label bound); `payload_json` bypasses
@@ -103,7 +102,6 @@ pub async fn deliver_live_message(
     content: &str,
     nonce: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    let nonce = bounded_nonce(nonce);
     let payload = serde_json::json!({
         PAYLOAD_CONTENT_KEY: content,
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
@@ -349,7 +347,42 @@ pub async fn deliver_transition_card(
     message: &TransitionMessage,
     nonce: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    deliver_payload(client, channel, &message.description, Some(message), nonce).await
+    let embed = Embed {
+        author: None,
+        color: Some(message.color),
+        description: Some(message.description.clone()),
+        fields: Vec::new(),
+        footer: None,
+        image: None,
+        kind: "rich".into(),
+        provider: None,
+        thumbnail: None,
+        timestamp: None,
+        title: None,
+        url: None,
+        video: None,
+    };
+    let mention_user = message.mention_user.as_deref();
+    let message_content = mention_user
+        .map(|owner_id| format!("<@{owner_id}>"))
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        PAYLOAD_CONTENT_KEY: message_content,
+        PAYLOAD_EMBEDS_KEY: [embed],
+        ALLOWED_MENTIONS_KEY: allowed_mentions(mention_user),
+        "nonce": nonce,
+        "enforce_nonce": true,
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    client
+        .create_message(channel)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| map_send_error(&error))?
+        .model()
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
 }
 
 /// Expires an informational blocked-pane card after the pane leaves `blocked`.
@@ -424,9 +457,8 @@ fn permission_card_description(tool: &str, command: &str) -> String {
     let tool_prefix = "Tool: `";
     let tool_suffix = "`\nCommand:\n```\n";
     let suffix = "\n```";
-    let content_limit = MAX_PERMISSION_DESCRIPTION_LENGTH.saturating_sub(
-        tool_prefix.chars().count() + tool_suffix.chars().count() + suffix.chars().count(),
-    );
+    let content_limit = MAX_PERMISSION_DESCRIPTION_LENGTH
+        - (tool_prefix.chars().count() + tool_suffix.chars().count() + suffix.chars().count());
     let tool_limit = content_limit / 2;
     let sanitized_tool = tool
         .chars()
@@ -437,7 +469,7 @@ fn permission_card_description(tool: &str, command: &str) -> String {
     let bounded_tool = if tool_length > tool_limit {
         let mut bounded = sanitized_tool
             .chars()
-            .take(tool_limit.saturating_sub(1))
+            .take(tool_limit - 1)
             .collect::<String>();
         bounded.push('…');
         bounded
@@ -445,8 +477,8 @@ fn permission_card_description(tool: &str, command: &str) -> String {
         sanitized_tool
     };
     let prefix = format!("{tool_prefix}{bounded_tool}{tool_suffix}");
-    let command_limit = MAX_PERMISSION_DESCRIPTION_LENGTH
-        .saturating_sub(prefix.chars().count() + suffix.chars().count());
+    let command_limit =
+        MAX_PERMISSION_DESCRIPTION_LENGTH - (prefix.chars().count() + suffix.chars().count());
     let sanitized_command = command
         .chars()
         .map(|character| if character == '`' { 'ˋ' } else { character })
@@ -455,7 +487,7 @@ fn permission_card_description(tool: &str, command: &str) -> String {
     let bounded_command = if command_length > command_limit {
         let mut bounded = sanitized_command
             .chars()
-            .take(command_limit.saturating_sub(1))
+            .take(command_limit - 1)
             .collect::<String>();
         bounded.push('…');
         bounded
@@ -569,11 +601,7 @@ pub async fn deliver_question_select_card(
 
 fn question_card_title(header: &str) -> String {
     let sanitized: String = header.chars().filter(|c| !c.is_control()).collect();
-    if sanitized.trim().is_empty() {
-        "Claude question".to_owned()
-    } else {
-        format!("Claude question: {sanitized}")
-    }
+    format!("Claude question: {sanitized}")
 }
 
 fn question_card_description(question: &str) -> String {
@@ -586,7 +614,7 @@ pub fn truncate_with_ellipsis(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_owned();
     }
-    let mut truncated: String = value.chars().take(limit.saturating_sub(1)).collect();
+    let mut truncated: String = value.chars().take(limit - 1).collect();
     truncated.push('…');
     truncated
 }
@@ -689,74 +717,11 @@ pub async fn expire_question_select_card(
     Ok(())
 }
 
-async fn deliver_payload(
-    client: &twilight_http::Client,
-    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    content: &str,
-    card: Option<&TransitionMessage>,
-    nonce: &str,
-) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    let nonce = bounded_nonce(nonce);
-    let embed = Embed {
-        author: None,
-        color: card.map(|message| message.color),
-        description: Some(content.to_owned()),
-        fields: Vec::new(),
-        footer: None,
-        image: None,
-        kind: "rich".into(),
-        provider: None,
-        thumbnail: None,
-        timestamp: None,
-        title: None,
-        url: None,
-        video: None,
-    };
-    let allowed = allowed_mentions(card);
-    let message_content = card
-        .and_then(|message| message.mention.as_deref())
-        .unwrap_or_default();
-    let payload = serde_json::json!({
-        PAYLOAD_CONTENT_KEY: message_content,
-        PAYLOAD_EMBEDS_KEY: [embed],
-        ALLOWED_MENTIONS_KEY: allowed,
-        "nonce": nonce,
-        "enforce_nonce": true,
-    });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
-    client
-        .create_message(channel)
-        .payload_json(&payload)
-        .await
-        .map_err(|error| map_send_error(&error))?
-        .model()
-        .await
-        .map(|message| message.id)
-        .map_err(|error| error.to_string())
-}
-
-fn allowed_mentions(card: Option<&TransitionMessage>) -> Value {
-    let Some(owner_mention) = card.and_then(|message| message.mention.as_deref()) else {
-        return json!({ALLOWED_MENTIONS_PARSE_KEY: []});
-    };
-    let Some(owner_id) = owner_mention
-        .strip_prefix("<@")
-        .and_then(|mention| mention.strip_suffix('>'))
-        .filter(|owner_id| !owner_id.is_empty())
-    else {
-        return json!({ALLOWED_MENTIONS_PARSE_KEY: []});
-    };
-    json!({ALLOWED_MENTIONS_PARSE_KEY: [], "users": [owner_id]})
-}
-
-fn bounded_nonce(nonce: &str) -> String {
-    if nonce.len() <= MAX_DISCORD_NONCE_LENGTH {
-        return nonce.to_owned();
-    }
-    let digest = nonce.bytes().fold(0_u64, |value, byte| {
-        value.wrapping_mul(257).wrapping_add(u64::from(byte))
-    });
-    format!("{digest:016x}")
+fn allowed_mentions(mention_user: Option<&str>) -> Value {
+    mention_user.map_or_else(
+        || json!({ALLOWED_MENTIONS_PARSE_KEY: []}),
+        |owner_id| json!({ALLOWED_MENTIONS_PARSE_KEY: [], "users": [owner_id]}),
+    )
 }
 
 fn transition_card_nonce_for_start(
@@ -780,20 +745,11 @@ fn process_start_component() -> u64 {
     *PROCESS_START_COMPONENT.get_or_init(new_process_start_component)
 }
 
-#[ctor::ctor]
-fn initialize_process_start_component() {
-    let _ = PROCESS_START_COMPONENT.set(new_process_start_component());
-}
-
 fn new_process_start_component() -> u64 {
-    let startup_millis = SystemTime::now()
+    let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration
-                .as_secs()
-                .saturating_mul(1_000)
-                .saturating_add(u64::from(duration.subsec_millis()))
-        });
+        .unwrap_or_else(|error| error.duration());
+    let startup_millis = since_epoch.as_secs() * 1_000 + u64::from(since_epoch.subsec_millis());
     let process_id = u64::from(std::process::id());
     startup_millis
         .rotate_left(17)
@@ -805,28 +761,25 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        MAX_DISCORD_NONCE_LENGTH, MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions,
-        live_message_nonce, owner_avatar_url, owner_display_name, permission_card_description,
-        permission_card_title, transition_card_nonce_for_start,
+        MAX_PERMISSION_DESCRIPTION_LENGTH, allowed_mentions, live_message_nonce, owner_avatar_url,
+        owner_display_name, permission_card_description, permission_card_title,
+        transition_card_nonce_for_start,
     };
-    use crate::cards::TransitionMessage;
     use crate::permission::PermissionVendor;
     use twilight_model::id::Id;
     use twilight_model::util::ImageHash;
 
+    /// Discord's limit on a message nonce.
+    const MAX_DISCORD_NONCE_LENGTH: usize = 25;
+
     #[test]
     fn allowed_mentions_only_allows_the_blocked_card_owner() {
-        let blocked = TransitionMessage {
-            description: "blocked".to_owned(),
-            color: 0,
-            mention: Some("<@42>".to_owned()),
-        };
         let cases = [
             (None, json!({"parse": []})),
-            (Some(&blocked), json!({"parse": [], "users": ["42"]})),
+            (Some("42"), json!({"parse": [], "users": ["42"]})),
         ];
-        for (card, expected) in cases {
-            assert_eq!(allowed_mentions(card), expected);
+        for (mention_user, expected) in cases {
+            assert_eq!(allowed_mentions(mention_user), expected);
         }
     }
 
@@ -1073,14 +1026,8 @@ mod tests {
     }
 
     #[test]
-    fn question_card_title_falls_back_without_a_header() {
-        let cases = [
-            ("Color", "Claude question: Color"),
-            ("   ", "Claude question"),
-        ];
-        for (header, expected) in cases {
-            assert_eq!(question_card_title(header), expected);
-        }
+    fn question_card_title_names_the_header() {
+        assert_eq!(question_card_title("Color"), "Claude question: Color");
     }
 
     #[test]

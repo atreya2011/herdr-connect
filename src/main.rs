@@ -3735,7 +3735,7 @@ mod tests {
             .next()
             .expect("blocked transition produces a card");
         assert_eq!(card.description, expected_question);
-        assert_eq!(card.mention.as_deref(), Some("<@42>"));
+        assert_eq!(card.mention_user.as_deref(), Some("42"));
     }
 
     #[cfg(unix)]
