@@ -8009,6 +8009,320 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const OWNER_DELETE_LABEL: &str = "testrun-owner-delete";
+
+    /// How long the real gateway needs to identify and receive guild events before a deletion is
+    /// issued; the gateway exposes no readiness signal, and a delete sent earlier is never seen.
+    #[cfg(unix)]
+    const GATEWAY_READY_WAIT: Duration = Duration::from_secs(8);
+
+    /// Starts the real Discord gateway with the production owner-deletion handling against
+    /// `connection`, returning its task and the notices it logs.
+    #[cfg(unix)]
+    async fn start_owner_deletion_gateway(
+        connection: &super::DiscordConnection,
+    ) -> Result<
+        (
+            tokio::task::JoinHandle<Result<(), String>>,
+            std::sync::mpsc::Receiver<String>,
+        ),
+        String,
+    > {
+        let (notices_tx, notices_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(herdr_connect_rs::drive_gateway_with_components(
+            std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
+            None,
+            herdr_connect_rs::GatewayContext {
+                client: Arc::clone(&connection.0),
+                guild: connection.1,
+                owner_id: connection.2.clone(),
+                responder: Arc::clone(&connection.3),
+            },
+            notices_tx,
+            super::component_handler(Arc::clone(&connection.3)),
+        ));
+        tokio::time::sleep(GATEWAY_READY_WAIT).await;
+        Ok((task, notices_rx))
+    }
+
+    #[cfg(unix)]
+    fn deletion_errors(notices: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+        notices
+            .try_iter()
+            .filter(|notice| notice.contains("error"))
+            .collect()
+    }
+
+    /// Deletes a tab's Discord thread as the owner would and asserts Herdr closes that tab, the
+    /// sibling tab survives, and a later topology sync recreates no thread for the closed tab.
+    #[cfg(unix)]
+    async fn owner_thread_delete_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+        second_tab: &Tab,
+    ) -> Result<(), String> {
+        report_idle_with_session(&workspace.pane_id)?;
+        report_idle_with_session(&second_tab.pane_id)?;
+        let root_agent = snapshot_for_pane(&workspace.pane_id)?;
+        let second_agent = snapshot_for_pane(&second_tab.pane_id)?;
+        let tabs = [
+            matching_tab(&workspace.tab_id)?,
+            matching_tab(&second_tab.tab_id)?,
+        ];
+        let agents = [root_agent.clone(), second_agent.clone()];
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
+        let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
+        let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", second_route.workspace_id);
+        let channel = guild_channel_with_topic(guild, &topic).await?;
+        let second_suffix = format!(" [{}]", second_route.tab_id);
+        let root_suffix = format!(" [{}]", root_route.tab_id);
+        let thread = active_threads_for_guild(guild)
+            .await?
+            .into_iter()
+            .find(|thread| {
+                thread.parent_id == Some(channel.id)
+                    && thread
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with(&second_suffix))
+            })
+            .ok_or("sync did not create the second tab's thread")?;
+
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+            .await
+            .map_err(|error| error.to_string())?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let deleted = guild
+            .client
+            .delete_channel(thread.id)
+            .await
+            .map_err(|error| error.to_string());
+        let closed = if deleted.is_ok() {
+            wait_for_event(
+                &mut lifecycle,
+                "tab_closed",
+                &second_tab.tab_id,
+                "/data/tab_id",
+                None,
+                Duration::from_secs(20),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        gateway.abort();
+        deleted?;
+        closed.map_err(|error| format!("owner thread delete did not close the tab: {error}"))?;
+        if matching_tab(&second_tab.tab_id).is_ok() {
+            return Err("the deleted thread's Herdr tab is still listed".to_owned());
+        }
+        matching_tab(&workspace.tab_id)
+            .map_err(|error| format!("the sibling tab did not survive: {error}"))?;
+        let errors = deletion_errors(&notices);
+        if !errors.is_empty() {
+            return Err(format!("gateway reported errors: {errors:?}"));
+        }
+
+        let remaining_agents = [root_agent];
+        let remaining_tabs = [matching_tab(&workspace.tab_id)?];
+        sync_startup_topology(&connection, &remaining_agents, &remaining_tabs).await;
+        if thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
+            return Err("a thread was recreated for the closed tab".to_owned());
+        }
+        if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
+            return Err("the sibling tab's thread did not survive".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn owner_thread_delete_closes_the_herdr_tab() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(OWNER_DELETE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(OWNER_DELETE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-owner-delete-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create owner-delete test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let created = match create_workspace(OWNER_DELETE_LABEL, cwd) {
+            Ok(workspace) => match create_tab(OWNER_DELETE_LABEL, &workspace.id, cwd) {
+                Ok(second_tab) => Ok((workspace, second_tab)),
+                Err(error) => Err((Some(workspace.id), error)),
+            },
+            Err(error) => Err((None, error)),
+        };
+        let (workspace_id, result) = match created {
+            Ok((workspace, second_tab)) => {
+                let workspace_id = workspace.id.clone();
+                let outcome = owner_thread_delete_exercise(&guild, &workspace, &second_tab).await;
+                (Some(workspace_id), outcome)
+            }
+            Err((workspace_id, error)) => (workspace_id, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(OWNER_DELETE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(OWNER_DELETE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    /// Deletes a workspace's Discord channel as the owner would and asserts Herdr closes that
+    /// workspace and no channel is recreated for it.
+    #[cfg(unix)]
+    async fn owner_channel_delete_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+    ) -> Result<(), String> {
+        report_idle_with_session(&workspace.pane_id)?;
+        let agent = snapshot_for_pane(&workspace.pane_id)?;
+        let tabs = [matching_tab(&workspace.tab_id)?];
+        let agents = [agent.clone()];
+
+        let connection = discord_tuple(guild);
+        sync_startup_topology(&connection, &agents, &tabs).await;
+        let route = route_topology(&agents, &tabs, &agent.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let channel = guild_channel_with_topic(guild, &topic).await?;
+
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
+            .await
+            .map_err(|error| error.to_string())?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let deleted = guild
+            .client
+            .delete_channel(channel.id)
+            .await
+            .map_err(|error| error.to_string());
+        let closed = if deleted.is_ok() {
+            wait_for_event(
+                &mut lifecycle,
+                "workspace_closed",
+                &workspace.id,
+                "/data/workspace_id",
+                None,
+                Duration::from_secs(20),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        gateway.abort();
+        deleted?;
+        closed.map_err(|error| {
+            format!("owner channel delete did not close the workspace: {error}")
+        })?;
+        if remaining_workspaces(OWNER_DELETE_LABEL)? != 0 {
+            return Err("the deleted channel's Herdr workspace is still listed".to_owned());
+        }
+        let errors = deletion_errors(&notices);
+        if !errors.is_empty() {
+            return Err(format!("gateway reported errors: {errors:?}"));
+        }
+        if !channel_with_topic_is_absent(guild, &topic).await? {
+            return Err("a channel was recreated for the closed workspace".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn owner_channel_delete_closes_the_herdr_workspace() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_tabs(OWNER_DELETE_LABEL).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        assert_eq!(
+            remaining_workspaces(OWNER_DELETE_LABEL).expect("workspace.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+
+        let cwd_dir = std::env::temp_dir().join(format!(
+            "testrun-owner-delete-channel-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd_dir).expect("create owner-delete test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+
+        let (workspace_id, result) = match create_workspace(OWNER_DELETE_LABEL, cwd) {
+            Ok(workspace) => {
+                let outcome = owner_channel_delete_exercise(&guild, &workspace).await;
+                (Some(workspace.id), outcome)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        if let Some(workspace_id) = &workspace_id {
+            close_workspace(workspace_id);
+        }
+        let _ = fs::remove_dir_all(&cwd_dir);
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left = remaining_tabs(OWNER_DELETE_LABEL)
+            .expect("tab.list succeeds for the zero-leftover check");
+        let workspaces_left = remaining_workspaces(OWNER_DELETE_LABEL)
+            .expect("workspace.list succeeds for the zero-leftover check");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        assert_eq!(workspaces_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
     const STARTUP_RECONCILE_LABEL: &str = "testrun-startup-reconcile";
 
     /// Creates an orphan channel/thread pair and an orphan thread under a live workspace channel,

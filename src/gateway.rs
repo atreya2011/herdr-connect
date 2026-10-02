@@ -10,6 +10,7 @@ use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
 
 use crate::broker::PermissionResponder;
+use crate::deletion::{GuildDeletion, handle_guild_deletion};
 
 pub type ComponentHandler = Arc<
     dyn Fn(
@@ -99,7 +100,12 @@ async fn drive_gateway(
     let mut shard = Shard::with_config(ShardId::ONE, config);
     let owner_prompt_sender = spawn_owner_prompt_consumer();
     while let Some(item) = shard
-        .next_event(EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE)
+        .next_event(
+            EventTypeFlags::MESSAGE_CREATE
+                | EventTypeFlags::INTERACTION_CREATE
+                | EventTypeFlags::THREAD_DELETE
+                | EventTypeFlags::CHANNEL_DELETE,
+        )
         .await
     {
         let notice = match item {
@@ -120,6 +126,18 @@ async fn drive_gateway(
                 tokio::spawn(async move { handler(interaction.0).await });
                 "discord gateway interaction: INTERACTION_CREATE".to_owned()
             }
+            Ok(Event::ThreadDelete(thread)) if thread.guild_id == context.guild => {
+                spawn_deletion(&context, &notices, GuildDeletion::Thread(thread.id));
+                "discord gateway deletion: THREAD_DELETE".to_owned()
+            }
+            Ok(Event::ChannelDelete(channel)) if channel.guild_id == Some(context.guild) => {
+                spawn_deletion(
+                    &context,
+                    &notices,
+                    GuildDeletion::Channel(Box::new(channel.0)),
+                );
+                "discord gateway deletion: CHANNEL_DELETE".to_owned()
+            }
             Ok(_) => continue,
             Err(error) => format!("discord gateway error: {error}"),
         };
@@ -128,6 +146,16 @@ async fn drive_gateway(
         }
     }
     gateway_closed_result()
+}
+
+fn spawn_deletion(context: &GatewayContext, notices: &Sender<String>, deletion: GuildDeletion) {
+    let responder = Arc::clone(&context.responder);
+    let notices = notices.clone();
+    tokio::spawn(async move {
+        if let Err(error) = handle_guild_deletion(responder.topology_cache(), deletion).await {
+            let _ = notices.send(format!("discord owner deletion error: {error}"));
+        }
+    });
 }
 
 fn gateway_closed_result() -> Result<(), String> {
