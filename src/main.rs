@@ -2005,9 +2005,6 @@ async fn run_question_hook(
 /// `/proc` parent chain from the parent upward. Off Linux, at pid 1 or 0, on any `/proc` read
 /// error, or with no such ancestor this returns `None` so the caller keeps the card flow.
 fn cursor_agent_ancestor_argv() -> Option<Vec<String>> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
     let mut pid = proc_parent_pid("self")?;
     while pid > 1 {
         let entry = pid.to_string();
