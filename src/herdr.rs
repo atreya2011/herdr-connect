@@ -40,6 +40,7 @@ fn herdr_socket_path() -> Result<PathBuf, String> {
     std::env::var_os("HERDR_SOCKET_PATH").map_or_else(
         || {
             std::env::var_os(ENV_HOME)
+                .filter(|home| !home.is_empty())
                 .map(|home| Path::new(&home).join(".config/herdr/herdr.sock"))
                 .ok_or_else(|| "HOME is not configured and HERDR_SOCKET_PATH is unset".to_owned())
         },
