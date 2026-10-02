@@ -4396,10 +4396,15 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
+    /// Feeds a real `pane_created` event through the lifecycle handler. The snapshot doorbell that
+    /// follows the event also subscribes to status when the pane list changed, so no outcome tells
+    /// the membership resubscribe apart from the doorbell's own subscribe: the row pins the
+    /// subscription as an outcome of the whole handler, and the recorded snapshot as the
+    /// doorbell's own effect.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn lifecycle_created_resubscribes_status_and_doorbells() {
+    async fn lifecycle_created_subscribes_status_and_records_the_pane_snapshot() {
         assert_eq!(
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
             0,
@@ -4432,6 +4437,8 @@ mod tests {
                 Duration::from_secs(10),
             )
             .await?;
+            report_agent_state(&tab.pane_id, "idle")?;
+            let terminal_id = snapshot_for_pane(&tab.pane_id)?.terminal_id;
             handle_lifecycle_select_result(
                 Ok(pane_created),
                 None,
@@ -4445,6 +4452,9 @@ mod tests {
                     "pane_created did not add the pane to the runtime: {:?}",
                     runtime.pane_ids
                 ));
+            }
+            if !runtime.state.previous.contains_key(&terminal_id) {
+                return Err("pane_created did not run the snapshot doorbell".to_owned());
             }
             let status = runtime
                 .status
