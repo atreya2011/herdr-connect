@@ -494,7 +494,7 @@ mod tests {
             .expect("issue multiSelect token");
         assert_eq!(
             registry.pending_question_token("session-a"),
-            Some(issued.token.clone()),
+            Some(issued.token),
             "a thread reply must be able to answer a pending multiSelect card too"
         );
         assert_eq!(registry.pending_question_token("session-b"), None);
