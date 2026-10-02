@@ -2013,8 +2013,8 @@ fn encode_hook_decision(
         };
     };
     let output = match vendor {
-        PermissionVendor::Claude => encode_claude_decision(decision)?,
-        PermissionVendor::Codex => encode_codex_decision(decision)?,
+        PermissionVendor::Claude => encode_claude_decision(decision),
+        PermissionVendor::Codex => encode_codex_decision(decision),
         PermissionVendor::Cursor => encode_cursor_decision(decision)?,
     };
     Ok(Some(output))

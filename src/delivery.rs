@@ -108,7 +108,7 @@ pub async fn deliver_live_message(
         "nonce": nonce,
         "enforce_nonce": true,
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -300,7 +300,7 @@ pub async fn deliver_activity_message(
         PAYLOAD_CONTENT_KEY: content,
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -327,7 +327,7 @@ pub async fn update_activity_message(
         PAYLOAD_CONTENT_KEY: content,
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .update_message(channel, message)
         .payload_json(&payload)
@@ -373,7 +373,7 @@ pub async fn deliver_transition_card(
         "nonce": nonce,
         "enforce_nonce": true,
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -402,7 +402,7 @@ pub async fn expire_informational_card(
         PAYLOAD_COMPONENTS_KEY: [],
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .update_message(channel, message)
         .payload_json(&payload)
@@ -433,7 +433,7 @@ pub async fn deliver_permission_card(
         PAYLOAD_COMPONENTS_KEY: permission_components(token, false),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -514,7 +514,7 @@ pub async fn expire_permission_card(
         PAYLOAD_COMPONENTS_KEY: permission_components(token, true),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .update_message(channel, message)
         .payload_json(&payload)
@@ -554,7 +554,7 @@ pub async fn deliver_question_button_card(
         PAYLOAD_COMPONENTS_KEY: question_button_components(&question.options, token, false),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -587,7 +587,7 @@ pub async fn deliver_question_select_card(
         PAYLOAD_COMPONENTS_KEY: question_select_components(&question.options, token, false),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -681,7 +681,7 @@ pub async fn expire_question_button_card(
         PAYLOAD_COMPONENTS_KEY: question_button_components(options, token, true),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .update_message(channel, message)
         .payload_json(&payload)
@@ -708,7 +708,7 @@ pub async fn expire_question_select_card(
         PAYLOAD_COMPONENTS_KEY: question_select_components(options, token, true),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
-    let payload = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    let payload = payload.to_string().into_bytes();
     client
         .update_message(channel, message)
         .payload_json(&payload)

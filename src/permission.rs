@@ -234,20 +234,14 @@ pub fn decode_cursor_permission_request(input: &[u8]) -> Result<Interaction, Str
 }
 
 /// Encodes a broker decision in Claude's object-form hook response schema.
-///
-/// # Errors
-///
-/// Returns an error if the response cannot be serialized.
-pub fn encode_claude_decision(decision: &Decision) -> Result<Vec<u8>, String> {
+#[must_use]
+pub fn encode_claude_decision(decision: &Decision) -> Vec<u8> {
     encode_permission_decision(decision)
 }
 
 /// Encodes a broker decision in Codex's object-form `PermissionRequest` hook response schema.
-///
-/// # Errors
-///
-/// Returns an error if the response cannot be serialized.
-pub fn encode_codex_decision(decision: &Decision) -> Result<Vec<u8>, String> {
+#[must_use]
+pub fn encode_codex_decision(decision: &Decision) -> Vec<u8> {
     encode_permission_decision(decision)
 }
 
@@ -255,7 +249,7 @@ pub fn encode_codex_decision(decision: &Decision) -> Result<Vec<u8>, String> {
 ///
 /// # Errors
 ///
-/// Returns an error if a deny decision carries no message or the response cannot be serialized.
+/// Returns an error if a deny decision carries no message.
 pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     let output = match decision.behavior {
         DecisionBehavior::Allow => serde_json::json!({"permission": "allow"}),
@@ -267,7 +261,7 @@ pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
                 .ok_or("deny decision has no message")?,
         }),
     };
-    serde_json::to_vec(&output).map_err(|error| error.to_string())
+    Ok(output.to_string().into_bytes())
 }
 
 /// Returns whether a `cursor-agent` argv runs hands-off.
@@ -297,12 +291,13 @@ pub fn is_cursor_agent_argv(argv: &[String]) -> bool {
     })
 }
 
-fn encode_permission_decision(decision: &Decision) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&serde_json::json!({
+fn encode_permission_decision(decision: &Decision) -> Vec<u8> {
+    serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": PERMISSION_REQUEST_EVENT,
             "decision": decision,
         },
-    }))
-    .map_err(|error| error.to_string())
+    })
+    .to_string()
+    .into_bytes()
 }

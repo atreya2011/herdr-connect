@@ -122,7 +122,7 @@ pub fn format_question_answer(answer: &QuestionAnswer) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if `raw_tool_input` is not a JSON object or the response cannot be serialized.
+/// Returns an error if `raw_tool_input` is not a JSON object.
 pub fn encode_claude_question_decision(
     raw_tool_input: &serde_json::Value,
     answers: &BTreeMap<String, QuestionAnswer>,
@@ -131,20 +131,25 @@ pub fn encode_claude_question_decision(
         .as_object()
         .cloned()
         .ok_or_else(|| "AskUserQuestion tool_input is not a JSON object".to_owned())?;
-    let string_answers: BTreeMap<String, String> = answers
+    let answers = answers
         .iter()
-        .map(|(question, answer)| (question.clone(), format_question_answer(answer)))
+        .map(|(question, answer)| {
+            (
+                question.clone(),
+                serde_json::Value::String(format_question_answer(answer)),
+            )
+        })
         .collect();
-    let answers = serde_json::to_value(string_answers).map_err(|error| error.to_string())?;
-    updated_input.insert("answers".to_owned(), answers);
-    serde_json::to_vec(&serde_json::json!({
+    updated_input.insert("answers".to_owned(), serde_json::Value::Object(answers));
+    Ok(serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": ASK_QUESTION_EVENT,
             "permissionDecision": "allow",
             "updatedInput": updated_input,
         },
-    }))
-    .map_err(|error| error.to_string())
+    })
+    .to_string()
+    .into_bytes())
 }
 
 #[cfg(test)]

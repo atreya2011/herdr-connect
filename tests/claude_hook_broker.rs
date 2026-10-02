@@ -168,7 +168,7 @@ fn permission_fixtures_decode_and_encode_allow_and_deny() {
         let interaction = decode_claude_permission_request(payload.as_bytes())
             .unwrap_or_else(|error| panic!("{name} fixture decodes: {error}"));
         assert_eq!(interaction.tool_name, "Bash");
-        let encoded = encode_claude_decision(&decision).expect("decision encodes");
+        let encoded = encode_claude_decision(&decision);
         let value: Value = serde_json::from_slice(&encoded).expect("encoded decision is JSON");
         assert_eq!(
             value["hookSpecificOutput"]["hookEventName"],

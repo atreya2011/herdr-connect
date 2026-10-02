@@ -32,7 +32,7 @@ fn codex_permission_fixture_decodes_and_encodes_allow_and_deny() {
         ),
     ];
     for (decision, behavior, message) in cases {
-        let encoded = encode_codex_decision(&decision).expect("Codex decision encodes");
+        let encoded = encode_codex_decision(&decision);
         let value: Value = serde_json::from_slice(&encoded).expect("encoded decision is JSON");
         assert_eq!(
             value["hookSpecificOutput"]["hookEventName"],
