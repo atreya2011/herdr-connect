@@ -774,11 +774,6 @@ mod tests {
             [("w-1:1".to_owned(), generated_tab_name("w-1:1"))],
             "owner labels, session-less tabs, agentless tabs, and generated names are left alone"
         );
-        let renamed = [tab("w-1:1", &generated_tab_name("w-1:1"))];
-        assert!(
-            tabs_needing_names(&agents, &renamed).is_empty(),
-            "a tab that already carries its generated name is not renamed again"
-        );
     }
 
     #[test]

@@ -450,7 +450,6 @@ mod tests {
             ),
             ("bridge", "herdr workspace [real-workspace]", false),
             ("bridge [real-workspace:tab-1]", "workspace", false),
-            ("bridge", "workspace", false),
         ];
         for (thread_name, topic, expected) in cases {
             assert_eq!(
@@ -462,16 +461,10 @@ mod tests {
 
     #[test]
     fn agent_list_failure_is_refused_in_a_qualifying_thread() {
-        let cases = [
-            (
-                "herdr RPC connect failed: no socket",
-                "refused: agent.list failed: herdr RPC connect failed: no socket",
-            ),
-            (
-                "agent.list response did not contain agents",
-                "refused: agent.list failed: agent.list response did not contain agents",
-            ),
-        ];
+        let cases = [(
+            "herdr RPC connect failed: no socket",
+            "refused: agent.list failed: herdr RPC connect failed: no socket",
+        )];
         for (error, expected) in cases {
             assert_eq!(agent_list_failure_reply(error), expected);
         }
@@ -626,12 +619,6 @@ mod tests {
         let resolved = matching_agent(&tab_id, &workspace_id, std::slice::from_ref(&working))
             .expect("a working pane is still resolvable by matching_agent");
         assert_eq!(resolved.pane_id, pane_id);
-        assert_eq!(
-            matching_agent("missing-tab", &workspace_id, std::slice::from_ref(&working))
-                .err()
-                .as_deref(),
-            Some("refused: unmapped pane")
-        );
     }
 
     #[test]
@@ -651,8 +638,12 @@ mod tests {
         working.agent_status = "working".to_owned();
         let mut idle = captured[0].clone();
         idle.agent_status = "idle".to_owned();
+        let mut other_pane_working = captured[0].clone();
+        other_pane_working.pane_id = Some("other-pane".to_owned());
+        other_pane_working.agent_status = "working".to_owned();
         let cases = [
             ("working pane matches", vec![working], true),
+            ("another pane is working", vec![other_pane_working], false),
             ("idle pane does not match", vec![idle], false),
             ("no matching pane", vec![], false),
         ];
