@@ -7294,6 +7294,11 @@ mod tests {
             }
             Err(error) => (None, Err(error)),
         };
+        let topic = format!("herdr workspace [{workspace_id}]");
+        let thread_cleanup = match &tab_id {
+            Some(tab_id) => delete_tab_threads(&guild, &topic, tab_id).await,
+            None => Ok(()),
+        };
         if let Some(tab_id) = &tab_id {
             close_tab(tab_id);
         }
@@ -7301,8 +7306,22 @@ mod tests {
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
+        assert!(thread_cleanup.is_ok(), "{thread_cleanup:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
         if let Some(tab_id) = &tab_id {
+            if let Some(channel) = guild_channels_for_guild(&guild)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+            {
+                assert!(
+                    !thread_with_suffix_survives(&guild, channel.id, &format!(" [{tab_id}]"))
+                        .await
+                        .unwrap(),
+                    "named zero-leftover check"
+                );
+            }
             let tabs = tab_list_result().expect("tab.list succeeds for the zero-leftover check");
             assert!(
                 !tabs.iter().any(|listed| &listed.tab_id == tab_id),
@@ -7641,6 +7660,39 @@ mod tests {
         let archived =
             herdr_connect_rs::archived_threads(guild.client.as_ref(), channel_id).await?;
         Ok(archived.iter().any(has_suffix))
+    }
+
+    /// Deletes every thread named `... [<tab_id>]` under the channel whose topic is `topic`, active
+    /// or archived. A tab in the shared real workspace mirrors into a channel that does not start
+    /// with `testrun-`, so the prefix-based cleanup never reaches its thread.
+    #[cfg(unix)]
+    async fn delete_tab_threads(
+        guild: &BlockedCaptureGuild,
+        topic: &str,
+        tab_id: &str,
+    ) -> Result<(), String> {
+        let Some(channel) = guild_channels_for_guild(guild)
+            .await?
+            .into_iter()
+            .find(|channel| channel.topic.as_deref() == Some(topic))
+        else {
+            return Ok(());
+        };
+        let suffix = format!(" [{tab_id}]");
+        let mut threads = active_threads_for_guild(guild)
+            .await?
+            .into_iter()
+            .filter(|thread| thread.parent_id == Some(channel.id))
+            .collect::<Vec<_>>();
+        threads
+            .extend(herdr_connect_rs::archived_threads(guild.client.as_ref(), channel.id).await?);
+        for thread in threads
+            .iter()
+            .filter(|thread| thread.name.as_deref().is_some_and(|n| n.ends_with(&suffix)))
+        {
+            blocked_capture_delete_thread(guild, thread.id).await?;
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
