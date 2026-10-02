@@ -255,48 +255,6 @@ impl QuestionRegistry {
             expiry,
         })
     }
-    /// Inserts a supplied token for deterministic state-machine tests.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid lifetimes, empty tokens, or collisions.
-    #[cfg(test)]
-    fn issue_with_token(
-        &self,
-        token: String,
-        request: ApprovalRequest,
-        created_at: Instant,
-        expiry: Instant,
-    ) -> Result<IssuedQuestion, String> {
-        if token.is_empty() || expiry <= created_at {
-            return Err("invalid question registry entry".to_owned());
-        }
-        let (sender, receiver) = oneshot::channel();
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| "question registry lock poisoned".to_owned())?;
-        if entries.contains_key(&token) {
-            return Err("question token collision".to_owned());
-        }
-        entries.insert(
-            token.clone(),
-            QuestionEntry {
-                request,
-                options: Vec::new(),
-                created_at,
-                expiry,
-                hook_alive: Arc::new(AtomicBool::new(true)),
-                sender,
-            },
-        );
-        drop(entries);
-        Ok(IssuedQuestion {
-            token,
-            receiver,
-            expiry,
-        })
-    }
     /// The label of `index` among the token's own options, if the token is still pending.
     pub fn option_label(&self, token: &str, index: usize) -> Option<String> {
         self.entries.lock().ok().and_then(|entries| {
@@ -502,11 +460,12 @@ mod tests {
         let now = Instant::now();
         let registry = QuestionRegistry::default();
         let issued = registry
-            .issue_with_token(
-                "token".to_owned(),
+            .issue_with_liveness(
                 request(7, "session"),
+                Vec::new(),
                 now,
                 now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
             )
             .expect("issue token");
         assert_eq!(
@@ -524,17 +483,18 @@ mod tests {
     fn pending_question_token_finds_a_multi_select_card_too() {
         let now = Instant::now();
         let registry = QuestionRegistry::default();
-        registry
-            .issue_with_token(
-                "multi-select-token".to_owned(),
+        let issued = registry
+            .issue_with_liveness(
                 request(7, "session-a"),
+                Vec::new(),
                 now,
                 now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
             )
             .expect("issue multiSelect token");
         assert_eq!(
             registry.pending_question_token("session-a"),
-            Some("multi-select-token".to_owned()),
+            Some(issued.token.clone()),
             "a thread reply must be able to answer a pending multiSelect card too"
         );
         assert_eq!(registry.pending_question_token("session-b"), None);
@@ -545,11 +505,12 @@ mod tests {
         let now = Instant::now();
         let registry = QuestionRegistry::default();
         let issued = registry
-            .issue_with_token(
-                "opaque-question-token".to_owned(),
+            .issue_with_liveness(
                 request(7, "session"),
+                Vec::new(),
                 now,
                 now + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(true)),
             )
             .expect("issue token");
         registry
@@ -566,7 +527,7 @@ mod tests {
         );
         assert_eq!(
             registry.resolve(
-                "opaque-question-token",
+                &issued.token,
                 7,
                 QuestionAnswer::Single("Red".to_owned()),
                 now,
