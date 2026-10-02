@@ -34,13 +34,14 @@ const TARGET_KEY: &str = "target";
 
 static RPC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn herdr_socket_path() -> String {
-    std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
-        format!(
-            "{}/.config/herdr/herdr.sock",
-            std::env::var(ENV_HOME).unwrap_or_default()
-        )
-    })
+/// The Herdr socket path: `HERDR_SOCKET_PATH`, else `$HOME/.config/herdr/herdr.sock`.
+fn herdr_socket_path() -> Result<String, String> {
+    if let Ok(path) = std::env::var("HERDR_SOCKET_PATH") {
+        return Ok(path);
+    }
+    let home = std::env::var(ENV_HOME)
+        .map_err(|_| "HOME is not configured and HERDR_SOCKET_PATH is unset".to_owned())?;
+    Ok(format!("{home}/.config/herdr/herdr.sock"))
 }
 
 fn next_rpc_id() -> String {
@@ -80,10 +81,7 @@ fn request_rpc_result_with_params_and_timeout(
     params: &Value,
     read_timeout: Duration,
 ) -> Result<String, String> {
-    if !params.is_object() {
-        return Err("herdr RPC params must be a JSON object".to_owned());
-    }
-    let path = herdr_socket_path();
+    let path = herdr_socket_path()?;
     let id = next_rpc_id();
     let request = serde_json::json!({RPC_ID_KEY: id, "method": method, "params": params});
     let result = (|| -> Result<Value, String> {
@@ -127,7 +125,10 @@ fn request_rpc_result_with_params_and_timeout(
                 "herdr returned response id {returned_id} for request {id}"
             ));
         }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("herdr {method} response has neither result nor error"))
     })();
     result.map(|value| value.to_string())
 }
@@ -283,20 +284,21 @@ pub fn generated_tab_name(tab_id: &str) -> String {
         .join("-")
 }
 
-/// The `(tab_id, name)` renames due.
+/// The `(index into tabs, name)` renames due.
 ///
 /// Due tabs have a numeric label and carry a session-reporting agent. Owner-given labels, tabs
 /// that already carry a generated name, and tabs the bridge does not mirror are never listed.
 #[must_use]
-fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(String, String)> {
+fn tabs_needing_names(agents: &[AgentSnapshot], tabs: &[HerdrTab]) -> Vec<(usize, String)> {
     tabs.iter()
-        .filter(|tab| is_numeric_label(&tab.label))
-        .filter(|tab| {
+        .enumerate()
+        .filter(|(_, tab)| is_numeric_label(&tab.label))
+        .filter(|(_, tab)| {
             agents.iter().any(|agent| {
                 agent.session.is_some() && agent.tab_id.as_deref() == Some(tab.tab_id.as_str())
             })
         })
-        .map(|tab| (tab.tab_id.clone(), generated_tab_name(&tab.tab_id)))
+        .map(|(index, tab)| (index, generated_tab_name(&tab.tab_id)))
         .collect()
 }
 
@@ -311,12 +313,11 @@ pub fn name_unlabeled_tabs<S: BuildHasher>(
     reported: &mut HashSet<String, S>,
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    for (tab_id, name) in tabs_needing_names(agents, tabs) {
+    for (index, name) in tabs_needing_names(agents, tabs) {
+        let tab_id = tabs[index].tab_id.clone();
         let outcome = tab_rename(&tab_id, &name);
-        if outcome.is_ok()
-            && let Some(tab) = tabs.iter_mut().find(|tab| tab.tab_id == tab_id)
-        {
-            tab.label = name;
+        if outcome.is_ok() {
+            tabs[index].label = name;
         }
         errors.extend(rename_failure_to_report(&tab_id, outcome, reported));
     }
@@ -473,16 +474,11 @@ impl From<SubscribeError> for String {
 ///
 /// # Errors
 ///
-/// Returns connect, timeout, protocol, empty-subscription, or Herdr-declared errors.
+/// Returns connect, timeout, protocol, or Herdr-declared errors.
 pub async fn subscribe_herdr_events(
     subscriptions: &[Value],
 ) -> Result<HerdrSubscription, SubscribeError> {
-    if subscriptions.is_empty() {
-        return Err(SubscribeError::Other(
-            "herdr events.subscribe requires at least one subscription".to_owned(),
-        ));
-    }
-    let path = herdr_socket_path();
+    let path = herdr_socket_path().map_err(SubscribeError::Other)?;
     let id = next_rpc_id();
     let request = json!({
         RPC_ID_KEY: id,
@@ -771,7 +767,7 @@ mod tests {
         ];
         assert_eq!(
             tabs_needing_names(&agents, &tabs),
-            [("w-1:1".to_owned(), generated_tab_name("w-1:1"))],
+            [(0, generated_tab_name("w-1:1"))],
             "owner labels, session-less tabs, agentless tabs, and generated names are left alone"
         );
     }
