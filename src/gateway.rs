@@ -76,27 +76,12 @@ async fn process_owner_prompt(request: OwnerPromptRequest) {
 /// Returns an error when the Discord gateway terminates.
 pub async fn drive_gateway_with_components(
     token: String,
-    gateway_url: Option<String>,
-    context: GatewayContext,
-    notices: Sender<String>,
-    components: ComponentHandler,
-) -> Result<(), String> {
-    drive_gateway(token, gateway_url, context, notices, components).await
-}
-
-async fn drive_gateway(
-    token: String,
-    gateway_url: Option<String>,
     context: GatewayContext,
     notices: Sender<String>,
     components: ComponentHandler,
 ) -> Result<(), String> {
     let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
-    let builder = ConfigBuilder::new(token, intents);
-    let config = match gateway_url {
-        Some(url) => builder.proxy_url(url).build(),
-        None => builder.build(),
-    };
+    let config = ConfigBuilder::new(token, intents).build();
     let mut shard = Shard::with_config(ShardId::ONE, config);
     let owner_prompt_sender = spawn_owner_prompt_consumer();
     while let Some(item) = shard

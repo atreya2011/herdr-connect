@@ -1816,7 +1816,6 @@ async fn discord_connection(
     ));
     let gateway = tokio::spawn(drive_gateway_with_components(
         config.token,
-        None,
         GatewayContext {
             client: Arc::clone(&client),
             guild,
@@ -8252,7 +8251,6 @@ mod tests {
         let (notices_tx, notices_rx) = std::sync::mpsc::channel();
         let task = tokio::spawn(herdr_connect_rs::drive_gateway_with_components(
             std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
-            None,
             herdr_connect_rs::GatewayContext {
                 client: Arc::clone(&connection.0),
                 guild: connection.1,
