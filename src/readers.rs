@@ -402,7 +402,7 @@ pub fn read_cursor_incremental(
     let mut new_last_rowid = last_rowid;
     let mut texts = Vec::new();
     for (rowid, record) in rows {
-        new_last_rowid = new_last_rowid.max(rowid);
+        new_last_rowid = rowid;
         let data = &record;
         if data.get(ROLE_KEY).and_then(Value::as_str) != Some(ASSISTANT_ROLE_VALUE) {
             continue;
@@ -473,7 +473,7 @@ pub fn read_cursor_prompts_incremental(
     let mut new_last_rowid = last_rowid;
     let mut prompts = Vec::new();
     for (rowid, record) in rows {
-        new_last_rowid = new_last_rowid.max(rowid);
+        new_last_rowid = rowid;
         let data = &record;
         if data.get(ROLE_KEY).and_then(Value::as_str) != Some(USER_ROLE_VALUE) {
             continue;
