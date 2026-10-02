@@ -350,13 +350,11 @@ async fn expire_blocked_card(
 }
 
 async fn expire_departed_card(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     terminal: &str,
     card: InformationalCard,
 ) {
-    let Some((client, ..)) = discord else {
-        return;
-    };
+    let (client, ..) = discord;
     if let Err(error) = expire_informational_card(
         client.as_ref(),
         card.channel,
@@ -1463,13 +1461,11 @@ async fn cached_route_channel(
 /// channel) clears the shared topology cache and logs; the next frame drops until the cache-first
 /// route is repopulated by other traffic. It does not re-resolve and retry inside this call.
 async fn handle_activity_event(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     frame: ActivityFrame,
     state: &mut BridgeState,
 ) {
-    let Some((client, _, _, responder, _)) = discord else {
-        return;
-    };
+    let (client, _, _, responder, _) = discord;
     let route = TopologyRoute {
         workspace_id: frame.workspace_id,
         tab_id: frame.tab_id,
@@ -2358,7 +2354,7 @@ async fn doorbell_unless_shutdown(
 }
 
 async fn bridge_event_loop(
-    discord: Option<&DiscordConnection>,
+    discord: &DiscordConnection,
     gateway: &mut Option<GatewayTask>,
     broker: &mut Option<BrokerTask>,
     stop: &mut tokio::signal::unix::Signal,
@@ -2367,17 +2363,17 @@ async fn bridge_event_loop(
     loop {
         tokio::select! {
             result = runtime.lifecycle.next_event() => {
-                if !handle_lifecycle_select_result(result, discord, stop, broker, runtime).await {
+                if !handle_lifecycle_select_result(result, Some(discord), stop, broker, runtime).await {
                     break;
                 }
             }
             result = next_status_event(&mut runtime.status) => {
-                if !handle_status_select_result(result, discord, stop, broker, runtime).await {
+                if !handle_status_select_result(result, Some(discord), stop, broker, runtime).await {
                     break;
                 }
             }
             Some(terminal) = runtime.live_events.recv() => {
-                handle_live_event(discord, &terminal, &mut runtime.state).await;
+                handle_live_event(Some(discord), &terminal, &mut runtime.state).await;
             }
             Some(frame) = runtime.activity_events.recv() => {
                 handle_activity_event(discord, frame, &mut runtime.state).await;
@@ -2628,8 +2624,10 @@ async fn apply_herdr_snapshot(
         .retain(|terminal, _| current_terminals.contains(terminal));
     let departed_cards =
         prune_departed_state(state, &current_terminals, &current_panes, &current_tabs);
-    for (terminal, card) in departed_cards {
-        expire_departed_card(discord, &terminal, card).await;
+    if let Some(discord) = discord {
+        for (terminal, card) in departed_cards {
+            expire_departed_card(discord, &terminal, card).await;
+        }
     }
     for snapshot in &agents {
         process_snapshot(snapshot, &agents, &tabs, discord, state).await;
@@ -2688,7 +2686,6 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
     let (connection, gateway) = discord_connection(Arc::clone(&topology_cache)).await?;
     let mut broker = start_broker(&connection, activity_tx);
-    let discord = Some(connection);
     let mut gateway = Some(gateway);
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
@@ -2718,7 +2715,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         activity_events,
     };
     if !doorbell_unless_shutdown(
-        discord.as_ref(),
+        Some(&connection),
         &mut runtime.state,
         &mut runtime.pane_ids,
         &mut runtime.status,
@@ -2729,12 +2726,10 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Ok(());
     }
-    if let Some(discord) = discord.as_ref() {
-        spawn_archived_thread_registration(discord);
-        spawn_startup_topology_sweep(discord, &mut runtime.state.rename_errors_reported);
-    }
+    spawn_archived_thread_registration(&connection);
+    spawn_startup_topology_sweep(&connection, &mut runtime.state.rename_errors_reported);
     bridge_event_loop(
-        discord.as_ref(),
+        &connection,
         &mut gateway,
         &mut broker,
         &mut stop,
@@ -5736,7 +5731,7 @@ mod tests {
         let settled = loop {
             tokio::select! {
                 Some(frame) = activity_rx.recv() => {
-                    super::handle_activity_event(Some(connection), frame, state).await;
+                    super::handle_activity_event(connection, frame, state).await;
                 }
                 event = wait_for_event(
                     sub, "pane.agent_status_changed", pane_id, "/data/pane_id", None,
@@ -5905,7 +5900,7 @@ mod tests {
             .await
             .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
             .ok_or_else(|| "activity channel closed before the late frame arrived".to_owned())?;
-        super::handle_activity_event(Some(&connection), received, &mut state).await;
+        super::handle_activity_event(&connection, received, &mut state).await;
         let after_late_frame = thread_messages(guild, thread).await?;
         if after_late_frame != after_first_turn {
             return Err(format!(
@@ -6760,7 +6755,7 @@ mod tests {
             .await
             .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
             .ok_or_else(|| "activity channel closed before the late frame arrived".to_owned())?;
-        super::handle_activity_event(Some(&connection), received, &mut state).await;
+        super::handle_activity_event(&connection, received, &mut state).await;
         let after_late_frame = thread_messages(guild, thread).await?;
         if after_late_frame != after_first_turn {
             return Err(format!(
