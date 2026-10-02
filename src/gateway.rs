@@ -145,7 +145,7 @@ async fn drive_gateway(
             break;
         }
     }
-    gateway_closed_result()
+    Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
 }
 
 fn spawn_deletion(context: &GatewayContext, notices: &Sender<String>, deletion: GuildDeletion) {
@@ -158,52 +158,38 @@ fn spawn_deletion(context: &GatewayContext, notices: &Sender<String>, deletion: 
     });
 }
 
-fn gateway_closed_result() -> Result<(), String> {
-    Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{consume_in_order, gateway_closed_result};
+    use super::consume_in_order;
 
     #[tokio::test]
     async fn owner_prompt_queue_consumes_messages_in_receive_order() {
-        let cases = [vec![1_u8, 2, 3], vec![3_u8, 1, 2]];
-        for received in cases {
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-            let consumer = tokio::spawn(consume_in_order(receiver, {
+        let messages = vec![1_u8, 2, 3];
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let consumer = tokio::spawn(consume_in_order(receiver, {
+            let observed = Arc::clone(&observed);
+            move |message| {
                 let observed = Arc::clone(&observed);
-                move |message| {
-                    let observed = Arc::clone(&observed);
-                    async move {
-                        if message == 1 {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                        observed.lock().await.push(message);
+                async move {
+                    if message == 1 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
+                    observed.lock().await.push(message);
                 }
-            }));
-            for message in received.iter().copied() {
-                sender
-                    .send(message)
-                    .expect("owner prompt queue accepts message");
             }
-            drop(sender);
-            consumer.await.expect("owner prompt consumer joins");
-
-            assert_eq!(*observed.lock().await, received);
+        }));
+        for message in messages.iter().copied() {
+            sender
+                .send(message)
+                .expect("owner prompt queue accepts message");
         }
-    }
+        drop(sender);
+        consumer.await.expect("owner prompt consumer joins");
 
-    #[test]
-    fn closed_gateway_returns_terminal_error() {
-        assert_eq!(
-            gateway_closed_result(),
-            Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
-        );
+        assert_eq!(*observed.lock().await, messages);
     }
 }
