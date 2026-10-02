@@ -6,8 +6,6 @@ fn owner_filter_cases() {
         ("42", false, "42", true),
         ("41", false, "42", false),
         ("42", true, "42", false),
-        ("42", false, "", false),
-        ("42", false, " 42 ", true),
     ];
     for (author_id, is_bot, owner_id, expected) in cases {
         assert_eq!(

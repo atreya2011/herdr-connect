@@ -4,7 +4,7 @@
 //! message creation responses do not carry the guild identifier required by the gateway handler.
 
 use std::future::Future;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use twilight_http::Client;
@@ -121,24 +121,18 @@ pub async fn handle_owner_message(
             return Err(error);
         }
     };
-    if let Ok(agent) = matching_agent(tab_id, workspace_id, &agents)
-        && let Some(session_id) = agent.session.as_ref().map(|session| session.value.as_str())
-        && let Some(token) = responder.pending_question_token(session_id)
-    {
-        let response = match responder.resolve_question_text(
-            &token,
-            message.channel_id.get(),
-            &message.content,
-        ) {
-            Ok(()) => QUESTION_ANSWER_ACCEPTED_REPLY,
-            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
-                QUESTION_ANSWER_STALE_REPLY
-            }
-        };
+    let agent = match matching_agent(tab_id, workspace_id, &agents) {
+        Ok(agent) => agent,
+        Err(reason) => {
+            reply(&client, &message, &reason).await?;
+            return Ok(());
+        }
+    };
+    if let Some(response) = answer_pending_question(responder, agent, &message) {
         reply(&client, &message, response).await?;
         return Ok(());
     }
-    let pane_id = match resolve_prompt_pane(tab_id, workspace_id, &agents) {
+    let pane_id = match resolve_prompt_pane(agent) {
         Ok(target) => target,
         Err(reason) => {
             reply(&client, &message, &reason).await?;
@@ -165,6 +159,25 @@ pub async fn handle_owner_message(
     }
 }
 
+/// Consumes `message` as the free-text answer to the question pending for `agent`'s session, and
+/// returns the reply to post; `None` when no question is pending.
+fn answer_pending_question(
+    responder: &PermissionResponder,
+    agent: &AgentSnapshot,
+    message: &Message,
+) -> Option<&'static str> {
+    let session_id = agent.session.as_ref()?.value.as_str();
+    let token = responder.pending_question_token(session_id)?;
+    Some(
+        match responder.resolve_question_text(&token, message.channel_id.get(), &message.content) {
+            Ok(()) => QUESTION_ANSWER_ACCEPTED_REPLY,
+            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
+                QUESTION_ANSWER_STALE_REPLY
+            }
+        },
+    )
+}
+
 #[must_use]
 fn has_prompt_content(content: &str) -> bool {
     !content.trim().is_empty()
@@ -172,7 +185,7 @@ fn has_prompt_content(content: &str) -> bool {
 
 #[must_use]
 pub fn should_handle_owner_message(author_id: &str, is_bot: bool, owner_id: &str) -> bool {
-    !is_bot && !owner_id.trim().is_empty() && author_id == owner_id.trim()
+    !is_bot && author_id == owner_id
 }
 
 #[must_use]
@@ -217,12 +230,7 @@ fn matching_agent<'agents>(
     }
 }
 
-fn resolve_prompt_pane(
-    tab_id: &str,
-    workspace_id: &str,
-    agents: &[AgentSnapshot],
-) -> Result<String, String> {
-    let agent = matching_agent(tab_id, workspace_id, agents)?;
+fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
     let pane_id = agent
         .pane_id
         .as_deref()
@@ -251,7 +259,7 @@ fn resolve_prompt_pane(
 ///
 /// # Errors
 ///
-/// Returns Herdr submission or follow-up key press errors.
+/// Returns Herdr submission, follow-up key press, or pane-state errors.
 pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
     record_owner_prompt_submission(target, text);
     let result = (|| {
@@ -260,7 +268,7 @@ pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
             return result;
         }
         agent_send_keys(target, &["enter"])?;
-        if pane_left_idle(target, STALL_RECOVERY_POLL_BOUND) {
+        if pane_left_idle(target, STALL_RECOVERY_POLL_BOUND)? {
             return result;
         }
         agent_send_keys(target, &["ctrl+u"])?;
@@ -273,9 +281,9 @@ pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
 }
 
 fn record_owner_prompt_submission(pane_id: &str, text: &str) {
-    let Ok(mut suppressions) = OWNER_PROMPT_SUPPRESSIONS.lock() else {
-        return;
-    };
+    let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     suppressions.retain(|(_, _, expires)| *expires > now);
     suppressions.push((
@@ -286,9 +294,9 @@ fn record_owner_prompt_submission(pane_id: &str, text: &str) {
 }
 
 fn forget_owner_prompt_submission(pane_id: &str, text: &str) {
-    let Ok(mut suppressions) = OWNER_PROMPT_SUPPRESSIONS.lock() else {
-        return;
-    };
+    let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     if let Some(index) = suppressions
         .iter()
         .position(|(pane, expected, _)| pane == pane_id && expected == text)
@@ -304,9 +312,9 @@ fn forget_owner_prompt_submission(pane_id: &str, text: &str) {
 /// mirrors normally.
 #[must_use]
 pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
-    let Ok(mut suppressions) = OWNER_PROMPT_SUPPRESSIONS.lock() else {
-        return false;
-    };
+    let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     suppressions.retain(|(_, _, expires)| *expires > now);
     let Some(index) = suppressions
@@ -320,20 +328,23 @@ pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
 }
 
 /// Polls `list_agents` for up to `bound`, returning true as soon as `target`'s pane is observed
-/// with an `agent_status` other than `idle`.
-fn pane_left_idle(target: &str, bound: Duration) -> bool {
+/// with an `agent_status` other than `idle`, or false when `bound` elapses first.
+///
+/// # Errors
+///
+/// Returns the `agent.list` error: with the pane's state unknown, the caller must not clear and
+/// resubmit.
+fn pane_left_idle(target: &str, bound: Duration) -> Result<bool, String> {
     let start = Instant::now();
     loop {
-        let left_idle = list_agents().is_ok_and(|agents| {
-            agents.iter().any(|agent| {
-                agent.pane_id.as_deref() == Some(target) && agent.agent_status.trim() != STATUS_IDLE
-            })
+        let left_idle = list_agents()?.iter().any(|agent| {
+            agent.pane_id.as_deref() == Some(target) && agent.agent_status.trim() != STATUS_IDLE
         });
         if left_idle {
-            return true;
+            return Ok(true);
         }
         if start.elapsed() >= bound {
-            return false;
+            return Ok(false);
         }
         std::thread::sleep(STALL_RECOVERY_POLL_INTERVAL);
     }
@@ -584,7 +595,7 @@ mod tests {
         ];
         for (branch, tab_id, workspace_id, agents, expected) in cases {
             assert_eq!(
-                resolve_prompt_pane(tab_id, workspace_id, &agents),
+                matching_agent(tab_id, workspace_id, &agents).and_then(resolve_prompt_pane),
                 Err(expected.to_owned()),
                 "branch={branch}"
             );
