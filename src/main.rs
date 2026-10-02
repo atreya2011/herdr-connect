@@ -32,9 +32,10 @@ use herdr_connect_rs::{
     load_discord_config, name_unlabeled_tabs, read_claude_incremental,
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
     read_cursor_incremental, read_cursor_prompts_incremental, reconcile_topology_cache,
-    resolve_terminal_prompt_webhook, route_topology, split_live_message, status_subscriptions,
-    subscribe_herdr_events, sync_topology, tab_list_result, take_owner_prompt_suppression,
-    transition_card_nonce, workspace_channel_id, workspace_list_result,
+    register_archived_tab_threads, resolve_terminal_prompt_webhook, route_topology,
+    split_live_message, status_subscriptions, subscribe_herdr_events, sync_topology,
+    tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_channel_id,
+    workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -2436,6 +2437,21 @@ async fn apply_lifecycle_event(
     .await
 }
 
+/// Registers every workspace channel's archived tab threads in a task of its own, independent of
+/// Herdr and of the startup sweep, so an owner deletion of an archived thread whose tab has no
+/// session still resolves. A failure that survives the bounded retries is logged loudly.
+fn spawn_archived_thread_registration(discord: &DiscordConnection) {
+    let (client, guild, _, _) = discord;
+    let (client, guild) = (client.clone(), *guild);
+    tokio::spawn(async move {
+        if let Err(error) = register_archived_tab_threads(client.as_ref(), guild).await {
+            bridge_eprintln!(
+                "herdr archived thread registration FAILED, owner deletion of an archived tab thread may be ignored: {error}"
+            );
+        }
+    });
+}
+
 /// Spawns the startup topology sweep (one `list_agents`/`tab_list_result` snapshot, then
 /// `sync_startup_topology`) beside the caller rather than blocking it. Runs once, at process
 /// start, after the first doorbell, so it shares that pass's `rename_errors_reported` and logs
@@ -2738,6 +2754,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(discord) = discord.as_ref() {
+        spawn_archived_thread_registration(discord);
         spawn_startup_topology_sweep(discord, &mut runtime.state.rename_errors_reported);
     }
     bridge_event_loop(
