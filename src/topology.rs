@@ -596,26 +596,14 @@ pub fn forget_owned(id: Id<ChannelMarker>) {
 
 /// The Herdr tab id behind a deleted thread, from the durable registry.
 ///
-/// `parent_id` is the thread's parent from the gateway event. `Ok(None)` means the thread is not
-/// under a bridge workspace channel and is not the bridge's concern.
-///
-/// # Errors
-///
-/// Returns an error when the thread is under a bridge workspace channel but was never recorded as
-/// a bridge tab thread: the tab cannot be identified, so it would stay open unnoticed.
-pub fn resolve_owner_deleted_tab(
-    thread_id: Id<ChannelMarker>,
-    parent_id: Id<ChannelMarker>,
-) -> Result<Option<String>, String> {
-    let owned = owned_topology();
-    if let Some(thread) = owned.threads.get(&thread_id) {
-        return Ok(Some(thread.tab_id.clone()));
-    }
-    owned.workspaces.get(&parent_id).map_or(Ok(None), |workspace_id| {
-        Err(format!(
-            "deleted thread {thread_id} under workspace {workspace_id} was never recorded as a tab thread; its Herdr tab is unresolved"
-        ))
-    })
+/// The registry holds the thread of every live tab, so a thread it does not hold is not a tab
+/// thread (an owner-made thread, or one already forgotten) and is not the bridge's concern.
+#[must_use]
+pub fn resolve_owner_deleted_tab(thread_id: Id<ChannelMarker>) -> Option<String> {
+    owned_topology()
+        .threads
+        .get(&thread_id)
+        .map(|thread| thread.tab_id.clone())
 }
 
 /// The Herdr workspace id a deleted channel's `herdr workspace [id]` topic named, if it had one.
@@ -791,37 +779,18 @@ pub mod owner_deletion_tests {
             channel(8_023, "plain thread", None, Some(8_010)),
         ]);
         let cases = [
-            ("bridge tab thread", 8_020, 8_010, Ok(Some("w1:t2"))),
-            (
-                "thread under a non-workspace channel",
-                8_021,
-                8_011,
-                Ok(None),
-            ),
-            (
-                "unknown thread under an unknown parent",
-                8_099,
-                8_098,
-                Ok(None),
-            ),
+            ("bridge tab thread", 8_020, Some("w1:t2")),
+            ("thread under a non-workspace channel", 8_021, None),
+            ("suffix from another workspace", 8_022, None),
+            ("name without a tab suffix", 8_023, None),
+            ("thread never recorded", 8_099, None),
         ];
-        for (name, thread_id, parent, expected) in cases {
-            let resolved = resolve_owner_deleted_tab(id(thread_id), id(parent));
+        for (name, thread_id, expected) in cases {
             assert_eq!(
-                resolved,
-                expected.map(|tab| tab.map(str::to_owned)),
+                resolve_owner_deleted_tab(id(thread_id)).as_deref(),
+                expected,
                 "{name}"
             );
-        }
-        let unresolved = [
-            ("suffix from another workspace", 8_022),
-            ("name without a tab suffix", 8_023),
-            ("thread never recorded", 8_024),
-        ];
-        for (name, thread_id) in unresolved {
-            let error = resolve_owner_deleted_tab(id(thread_id), id(8_010))
-                .expect_err("an unrecorded thread under a workspace channel is an error");
-            assert!(error.contains("unresolved"), "{name}: {error}");
         }
     }
 
@@ -844,8 +813,8 @@ pub mod owner_deletion_tests {
             "the refetch dropped the older thread"
         );
         assert_eq!(
-            resolve_owner_deleted_tab(id(8_220), id(8_210)),
-            Ok(Some("w3:t1".to_owned())),
+            resolve_owner_deleted_tab(id(8_220)),
+            Some("w3:t1".to_owned()),
             "after reconcile"
         );
     }
@@ -858,13 +827,13 @@ pub mod owner_deletion_tests {
             channel(8_121, "b [w2:t2]", None, Some(8_110)),
         ]);
         forget_owned(id(8_120));
-        assert!(resolve_owner_deleted_tab(id(8_120), id(8_110)).is_err());
+        assert_eq!(resolve_owner_deleted_tab(id(8_120)), None);
         assert_eq!(
-            resolve_owner_deleted_tab(id(8_121), id(8_110)),
-            Ok(Some("w2:t2".to_owned()))
+            resolve_owner_deleted_tab(id(8_121)),
+            Some("w2:t2".to_owned())
         );
         forget_owned(id(8_110));
-        assert_eq!(resolve_owner_deleted_tab(id(8_121), id(8_110)), Ok(None));
+        assert_eq!(resolve_owner_deleted_tab(id(8_121)), None);
     }
 
     #[test]
