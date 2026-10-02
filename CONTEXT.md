@@ -25,7 +25,7 @@ The non-interactive Discord card posted when a pane goes blocked and no live per
 _Avoid_: Transition card, end card, notification, log dump
 
 **Reported session**:
-The vendor session identity supplied by the agent's Herdr integration. Codex supplies it correctly only when the pane runs `codex --no-daemon`; the shared daemon runs hooks with another pane's environment.
+The vendor session identity supplied by the agent's Herdr integration. Codex supplies it correctly only when the pane runs `codex --no-daemon`; the shared daemon runs hooks with another pane's environment. Codex reports it only when the first prompt is submitted, at the same moment it creates the session log.
 _Avoid_: Terminal session, inferred session
 
 **Owner prompt**:

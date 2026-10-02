@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use notify::Watcher;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,14 +132,21 @@ struct BridgeState {
     /// live text watch: when this pane's own session log finally appears, both baseline at 0 rather
     /// than at the current end, so the pane's own first prompt and reply are mirrored.
     ///
-    /// A pane first seen *without* any session records nothing here: it may later resolve to an
-    /// already-populated session (a relaunch straight into existing history, or a resume), whose
-    /// history predates the bridge and must never be replayed. A pane can also switch to a
+    /// A pane first seen *without* any session records nothing here but its first sighting in
+    /// [`BridgeState::seen_without_session`]: it may later resolve to an already-populated session
+    /// (a relaunch straight into existing history, or a resume), whose history predates the bridge
+    /// and must never be replayed. A pane can also switch to a
     /// *different*, already-populated session before its pending one's log ever appears; the
     /// recorded session identity is compared against the resolved one, so only the same session
     /// that was pending baselines at 0, and any other session gets the normal
     /// discard-what-already-exists baseline. Removed the moment a path resolves for this terminal.
     awaiting_first_log: HashMap<String, String>,
+    /// When the bridge first saw each terminal without a session. Codex creates its log and reports
+    /// its session only when the first prompt is submitted, so a session that first appears with a
+    /// log created after this moment is the pane's own fresh log and is read from position 0; a
+    /// log that predates it is history and is discarded. Removed once the terminal's baseline is
+    /// set.
+    seen_without_session: HashMap<String, SystemTime>,
     /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
     /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
     /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
@@ -1169,11 +1176,18 @@ async fn mirror_one_terminal_prompt<'a>(
 /// first seen without a session, then relaunched straight into existing history), or a different
 /// one that superseded the pending session -- gets the normal discard-what-already-exists baseline
 /// instead, and the stale pending record is dropped either way so it cannot later misapply to a
-/// third session. A permanent resolution error is logged and retried too, since resolving it costs
+/// third session. A pane first seen without a session is recorded in
+/// [`BridgeState::seen_without_session`]: Codex creates its log and reports its session only when
+/// the first prompt is submitted, so a log created after that first sighting is also the pane's own
+/// and baselines at 0, while a log that predates it is history and is discarded. A permanent resolution error is logged and retried too, since resolving it costs
 /// only a directory read.
 fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
     let terminal = &snapshot.terminal_id;
     let Some(session) = snapshot.session.as_ref() else {
+        state
+            .seen_without_session
+            .entry(terminal.clone())
+            .or_insert_with(SystemTime::now);
         return;
     };
     // Claude, Codex, and Cursor are the vendors whose logs are followed; `zero` is the baseline for
@@ -1204,6 +1218,16 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
         .awaiting_first_log
         .get(terminal)
         .is_some_and(|awaiting_session| awaiting_session == &session.value);
+    let created_after_first_sighting = match state.seen_without_session.get(terminal) {
+        Some(first_seen) => match fs::metadata(&path).and_then(|metadata| metadata.created()) {
+            Ok(created) => created > *first_seen,
+            Err(error) => {
+                bridge_eprintln!("terminal prompt baseline error for {terminal}: {error}");
+                return;
+            }
+        },
+        None => false,
+    };
     // Capture the prompt reader's and the live text watch's start positions together, from the one
     // log the pane resolves now, so no prompt written between two separate reads is mirrored
     // without its reply. When this pane's own session log has only just appeared, both start at 0
@@ -1211,7 +1235,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     // read that errors (Cursor creates its message table lazily on the first write) defers the
     // whole baseline -- and with it the watch -- to the next snapshot rather than baselining a log
     // that cannot be read yet.
-    let positions = if was_awaiting_this_session {
+    let positions = if was_awaiting_this_session || created_after_first_sighting {
         initial_live_position(zero, &path).map(|_| (zero, zero))
     } else {
         initial_terminal_prompt_position(zero, &path)
@@ -1220,6 +1244,7 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     match positions {
         Ok((prompt_position, live_position)) => {
             state.awaiting_first_log.remove(terminal);
+            state.seen_without_session.remove(terminal);
             state
                 .terminal_prompt_positions
                 .insert(terminal.clone(), (path, prompt_position, live_position));
@@ -1761,6 +1786,9 @@ fn prune_departed_state(
         .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .awaiting_first_log
+        .retain(|terminal, _| current_terminals.contains(terminal));
+    state
+        .seen_without_session
         .retain(|terminal, _| current_terminals.contains(terminal));
     state
         .rename_errors_reported
@@ -3061,6 +3089,116 @@ mod tests {
             );
         });
 
+        match original_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(&temp_home);
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Codex creates its rollout and reports its session only when the first prompt is submitted,
+    /// so the bridge first sees the pane with no session and later sees a session whose log
+    /// already holds the prompt. A log created after that first sighting is the pane's own and is
+    /// read from 0; a log that predates the sighting is history and is discarded.
+    #[test]
+    fn codex_log_created_after_the_pane_was_first_seen_without_a_session_is_read_from_zero() {
+        struct Case {
+            name: &'static str,
+            log_predates_first_sighting: bool,
+            expect_mirrored: bool,
+        }
+        let cases = [
+            Case {
+                name: "log created after the sessionless sighting",
+                log_predates_first_sighting: false,
+                expect_mirrored: true,
+            },
+            Case {
+                name: "log created before the sessionless sighting",
+                log_predates_first_sighting: true,
+                expect_mirrored: false,
+            },
+        ];
+        let original_home = std::env::var_os("HOME");
+        let temp_home = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-codex-first-turn-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_home);
+        // SAFETY: `cargo test -- --test-threads=1` (this crate's mandated invocation) serializes
+        // every test in this binary, so no other test observes HOME mid-mutation.
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+        }
+        let test_result = std::panic::catch_unwind(|| {
+            let rollout = "rollout-2026-09-28T09-50-11-00000000-0000-7000-8000-000000000001.jsonl";
+            let log_path = temp_home
+                .join(".codex-one/sessions/2026/09/28")
+                .join(rollout);
+            let write_log = || {
+                fs::create_dir_all(log_path.parent().expect("rollout has a parent"))
+                    .expect("create Codex sessions directory");
+                fs::copy(
+                    Path::new("tests/fixtures/codex-rollouts").join(rollout),
+                    &log_path,
+                )
+                .expect("copy committed Codex rollout fixture");
+            };
+            let snapshot = |session: Option<AgentSession>| AgentSnapshot {
+                agent: Some(VENDOR_CODEX.to_owned()),
+                terminal_id: "terminal-codex-first-turn".to_owned(),
+                agent_status: STATUS_IDLE.to_owned(),
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                pane_id: "w1:p1".to_owned(),
+                cwd: Some("/srv/bridge".to_owned()),
+                session,
+            };
+            let session = AgentSession {
+                agent: VENDOR_CODEX.to_owned(),
+                value: "00000000-0000-7000-8000-000000000001".to_owned(),
+            };
+            // Filesystem timestamps come from a coarse clock, so the creation and the first
+            // sighting are separated by more than its tick.
+            let tick = std::time::Duration::from_millis(50);
+            for case in &cases {
+                let _ = fs::remove_dir_all(&temp_home);
+                let mut state = BridgeState::default();
+                if case.log_predates_first_sighting {
+                    write_log();
+                    std::thread::sleep(tick);
+                }
+                maybe_establish_terminal_prompt_baseline(&snapshot(None), &mut state);
+                if !case.log_predates_first_sighting {
+                    std::thread::sleep(tick);
+                    write_log();
+                }
+                maybe_establish_terminal_prompt_baseline(
+                    &snapshot(Some(session.clone())),
+                    &mut state,
+                );
+                let (path, prompt_position, live_position) = state
+                    .terminal_prompt_positions
+                    .get("terminal-codex-first-turn")
+                    .unwrap_or_else(|| panic!("{}: baseline established", case.name));
+                assert_eq!(path, &log_path, "{}", case.name);
+                let (prompts, _) = read_new_terminal_prompts(path, *prompt_position)
+                    .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                let (texts, _) = super::read_new_live_texts(path, *live_position)
+                    .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                let texts: Vec<String> = texts.into_iter().map(|(text, _)| text).collect();
+                let (expected_prompts, expected_texts) = if case.expect_mirrored {
+                    (vec!["original prompt"], vec!["original answer"])
+                } else {
+                    (vec![], vec![])
+                };
+                assert_eq!(prompts, expected_prompts, "{}: prompts", case.name);
+                assert_eq!(texts, expected_texts, "{}: live texts", case.name);
+            }
+        });
         match original_home {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
             None => unsafe { std::env::remove_var("HOME") },
