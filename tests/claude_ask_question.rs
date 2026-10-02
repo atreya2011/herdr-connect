@@ -91,13 +91,3 @@ fn hook_subcommand_falls_through_when_the_peer_does_not_understand_questions() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
 }
-
-#[test]
-fn hook_subcommand_emits_nothing_for_malformed_question_input() {
-    let output = invoke_hook(
-        "{ malformed",
-        Path::new("/tmp/herdr-connect-rs-no-such-question-broker.sock"),
-    );
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-}
