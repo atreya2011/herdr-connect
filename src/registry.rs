@@ -25,7 +25,7 @@ fn generate_token() -> Result<String, String> {
         .map_err(|error| format!("cannot create interaction token: {error}"))?;
     let mut token = String::with_capacity(TOKEN_BYTES * 2);
     for byte in token_bytes {
-        write!(&mut token, "{byte:02x}").map_err(|_| "token formatting failed".to_owned())?;
+        let _ = write!(&mut token, "{byte:02x}");
     }
     Ok(token)
 }
