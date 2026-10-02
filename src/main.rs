@@ -660,11 +660,12 @@ fn resolve_session_path(
                         .is_some_and(|name| name == ".codex" || name.starts_with(".codex-"))
                 })
                 .collect::<Vec<_>>();
-            let roots = if roots.is_empty() {
-                vec![search_root.join(".codex")]
-            } else {
-                roots
-            };
+            if roots.is_empty() {
+                return Err(SessionPathError::Permanent(format!(
+                    "no Codex home (.codex or .codex-*) under {}",
+                    search_root.display()
+                )));
+            }
             let mut candidates = Vec::new();
             for root in roots {
                 collect_matching_paths(
@@ -3613,6 +3614,44 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn codex_session_search_without_a_codex_home_names_the_missing_home() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-connect-rs-codex-no-home-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create synthetic HOME directory");
+        let session = AgentSession {
+            agent: VENDOR_CODEX.to_owned(),
+            value: "no-home-session".to_owned(),
+        };
+        let snapshot = AgentSnapshot {
+            agent: Some(VENDOR_CODEX.to_owned()),
+            terminal_id: "codex-no-home-terminal".to_owned(),
+            agent_status: STATUS_DONE.to_owned(),
+            tab_id: None,
+            workspace_id: None,
+            pane_id: None,
+            cwd: Some("/srv/bridge".to_owned()),
+            session: Some(session.clone()),
+        };
+
+        let resolved = resolve_session_path(&root, &snapshot, &session);
+        fs::remove_dir_all(&root).expect("remove synthetic HOME directory");
+
+        assert_eq!(
+            resolved,
+            Err(SessionPathError::Permanent(format!(
+                "no Codex home (.codex or .codex-*) under {}",
+                root.display()
+            )))
+        );
     }
 
     /// One case in [`unique_existing_path_collapses_hard_linked_candidates`].
