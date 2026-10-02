@@ -2122,7 +2122,8 @@ fn parse_hook_args(
 
 /// Reads one harness `PreToolUse` hook payload from stdin and forwards it to the broker as an
 /// activity frame, always exiting 0 with no output: activity display is best-effort and must
-/// never fail the tool call it rides on.
+/// never fail the tool call it rides on. A hook run outside a Herdr pane has no workspace, tab or
+/// pane id to name, so it sends nothing.
 async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let Ok((vendor, requested_socket)) = parse_activity_args(args) else {
         return Ok(());
@@ -2142,12 +2143,19 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     else {
         return Ok(());
     };
+    let (Ok(workspace_id), Ok(tab_id), Ok(pane_id)) = (
+        std::env::var("HERDR_WORKSPACE_ID"),
+        std::env::var("HERDR_TAB_ID"),
+        std::env::var("HERDR_PANE_ID"),
+    ) else {
+        return Ok(());
+    };
     let frame = ActivityFrame {
         kind: ACTIVITY_KIND.to_owned(),
         vendor: vendor.to_owned(),
-        workspace_id: std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default(),
-        tab_id: std::env::var("HERDR_TAB_ID").unwrap_or_default(),
-        pane_id: std::env::var("HERDR_PANE_ID").unwrap_or_default(),
+        workspace_id,
+        tab_id,
+        pane_id,
         session_id: request.session_id,
         tool: request.tool,
         summary: request.summary,

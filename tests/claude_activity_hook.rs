@@ -116,6 +116,45 @@ async fn activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
 }
 
 #[tokio::test]
+async fn activity_subcommand_sends_no_frame_outside_a_herdr_pane() {
+    let path = socket_path("no-pane");
+    let listener = UnixListener::bind(&path).expect("bind test listener");
+    let output = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
+                .args(["activity", "--vendor", "claude", "--socket"])
+                .arg(&path)
+                .env("HERDR_WORKSPACE_ID", "w1")
+                .env("HERDR_TAB_ID", "w1:t1")
+                .env_remove("HERDR_PANE_ID")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn activity subcommand");
+            child
+                .stdin
+                .take()
+                .expect("activity stdin is piped")
+                .write_all(COMMAND_FIXTURE.as_bytes())
+                .expect("write activity payload");
+            child
+                .wait_with_output()
+                .expect("wait for activity subcommand")
+        }
+    })
+    .await
+    .expect("activity process task completes");
+    let frame = recv_frame(&listener).await;
+    let _ = std::fs::remove_file(&path);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "unexpected stdout");
+    assert_eq!(frame, None);
+}
+
+#[tokio::test]
 async fn codex_activity_subcommand_writes_the_expected_frame_by_tool_input_field() {
     let path = socket_path("command");
     let listener = UnixListener::bind(&path).expect("bind test listener");
