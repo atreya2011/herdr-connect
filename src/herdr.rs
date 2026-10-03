@@ -191,6 +191,15 @@ pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
     )
 }
 
+/// Types literal text into a pane, without a trailing Enter.
+///
+/// # Errors
+///
+/// Returns socket, protocol, or Herdr-declared errors.
+pub fn pane_send_text(pane_id: &str, text: &str) -> Result<String, String> {
+    request_rpc_result_with_params("pane.send_text", &json!({"pane_id": pane_id, "text": text}))
+}
+
 /// Closes one Herdr tab, ending its pane processes, through the bounded RPC socket.
 ///
 /// # Errors

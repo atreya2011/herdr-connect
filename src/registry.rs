@@ -10,7 +10,12 @@ use std::time::Instant;
 
 use tokio::sync::oneshot;
 
-use crate::Decision;
+use twilight_model::id::{
+    Id,
+    marker::{ChannelMarker, MessageMarker},
+};
+
+use crate::{Decision, Question};
 const TOKEN_BYTES: usize = 24;
 
 /// Generates one opaque, random hex token for a newly issued registry entry.
@@ -18,7 +23,7 @@ const TOKEN_BYTES: usize = 24;
 /// # Errors
 ///
 /// Returns an error when `/dev/urandom` cannot be read.
-fn generate_token() -> Result<String, String> {
+pub fn generate_token() -> Result<String, String> {
     let mut token_bytes = [0_u8; TOKEN_BYTES];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut token_bytes))
@@ -143,6 +148,44 @@ impl InteractionRegistry {
     }
     pub fn remove(&self, token: &str) -> bool {
         self.lock_entries().remove(token).is_some()
+    }
+}
+
+/// One Discord question card waiting for an answer, and the pane whose dialog it mirrors.
+#[derive(Clone, Debug)]
+pub struct PendingQuestion {
+    pub channel: Id<ChannelMarker>,
+    pub message: Id<MessageMarker>,
+    pub pane_id: String,
+    pub question: Question,
+}
+
+/// The open question cards, by the token their components carry.
+#[derive(Default, Debug)]
+pub struct QuestionRegistry {
+    entries: Mutex<HashMap<String, PendingQuestion>>,
+}
+impl QuestionRegistry {
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, PendingQuestion>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    pub fn insert(&self, token: String, pending: PendingQuestion) {
+        self.lock_entries().insert(token, pending);
+    }
+    /// Removes and returns the card, so one card is answered at most once.
+    pub fn take(&self, token: &str) -> Option<PendingQuestion> {
+        self.lock_entries().remove(token)
+    }
+    /// The token of the open card in `channel`, the one a thread reply answers.
+    pub fn token_in_channel(&self, channel: Id<ChannelMarker>) -> Option<String> {
+        self.lock_entries()
+            .iter()
+            .find(|(_, pending)| pending.channel == channel)
+            .map(|(token, _)| token.clone())
+    }
+    pub fn forget_message(&self, message: Id<MessageMarker>) {
+        self.lock_entries()
+            .retain(|_, pending| pending.message != message);
     }
 }
 

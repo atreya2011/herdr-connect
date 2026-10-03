@@ -18,11 +18,12 @@ use twilight_model::{
     },
 };
 
-use crate::broker::PermissionResponder;
+use crate::broker::{PermissionResponder, QuestionOutcome};
 use crate::herdr::{
     PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
     agent_prompt, agent_send_keys,
 };
+use crate::question::Answer;
 use crate::{AgentSnapshot, list_agents};
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
@@ -43,6 +44,10 @@ static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
+/// A thread reply while a question card is open in that thread is typed into the pane's dialog as
+/// its free-text answer instead of being submitted as an `agent.prompt`: the pane is `blocked`
+/// then, and [`resolve_prompt_pane`] would refuse it.
+///
 /// # Errors
 ///
 /// Returns Discord, Herdr, or task-dispatch errors.
@@ -51,7 +56,7 @@ pub async fn handle_owner_message(
     guild: Id<GuildMarker>,
     owner_id: &str,
     message: Message,
-    _responder: &PermissionResponder,
+    responder: &PermissionResponder,
 ) -> Result<(), String> {
     if message.guild_id != Some(guild)
         || !should_handle_owner_message(
@@ -117,6 +122,10 @@ pub async fn handle_owner_message(
             return Ok(());
         }
     };
+    if let Some(response) = answer_pending_question(responder, &message).await {
+        reply(&client, &message, &response).await?;
+        return Ok(());
+    }
     let pane_id = match resolve_prompt_pane(agent) {
         Ok(target) => target,
         Err(reason) => {
@@ -142,6 +151,24 @@ pub async fn handle_owner_message(
             Err(format!("agent.prompt failed: {error}"))
         }
     }
+}
+
+/// Types `message` into the dialog of the question card open in its thread and returns the reply to
+/// post; `None` when no card is open there.
+async fn answer_pending_question(
+    responder: &PermissionResponder,
+    message: &Message,
+) -> Option<String> {
+    let token = responder.pending_question_token(message.channel_id)?;
+    let answer = Answer::Text(message.content.clone());
+    Some(match responder.answer_question(&token, &answer).await {
+        Ok(QuestionOutcome::Sent) => "accepted: answer typed into the dialog".to_owned(),
+        Ok(QuestionOutcome::AnsweredInTerminal) => {
+            "refused: the question was already answered in the terminal".to_owned()
+        }
+        Ok(QuestionOutcome::Unknown) => "refused: the question card is no longer open".to_owned(),
+        Err(error) => format!("refused: typing the answer failed: {error}"),
+    })
 }
 
 #[must_use]

@@ -24,8 +24,8 @@ pub use activity::{
     decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
 };
 pub use broker::{
-    PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
-    send_activity_frame,
+    PermissionResponder, QuestionOutcome, handle_component, hook_timeout, request_decision,
+    run_broker, send_activity_frame,
 };
 pub use cards::{
     AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,
@@ -63,7 +63,7 @@ pub use prompting::{
     forget_departed_owner_prompt_suppressions, maintain_typing_until_settled,
     should_handle_owner_message, submit_owner_prompt, take_owner_prompt_suppression,
 };
-pub use question::{Answer, AnswerStep, Question, QuestionOption, answer_steps};
+pub use question::{Answer, Question, QuestionOption, dialog_shows_question};
 pub use readers::{
     AgentLog, format_detection_question, read_agent_log, read_claude_incremental,
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,

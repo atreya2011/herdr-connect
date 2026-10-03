@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::readers::format_detection_question;
+
 /// One option Claude offered for a single question.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QuestionOption {
@@ -15,6 +17,12 @@ pub struct Question {
     pub options: Vec<QuestionOption>,
     #[serde(rename = "multiSelect")]
     pub multi_select: bool,
+}
+
+/// Whether Herdr's detection snapshot of a pane still shows Claude's dialog for `question`.
+#[must_use]
+pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
+    format_detection_question(detection).is_some_and(|dialog| dialog.contains(&question.question))
 }
 
 /// What the owner chose on a question card.
@@ -62,7 +70,9 @@ pub fn answer_steps(question: &Question, answer: &Answer) -> Vec<AnswerStep> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, AnswerStep, Question, QuestionOption, answer_steps};
+    use super::{
+        Answer, AnswerStep, Question, QuestionOption, answer_steps, dialog_shows_question,
+    };
 
     fn question(multi_select: bool) -> Question {
         Question {
@@ -111,5 +121,16 @@ mod tests {
                 "multi_select={multi_select}"
             );
         }
+    }
+
+    #[test]
+    fn the_dialog_check_matches_the_question_text_in_the_detection_snapshot() {
+        let dialog = include_str!("../tests/fixtures/claude-detection-blocked-question.txt");
+        let no_dialog = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
+        let mut asked = question(false);
+        asked.question = "Which color do you prefer?".to_owned();
+        assert!(dialog_shows_question(dialog, &asked));
+        assert!(!dialog_shows_question(dialog, &question(false)));
+        assert!(!dialog_shows_question(no_dialog, &asked));
     }
 }

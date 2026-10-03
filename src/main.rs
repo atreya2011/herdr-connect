@@ -21,11 +21,11 @@ use herdr_connect_rs::{
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, GatewayContext,
-    HerdrSubscription, HerdrTab, OwnerIdentity, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE,
+    HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE,
     STATUS_WORKING, TopologyCache, TopologyRoute, Transition, TransitionMessage,
     UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, agent_read_detection,
     cached_route, create_transition_messages, delete_tab_thread, delete_topology_absent_from_herdr,
-    delete_workspace_channel, deliver_live_message, deliver_transition_card,
+    delete_workspace_channel, deliver_live_message, deliver_transition_card, dialog_shows_question,
     drive_gateway_with_components, execute_terminal_prompt_webhook, expire_informational_card,
     fetch_owner_identity, fetch_topology_lists, forget_departed_owner_prompt_suppressions,
     format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
@@ -199,10 +199,12 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
 }
 
 /// Posts one blocked card for a pane that just entered `blocked`, built from whatever context is
-/// available at that moment: a Claude pane's Herdr detection snapshot for the pending question, or
-/// the vendor log otherwise. A supported vendor whose broker already has a pending permission or
-/// question request for this session is left to that interactive card and posts nothing here. The
-/// card is posted once; there is no capture retry.
+/// available at that moment. A Claude pane showing an `AskUserQuestion` dialog gets an interactive
+/// question card, built from the pending question in its vendor log; answering it types the answer
+/// into the dialog. Otherwise the card is plain text from the detection snapshot or the vendor log.
+/// A supported vendor whose broker already has a pending permission request for this session is
+/// left to that interactive card and posts nothing here. The card is posted once; there is no
+/// capture retry.
 async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let BlockedCardContext {
         client,
@@ -230,10 +232,28 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     if supported_broker_pending {
         return;
     }
-    let detection_question = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
+    let detection = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
         .then(|| agent_read_detection(&route.pane_id).ok())
-        .flatten()
-        .and_then(|text| format_detection_question(&text));
+        .flatten();
+    if let Some(question) = shown_question(snapshot, session, detection.as_deref()) {
+        match responder
+            .deliver_question_card(target, &route.pane_id, &question)
+            .await
+        {
+            Ok(message) => {
+                informational_cards.insert(
+                    terminal.to_owned(),
+                    InformationalCard {
+                        channel: target,
+                        message,
+                    },
+                );
+            }
+            Err(error) => bridge_eprintln!("discord delivery error: {error}"),
+        }
+        return;
+    }
+    let detection_question = detection.as_deref().and_then(format_detection_question);
     let capture = detection_question.map_or_else(
         || capture_for_blocked(snapshot, session),
         |question| AgentLogCapture {
@@ -261,6 +281,20 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         informational_cards,
     )
     .await;
+}
+
+/// The pending `AskUserQuestion` question from the pane's vendor log that its dialog, in Herdr's
+/// detection snapshot, currently shows.
+fn shown_question(
+    snapshot: &AgentSnapshot,
+    session: &AgentSession,
+    detection: Option<&str>,
+) -> Option<Question> {
+    let detection = detection?;
+    capture_for_blocked(snapshot, session)
+        .pending_questions
+        .into_iter()
+        .find(|question| dialog_shows_question(detection, question))
 }
 
 /// What [`deliver_blocked_messages`] needs to deliver a blocked card, bundled to keep the function
@@ -318,7 +352,8 @@ async fn expire_blocked_card(
     informational_cards: &mut HashMap<String, InformationalCard>,
 ) {
     if let Some(card) = informational_cards.get(terminal).copied() {
-        let (client, ..) = discord;
+        let (client, _, _, responder, _) = discord;
+        responder.forget_question_card(card.message);
         if let Err(error) = expire_informational_card(
             client.as_ref(),
             card.channel,
@@ -339,7 +374,8 @@ async fn expire_departed_card(
     terminal: &str,
     card: InformationalCard,
 ) {
-    let (client, ..) = discord;
+    let (client, _, _, responder, _) = discord;
+    responder.forget_question_card(card.message);
     if let Err(error) = expire_informational_card(
         client.as_ref(),
         card.channel,

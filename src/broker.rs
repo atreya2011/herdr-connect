@@ -18,14 +18,23 @@ use twilight_model::channel::message::MessageFlags;
 use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
-use twilight_model::id::{Id, marker::GuildMarker};
+use twilight_model::id::{
+    Id,
+    marker::{ChannelMarker, GuildMarker, MessageMarker},
+};
 
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::delivery::expire_permission_card;
+use crate::herdr::{STATUS_BLOCKED, agent_read_detection, agent_send_keys, pane_send_text};
 use crate::permission::{Decision, DecisionBehavior, Interaction};
-use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
+use crate::question::{Answer, AnswerStep, Question, answer_steps, dialog_shows_question};
+use crate::registry::{
+    ApprovalRequest, InteractionRegistry, PendingQuestion, QuestionRegistry, ResolveError,
+    generate_token,
+};
 use crate::{
-    TopologyCache, bridge_eprintln, deliver_permission_card, fetch_topology_lists, list_agents,
+    TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_button_card,
+    deliver_question_select_card, expire_informational_card, fetch_topology_lists, list_agents,
     route_topology, sync_topology, tab_list_result,
 };
 
@@ -42,7 +51,20 @@ pub struct PermissionResponder {
     guild: Id<GuildMarker>,
     owner_id: String,
     registry: Arc<InteractionRegistry>,
+    question_registry: QuestionRegistry,
     topology_cache: TopologyCache,
+}
+
+/// What came of an answer to a question card.
+#[derive(Debug, Eq, PartialEq)]
+pub enum QuestionOutcome {
+    /// The answer was typed into the pane's dialog.
+    Sent,
+    /// The pane no longer shows the dialog, so the owner answered in the terminal: nothing was
+    /// sent and the card says so.
+    AnsweredInTerminal,
+    /// No open card has this token.
+    Unknown,
 }
 
 #[derive(Clone)]
@@ -111,6 +133,7 @@ impl PermissionResponder {
             guild,
             owner_id,
             registry: Arc::new(InteractionRegistry::default()),
+            question_registry: QuestionRegistry::default(),
             topology_cache,
         }
     }
@@ -118,6 +141,83 @@ impl PermissionResponder {
     #[must_use]
     pub fn has_pending_session(&self, session_id: &str) -> bool {
         self.registry.has_pending_session(session_id)
+    }
+
+    /// Posts the question card for the dialog Claude shows in `pane_id`: one button per option for
+    /// a single-select question, a select menu for a multiSelect question.
+    ///
+    /// # Errors
+    ///
+    /// Returns token-generation or Discord delivery errors.
+    pub async fn deliver_question_card(
+        &self,
+        channel: Id<ChannelMarker>,
+        pane_id: &str,
+        question: &Question,
+    ) -> Result<Id<MessageMarker>, String> {
+        let token = generate_token()?;
+        let client = self.client.as_ref();
+        let message = if question.multi_select {
+            deliver_question_select_card(client, channel, question, &token).await?
+        } else {
+            deliver_question_button_card(client, channel, question, &token).await?
+        };
+        self.question_registry.insert(
+            token,
+            PendingQuestion {
+                channel,
+                message,
+                pane_id: pane_id.to_owned(),
+                question: question.clone(),
+            },
+        );
+        Ok(message)
+    }
+
+    /// Stops accepting answers for the question card `message`, once its card is retired.
+    pub fn forget_question_card(&self, message: Id<MessageMarker>) {
+        self.question_registry.forget_message(message);
+    }
+
+    /// The token of the open question card in `channel`, the one a thread reply there answers.
+    #[must_use]
+    pub fn pending_question_token(&self, channel: Id<ChannelMarker>) -> Option<String> {
+        self.question_registry.token_in_channel(channel)
+    }
+
+    /// Types `answer` into the dialog of the pane behind question card `token`.
+    ///
+    /// The pane is re-read first: it must still be `blocked` and still show the card's question.
+    /// Otherwise the owner answered in the terminal, so the card is edited to say so and nothing is
+    /// sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns Herdr or Discord errors.
+    pub async fn answer_question(
+        &self,
+        token: &str,
+        answer: &Answer,
+    ) -> Result<QuestionOutcome, String> {
+        let Some(pending) = self.question_registry.take(token) else {
+            return Ok(QuestionOutcome::Unknown);
+        };
+        let steps = answer_steps(&pending.question, answer);
+        let (pane_id, question) = (pending.pane_id.clone(), pending.question.clone());
+        let sent = tokio::task::spawn_blocking(move || type_answer(&pane_id, &question, &steps))
+            .await
+            .map_err(|error| format!("question answer task failed: {error}"))??;
+        if sent {
+            return Ok(QuestionOutcome::Sent);
+        }
+        expire_informational_card(
+            self.client.as_ref(),
+            pending.channel,
+            pending.message,
+            "resolved: answered in the terminal",
+        )
+        .await?;
+        Ok(QuestionOutcome::AnsweredInTerminal)
     }
 
     #[must_use]
@@ -321,6 +421,29 @@ impl PermissionResponder {
     }
 }
 
+/// Types the steps into the pane's dialog and returns `true`, or returns `false` without typing
+/// when the pane is no longer `blocked` on `question`.
+fn type_answer(pane_id: &str, question: &Question, steps: &[AnswerStep]) -> Result<bool, String> {
+    let blocked = list_agents()?
+        .iter()
+        .any(|agent| agent.pane_id == pane_id && agent.agent_status == STATUS_BLOCKED);
+    if !blocked || !dialog_shows_question(&agent_read_detection(pane_id)?, question) {
+        return Ok(false);
+    }
+    for step in steps {
+        match step {
+            AnswerStep::Keys(keys) => {
+                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                agent_send_keys(pane_id, &keys)?;
+            }
+            AnswerStep::Text(text) => {
+                pane_send_text(pane_id, text)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
 pub async fn handle_component(
     responder: Arc<PermissionResponder>,
     interaction: DiscordInteraction,
@@ -337,6 +460,21 @@ pub async fn handle_component(
             .is_some_and(|id| id.to_string() == responder.owner_id);
     let response = if !authorized {
         Some(ephemeral_response("not authorized"))
+    } else if let Some(token) = data.custom_id.strip_prefix("herdrask-multi:") {
+        let indices: Option<Vec<usize>> =
+            data.values.iter().map(|value| value.parse().ok()).collect();
+        let Some(indices) = indices else {
+            return;
+        };
+        Some(question_component_response(&responder, token, indices).await)
+    } else if let Some(rest) = data.custom_id.strip_prefix("herdrask:") {
+        let Some((token, index)) = rest
+            .split_once(':')
+            .and_then(|(token, index)| Some((token, index.parse().ok()?)))
+        else {
+            return;
+        };
+        Some(question_component_response(&responder, token, vec![index]).await)
     } else if let Some((action, token)) = data
         .custom_id
         .split_once(':')
@@ -382,6 +520,25 @@ fn permission_component_response(
             }
         },
     )
+}
+
+async fn question_component_response(
+    responder: &PermissionResponder,
+    token: &str,
+    indices: Vec<usize>,
+) -> InteractionResponse {
+    match responder
+        .answer_question(token, &Answer::Options(indices))
+        .await
+    {
+        Ok(QuestionOutcome::Sent) => ephemeral_response("answer sent"),
+        Ok(QuestionOutcome::AnsweredInTerminal) => ephemeral_response("answered in the terminal"),
+        Ok(QuestionOutcome::Unknown) => ephemeral_response("expired"),
+        Err(error) => {
+            bridge_eprintln!("question answer failed: {error}");
+            ephemeral_response("answer failed; see the bridge log")
+        }
+    }
 }
 
 fn ephemeral_response(content: &str) -> InteractionResponse {
