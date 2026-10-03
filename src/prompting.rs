@@ -286,10 +286,17 @@ fn record_owner_prompt_submission(pane_id: &str, text: &str) {
 pub fn forget_departed_owner_prompt_suppressions(
     current_panes: &HashSet<String, impl BuildHasher>,
 ) {
-    OWNER_PROMPT_SUPPRESSIONS
+    let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .retain(|(pane, _)| current_panes.contains(pane));
+        .unwrap_or_else(PoisonError::into_inner);
+    retain_present_panes(&mut suppressions, current_panes);
+}
+
+fn retain_present_panes(
+    suppressions: &mut Vec<OwnerPromptSuppression>,
+    current_panes: &HashSet<String, impl BuildHasher>,
+) {
+    suppressions.retain(|(pane, _)| current_panes.contains(pane));
 }
 
 fn forget_owner_prompt_submission(pane_id: &str, text: &str) {
@@ -419,10 +426,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        OWNER_PROMPT_SUPPRESSIONS, agent_list_failure_reply,
-        forget_departed_owner_prompt_suppressions, has_prompt_content, is_thread_channel,
+        OWNER_PROMPT_SUPPRESSIONS, agent_list_failure_reply, has_prompt_content, is_thread_channel,
         matching_agent, pane_status_is_working, prompt_surface_markers, resolve_prompt_pane,
-        take_owner_prompt_suppression,
+        retain_present_panes, take_owner_prompt_suppression,
     };
     use crate::AgentSnapshot;
 
@@ -493,19 +499,13 @@ mod tests {
 
     #[test]
     fn owner_prompt_suppression_is_dropped_when_its_pane_departs() {
-        let departed = "test-pane-suppression-departed";
-        let present = "test-pane-suppression-present";
         let text = "queued behind a long turn";
-        {
-            let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
-                .lock()
-                .expect("lock owner prompt suppression markers");
-            suppressions.push((departed.to_owned(), text.to_owned()));
-            suppressions.push((present.to_owned(), text.to_owned()));
-        }
-        forget_departed_owner_prompt_suppressions(&HashSet::from([present.to_owned()]));
-        assert!(!take_owner_prompt_suppression(departed, text));
-        assert!(take_owner_prompt_suppression(present, text));
+        let mut suppressions = vec![
+            ("departed".to_owned(), text.to_owned()),
+            ("present".to_owned(), text.to_owned()),
+        ];
+        retain_present_panes(&mut suppressions, &HashSet::from(["present".to_owned()]));
+        assert_eq!(suppressions, [("present".to_owned(), text.to_owned())]);
     }
 
     #[test]
