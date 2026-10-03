@@ -103,13 +103,13 @@ pub async fn drive_gateway_with_components(
                 if owner_prompt_sender.send(request).is_err() {
                     "discord owner prompt error: owner prompt queue closed".to_owned()
                 } else {
-                    "discord gateway message: MESSAGE_CREATE".to_owned()
+                    continue;
                 }
             }
             Ok(Event::InteractionCreate(interaction)) => {
                 let handler = Arc::clone(&components);
                 tokio::spawn(async move { handler(interaction.0).await });
-                "discord gateway interaction: INTERACTION_CREATE".to_owned()
+                continue;
             }
             Ok(Event::ThreadDelete(thread)) if thread.guild_id == context.guild => {
                 spawn_deletion(&context, &notices, GuildDeletion::Thread { id: thread.id });
