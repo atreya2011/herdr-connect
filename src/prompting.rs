@@ -251,19 +251,23 @@ fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
 /// A pane that reports a stalled submission (the composer received the text but never actually
 /// submitted it) is recovered with a two-rung ladder: an Enter key press first, since that alone
 /// submits a paste-block-stuck composer; if the pane still has not left `idle` shortly after,
-/// a Ctrl+U clear followed by one fresh `agent.prompt` resubmission.
+/// a Ctrl+U clear followed by one fresh `agent.prompt` resubmission. The ladder runs only for a
+/// pane that was not `working` at submission: the agent itself queues a prompt submitted
+/// mid-turn, where a stalled prompt cannot be told from a queued one and Ctrl+U would clear the
+/// queued text.
 ///
 /// # Errors
 ///
 /// Returns Herdr submission, follow-up key press, or pane-state errors.
 pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
+    let was_working = pane_status_is_working(&list_agents()?, target);
     record_owner_prompt_submission(target, text);
     let result = agent_prompt(target, text);
     if result.is_err() {
         forget_owner_prompt_submission(target, text);
         return result;
     }
-    if result.as_deref() != Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
+    if was_working || result.as_deref() != Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
         return result;
     }
     agent_send_keys(target, &["enter"])?;
