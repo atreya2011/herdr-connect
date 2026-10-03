@@ -19,8 +19,9 @@ pub struct Question {
     pub multi_select: bool,
 }
 
-/// Whether Herdr's detection snapshot of a pane still shows Claude's dialog for `question`. The
-/// screen wraps the question at the pane width, so both sides are compared with every run of
+/// Whether Herdr's detection snapshot still shows Claude's dialog for `question`.
+///
+/// The screen wraps the question at the pane width, so both sides are compared with every run of
 /// whitespace collapsed to one space.
 #[must_use]
 pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
