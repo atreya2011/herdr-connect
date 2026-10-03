@@ -59,7 +59,7 @@ pub use permission::{
     encode_cursor_decision, is_cursor_agent_argv,
 };
 pub use prompting::{
-    forget_departed_owner_prompt_suppressions, maintain_typing_until_settled,
+    forget_departed_owner_prompt_suppressions, handle_owner_message, maintain_typing_until_settled,
     should_handle_owner_message, submit_owner_prompt, take_owner_prompt_suppression,
 };
 pub use question::{Answer, Question, QuestionOption, dialog_shows_question};

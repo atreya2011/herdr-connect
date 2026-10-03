@@ -6625,6 +6625,17 @@ mod tests {
         }))
     }
 
+    /// A two-question call: a single-select question, then a multiSelect question.
+    #[cfg(unix)]
+    const TWO_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now, in a single \
+        call with exactly two questions. First: header \"Color\", question text \"Which color?\", \
+        multiSelect false, and exactly two options: label \"Red\" with description \"The color \
+        red\", and label \"Blue\" with description \"The color blue\". Second: header \
+        \"Toppings\", question text \"Which toppings?\", multiSelect true, and exactly three \
+        options: label \"Cheese\" with description \"Add cheese\", label \"Olives\" with \
+        description \"Add olives\", and label \"Mushrooms\" with description \"Add mushrooms\". \
+        Do not do anything else and do not say anything else.";
+
     /// How the owner answers the question card in one row.
     #[cfg(unix)]
     enum QuestionAction {
@@ -6632,8 +6643,11 @@ mod tests {
         Button(usize),
         /// Picks these option indices in the multiSelect menu.
         Select(&'static [&'static str]),
-        /// Replies in the thread with this text.
+        /// Replies in the thread with this text, through the owner-message handler.
         Text(&'static str),
+        /// Taps option `1` of the first question, then picks options `0` and `2` of the second
+        /// question on the same card.
+        TwoQuestions,
         /// Presses `1` in the pane's own dialog first, then taps option `1` on the now stale card.
         TerminalThenButton,
     }
@@ -6646,8 +6660,10 @@ mod tests {
         status_before: String,
         /// The question card's content once the row finished.
         card: Option<String>,
-        /// What Claude's own session transcript recorded as the answer.
-        answered: Option<String>,
+        /// What Claude's own session transcript recorded as the answer to each question.
+        answered: Vec<Option<String>>,
+        /// Every message left in the tab thread.
+        messages: Vec<String>,
     }
 
     /// Drives one real `claude --model haiku` agent with no hook registered through a forced
@@ -6659,7 +6675,7 @@ mod tests {
         tab: &Tab,
         agent_name: &str,
         prompt: &str,
-        question: &str,
+        questions: &[&str],
         action: QuestionAction,
     ) -> Result<QuestionOutcome, String> {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
@@ -6704,10 +6720,53 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
-        let click = |custom_id: String, values: &'static [&'static str]| {
-            synthetic_component_interaction(guild.id, &connection.2, &channel, &custom_id, values)
-        };
         let terminal_answered = matches!(action, QuestionAction::TerminalThenButton);
+        perform_question_action(guild, &connection, tab, &channel, &token, action).await?;
+
+        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(60), |snapshot| {
+            matches!(snapshot.agent_status.as_str(), "done" | "idle")
+        })?;
+        if !terminal_answered {
+            own(&settled, &tabs, &connection, &mut state).await;
+        }
+        let messages = thread_messages(guild, thread).await?;
+        let card = messages
+            .iter()
+            .find(|(content, _, _)| content.starts_with("resolved:"))
+            .map(|(content, _, _)| content.clone());
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let answered = questions
+            .iter()
+            .map(|question| transcript_question_answer(&home, &settled, question))
+            .collect::<Result<_, _>>()?;
+        Ok(QuestionOutcome {
+            status_before,
+            card,
+            answered,
+            messages: messages
+                .into_iter()
+                .map(|(content, _, _)| content)
+                .collect(),
+        })
+    }
+
+    /// Answers the open question card `token` the way `action` says.
+    #[cfg(unix)]
+    async fn perform_question_action(
+        guild: &BlockedCaptureGuild,
+        connection: &super::DiscordConnection,
+        tab: &Tab,
+        channel: &twilight_model::channel::Channel,
+        token: &str,
+        action: QuestionAction,
+    ) -> Result<(), String> {
+        let responder = Arc::clone(&connection.3);
+        let thread = channel.id;
+        let click = |custom_id: String, values: &'static [&'static str]| {
+            synthetic_component_interaction(guild.id, &connection.2, channel, &custom_id, values)
+        };
         match action {
             QuestionAction::Button(index) => {
                 let interaction = click(format!("herdrask:{token}:{index}"), &[])?;
@@ -6718,12 +6777,54 @@ mod tests {
                 super::handle_component(Arc::clone(&responder), interaction).await;
             }
             QuestionAction::Text(text) => {
-                let outcome = responder
-                    .answer_question(&token, &herdr_connect_rs::Answer::Text(text.to_owned()))
-                    .await?;
-                if outcome != herdr_connect_rs::QuestionOutcome::Sent {
-                    return Err(format!("free-text answer was not typed: {outcome:?}"));
+                // The gateway hands the handler the owner's message; REST message creation
+                // returns the bridge bot's message without a guild, so it is re-attributed to the
+                // owner the way the gateway event would carry it.
+                let mut message = guild
+                    .client
+                    .create_message(thread)
+                    .content(text)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .model()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                message.author.id = Id::<UserMarker>::new(
+                    connection
+                        .2
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+                message.author.bot = false;
+                message.guild_id = Some(guild.id);
+                herdr_connect_rs::handle_owner_message(
+                    Arc::clone(&guild.client),
+                    guild.id,
+                    &connection.2,
+                    message,
+                    &responder,
+                )
+                .await?;
+            }
+            QuestionAction::TwoQuestions => {
+                let card_before = card_message_ids(guild, thread).await?;
+                let interaction = click(format!("herdrask:{token}:1"), &[])?;
+                super::handle_component(Arc::clone(&responder), interaction).await;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let second = loop {
+                    match responder.pending_question_token(thread) {
+                        Some(next) if next != token => break next,
+                        _ if Instant::now() >= deadline => {
+                            return Err("the card never moved to the second question".to_owned());
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(200)).await,
+                    }
+                };
+                if card_message_ids(guild, thread).await? != card_before {
+                    return Err("the second question was not edited into the same card".to_owned());
                 }
+                let interaction = click(format!("herdrask-multi:{second}"), &["0", "2"])?;
+                super::handle_component(Arc::clone(&responder), interaction).await;
             }
             QuestionAction::TerminalThenButton => {
                 let status = Command::new("herdr")
@@ -6740,27 +6841,21 @@ mod tests {
                 super::handle_component(Arc::clone(&responder), interaction).await;
             }
         }
+        Ok(())
+    }
 
-        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(60), |snapshot| {
-            matches!(snapshot.agent_status.as_str(), "done" | "idle")
-        })?;
-        if !terminal_answered {
-            own(&settled, &tabs, &connection, &mut state).await;
-        }
-        let messages = thread_messages(guild, thread).await?;
-        let card = messages
-            .iter()
-            .find(|(content, _, _)| content.starts_with("resolved:"))
-            .map(|(content, _, _)| content.clone());
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
-        let answered = transcript_question_answer(&home, &settled, question)?;
-        Ok(QuestionOutcome {
-            status_before,
-            card,
-            answered,
-        })
+    /// The ids of the thread's messages that carry an embed: the open question cards.
+    #[cfg(unix)]
+    async fn card_message_ids(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+    ) -> Result<Vec<Id<MessageMarker>>, String> {
+        Ok(thread_messages(guild, thread)
+            .await?
+            .into_iter()
+            .filter(|(_, has_embed, _)| *has_embed)
+            .map(|(_, _, id)| id)
+            .collect())
     }
 
     /// Runs [`question_dialog_exercise`] inside the real-guild fixture: zero leftovers before, the
@@ -6768,7 +6863,7 @@ mod tests {
     #[cfg(unix)]
     async fn run_question_dialog_test(
         prompt: &str,
-        question: &str,
+        questions: &[&str],
         action: QuestionAction,
     ) -> Option<QuestionOutcome> {
         let Some(guild) = blocked_capture_guild() else {
@@ -6802,7 +6897,7 @@ mod tests {
                         &tab,
                         &agent_name,
                         prompt,
-                        question,
+                        questions,
                         action,
                     )),
                 )
@@ -6829,15 +6924,15 @@ mod tests {
     }
 
     /// Real row: the pane showed its own dialog (`blocked`) while the card was up; the Discord tap
-    /// typed option 2's number key, Claude's transcript records Blue, and the departed-card
-    /// expiry retired the card once the pane left `blocked`.
+    /// typed option 2's number key, Claude's transcript records Blue, and the blocked-card expiry
+    /// retired the card once the next snapshot showed the pane had left `blocked`.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn question_card_tap_types_the_option_into_the_open_dialog() {
         let Some(outcome) = Box::pin(run_question_dialog_test(
             QUESTION_FORCE_PROMPT,
-            "Which color?",
+            &["Which color?"],
             QuestionAction::Button(1),
         ))
         .await
@@ -6845,7 +6940,7 @@ mod tests {
             return;
         };
         assert_eq!(outcome.status_before, "blocked");
-        assert_eq!(outcome.answered.as_deref(), Some("Blue"));
+        assert_eq!(outcome.answered, [Some("Blue".to_owned())]);
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
@@ -6858,7 +6953,7 @@ mod tests {
     async fn question_card_answered_in_the_terminal_is_retired_without_typing() {
         let Some(outcome) = Box::pin(run_question_dialog_test(
             QUESTION_FORCE_PROMPT,
-            "Which color?",
+            &["Which color?"],
             QuestionAction::TerminalThenButton,
         ))
         .await
@@ -6866,7 +6961,7 @@ mod tests {
             return;
         };
         assert_eq!(outcome.status_before, "blocked");
-        assert_eq!(outcome.answered.as_deref(), Some("Red"));
+        assert_eq!(outcome.answered, [Some("Red".to_owned())]);
         assert_eq!(
             outcome.card.as_deref(),
             Some("resolved: answered in the terminal")
@@ -6881,7 +6976,7 @@ mod tests {
     async fn multi_select_question_card_submits_every_picked_option() {
         let Some(outcome) = Box::pin(run_question_dialog_test(
             MULTI_QUESTION_FORCE_PROMPT,
-            "Which toppings?",
+            &["Which toppings?"],
             QuestionAction::Select(&["0", "2"]),
         ))
         .await
@@ -6889,21 +6984,22 @@ mod tests {
             return;
         };
         assert_eq!(outcome.status_before, "blocked");
-        assert_eq!(outcome.answered.as_deref(), Some("Cheese, Mushrooms"));
+        assert_eq!(outcome.answered, [Some("Cheese, Mushrooms".to_owned())]);
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
-    /// Real row: a free-text reply presses the "Type something" entry's number (the one after the
-    /// two options), types the text, and presses Enter; Claude's transcript records the text. The
-    /// keys for the free-text entry were not probed live, so this row is their evidence: if the
-    /// dialog takes different keys, record them here and in `answer_steps`.
+    /// Real row: a thread reply, routed through the owner-message handler, presses the "Type
+    /// something" entry's number (the one after the two options), types the text, and presses
+    /// Enter; Claude's transcript records the text and the handler answers `accepted`. The keys for
+    /// the free-text entry were not probed live, so this row is their evidence: if the dialog takes
+    /// different keys, record them here and in `answer_steps`.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn question_card_free_text_reply_is_typed_into_the_dialog() {
         let Some(outcome) = Box::pin(run_question_dialog_test(
             QUESTION_FORCE_PROMPT,
-            "Which color?",
+            &["Which color?"],
             QuestionAction::Text("purple"),
         ))
         .await
@@ -6912,12 +7008,47 @@ mod tests {
         };
         assert_eq!(outcome.status_before, "blocked");
         assert!(
-            outcome
-                .answered
+            outcome.answered[0]
                 .as_deref()
                 .is_some_and(|answer| answer.contains("purple")),
             "transcript answer was {:?}",
             outcome.answered
+        );
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|content| content == "accepted: answer typed into the dialog"),
+            "thread has {:?}",
+            outcome.messages
+        );
+        assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
+    }
+
+    /// Real row: a two-question call (single-select, then multiSelect) is answered entirely from
+    /// Discord on one card. The first tap types option 2's number, which moves the dialog on; the
+    /// card is edited in place to the second question; its pick of options 0 and 2 toggles both,
+    /// moves to Submit, and submits. Claude's transcript records both answers.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn two_question_call_is_answered_from_discord_on_one_card() {
+        let Some(outcome) = Box::pin(run_question_dialog_test(
+            TWO_QUESTION_FORCE_PROMPT,
+            &["Which color?", "Which toppings?"],
+            QuestionAction::TwoQuestions,
+        ))
+        .await
+        else {
+            return;
+        };
+        assert_eq!(outcome.status_before, "blocked");
+        assert_eq!(
+            outcome.answered,
+            [
+                Some("Blue".to_owned()),
+                Some("Cheese, Mushrooms".to_owned())
+            ]
         );
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
