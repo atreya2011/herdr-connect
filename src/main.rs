@@ -5716,7 +5716,10 @@ mod tests {
 
     /// Fourth turn of [`terminal_origin_prompt_exercise`]: a second Discord prompt submitted while
     /// the pane is `working` on a long first turn is acknowledged, answered after the first turn's
-    /// reply, and mirrored back neither as itself nor as the long prompt.
+    /// reply, and mirrored back neither as itself nor as the long prompt. The first turn is a long
+    /// generation rather than a shell wait because vendors block or time out shell waits and their
+    /// shell permissions differ; its reply is one plain message holding the whole list, so it is
+    /// matched by containing the long marker.
     #[cfg(unix)]
     async fn queued_prompt_exercise(
         fixture: &TerminalPromptFixture<'_>,
@@ -5728,11 +5731,12 @@ mod tests {
     ) -> Result<(), String> {
         let vendor = fixture.vendor;
         let long_reply = format!("terminal-origin-{vendor}-long-{nonce}");
-        // The first turn outlasts the former 30 s marker lifetime, so a regression to a timed
-        // marker lets the queued prompt be mirrored back and fails the row. The wait is a
-        // `timeout` around `tail -f /dev/null` because Claude Code refuses a foreground `sleep`.
+        // The first turn is a long generation that needs no tool, not a shell wait: vendors block
+        // or time out shell waits (Claude Code refuses a foreground `sleep`) and their shell
+        // permissions differ per row. Emitting 300 numbers takes well over 10 s on every vendor,
+        // which outlasts the second submission made right after the pane is seen working.
         let long_prompt = format!(
-            "Run the shell command `timeout 45 tail -f /dev/null; echo waited`. Then reply with exactly: {long_reply}"
+            "List the numbers from 1 to 300, one per line. On the last line write exactly: {long_reply}"
         );
         let queued_reply = format!("terminal-origin-{vendor}-queued-{nonce}");
         let queued_prompt = format!("Reply with exactly: {queued_reply}");
@@ -5752,8 +5756,8 @@ mod tests {
         assert_queued_reply_follows_first_reply(&messages, &long_reply, &queued_reply)
     }
 
-    /// Asserts the plain message carrying `queued_reply` follows the one carrying `first_reply`,
-    /// and that `first_reply` is present exactly once.
+    /// Asserts the plain message equal to `queued_reply` follows the plain message containing
+    /// `first_reply`, and that each is present exactly once.
     #[cfg(unix)]
     fn assert_queued_reply_follows_first_reply(
         messages: &[twilight_model::channel::Message],
@@ -5762,16 +5766,16 @@ mod tests {
     ) -> Result<(), String> {
         let mut sorted: Vec<_> = messages.iter().collect();
         sorted.sort_by_key(|message| message.id);
-        let plain_positions = |reply: &str| -> Vec<usize> {
+        let plain_positions = |matches: &dyn Fn(&str) -> bool| -> Vec<usize> {
             sorted
                 .iter()
                 .enumerate()
-                .filter(|(_, message)| message.webhook_id.is_none() && message.content == reply)
+                .filter(|(_, message)| message.webhook_id.is_none() && matches(&message.content))
                 .map(|(position, _)| position)
                 .collect()
         };
-        let first = plain_positions(first_reply);
-        let queued = plain_positions(queued_reply);
+        let first = plain_positions(&|content| content.contains(first_reply));
+        let queued = plain_positions(&|content| content == queued_reply);
         let ([first], [queued]) = (first.as_slice(), queued.as_slice()) else {
             let plain: Vec<_> = sorted
                 .iter()
