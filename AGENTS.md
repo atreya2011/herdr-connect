@@ -30,6 +30,6 @@ Stop the bridge service before running the suite. Never print or commit `.env`. 
 
 - Commits go to `main` in small atomic chunks.
 - Source is modules under `src/` with crate-root re-exports.
-- Prompts may stall at the Herdr level for any vendor. The bridge acknowledges submission with state unconfirmed and recovers with a two-rung ladder: Enter first; only if the pane is still idle, Ctrl+U then one fresh resubmission.
+- Prompts may stall at the Herdr level for any vendor. The bridge acknowledges submission with state unconfirmed and recovers with a two-rung ladder: Enter first; only if the pane is still idle, Ctrl+U then one fresh resubmission. The ladder never runs for a pane that was `working` at submission: the agent queues that prompt.
 - Refusal replies exist only inside threads with a `[tab_id]` suffix whose parent topic is `herdr workspace [workspace_id]`.
 - Use the terms in `CONTEXT.md`. Read `ROADMAP.md` before selecting new implementation work.

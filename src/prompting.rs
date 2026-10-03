@@ -48,9 +48,8 @@ static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
 ///
 /// A thread reply while any question card -- single-select or multiSelect -- is pending for the
 /// mapped pane's session is consumed as that question's free-text answer instead of being
-/// submitted as an `agent.prompt` (the pane's Herdr status is `working`, not `idle`/`done`, while a
-/// question is pending, so this check runs before -- not through -- [`resolve_prompt_pane`]'s
-/// status gate).
+/// submitted as an `agent.prompt` (the pane's Herdr status is `working` while a question is
+/// pending, and [`resolve_prompt_pane`] accepts a `working` pane, so this check must run first).
 ///
 /// # Errors
 ///
@@ -209,8 +208,7 @@ fn prompt_surface_markers<'a, 'b>(
 
 /// The one pane mapped to `tab_id`/`workspace_id`, independent of its Herdr status: shared by
 /// [`resolve_prompt_pane`] (which additionally gates on status) and the pending-question check in
-/// [`handle_owner_message`] (which must not, since a pane awaiting a question answer reports
-/// `working`).
+/// [`handle_owner_message`] (which must not gate on status).
 fn matching_agent<'agents>(
     tab_id: &str,
     workspace_id: &str,
@@ -231,8 +229,7 @@ fn matching_agent<'agents>(
 fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
     let pane_id = agent.pane_id.as_str();
     match agent.agent_status.trim() {
-        STATUS_IDLE | STATUS_DONE => Ok(pane_id.to_owned()),
-        STATUS_WORKING => Err("refused: agent state is working".to_owned()),
+        STATUS_IDLE | STATUS_DONE | STATUS_WORKING => Ok(pane_id.to_owned()),
         STATUS_BLOCKED => Err("refused: agent state is blocked".to_owned()),
         "" => Err("refused: agent state is unknown".to_owned()),
         state => Err(format!("refused: agent state is {state}")),
@@ -534,8 +531,6 @@ mod tests {
                 .expect("captured agent snapshot has the expected shape");
         let workspace_id = captured[0].workspace_id.as_str();
         let tab_id = captured[0].tab_id.as_str();
-        let mut working = captured[0].clone();
-        working.agent_status = "working".to_owned();
         let mut blocked = captured[0].clone();
         blocked.agent_status = "blocked".to_owned();
         let mut unknown = captured[0].clone();
@@ -558,13 +553,6 @@ mod tests {
                 workspace_id,
                 ambiguous,
                 "refused: ambiguous pane mapping",
-            ),
-            (
-                "working pane",
-                tab_id,
-                workspace_id,
-                vec![working],
-                "refused: agent state is working",
             ),
             (
                 "blocked pane",
@@ -597,9 +585,28 @@ mod tests {
         }
     }
 
-    /// Unlike [`resolve_prompt_pane`], `matching_agent` must resolve a `working` or `blocked` pane:
-    /// it backs the pending-question check, which has to find a pane's session while a question is
-    /// pending and the pane therefore reports `working`, not `idle`/`done`.
+    /// A `working` pane accepts the prompt: the agent queues it and answers after the current turn.
+    #[test]
+    fn resolve_prompt_pane_accepts_a_working_pane() {
+        let value: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
+                .expect("captured agent snapshot is JSON");
+        let captured: Vec<AgentSnapshot> =
+            serde_json::from_value(value["result"]["agents"].clone())
+                .expect("captured agent snapshot has the expected shape");
+        let mut working = captured[0].clone();
+        working.agent_status = "working".to_owned();
+        let pane_id = working.pane_id.clone();
+        assert_eq!(
+            matching_agent(&working.tab_id, &working.workspace_id, &[working.clone()])
+                .and_then(resolve_prompt_pane),
+            Ok(pane_id)
+        );
+    }
+
+    /// Unlike [`resolve_prompt_pane`], `matching_agent` resolves a pane whatever its status: it
+    /// backs the pending-question check, which has to find a pane's session while a question is
+    /// pending.
     #[test]
     fn matching_agent_ignores_status_unlike_resolve_prompt_pane() {
         let value: Value =

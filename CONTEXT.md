@@ -29,7 +29,7 @@ The vendor session identity supplied by the agent's Herdr integration. Codex sup
 _Avoid_: Terminal session, inferred session
 
 **Owner prompt**:
-Text authored by the owner in a tab thread for semantic submission to its mapped agent.
+Text authored by the owner in a tab thread for semantic submission to its mapped agent. Submitted the same way to an idle, done, or working pane; the agent queues one sent mid-turn.
 _Avoid_: Key injection, terminal input
 
 **Terminal prompt**:
