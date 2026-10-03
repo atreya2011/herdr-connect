@@ -8201,7 +8201,7 @@ mod tests {
 
     /// Checks that the parent channel holds, or no longer holds, the system message Discord posted
     /// when it created `thread_id`. The listing is independent of the production lookup. When the
-    /// message is expected present, the production lookup must also find it. A mismatch reports
+    /// message is expected present, the production lookup must also find it, under the thread's own id. A mismatch reports
     /// the facts of both.
     #[cfg(unix)]
     async fn expect_thread_created_message(
@@ -8220,7 +8220,7 @@ mod tests {
                 thread_id,
             )
             .await?
-            .is_some();
+            .is_some_and(|message| message.id.get() == thread_id.get());
         if listed == present && (!present || found) {
             return Ok(());
         }
