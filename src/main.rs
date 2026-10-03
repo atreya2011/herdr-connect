@@ -6267,7 +6267,8 @@ mod tests {
     /// `own`, the same as a real doorbell would), drains activity frames into `state` until the
     /// pane settles, then marks it settled via `own` (forgetting the turn's activity message and
     /// revoking eligibility, exactly as `process_snapshot` does in production). Returns the
-    /// settled snapshot.
+    /// settled snapshot. `activity` pairs the broker's frame receiver with the diagnostic list that
+    /// records each received frame.
     #[cfg(unix)]
     async fn drive_one_activity_turn(
         pane_id: &str,
@@ -6275,9 +6276,13 @@ mod tests {
         sub: &mut herdr_connect_rs::HerdrSubscription,
         connection: &super::DiscordConnection,
         state: &mut BridgeState,
-        activity_rx: &mut tokio::sync::mpsc::UnboundedReceiver<herdr_connect_rs::ActivityFrame>,
+        (activity_rx, frames): (
+            &mut tokio::sync::mpsc::UnboundedReceiver<herdr_connect_rs::ActivityFrame>,
+            &mut Vec<String>,
+        ),
         prompt: &str,
     ) -> Result<AgentSnapshot, String> {
+        let started = Instant::now();
         submit_owner_prompt(pane_id, prompt)?;
         wait_for_event(
             sub,
@@ -6294,6 +6299,7 @@ mod tests {
         let settled = loop {
             tokio::select! {
                 Some(frame) = activity_rx.recv() => {
+                    frames.push(activity_frame_line(started, &frame, state));
                     super::handle_activity_event(connection, frame, state).await;
                 }
                 event = wait_for_event(
@@ -6312,6 +6318,27 @@ mod tests {
         };
         own(&settled, tabs, connection, state).await;
         Ok(settled)
+    }
+
+    /// One diagnostic line for a frame the broker forwarded: milliseconds since `started`, the
+    /// frame's pane, tool, summary (40 chars) and session (16 chars), and whether the pane was
+    /// activity-eligible when the frame arrived. The production broker socket also carries every
+    /// other live agent's frames, so a failing row needs this list to show which frames it handled.
+    #[cfg(unix)]
+    fn activity_frame_line(
+        started: Instant,
+        frame: &herdr_connect_rs::ActivityFrame,
+        state: &BridgeState,
+    ) -> String {
+        format!(
+            "+{}ms pane={} tool={} summary={:?} session={:?} eligible={}",
+            started.elapsed().as_millis(),
+            frame.pane_id,
+            frame.tool,
+            frame.summary.chars().take(40).collect::<String>(),
+            frame.session_id.chars().take(16).collect::<String>(),
+            state.activity_eligible_panes.contains(&frame.pane_id),
+        )
     }
 
     /// The thread's plain `⚙️`-prefixed messages, in post order.
@@ -6334,18 +6361,23 @@ mod tests {
     #[cfg(unix)]
     fn assert_first_turn_activity(
         messages: &[(String, bool, Id<MessageMarker>)],
+        frames: &[String],
     ) -> Result<Id<MessageMarker>, String> {
         if let Some((content, _, _)) = messages.iter().find(|(_, embed, _)| *embed) {
-            return Err(format!("a card was posted for turn one: {content:?}"));
+            return Err(format!(
+                "a card was posted for turn one: {content:?}; frames received: {frames:?}"
+            ));
         }
         let rows = activity_message_rows(messages);
         let [(text, _, activity_id)] = rows.as_slice() else {
             return Err(format!(
-                "expected exactly one activity message after turn one, thread has {messages:?}"
+                "expected exactly one activity message after turn one, thread has {messages:?}; frames received: {frames:?}"
             ));
         };
         if !text.contains("Bash") {
-            return Err(format!("activity message did not name Bash: {text}"));
+            return Err(format!(
+                "activity message did not name Bash: {text}; frames received: {frames:?}"
+            ));
         }
         Ok(*activity_id)
     }
@@ -6357,27 +6389,28 @@ mod tests {
     fn assert_second_turn_activity(
         messages: &[(String, bool, Id<MessageMarker>)],
         first_activity_id: Id<MessageMarker>,
+        frames: &[String],
     ) -> Result<(), String> {
         let rows = activity_message_rows(messages);
         let [first_row, second_row] = rows.as_slice() else {
             return Err(format!(
-                "expected exactly two activity messages after turn two, thread has {messages:?}"
+                "expected exactly two activity messages after turn two, thread has {messages:?}; frames received: {frames:?}"
             ));
         };
         if first_row.2 != first_activity_id {
             return Err(format!(
-                "turn one's activity message changed identity: {first_row:?}"
+                "turn one's activity message changed identity: {first_row:?}; frames received: {frames:?}"
             ));
         }
         if !second_row.0.starts_with("⚙️ 1 ·") {
             return Err(format!(
-                "turn two's activity message did not start a fresh count: {}",
+                "turn two's activity message did not start a fresh count: {}; frames received: {frames:?}",
                 second_row.0
             ));
         }
         if !second_row.0.contains("Bash") {
             return Err(format!(
-                "turn two's activity message did not name Bash: {}",
+                "turn two's activity message did not name Bash: {}; frames received: {frames:?}",
                 second_row.0
             ));
         }
@@ -6401,6 +6434,7 @@ mod tests {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
         let mut state = BridgeState::default();
+        let mut frames = Vec::new();
 
         let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
         let responder = Arc::clone(&connection.3);
@@ -6439,12 +6473,12 @@ mod tests {
             &mut sub,
             &connection,
             &mut state,
-            &mut activity_rx,
+            (&mut activity_rx, &mut frames),
             ACTIVITY_FORCE_PROMPT,
         )
         .await?;
         let after_first_turn = thread_messages(guild, thread).await?;
-        let first_activity_id = assert_first_turn_activity(&after_first_turn)?;
+        let first_activity_id = assert_first_turn_activity(&after_first_turn, &frames)?;
 
         // Row 2: a frame injected after the turn settled is dropped, not edited or recreated.
         let late_frame = herdr_connect_rs::ActivityFrame {
@@ -6457,12 +6491,14 @@ mod tests {
             tool: "LateGhost".to_owned(),
             summary: "late-frame-should-be-dropped".to_owned(),
         };
+        let late_started = Instant::now();
         herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
             .await;
         let received = tokio::time::timeout(Duration::from_secs(2), activity_rx.recv())
             .await
             .map_err(|_| "late synthetic frame was not forwarded by the broker".to_owned())?
             .ok_or_else(|| "activity channel closed before the late frame arrived".to_owned())?;
+        frames.push(activity_frame_line(late_started, &received, &state));
         super::handle_activity_event(&connection, received, &mut state).await;
         let after_late_frame = thread_messages(guild, thread).await?;
         if after_late_frame != after_first_turn {
@@ -6479,7 +6515,7 @@ mod tests {
             &mut sub,
             &connection,
             &mut state,
-            &mut activity_rx,
+            (&mut activity_rx, &mut frames),
             ACTIVITY_FORCE_PROMPT,
         )
         .await?;
@@ -6487,7 +6523,7 @@ mod tests {
         let _ = std::fs::remove_file(broker_socket);
 
         let after_second_turn = thread_messages(guild, thread).await?;
-        assert_second_turn_activity(&after_second_turn, first_activity_id)
+        assert_second_turn_activity(&after_second_turn, first_activity_id, &frames)
     }
 
     #[cfg(unix)]
@@ -7270,6 +7306,7 @@ mod tests {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
         let mut state = BridgeState::default();
+        let mut frames = Vec::new();
 
         let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
         let responder = Arc::clone(&connection.3);
@@ -7317,12 +7354,12 @@ mod tests {
             &mut sub,
             &connection,
             &mut state,
-            &mut activity_rx,
+            (&mut activity_rx, &mut frames),
             ACTIVITY_FORCE_PROMPT,
         )
         .await?;
         let after_first_turn = thread_messages(guild, thread).await?;
-        let first_activity_id = assert_first_turn_activity(&after_first_turn)?;
+        let first_activity_id = assert_first_turn_activity(&after_first_turn, &frames)?;
 
         // Row 2: a frame injected after the turn settled is dropped, not edited or recreated.
         let late_frame = herdr_connect_rs::ActivityFrame {
@@ -7335,6 +7372,7 @@ mod tests {
             tool: "LateGhost".to_owned(),
             summary: "late-frame-should-be-dropped".to_owned(),
         };
+        let late_started = Instant::now();
         herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
             .await;
         // The production socket is shared with the owner's other live panes, so foreign frames
@@ -7347,6 +7385,7 @@ mod tests {
                 .ok_or_else(|| {
                     "activity channel closed before the late frame arrived".to_owned()
                 })?;
+            frames.push(activity_frame_line(late_started, &received, &state));
             let is_synthetic = received.session_id == "late-frame-synthetic";
             super::handle_activity_event(&connection, received, &mut state).await;
             if is_synthetic {
@@ -7368,14 +7407,14 @@ mod tests {
             &mut sub,
             &connection,
             &mut state,
-            &mut activity_rx,
+            (&mut activity_rx, &mut frames),
             ACTIVITY_FORCE_PROMPT,
         )
         .await?;
         broker_task.abort();
 
         let after_second_turn = thread_messages(guild, thread).await?;
-        assert_second_turn_activity(&after_second_turn, first_activity_id)
+        assert_second_turn_activity(&after_second_turn, first_activity_id, &frames)
     }
 
     #[cfg(unix)]
