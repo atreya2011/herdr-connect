@@ -235,7 +235,8 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let detection = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
         .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten();
-    if let Some((questions, index)) = shown_question(snapshot, session, detection.as_deref()) {
+    if let Some((questions, index)) = shown_question(snapshot, session, detection.as_deref()).await
+    {
         match responder
             .deliver_question_card(target, &route.pane_id, questions, index)
             .await
@@ -283,19 +284,39 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     .await;
 }
 
+/// How long, and how often, the blocked-card path re-reads the vendor log for a pending question
+/// the pane's dialog already shows. Herdr reports the pane `blocked` as soon as the dialog renders,
+/// and Claude's `AskUserQuestion` record can reach the log a moment later: in a live run, two of
+/// three single-question rows built the plain card because the first read found no pending
+/// question.
+const PENDING_QUESTION_WAIT: Duration = Duration::from_secs(3);
+const PENDING_QUESTION_POLL: Duration = Duration::from_millis(250);
+
 /// The pending `AskUserQuestion` call from the pane's vendor log, and the index of the question
-/// its dialog, in Herdr's detection snapshot, currently shows.
-fn shown_question(
+/// its dialog, in Herdr's detection snapshot, currently shows. A pane whose snapshot shows a
+/// question dialog but whose log has no pending question yet is re-read for
+/// [`PENDING_QUESTION_WAIT`]; after that the caller keeps the plain card.
+async fn shown_question(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
     detection: Option<&str>,
 ) -> Option<(Vec<Question>, usize)> {
     let detection = detection?;
-    let questions = capture_for_blocked(snapshot, session).pending_questions;
-    let index = questions
-        .iter()
-        .position(|question| dialog_shows_question(detection, question))?;
-    Some((questions, index))
+    format_detection_question(detection)?;
+    let deadline = tokio::time::Instant::now() + PENDING_QUESTION_WAIT;
+    loop {
+        let questions = capture_for_blocked(snapshot, session).pending_questions;
+        if let Some(index) = questions
+            .iter()
+            .position(|question| dialog_shows_question(detection, question))
+        {
+            return Some((questions, index));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(PENDING_QUESTION_POLL).await;
+    }
 }
 
 /// What [`deliver_blocked_messages`] needs to deliver a blocked card, bundled to keep the function
