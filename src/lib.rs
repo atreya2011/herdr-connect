@@ -24,8 +24,8 @@ pub use activity::{
     decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
 };
 pub use broker::{
-    PermissionResponder, handle_component, hook_timeout, question_hook_timeout, request_decision,
-    request_question_answers, run_broker, send_activity_frame,
+    PermissionResponder, handle_component, hook_timeout, request_decision, run_broker,
+    send_activity_frame,
 };
 pub use cards::{
     AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,

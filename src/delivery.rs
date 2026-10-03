@@ -31,10 +31,6 @@ const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
 const SELECT_OPTION_TEXT_LIMIT: usize = 100;
 /// Discord's button label length limit (`twilight-validate`'s `COMPONENT_BUTTON_LABEL_LENGTH`).
 const BUTTON_LABEL_LIMIT: usize = 80;
-/// Discord's message content length limit (`twilight-validate`'s `MESSAGE_CONTENT_LENGTH_MAX`): a
-/// free-text answer can run well past it, and an oversized `update_message` is rejected outright,
-/// leaving the card's buttons enabled and unresolved.
-pub const MAX_QUESTION_CARD_CONTENT_LENGTH: usize = 2_000;
 const STARTUP_COMPONENT_MASK: u64 = (1_u64 << 44) - 1;
 const PAYLOAD_COMPONENT_MASK: u64 = (1_u64 << 52) - 1;
 const COMPONENT_TYPE_KEY: &str = "type";

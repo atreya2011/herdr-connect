@@ -23,12 +23,9 @@ use crate::herdr::{
     PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
     agent_prompt, agent_send_keys,
 };
-use crate::registry::ResolveError;
 use crate::{AgentSnapshot, list_agents};
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
-const QUESTION_ANSWER_ACCEPTED_REPLY: &str = "accepted: answer recorded";
-const QUESTION_ANSWER_STALE_REPLY: &str = "refused: the question already resolved or expired";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
 const STALL_RECOVERY_POLL_BOUND: Duration = Duration::from_secs(5);
 const STALL_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -46,11 +43,6 @@ static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
 
 /// Handles one Discord owner message after gateway-level filtering.
 ///
-/// A thread reply while any question card -- single-select or multiSelect -- is pending for the
-/// mapped pane's session is consumed as that question's free-text answer instead of being
-/// submitted as an `agent.prompt` (the pane's Herdr status is `working` while a question is
-/// pending, and [`resolve_prompt_pane`] accepts a `working` pane, so this check must run first).
-///
 /// # Errors
 ///
 /// Returns Discord, Herdr, or task-dispatch errors.
@@ -59,7 +51,7 @@ pub async fn handle_owner_message(
     guild: Id<GuildMarker>,
     owner_id: &str,
     message: Message,
-    responder: &PermissionResponder,
+    _responder: &PermissionResponder,
 ) -> Result<(), String> {
     if message.guild_id != Some(guild)
         || !should_handle_owner_message(
@@ -125,10 +117,6 @@ pub async fn handle_owner_message(
             return Ok(());
         }
     };
-    if let Some(response) = answer_pending_question(responder, agent, &message) {
-        reply(&client, &message, response).await?;
-        return Ok(());
-    }
     let pane_id = match resolve_prompt_pane(agent) {
         Ok(target) => target,
         Err(reason) => {
@@ -154,25 +142,6 @@ pub async fn handle_owner_message(
             Err(format!("agent.prompt failed: {error}"))
         }
     }
-}
-
-/// Consumes `message` as the free-text answer to the question pending for `agent`'s session, and
-/// returns the reply to post; `None` when no question is pending.
-fn answer_pending_question(
-    responder: &PermissionResponder,
-    agent: &AgentSnapshot,
-    message: &Message,
-) -> Option<&'static str> {
-    let session_id = agent.session.as_ref()?.value.as_str();
-    let token = responder.pending_question_token(session_id)?;
-    Some(
-        match responder.resolve_question_text(&token, message.channel_id.get(), &message.content) {
-            Ok(()) => QUESTION_ANSWER_ACCEPTED_REPLY,
-            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
-                QUESTION_ANSWER_STALE_REPLY
-            }
-        },
-    )
 }
 
 #[must_use]

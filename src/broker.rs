@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -21,105 +21,20 @@ use twilight_model::http::interaction::{
 use twilight_model::id::{Id, marker::GuildMarker};
 
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
-use crate::delivery::{
-    MAX_QUESTION_CARD_CONTENT_LENGTH, expire_permission_card, truncate_with_ellipsis,
-};
+use crate::delivery::expire_permission_card;
 use crate::permission::{Decision, DecisionBehavior, Interaction};
-use crate::question::{
-    QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction, format_question_answer,
-};
-use crate::registry::{ApprovalRequest, InteractionRegistry, QuestionRegistry, ResolveError};
+use crate::registry::{ApprovalRequest, InteractionRegistry, ResolveError};
 use crate::{
-    TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_button_card,
-    deliver_question_select_card, expire_question_button_card, expire_question_select_card,
-    fetch_topology_lists, list_agents, route_topology, sync_topology, tab_list_result,
+    TopologyCache, bridge_eprintln, deliver_permission_card, fetch_topology_lists, list_agents,
+    route_topology, sync_topology, tab_list_result,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one question card stays open for an owner answer before the hook falls through to
-/// Claude's own dialog.
-const QUESTION_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[must_use]
 pub const fn hook_timeout() -> Duration {
     Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
-}
-
-/// The `AskUserQuestion` hook's own margin over [`QUESTION_TIMEOUT`], mirroring [`hook_timeout`]'s
-/// margin over `PERMISSION_TIMEOUT`.
-#[must_use]
-pub const fn question_hook_timeout() -> Duration {
-    Duration::from_secs(QUESTION_TIMEOUT.as_secs() + 5)
-}
-
-/// One `AskUserQuestion` request forwarded to the broker over the shared socket, tagged the same
-/// way [`ActivityFrame`] is so [`handle_connection`] can tell frame kinds apart before choosing
-/// which type to decode into.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct QuestionFrame {
-    kind: String,
-    session_id: String,
-    request_id: String,
-    questions: Vec<Question>,
-}
-
-impl From<&QuestionInteraction> for QuestionFrame {
-    fn from(interaction: &QuestionInteraction) -> Self {
-        Self {
-            kind: QUESTION_KIND.to_owned(),
-            session_id: interaction.session_id.clone(),
-            request_id: interaction.request_id.clone(),
-            questions: interaction.questions.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct QuestionBrokerResponse {
-    session_id: String,
-    request_id: String,
-    answers: BTreeMap<String, QuestionAnswer>,
-}
-
-/// Accepts a broker answer set only when its session and request id match the request.
-///
-/// # Errors
-///
-/// Returns `MismatchedRequest` for a response belonging to another or stale request.
-fn correlate_question_answers(
-    interaction: &QuestionInteraction,
-    response: QuestionBrokerResponse,
-) -> Result<BTreeMap<String, QuestionAnswer>, CorrelationError> {
-    if interaction.session_id != response.session_id
-        || interaction.request_id != response.request_id
-    {
-        return Err(CorrelationError::MismatchedRequest);
-    }
-    Ok(response.answers)
-}
-
-/// Sends one `AskUserQuestion` request to the broker and awaits its resolved answers.
-///
-/// Returns `None` on any connect failure, malformed or mismatched response, or timeout, matching
-/// the hook's best-effort contract: the caller falls through to Claude's own dialog rather than
-/// failing the tool call.
-pub async fn request_question_answers(
-    interaction: &QuestionInteraction,
-    socket_path: &Path,
-    timeout_duration: Duration,
-) -> Option<BTreeMap<String, QuestionAnswer>> {
-    let frame = QuestionFrame::from(interaction);
-    tokio::time::timeout(timeout_duration, async {
-        let mut stream = UnixStream::connect(socket_path).await.map_err(|_| ())?;
-        write_json_line(&mut stream, &frame).await.map_err(|_| ())?;
-        let response: QuestionBrokerResponse = read_json_line(&mut stream).await.map_err(|_| ())?;
-        correlate_question_answers(interaction, response).map_err(|_| ())
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
 }
 
 pub struct PermissionResponder {
@@ -127,7 +42,6 @@ pub struct PermissionResponder {
     guild: Id<GuildMarker>,
     owner_id: String,
     registry: Arc<InteractionRegistry>,
-    question_registry: Arc<QuestionRegistry>,
     topology_cache: TopologyCache,
 }
 
@@ -197,7 +111,6 @@ impl PermissionResponder {
             guild,
             owner_id,
             registry: Arc::new(InteractionRegistry::default()),
-            question_registry: Arc::new(QuestionRegistry::default()),
             topology_cache,
         }
     }
@@ -205,33 +118,6 @@ impl PermissionResponder {
     #[must_use]
     pub fn has_pending_session(&self, session_id: &str) -> bool {
         self.registry.has_pending_session(session_id)
-    }
-
-    /// The token of the pending question card for `session_id`, if one is open, single-select or
-    /// multiSelect alike.
-    #[must_use]
-    pub fn pending_question_token(&self, session_id: &str) -> Option<String> {
-        self.question_registry.pending_question_token(session_id)
-    }
-
-    /// Resolves the pending question card `token` with a free-text owner answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejection reason for an unknown, expired, wrong-channel, or already-resolved
-    /// token -- the same race an owner tapping a now-stale button would hit.
-    pub fn resolve_question_text(
-        &self,
-        token: &str,
-        channel_id: u64,
-        text: &str,
-    ) -> Result<(), ResolveError> {
-        self.question_registry.resolve(
-            token,
-            channel_id,
-            QuestionAnswer::Single(text.to_owned()),
-            std::time::Instant::now(),
-        )
     }
 
     #[must_use]
@@ -433,279 +319,6 @@ impl PermissionResponder {
         let _ =
             expire_permission_card(self.client.as_ref(), channel, message, token, content).await;
     }
-
-    /// Answers one `AskUserQuestion` request by posting its questions as Discord cards, in order,
-    /// and collecting the owner's resolved answers.
-    ///
-    /// The first question that expires, or whose card cannot be delivered, aborts the whole
-    /// request: no further question in the same call gets a card, and the caller falls through to
-    /// Claude's own dialog -- an `AskUserQuestion` call is answered in full or not at all.
-    ///
-    /// Every card in the call shares one `call_deadline` (`QUESTION_TIMEOUT` from the call's own
-    /// start), not its own fresh `QUESTION_TIMEOUT` window: a multi-question call otherwise lets a
-    /// later card outlive the hook's own `question_hook_timeout` margin over a single card's
-    /// window, discarding an already-answered earlier question when the hook gives up.
-    async fn request_question(
-        &self,
-        frame: &QuestionFrame,
-        liveness: HookLiveness,
-    ) -> Option<BTreeMap<String, QuestionAnswer>> {
-        let route = self.route(&frame.session_id, &liveness).await?;
-        let channel = self.sync_channel(&route, &liveness).await?;
-        let call_deadline = std::time::Instant::now() + QUESTION_TIMEOUT;
-        let mut answers = BTreeMap::new();
-        for question in &frame.questions {
-            let answer = self
-                .request_one_question(
-                    channel,
-                    &frame.session_id,
-                    question,
-                    call_deadline,
-                    &liveness,
-                )
-                .await?;
-            answers.insert(question.question.clone(), answer);
-        }
-        Some(answers)
-    }
-
-    async fn request_one_question(
-        &self,
-        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-        session_id: &str,
-        question: &Question,
-        call_deadline: std::time::Instant,
-        liveness: &HookLiveness,
-    ) -> Option<QuestionAnswer> {
-        let created_at = std::time::Instant::now();
-        let issued = self
-            .question_registry
-            .issue_with_liveness(
-                ApprovalRequest {
-                    channel_id: channel.get(),
-                    session_id: session_id.to_owned(),
-                },
-                question.options.clone(),
-                created_at,
-                call_deadline,
-                Arc::clone(&liveness.alive),
-            )
-            .ok()?;
-        let message = self
-            .deliver_question_card(channel, question, &issued.token, liveness)
-            .await?;
-        let token = issued.token.clone();
-        let answer = Self::wait_question_answer(
-            issued.receiver,
-            liveness,
-            tokio::time::sleep(
-                issued
-                    .expiry
-                    .saturating_duration_since(std::time::Instant::now()),
-            ),
-        )
-        .await;
-        let answer = answer.filter(|_| liveness.is_alive());
-        let card_text = answer.as_ref().map_or_else(
-            || {
-                self.question_registry.remove(&token);
-                if liveness.is_alive() {
-                    "expired: no owner answer".to_owned()
-                } else {
-                    "expired: hook disconnected".to_owned()
-                }
-            },
-            |resolved| {
-                truncate_with_ellipsis(
-                    &format!("resolved: {}", format_question_answer(resolved)),
-                    MAX_QUESTION_CARD_CONTENT_LENGTH,
-                )
-            },
-        );
-        let client = Arc::clone(&self.client);
-        let options = question.options.clone();
-        let multi_select = question.multi_select;
-        return_value_before_card_edit(answer, async move {
-            if multi_select {
-                expire_question_select_card(
-                    client.as_ref(),
-                    channel,
-                    message,
-                    &options,
-                    &token,
-                    &card_text,
-                )
-                .await
-            } else {
-                expire_question_button_card(
-                    client.as_ref(),
-                    channel,
-                    message,
-                    &options,
-                    &token,
-                    &card_text,
-                )
-                .await
-            }
-        })
-    }
-
-    async fn deliver_question_card(
-        &self,
-        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-        question: &Question,
-        token: &str,
-        liveness: &HookLiveness,
-    ) -> Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>> {
-        let delivery: std::pin::Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
-                            String,
-                        >,
-                    > + Send,
-            >,
-        > = if question.multi_select {
-            Box::pin(deliver_question_select_card(
-                self.client.as_ref(),
-                channel,
-                question,
-                token,
-            ))
-        } else {
-            Box::pin(deliver_question_button_card(
-                self.client.as_ref(),
-                channel,
-                question,
-                token,
-            ))
-        };
-        tokio::pin!(delivery);
-        tokio::select! {
-            result = &mut delivery => {
-                let message = match result {
-                    Ok(message) => message,
-                    Err(error) => {
-                        bridge_eprintln!("question card delivery failed: {error}");
-                        self.question_registry.remove(token);
-                        return None;
-                    }
-                };
-                if liveness.is_alive() {
-                    Some(message)
-                } else {
-                    self.expire_question_card_disconnected(channel, message, question, token).await;
-                    None
-                }
-            }
-            () = liveness.wait_closed() => {
-                let message = delivery.await.ok();
-                if let Some(message) = message {
-                    self.expire_question_card_disconnected(channel, message, question, token).await;
-                } else {
-                    self.question_registry.remove(token);
-                }
-                None
-            }
-        }
-    }
-
-    async fn wait_question_answer(
-        receiver: oneshot::Receiver<QuestionAnswer>,
-        liveness: &HookLiveness,
-        expiry: tokio::time::Sleep,
-    ) -> Option<QuestionAnswer> {
-        tokio::pin!(expiry);
-        tokio::select! {
-            biased;
-            result = receiver => result.ok(),
-            () = liveness.wait_closed() => None,
-            () = &mut expiry => None,
-        }
-    }
-
-    async fn expire_question_card_disconnected(
-        &self,
-        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-        message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
-        question: &Question,
-        token: &str,
-    ) {
-        self.question_registry.remove(token);
-        let _ = if question.multi_select {
-            expire_question_select_card(
-                self.client.as_ref(),
-                channel,
-                message,
-                &question.options,
-                token,
-                "expired: hook disconnected",
-            )
-            .await
-        } else {
-            expire_question_button_card(
-                self.client.as_ref(),
-                channel,
-                message,
-                &question.options,
-                token,
-                "expired: hook disconnected",
-            )
-            .await
-        };
-    }
-
-    /// Resolves the pending single-select question card `token` with the option chosen by button
-    /// tap, identified by its index among the card's own options.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejection reason for an unknown, expired, wrong-channel, already-resolved, or
-    /// out-of-range option index.
-    fn resolve_question_option(
-        &self,
-        token: &str,
-        channel_id: u64,
-        option_index: usize,
-    ) -> Result<(), ResolveError> {
-        let label = self
-            .question_registry
-            .option_label(token, option_index)
-            .ok_or(ResolveError::UnknownOrExpired)?;
-        self.question_registry.resolve(
-            token,
-            channel_id,
-            QuestionAnswer::Single(label),
-            std::time::Instant::now(),
-        )
-    }
-
-    /// Resolves the pending multiSelect question card `token` with the options chosen through its
-    /// select menu, identified by index among the card's own options.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejection reason for an unknown, expired, wrong-channel, already-resolved, or
-    /// out-of-range option index.
-    fn resolve_question_options(
-        &self,
-        token: &str,
-        channel_id: u64,
-        option_indices: &[usize],
-    ) -> Result<(), ResolveError> {
-        let labels = option_indices
-            .iter()
-            .map(|&index| self.question_registry.option_label(token, index))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(ResolveError::UnknownOrExpired)?;
-        self.question_registry.resolve(
-            token,
-            channel_id,
-            QuestionAnswer::Multiple(labels),
-            std::time::Instant::now(),
-        )
-    }
 }
 
 pub async fn handle_component(
@@ -724,10 +337,6 @@ pub async fn handle_component(
             .is_some_and(|id| id.to_string() == responder.owner_id);
     let response = if !authorized {
         Some(ephemeral_response("not authorized"))
-    } else if let Some(rest) = data.custom_id.strip_prefix("herdrask-multi:") {
-        question_select_response(&responder, rest, channel.id.get(), &data.values)
-    } else if let Some(rest) = data.custom_id.strip_prefix("herdrask:") {
-        question_button_response(&responder, rest, channel.id.get())
     } else if let Some((action, token)) = data
         .custom_id
         .split_once(':')
@@ -768,43 +377,6 @@ fn permission_component_response(
             .resolve(token, channel_id, decision, std::time::Instant::now())
         {
             Ok(()) => ephemeral_response("decision recorded"),
-            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
-                ephemeral_response("expired")
-            }
-        },
-    )
-}
-
-/// `token` is `"<token>:<option index>"`, the tail of a `herdrask:` single-select button's
-/// `custom_id`.
-fn question_button_response(
-    responder: &PermissionResponder,
-    token: &str,
-    channel_id: u64,
-) -> Option<InteractionResponse> {
-    let (token, index) = token.split_once(':')?;
-    let index: usize = index.parse().ok()?;
-    Some(
-        match responder.resolve_question_option(token, channel_id, index) {
-            Ok(()) => ephemeral_response("answer recorded"),
-            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
-                ephemeral_response("expired")
-            }
-        },
-    )
-}
-
-fn question_select_response(
-    responder: &PermissionResponder,
-    token: &str,
-    channel_id: u64,
-    values: &[String],
-) -> Option<InteractionResponse> {
-    let indices: Option<Vec<usize>> = values.iter().map(|value| value.parse().ok()).collect();
-    let indices = indices?;
-    Some(
-        match responder.resolve_question_options(token, channel_id, &indices) {
-            Ok(()) => ephemeral_response("answer recorded"),
             Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
                 ephemeral_response("expired")
             }
@@ -1060,26 +632,6 @@ async fn handle_connection(
         }
         return;
     }
-    if is_question_frame(&bytes) {
-        let Ok(frame) = serde_json::from_slice::<QuestionFrame>(&bytes) else {
-            bridge_eprintln!("broker rejected initial frame: malformed question frame");
-            return;
-        };
-        let (read_half, mut write_half) = stream.into_split();
-        let liveness = HookLiveness::new();
-        let monitor = spawn_hook_monitor(read_half, liveness.clone());
-        let answers = responder.request_question(&frame, liveness).await;
-        if let Some(answers) = answers {
-            let response = QuestionBrokerResponse {
-                session_id: frame.session_id.clone(),
-                request_id: frame.request_id.clone(),
-                answers,
-            };
-            let _ = write_json_line(&mut write_half, &response).await;
-        }
-        monitor.abort();
-        return;
-    }
     let interaction = match serde_json::from_slice::<Interaction>(&bytes) {
         Ok(interaction) if is_valid_interaction(&interaction) => interaction,
         Ok(_) => return,
@@ -1132,21 +684,6 @@ fn is_activity_frame(bytes: &[u8]) -> bool {
         })
         .as_deref()
         == Some(ACTIVITY_KIND)
-}
-
-/// Whether a raw initial frame names itself a question frame (tagged `"kind":"question"`), the
-/// same way [`is_activity_frame`] recognizes an activity frame ahead of a typed decode.
-fn is_question_frame(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some(QUESTION_KIND)
 }
 
 async fn read_json_line_bytes(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
@@ -1205,14 +742,11 @@ mod tests {
 
     use super::{
         BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingRequests, PermissionResponder,
-        QUESTION_TIMEOUT, QuestionBrokerResponse, RequestFingerprint, correlate_decision,
-        correlate_question_answers, hook_timeout, question_hook_timeout, read_json_line,
+        RequestFingerprint, correlate_decision, hook_timeout, read_json_line,
         return_value_before_card_edit, spawn_hook_monitor,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
-    use crate::question::{Question, QuestionAnswer, QuestionInteraction, QuestionOption};
     use crate::registry::ApprovalRequest;
-    use std::collections::BTreeMap;
 
     fn interaction() -> Interaction {
         Interaction {
@@ -1231,58 +765,6 @@ mod tests {
     fn permission_hook_margin_matches_the_permission_timeout() {
         assert_eq!(PERMISSION_TIMEOUT, Duration::from_secs(45));
         assert_eq!(hook_timeout(), Duration::from_secs(50));
-    }
-
-    #[test]
-    fn question_hook_margin_matches_the_question_timeout() {
-        assert_eq!(QUESTION_TIMEOUT, Duration::from_secs(30));
-        assert_eq!(question_hook_timeout(), Duration::from_secs(35));
-    }
-
-    fn question_interaction() -> QuestionInteraction {
-        QuestionInteraction {
-            session_id: "session".to_owned(),
-            request_id: "toolu_1".to_owned(),
-            questions: vec![Question {
-                question: "Which color?".to_owned(),
-                header: "Color".to_owned(),
-                options: vec![
-                    QuestionOption {
-                        label: "Red".to_owned(),
-                        description: "The color red".to_owned(),
-                    },
-                    QuestionOption {
-                        label: "Blue".to_owned(),
-                        description: "The color blue".to_owned(),
-                    },
-                ],
-                multi_select: false,
-            }],
-            raw_tool_input: serde_json::json!({"questions": []}),
-        }
-    }
-
-    #[test]
-    fn mismatched_question_session_or_request_id_is_rejected() {
-        let request = question_interaction();
-        let answers = BTreeMap::from([(
-            "Which color?".to_owned(),
-            QuestionAnswer::Single("Blue".to_owned()),
-        )]);
-        for (session_id, request_id) in [("other", "toolu_1"), ("session", "other")] {
-            let response = QuestionBrokerResponse {
-                session_id: session_id.to_owned(),
-                request_id: request_id.to_owned(),
-                answers: answers.clone(),
-            };
-            assert!(correlate_question_answers(&request, response).is_err());
-        }
-        let response = QuestionBrokerResponse {
-            session_id: request.session_id.clone(),
-            request_id: request.request_id.clone(),
-            answers: answers.clone(),
-        };
-        assert_eq!(correlate_question_answers(&request, response), Ok(answers));
     }
 
     #[test]
@@ -1378,9 +860,7 @@ mod tests {
         assert!(edit_started.load(Ordering::Acquire));
     }
 
-    use super::{
-        permission_component_response, question_button_response, question_select_response,
-    };
+    use super::permission_component_response;
     use std::time::Instant;
     use twilight_http::Client;
     use twilight_model::http::interaction::InteractionResponse;
@@ -1395,142 +875,12 @@ mod tests {
         )
     }
 
-    fn question_option(label: &str) -> QuestionOption {
-        QuestionOption {
-            label: label.to_owned(),
-            description: String::new(),
-        }
-    }
-
     fn response_content(response: Option<InteractionResponse>) -> String {
         response
             .expect("component dispatch replies")
             .data
             .and_then(|data| data.content)
             .expect("ephemeral reply has content")
-    }
-
-    #[tokio::test]
-    async fn question_button_tap_resolves_by_option_index_and_rejects_a_replay() {
-        let responder = test_responder();
-        let now = Instant::now();
-        let issued = responder
-            .question_registry
-            .issue_with_liveness(
-                ApprovalRequest {
-                    channel_id: 7,
-                    session_id: "session".to_owned(),
-                },
-                vec![question_option("Red"), question_option("Blue")],
-                now,
-                now + Duration::from_secs(30),
-                Arc::new(AtomicBool::new(true)),
-            )
-            .expect("issue token");
-
-        let response = question_button_response(&responder, &format!("{}:1", issued.token), 7);
-        assert_eq!(response_content(response), "answer recorded");
-        assert_eq!(
-            issued.receiver.await,
-            Ok(QuestionAnswer::Single("Blue".to_owned()))
-        );
-
-        let replay = question_button_response(&responder, &format!("{}:0", issued.token), 7);
-        assert_eq!(response_content(replay), "expired");
-    }
-
-    #[tokio::test]
-    async fn question_button_tap_rejects_the_wrong_channel_or_a_bad_index() {
-        let responder = test_responder();
-        let now = Instant::now();
-        let issued = responder
-            .question_registry
-            .issue_with_liveness(
-                ApprovalRequest {
-                    channel_id: 7,
-                    session_id: "session".to_owned(),
-                },
-                vec![question_option("Red")],
-                now,
-                now + Duration::from_secs(30),
-                Arc::new(AtomicBool::new(true)),
-            )
-            .expect("issue token");
-
-        let out_of_range = question_button_response(&responder, &format!("{}:9", issued.token), 7);
-        assert_eq!(response_content(out_of_range), "expired");
-
-        let wrong_channel = question_button_response(&responder, &format!("{}:0", issued.token), 8);
-        assert_eq!(response_content(wrong_channel), "expired");
-    }
-
-    #[tokio::test]
-    async fn question_select_tap_resolves_every_chosen_index() {
-        let responder = test_responder();
-        let now = Instant::now();
-        let issued = responder
-            .question_registry
-            .issue_with_liveness(
-                ApprovalRequest {
-                    channel_id: 7,
-                    session_id: "session".to_owned(),
-                },
-                vec![
-                    question_option("Cheese"),
-                    question_option("Olives"),
-                    question_option("Mushrooms"),
-                ],
-                now,
-                now + Duration::from_secs(30),
-                Arc::new(AtomicBool::new(true)),
-            )
-            .expect("issue token");
-
-        let values = ["0".to_owned(), "2".to_owned()];
-        let response = question_select_response(&responder, &issued.token, 7, &values);
-        assert_eq!(response_content(response), "answer recorded");
-        assert_eq!(
-            issued.receiver.await,
-            Ok(QuestionAnswer::Multiple(vec![
-                "Cheese".to_owned(),
-                "Mushrooms".to_owned()
-            ]))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_thread_reply_answers_a_pending_multi_select_question_as_free_text() {
-        let responder = test_responder();
-        let now = Instant::now();
-        let issued = responder
-            .question_registry
-            .issue_with_liveness(
-                ApprovalRequest {
-                    channel_id: 7,
-                    session_id: "session".to_owned(),
-                },
-                vec![
-                    question_option("Cheese"),
-                    question_option("Olives"),
-                    question_option("Mushrooms"),
-                ],
-                now,
-                now + Duration::from_secs(30),
-                Arc::new(AtomicBool::new(true)),
-            )
-            .expect("issue token");
-
-        let token = responder
-            .pending_question_token("session")
-            .expect("a pending multiSelect card is still found by a free-text lookup");
-        assert_eq!(token, issued.token);
-        responder
-            .resolve_question_text(&token, 7, "none of these")
-            .expect("free-text reply resolves a pending multiSelect card");
-        assert_eq!(
-            issued.receiver.await,
-            Ok(QuestionAnswer::Single("none of these".to_owned()))
-        );
     }
 
     #[tokio::test]
