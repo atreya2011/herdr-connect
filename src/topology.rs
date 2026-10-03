@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex;
-use twilight_model::channel::{Channel, Message, message::MessageType};
+use twilight_model::channel::Channel;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker};
 
@@ -483,41 +483,10 @@ pub fn record_self_deletion(id: Id<ChannelMarker>) {
         .insert(id);
 }
 
-/// Finds the `THREAD_CREATED` system message Discord posted in `parent` for `thread_id`.
-///
-/// It is the message, in the page of messages around the thread id, whose reference points at the
-/// thread. `None` means the page holds no such message.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
-pub async fn find_thread_created_message(
-    client: &twilight_http::Client,
-    parent: Id<ChannelMarker>,
-    thread_id: Id<ChannelMarker>,
-) -> Result<Option<Message>, String> {
-    let messages = client
-        .channel_messages(parent)
-        .around(Id::new(thread_id.get()))
-        .limit(100)
-        .await
-        .map_err(|error| error.to_string())?
-        .models()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(messages.into_iter().find(|message| {
-        message.kind == MessageType::ThreadCreated
-            && message
-                .reference
-                .as_ref()
-                .is_some_and(|reference| reference.channel_id == Some(thread_id))
-    }))
-}
-
 /// Deletes the `THREAD_CREATED` system message Discord posted in `parent` for `thread_id`.
 ///
-/// This leaves no "started a thread" line behind a deleted thread. No such message, or one already
-/// deleted, is not an error.
+/// Discord gives that message the thread's own id, so it is deleted directly. This leaves no
+/// "started a thread" line behind a deleted thread. A message already deleted is not an error.
 ///
 /// # Errors
 ///
@@ -527,10 +496,10 @@ pub async fn delete_thread_created_message(
     parent: Id<ChannelMarker>,
     thread_id: Id<ChannelMarker>,
 ) -> Result<(), String> {
-    let Some(message) = find_thread_created_message(client, parent, thread_id).await? else {
-        return Ok(());
-    };
-    match client.delete_message(parent, message.id).await {
+    match client
+        .delete_message(parent, Id::new(thread_id.get()))
+        .await
+    {
         Err(error) if !is_unknown_message_error(&error) => Err(error.to_string()),
         _ => Ok(()),
     }

@@ -8200,9 +8200,9 @@ mod tests {
     }
 
     /// Checks that the parent channel holds, or no longer holds, the system message Discord posted
-    /// when it created `thread_id`. The listing is independent of the production lookup. When the
-    /// message is expected present, the production lookup must also find it, under the thread's own id. A mismatch reports
-    /// the facts of both.
+    /// when it created `thread_id`. When it is expected present, it must carry the thread's own id,
+    /// which is what the production direct delete relies on. A mismatch reports the thread id and
+    /// the messages found with their ids and references.
     #[cfg(unix)]
     async fn expect_thread_created_message(
         guild: &BlockedCaptureGuild,
@@ -8210,24 +8210,20 @@ mod tests {
         thread_id: Id<ChannelMarker>,
         present: bool,
     ) -> Result<(), String> {
-        let listed = !thread_created_messages(guild, parent, thread_id)
-            .await?
-            .is_empty();
-        let found = present
-            && herdr_connect_rs::find_thread_created_message(
-                guild.client.as_ref(),
-                parent,
-                thread_id,
-            )
-            .await?
-            .is_some_and(|message| message.id.get() == thread_id.get());
-        if listed == present && (!present || found) {
+        let found = thread_created_messages(guild, parent, thread_id).await?;
+        let ids_match = found
+            .iter()
+            .all(|message| message.id.get() == thread_id.get());
+        if found.is_empty() != present && ids_match {
             return Ok(());
         }
+        let found = found
+            .iter()
+            .map(|message| (message.id, message.reference.clone()))
+            .collect::<Vec<_>>();
         Err(format!(
-            "started-a-thread message expected {}: {}",
+            "started-a-thread message expected {}: thread id {thread_id}; found {found:?}",
             if present { "present" } else { "deleted" },
-            thread_created_facts(guild, parent, thread_id).await
         ))
     }
 
@@ -8255,30 +8251,6 @@ mod tests {
                         .is_some_and(|reference| reference.channel_id == Some(thread_id))
             })
             .collect())
-    }
-
-    /// The thread id, the system messages found by the independent listing with their ids and
-    /// references, and what the production lookup returns, for a failure message.
-    #[cfg(unix)]
-    async fn thread_created_facts(
-        guild: &BlockedCaptureGuild,
-        parent: Id<ChannelMarker>,
-        thread_id: Id<ChannelMarker>,
-    ) -> String {
-        let listed = thread_created_messages(guild, parent, thread_id).await;
-        let found =
-            herdr_connect_rs::find_thread_created_message(guild.client.as_ref(), parent, thread_id)
-                .await
-                .map(|message| message.map(|message| message.id));
-        let listed = listed.map(|messages| {
-            messages
-                .iter()
-                .map(|message| (message.id, message.reference.clone()))
-                .collect::<Vec<_>>()
-        });
-        format!(
-            "thread id {thread_id}; system messages listed {listed:?}; production lookup {found:?}"
-        )
     }
 
     /// Deletes every thread named `... [<tab_id>]` under the channel whose topic is `topic`, active
