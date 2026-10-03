@@ -60,8 +60,8 @@ pub use permission::{
     encode_cursor_decision, is_cursor_agent_argv,
 };
 pub use prompting::{
-    maintain_typing_until_settled, should_handle_owner_message, submit_owner_prompt,
-    take_owner_prompt_suppression,
+    forget_departed_owner_prompt_suppressions, maintain_typing_until_settled,
+    should_handle_owner_message, submit_owner_prompt, take_owner_prompt_suppression,
 };
 pub use question::{
     ASK_QUESTION_TOOL, QUESTION_KIND, Question, QuestionAnswer, QuestionInteraction,

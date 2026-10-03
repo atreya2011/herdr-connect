@@ -27,15 +27,15 @@ use herdr_connect_rs::{
     cached_route, create_transition_messages, delete_tab_thread, delete_topology_absent_from_herdr,
     delete_workspace_channel, deliver_live_message, deliver_transition_card,
     drive_gateway_with_components, execute_terminal_prompt_webhook, expire_informational_card,
-    fetch_owner_identity, fetch_topology_lists, format_detection_question, hook_timeout,
-    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
-    load_discord_config, name_unlabeled_tabs, read_claude_incremental,
-    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
-    read_cursor_incremental, read_cursor_prompts_incremental, reconcile_topology_cache,
-    register_archived_tab_threads, resolve_terminal_prompt_webhook, route_topology,
-    split_live_message, status_subscriptions, subscribe_herdr_events, sync_topology,
-    tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_channel_id,
-    workspace_list_result,
+    fetch_owner_identity, fetch_topology_lists, forget_departed_owner_prompt_suppressions,
+    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, live_message_nonce, load_discord_config, name_unlabeled_tabs,
+    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
+    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
+    reconcile_topology_cache, register_archived_tab_threads, resolve_terminal_prompt_webhook,
+    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
+    sync_topology, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
+    workspace_channel_id, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1772,7 +1772,7 @@ fn next_state_change_sequence(
 /// `state_change_sequences`, which keeps counting so a returning terminal never reuses a card
 /// nonce. Also removes every tab-keyed entry (`rename_errors_reported`) for a tab absent from
 /// `current_tabs`, and every pane-keyed entry (`activity_messages`, `activity_eligible_panes`)
-/// for a pane absent from `current_panes`, returning the informational cards that departed so
+/// for a pane absent from `current_panes` (as are the owner-prompt suppression markers), returning the informational cards that departed so
 /// callers can expire them.
 fn prune_departed_state(
     state: &mut BridgeState,
@@ -1804,6 +1804,7 @@ fn prune_departed_state(
     state
         .activity_eligible_panes
         .retain(|pane_id| current_panes.contains(pane_id));
+    forget_departed_owner_prompt_suppressions(current_panes);
     let departed_cards = state
         .informational_cards
         .iter()

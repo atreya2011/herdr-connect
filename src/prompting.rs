@@ -3,7 +3,9 @@
 //! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
 //! message creation responses do not carry the guild identifier required by the gateway handler.
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -31,18 +33,14 @@ const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
 const STALL_RECOVERY_POLL_BOUND: Duration = Duration::from_secs(5);
 const STALL_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long a Discord-submitted prompt stays eligible to suppress its own terminal-log mirror.
-/// Bounds a submission whose pane never actually echoes it (Herdr rejected it, the pane closed)
-/// from leaking into the next unrelated prompt on the same pane that happens to share its text.
-const OWNER_PROMPT_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
-
-/// One pending "the bridge itself submitted this text to this pane" marker: `(pane_id, text,
-/// expires_at)`.
-type OwnerPromptSuppression = (String, String, Instant);
+/// One pending "the bridge itself submitted this text to this pane" marker: `(pane_id, text)`.
+type OwnerPromptSuppression = (String, String);
 
 /// Prompts the bridge submitted to Herdr on the owner's behalf, not yet observed back in the
 /// pane's vendor log. Consulted by every vendor's terminal-prompt mirroring so a prompt the owner
-/// typed in Discord is never mirrored back into the same thread it came from.
+/// typed in Discord is never mirrored back into the same thread it came from. A prompt queued
+/// behind a running turn reaches the log only when the agent starts it, so a marker lives until it
+/// is consumed or its pane departs ([`forget_departed_owner_prompt_suppressions`]).
 static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -280,13 +278,17 @@ fn record_owner_prompt_submission(pane_id: &str, text: &str) {
     let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let now = Instant::now();
-    suppressions.retain(|(_, _, expires)| *expires > now);
-    suppressions.push((
-        pane_id.to_owned(),
-        text.to_owned(),
-        now + OWNER_PROMPT_SUPPRESSION_TTL,
-    ));
+    suppressions.push((pane_id.to_owned(), text.to_owned()));
+}
+
+/// Drops every suppression marker whose pane is absent from `current_panes`.
+pub fn forget_departed_owner_prompt_suppressions(
+    current_panes: &HashSet<String, impl BuildHasher>,
+) {
+    OWNER_PROMPT_SUPPRESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|(pane, _)| current_panes.contains(pane));
 }
 
 fn forget_owner_prompt_submission(pane_id: &str, text: &str) {
@@ -295,13 +297,13 @@ fn forget_owner_prompt_submission(pane_id: &str, text: &str) {
         .unwrap_or_else(PoisonError::into_inner);
     if let Some(index) = suppressions
         .iter()
-        .position(|(pane, expected, _)| pane == pane_id && expected == text)
+        .position(|(pane, expected)| pane == pane_id && expected == text)
     {
         suppressions.swap_remove(index);
     }
 }
 
-/// Consumes the suppression marker for `(pane_id, text)`, if one is still pending.
+/// Consumes the suppression marker for `(pane_id, text)`, if one is pending.
 ///
 /// `true` means this exact text was submitted by the bridge itself and must not be mirrored; the
 /// marker is cleared either way it matches, so a later, unrelated prompt with the same text
@@ -311,11 +313,9 @@ pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
     let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let now = Instant::now();
-    suppressions.retain(|(_, _, expires)| *expires > now);
     let Some(index) = suppressions
         .iter()
-        .position(|(pane, expected, _)| pane == pane_id && expected == text)
+        .position(|(pane, expected)| pane == pane_id && expected == text)
     else {
         return false;
     };
@@ -415,10 +415,11 @@ mod tests {
     use serde_json::Value;
     use twilight_model::channel::ChannelType;
 
-    use std::time::{Duration, Instant};
+    use std::collections::HashSet;
 
     use super::{
-        OWNER_PROMPT_SUPPRESSIONS, agent_list_failure_reply, has_prompt_content, is_thread_channel,
+        OWNER_PROMPT_SUPPRESSIONS, agent_list_failure_reply,
+        forget_departed_owner_prompt_suppressions, has_prompt_content, is_thread_channel,
         matching_agent, pane_status_is_working, prompt_surface_markers, resolve_prompt_pane,
         take_owner_prompt_suppression,
     };
@@ -484,13 +485,26 @@ mod tests {
         OWNER_PROMPT_SUPPRESSIONS
             .lock()
             .expect("lock owner prompt suppression markers")
-            .push((
-                pane_id.to_owned(),
-                text.to_owned(),
-                Instant::now() + Duration::from_secs(30),
-            ));
+            .push((pane_id.to_owned(), text.to_owned()));
         assert!(take_owner_prompt_suppression(pane_id, text));
         assert!(!take_owner_prompt_suppression(pane_id, text));
+    }
+
+    #[test]
+    fn owner_prompt_suppression_is_dropped_when_its_pane_departs() {
+        let departed = "test-pane-suppression-departed";
+        let present = "test-pane-suppression-present";
+        let text = "queued behind a long turn";
+        {
+            let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
+                .lock()
+                .expect("lock owner prompt suppression markers");
+            suppressions.push((departed.to_owned(), text.to_owned()));
+            suppressions.push((present.to_owned(), text.to_owned()));
+        }
+        forget_departed_owner_prompt_suppressions(&HashSet::from([present.to_owned()]));
+        assert!(!take_owner_prompt_suppression(departed, text));
+        assert!(take_owner_prompt_suppression(present, text));
     }
 
     #[test]
@@ -500,11 +514,7 @@ mod tests {
         OWNER_PROMPT_SUPPRESSIONS
             .lock()
             .expect("lock owner prompt suppression markers")
-            .push((
-                pane_id.to_owned(),
-                text.to_owned(),
-                Instant::now() + Duration::from_secs(30),
-            ));
+            .push((pane_id.to_owned(), text.to_owned()));
         assert!(!take_owner_prompt_suppression("other-pane", text));
         assert!(!take_owner_prompt_suppression(pane_id, "different text"));
         assert!(take_owner_prompt_suppression(pane_id, text));
