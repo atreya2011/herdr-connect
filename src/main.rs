@@ -8179,6 +8179,52 @@ mod tests {
         Ok(archived.iter().any(has_suffix))
     }
 
+    /// The active thread under `channel_id` whose name ends with `suffix`.
+    #[cfg(unix)]
+    async fn active_tab_thread(
+        guild: &BlockedCaptureGuild,
+        channel_id: Id<ChannelMarker>,
+        suffix: &str,
+    ) -> Result<twilight_model::channel::Channel, String> {
+        active_threads_for_guild(guild)
+            .await?
+            .into_iter()
+            .find(|thread| {
+                thread.parent_id == Some(channel_id)
+                    && thread
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with(suffix))
+            })
+            .ok_or_else(|| "sync did not create the second tab's thread".to_owned())
+    }
+
+    /// Whether the parent channel still holds the system message Discord posted when it created
+    /// `thread_id`: a `THREAD_CREATED` message whose reference points at the thread.
+    #[cfg(unix)]
+    async fn thread_created_message_survives(
+        guild: &BlockedCaptureGuild,
+        parent: Id<ChannelMarker>,
+        thread_id: Id<ChannelMarker>,
+    ) -> Result<bool, String> {
+        let messages = guild
+            .client
+            .channel_messages(parent)
+            .limit(100)
+            .await
+            .map_err(|error| error.to_string())?
+            .models()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(messages.iter().any(|message| {
+            message.kind == twilight_model::channel::message::MessageType::ThreadCreated
+                && message
+                    .reference
+                    .as_ref()
+                    .is_some_and(|reference| reference.channel_id == Some(thread_id))
+        }))
+    }
+
     /// Deletes every thread named `... [<tab_id>]` under the channel whose topic is `topic`, active
     /// or archived. A tab in the shared real workspace mirrors into a channel that does not start
     /// with `testrun-`, so the prefix-based cleanup never reaches its thread.
@@ -8391,9 +8437,9 @@ mod tests {
         let channel = guild_channel_with_topic(guild, &topic).await?;
         let root_suffix = format!(" [{}]", root_route.tab_id);
         let second_suffix = format!(" [{}]", second_route.tab_id);
-        if !thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
-            return Err("sync did not create the second tab's thread".to_owned());
-        }
+        let second_thread_id = active_tab_thread(guild, channel.id, &second_suffix)
+            .await?
+            .id;
 
         let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -8422,6 +8468,11 @@ mod tests {
         )
         .await
         .map_err(|_| "snapshot doorbell was interrupted".to_owned())?;
+        if !thread_created_message_survives(guild, channel.id, second_thread_id).await? {
+            return Err(
+                "the parent channel holds no started-a-thread message to delete".to_owned(),
+            );
+        }
         close_tab(&second_tab.tab_id);
         let tab_closed = wait_for_event(
             &mut runtime.lifecycle,
@@ -8443,6 +8494,9 @@ mod tests {
 
         if thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
             return Err("tab close did not delete the tab's thread".to_owned());
+        }
+        if thread_created_message_survives(guild, channel.id, second_thread_id).await? {
+            return Err("tab close left the started-a-thread message in the parent".to_owned());
         }
         if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
             return Err("tab close deleted the root tab's thread".to_owned());
@@ -8641,17 +8695,12 @@ mod tests {
         let channel = guild_channel_with_topic(guild, &topic).await?;
         let second_suffix = format!(" [{}]", second_route.tab_id);
         let root_suffix = format!(" [{}]", root_route.tab_id);
-        let thread = active_threads_for_guild(guild)
-            .await?
-            .into_iter()
-            .find(|thread| {
-                thread.parent_id == Some(channel.id)
-                    && thread
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.ends_with(&second_suffix))
-            })
-            .ok_or("sync did not create the second tab's thread")?;
+        let thread = active_tab_thread(guild, channel.id, &second_suffix).await?;
+        if !thread_created_message_survives(guild, channel.id, thread.id).await? {
+            return Err(
+                "the parent channel holds no started-a-thread message to delete".to_owned(),
+            );
+        }
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
@@ -8685,6 +8734,9 @@ mod tests {
         let errors = deletion_errors(&notices);
         if !errors.is_empty() {
             return Err(format!("gateway reported errors: {errors:?}"));
+        }
+        if thread_created_message_survives(guild, channel.id, thread.id).await? {
+            return Err("owner thread delete left the started-a-thread message".to_owned());
         }
 
         if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
