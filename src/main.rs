@@ -5729,9 +5729,11 @@ mod tests {
         let vendor = fixture.vendor;
         let long_reply = format!("terminal-origin-{vendor}-long-{nonce}");
         // The first turn outlasts the former 30 s marker lifetime, so a regression to a timed
-        // marker lets the queued prompt be mirrored back and fails the row.
-        let long_prompt =
-            format!("Run the shell command `sleep 45`. Then reply with exactly: {long_reply}");
+        // marker lets the queued prompt be mirrored back and fails the row. The wait is a
+        // `timeout` around `tail -f /dev/null` because Claude Code refuses a foreground `sleep`.
+        let long_prompt = format!(
+            "Run the shell command `timeout 45 tail -f /dev/null; echo waited`. Then reply with exactly: {long_reply}"
+        );
         let queued_reply = format!("terminal-origin-{vendor}-queued-{nonce}");
         let queued_prompt = format!("Reply with exactly: {queued_reply}");
         run_queued_prompt_turns(
