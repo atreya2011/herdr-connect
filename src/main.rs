@@ -8860,8 +8860,8 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         herdr_connect_rs::register_archived_tab_threads(guild.client.as_ref(), guild.id).await?;
-        if herdr_connect_rs::resolve_owner_deleted_tab(thread.id).as_deref()
-            != Some(second_tab.tab_id.as_str())
+        if herdr_connect_rs::resolve_owner_deleted_tab(thread.id).map(|(tab, _)| tab)
+            != Some(second_tab.tab_id.clone())
         {
             return Err("the archived registration did not record the thread".to_owned());
         }

@@ -626,25 +626,19 @@ pub fn forget_owned(id: Id<ChannelMarker>) {
     }
 }
 
-/// The Herdr tab id behind a deleted thread, from the durable registry.
+/// The Herdr tab id behind a deleted thread and the workspace channel that parented it, from the
+/// durable registry.
 ///
 /// The registry holds the thread of every live tab, so a thread it does not hold is not a tab
 /// thread (an owner-made thread, or one already forgotten) and is not the bridge's concern.
 #[must_use]
-pub fn resolve_owner_deleted_tab(thread_id: Id<ChannelMarker>) -> Option<String> {
+pub fn resolve_owner_deleted_tab(
+    thread_id: Id<ChannelMarker>,
+) -> Option<(String, Id<ChannelMarker>)> {
     owned_topology()
         .threads
         .get(&thread_id)
-        .map(|thread| thread.tab_id.clone())
-}
-
-/// The workspace channel that parented a bridge-owned tab thread, from the durable registry.
-#[must_use]
-pub fn owned_thread_parent(thread_id: Id<ChannelMarker>) -> Option<Id<ChannelMarker>> {
-    owned_topology()
-        .threads
-        .get(&thread_id)
-        .map(|thread| thread.parent)
+        .map(|thread| (thread.tab_id.clone(), thread.parent))
 }
 
 /// The Herdr workspace id a deleted channel's `herdr workspace [id]` topic named, if it had one.
@@ -829,7 +823,9 @@ pub mod owner_deletion_tests {
         ];
         for (name, thread_id, expected) in cases {
             assert_eq!(
-                resolve_owner_deleted_tab(id(thread_id)).as_deref(),
+                resolve_owner_deleted_tab(id(thread_id))
+                    .map(|(tab, _)| tab)
+                    .as_deref(),
                 expected,
                 "{name}"
             );
@@ -855,7 +851,7 @@ pub mod owner_deletion_tests {
             "the refetch dropped the older thread"
         );
         assert_eq!(
-            resolve_owner_deleted_tab(id(8_220)),
+            resolve_owner_deleted_tab(id(8_220)).map(|(tab, _)| tab),
             Some("w3:t1".to_owned()),
             "after reconcile"
         );
@@ -871,7 +867,7 @@ pub mod owner_deletion_tests {
         forget_owned(id(8_120));
         assert_eq!(resolve_owner_deleted_tab(id(8_120)), None);
         assert_eq!(
-            resolve_owner_deleted_tab(id(8_121)),
+            resolve_owner_deleted_tab(id(8_121)).map(|(tab, _)| tab),
             Some("w2:t2".to_owned())
         );
         forget_owned(id(8_110));

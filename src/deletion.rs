@@ -2,9 +2,8 @@ use twilight_model::channel::Channel;
 use twilight_model::id::{Id, marker::ChannelMarker};
 
 use crate::{
-    TopologyCache, delete_thread_created_message, forget_owned, owned_thread_parent,
-    resolve_owner_deleted_tab, resolve_owner_deleted_workspace, tab_close, take_self_deletion,
-    workspace_close,
+    TopologyCache, delete_thread_created_message, forget_owned, resolve_owner_deleted_tab,
+    resolve_owner_deleted_workspace, tab_close, take_self_deletion, workspace_close,
 };
 
 /// A guild channel or thread the Discord gateway reported deleted.
@@ -28,7 +27,8 @@ impl GuildDeletion {
 /// The Herdr object an owner deletion closes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Close {
-    Tab(String),
+    /// The tab id behind the deleted thread and the workspace channel that parented it.
+    Tab(String, Id<ChannelMarker>),
     Workspace(String),
 }
 
@@ -43,7 +43,9 @@ pub fn decide_close(deletion: &GuildDeletion) -> Option<Close> {
         return None;
     }
     match deletion {
-        GuildDeletion::Thread { id } => resolve_owner_deleted_tab(*id).map(Close::Tab),
+        GuildDeletion::Thread { id } => {
+            resolve_owner_deleted_tab(*id).map(|(tab, parent)| Close::Tab(tab, parent))
+        }
         GuildDeletion::Channel(channel) => {
             resolve_owner_deleted_workspace(channel).map(Close::Workspace)
         }
@@ -71,14 +73,13 @@ pub async fn handle_guild_deletion(
     deletion: GuildDeletion,
 ) -> Result<(), String> {
     let id = deletion.id();
-    let parent = owned_thread_parent(id);
     let close = decide_close(&deletion);
     let Some(close) = close else {
         return Ok(());
     };
-    let message = match (&close, parent) {
-        (Close::Tab(_), Some(parent)) => delete_thread_created_message(client, parent, id).await,
-        _ => Ok(()),
+    let message = match &close {
+        Close::Tab(_, parent) => delete_thread_created_message(client, *parent, id).await,
+        Close::Workspace(_) => Ok(()),
     };
     let mut guard = topology_cache.lock().await;
     if let Some((channels, threads)) = guard.as_mut() {
@@ -86,7 +87,7 @@ pub async fn handle_guild_deletion(
         threads.retain(|thread| thread.id != id && thread.parent_id != Some(id));
     }
     let result = tokio::task::spawn_blocking(move || match close {
-        Close::Tab(tab_id) => tab_close(&tab_id),
+        Close::Tab(tab_id, _) => tab_close(&tab_id),
         Close::Workspace(workspace_id) => workspace_close(&workspace_id),
     })
     .await
@@ -119,7 +120,7 @@ mod tests {
             (
                 "owner deletes a tab thread",
                 GuildDeletion::Thread { id: thread.id },
-                Some(Close::Tab("testrun-a:t1".to_owned())),
+                Some(Close::Tab("testrun-a:t1".to_owned(), workspace.id)),
             ),
             (
                 "the bridge's own thread deletion",
