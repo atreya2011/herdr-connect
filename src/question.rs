@@ -21,13 +21,18 @@ pub struct Question {
 
 /// Whether Herdr's detection snapshot still shows Claude's dialog for `question`.
 ///
-/// The screen wraps the question at the pane width, so both sides are compared with every run of
-/// whitespace collapsed to one space.
+/// The screen wraps the question at the pane width and prefixes continuation lines, so both sides
+/// are compared after keeping only lowercase ASCII alphanumeric characters.
 #[must_use]
 pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
-    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalize = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>()
+    };
     format_detection_question(detection)
-        .is_some_and(|dialog| collapse(&dialog).contains(&collapse(&question.question)))
+        .is_some_and(|dialog| normalize(&dialog).contains(&normalize(&question.question)))
 }
 
 /// What the owner chose on a question card.
@@ -215,18 +220,29 @@ mod tests {
         let dialog = include_str!("../tests/fixtures/claude-detection-blocked-question.txt");
         let no_dialog = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
         let mut asked = question(false);
+        let mut different = question(false);
         asked.question = "Which color do you prefer?".to_owned();
+        different.question = "Which animal do you prefer?".to_owned();
         assert!(dialog_shows_question(dialog, &asked));
-        assert!(!dialog_shows_question(dialog, &question(false)));
+        assert!(!dialog_shows_question(dialog, &different));
         assert!(!dialog_shows_question(no_dialog, &asked));
     }
 
     #[test]
-    fn the_dialog_check_ignores_how_the_screen_wraps_the_question() {
-        let dialog = include_str!("../tests/fixtures/claude-detection-blocked-question.txt")
-            .replace("Which color do you prefer?", "Which color do\nyou  prefer?");
+    fn the_dialog_check_matches_a_question_wrapped_with_box_prefixes() {
+        let dialog = concat!(
+            "────\n",
+            " ☐ Gauntlet mode\n",
+            "\n",
+            "│ Your message is only a pasted kickoff for gauntlet run gk1004b on issue #110 (it reads as if another agent wrote it). It asks for discovery, sizing and a dispatch\n",
+            "│ plan before any code is written, so which mode should I run it in?\n",
+            "\n",
+            "❯ 1. Run it as written\n",
+            "  2. Discovery only\n",
+            "────\n",
+        );
         let mut asked = question(false);
-        asked.question = "Which color do you prefer?".to_owned();
-        assert!(dialog_shows_question(&dialog, &asked));
+        asked.question = "Your message is only a pasted kickoff for gauntlet run gk1004b on issue #110 (it reads as if another agent wrote it). It asks for discovery, sizing and a dispatch plan before any code is written, so which mode should I run it in?".to_owned();
+        assert!(dialog_shows_question(dialog, &asked));
     }
 }

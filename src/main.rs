@@ -6617,6 +6617,15 @@ mod tests {
         \"The color blue\". multiSelect must be false. Do not do anything else and do not say \
         anything else.";
 
+    /// The single-select question used by the wrap regression row, long enough to wrap in the
+    /// real 160-column Claude dialog.
+    #[cfg(unix)]
+    const WRAPPED_QUESTION: &str = "Your message is only a pasted kickoff for gauntlet run gk1004b on issue #110 (it reads as if another agent wrote it). It asks for discovery, sizing and a dispatch plan before any code is written, so which mode should I run it in?";
+
+    /// The forced single-select call whose question exercises dialog wrapping.
+    #[cfg(unix)]
+    const WRAPPED_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly one question with header \"Gauntlet mode\", question text \"Your message is only a pasted kickoff for gauntlet run gk1004b on issue #110 (it reads as if another agent wrote it). It asks for discovery, sizing and a dispatch plan before any code is written, so which mode should I run it in?\", and exactly two options: label \"Run it as written\" with description \"Execute the kickoff following its stated objectives for discovery, sizing, and dispatch plan\", and label \"Do not run\" with description \"Do not execute the gauntlet run\". multiSelect must be false. Do not do anything else and do not say anything else.";
+
     /// The multiSelect counterpart of [`QUESTION_FORCE_PROMPT`].
     #[cfg(unix)]
     const MULTI_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly \
@@ -7021,16 +7030,17 @@ mod tests {
         Some(outcome)
     }
 
-    /// Real row: the pane showed its own dialog (`blocked`) while the card was up; the Discord tap
-    /// typed option 2's number key, Claude's transcript records Blue, and the blocked-card expiry
-    /// retired the card once the next snapshot showed the pane had left `blocked`.
+    /// Real row: the pane showed its own wrapped dialog (`blocked`) while the card was up; the
+    /// Discord tap typed option 2's number key, Claude's transcript records Do not run, and the
+    /// blocked-card expiry retired the card once the next snapshot showed the pane had left
+    /// `blocked`.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn question_card_tap_types_the_option_into_the_open_dialog() {
         let Some(outcome) = Box::pin(run_question_dialog_test(
-            QUESTION_FORCE_PROMPT,
-            &["Which color?"],
+            WRAPPED_QUESTION_FORCE_PROMPT,
+            &[WRAPPED_QUESTION],
             QuestionAction::Button(1),
         ))
         .await
@@ -7038,7 +7048,7 @@ mod tests {
             return;
         };
         assert_eq!(outcome.status_before, "blocked");
-        assert_eq!(outcome.answered, [Some("Blue".to_owned())]);
+        assert_eq!(outcome.answered, [Some("Do not run".to_owned())]);
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
