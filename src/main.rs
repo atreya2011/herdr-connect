@@ -5607,6 +5607,182 @@ mod tests {
         Ok(())
     }
 
+    /// Submits `long_prompt` through the bridge's own Discord path, then `queued_prompt` the same
+    /// way while the pane is `working` on the first turn, and runs until the thread carries the
+    /// reply to `queued_reply` -- the agent queues the second prompt itself and answers it after
+    /// the first turn. The second submission must be acknowledged, not refused.
+    #[cfg(unix)]
+    async fn run_queued_prompt_turns(
+        fixture: &TerminalPromptFixture<'_>,
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+        state: &mut BridgeState,
+        live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        prompts: [&str; 2],
+        queued_reply: &str,
+    ) -> Result<(), String> {
+        let [long_prompt, queued_prompt] = prompts;
+        let TerminalPromptFixture {
+            tab,
+            vendor,
+            connection,
+            tabs,
+            terminal,
+            ..
+        } = *fixture;
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+        let first_pane = tab.pane_id.clone();
+        let first_prompt = long_prompt.to_owned();
+        let first_task = tokio::task::spawn_blocking(move || {
+            submit_owner_prompt(&first_pane, &first_prompt).map(drop)
+        });
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some(STATUS_WORKING),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let working = poll_snapshot(&tab.pane_id, Duration::from_secs(10), |snapshot| {
+            snapshot.session.is_some()
+        })?;
+        if working.agent_status != STATUS_WORKING
+            || working
+                .session
+                .as_ref()
+                .is_none_or(|session| session.agent != vendor)
+        {
+            return Err(format!(
+                "no confirmed {vendor} working session: {working:?}"
+            ));
+        }
+        own(&working, tabs, connection, state).await;
+        let watch_deadline = Instant::now() + Duration::from_secs(5);
+        while !state.live_watches.contains_key(terminal) && Instant::now() < watch_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            own(&working, tabs, connection, state).await;
+        }
+        let queued_pane = tab.pane_id.clone();
+        let queued_text = queued_prompt.to_owned();
+        let queued_task = tokio::task::spawn_blocking(move || {
+            submit_owner_prompt(&queued_pane, &queued_text).map(drop)
+        });
+        loop {
+            tokio::select! {
+                Some(event_terminal) = live_events.recv() => {
+                    handle_live_event(connection, &event_terminal, state).await;
+                }
+                event = wait_for_event(
+                    &mut sub,
+                    "pane.agent_status_changed",
+                    &tab.pane_id,
+                    "/data/pane_id",
+                    None,
+                    Duration::from_secs(90),
+                ) => {
+                    let event = event?;
+                    if matches!(
+                        event.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some(STATUS_DONE | STATUS_IDLE)
+                    ) {
+                        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
+                        wait_for_readable_capture(&settled).await?;
+                        own(&settled, tabs, connection, state).await;
+                        while let Ok(event_terminal) = live_events.try_recv() {
+                            handle_live_event(connection, &event_terminal, state).await;
+                        }
+                        handle_live_event(connection, terminal, state).await;
+                        let messages = thread_full_messages(guild, thread).await?;
+                        if messages.iter().any(|message| {
+                            message.webhook_id.is_none() && message.content == queued_reply
+                        }) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        first_task
+            .await
+            .map_err(|error| format!("first prompt task failed: {error}"))??;
+        queued_task
+            .await
+            .map_err(|error| format!("queued prompt task failed: {error}"))??;
+        Ok(())
+    }
+
+    /// Fourth turn of [`terminal_origin_prompt_exercise`]: a second Discord prompt submitted while
+    /// the pane is `working` on a long first turn is acknowledged, answered after the first turn's
+    /// reply, and mirrored back neither as itself nor as the long prompt.
+    #[cfg(unix)]
+    async fn queued_prompt_exercise(
+        fixture: &TerminalPromptFixture<'_>,
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+        state: &mut BridgeState,
+        live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        nonce: &str,
+    ) -> Result<(), String> {
+        let vendor = fixture.vendor;
+        let long_reply = format!("terminal-origin-{vendor}-long-{nonce}");
+        let long_prompt =
+            format!("Run the shell command `sleep 25`. Then reply with exactly: {long_reply}");
+        let queued_reply = format!("terminal-origin-{vendor}-queued-{nonce}");
+        let queued_prompt = format!("Reply with exactly: {queued_reply}");
+        run_queued_prompt_turns(
+            fixture,
+            guild,
+            thread,
+            state,
+            live_events,
+            [&long_prompt, &queued_prompt],
+            &queued_reply,
+        )
+        .await?;
+        let messages = thread_full_messages(guild, thread).await?;
+        assert_prompt_was_not_mirrored(&messages, &long_prompt)?;
+        assert_prompt_was_not_mirrored(&messages, &queued_prompt)?;
+        assert_queued_reply_follows_first_reply(&messages, &long_reply, &queued_reply)
+    }
+
+    /// Asserts the plain message carrying `queued_reply` follows the one carrying `first_reply`,
+    /// and that `first_reply` is present exactly once.
+    #[cfg(unix)]
+    fn assert_queued_reply_follows_first_reply(
+        messages: &[twilight_model::channel::Message],
+        first_reply: &str,
+        queued_reply: &str,
+    ) -> Result<(), String> {
+        let mut sorted: Vec<_> = messages.iter().collect();
+        sorted.sort_by_key(|message| message.id);
+        let plain_positions = |reply: &str| -> Vec<usize> {
+            sorted
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.webhook_id.is_none() && message.content == reply)
+                .map(|(position, _)| position)
+                .collect()
+        };
+        let first = plain_positions(first_reply);
+        let queued = plain_positions(queued_reply);
+        let ([first], [queued]) = (first.as_slice(), queued.as_slice()) else {
+            return Err(format!(
+                "expected one first reply and one queued reply, found {} and {}",
+                first.len(),
+                queued.len()
+            ));
+        };
+        if first >= queued {
+            return Err(
+                "the queued prompt's reply did not follow the first turn's reply".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     async fn thread_full_messages(
         guild: &BlockedCaptureGuild,
@@ -5684,9 +5860,11 @@ mod tests {
 
     /// Drives one real pane through three turns for `vendor`: a first turn -- the new session's
     /// very first prompt, typed before its log even exists -- whose prompt is mirrored ahead of its
-    /// assistant reply exactly like the second, ordinary terminal-origin turn's is, and a third turn
+    /// assistant reply exactly like the second, ordinary terminal-origin turn's is, a third turn
     /// submitted through the bridge's own Discord path (`submit_owner_prompt`) whose prompt must not
-    /// be mirrored back.
+    /// be mirrored back, and a fourth where a second Discord prompt is submitted while the pane is
+    /// `working` on a long turn: the agent queues it, its reply follows the long turn's, and
+    /// neither prompt is mirrored back.
     #[cfg(unix)]
     async fn terminal_origin_prompt_exercise(
         guild: &BlockedCaptureGuild,
@@ -5781,6 +5959,16 @@ mod tests {
         .await?;
         let after_suppressed = thread_full_messages(guild, thread).await?;
         assert_prompt_was_not_mirrored(&after_suppressed, &suppressed_prompt)?;
+
+        queued_prompt_exercise(
+            &fixture,
+            guild,
+            thread,
+            &mut state,
+            &mut live_events,
+            &nonce,
+        )
+        .await?;
         Ok(())
     }
 
