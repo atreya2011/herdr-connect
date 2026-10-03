@@ -695,9 +695,8 @@ pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
         return Ok(());
     };
     delete_channel_if_present(client, thread.id).await?;
-    delete_thread_created_message(client, workspace_channel, thread.id).await?;
     active_threads.retain(|entry| entry.id != thread.id);
-    Ok(())
+    delete_thread_created_message(client, workspace_channel, thread.id).await
 }
 
 /// Deletes the Discord channel representing one closed Herdr workspace, if one exists. Discord
@@ -770,8 +769,8 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
             // owner-made thread name coincidence, not a bridge-owned tab thread; leave it alone.
             if tab_id.starts_with(&tab_id_prefix) && !live_tab_ids.contains(tab_id) {
                 delete_channel_if_present(client, thread.id).await?;
-                delete_thread_created_message(client, workspace_channel, thread.id).await?;
                 active_threads.retain(|entry| entry.id != thread.id);
+                delete_thread_created_message(client, workspace_channel, thread.id).await?;
             }
         }
     }
