@@ -290,12 +290,17 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
 /// three single-question rows built the plain card because the first read found no pending
 /// question.
 const PENDING_QUESTION_WAIT: Duration = Duration::from_secs(3);
-const PENDING_QUESTION_POLL: Duration = Duration::from_millis(250);
+const PENDING_QUESTION_POLL: Duration = Duration::from_millis(500);
+
+/// The dialog entry only `AskUserQuestion` has. The wait is for a pane showing it, so every other
+/// blocked dialog (a permission prompt, for one) costs no delay.
+const QUESTION_DIALOG_MARKER: &str = "Type something.";
 
 /// The pending `AskUserQuestion` call from the pane's vendor log, and the index of the question
-/// its dialog, in Herdr's detection snapshot, currently shows. A pane whose snapshot shows a
-/// question dialog but whose log has no pending question yet is re-read for
-/// [`PENDING_QUESTION_WAIT`]; after that the caller keeps the plain card.
+/// its dialog, in Herdr's detection snapshot, currently shows. A dialog with the
+/// [`QUESTION_DIALOG_MARKER`] entry whose log has no pending question yet is re-read for
+/// [`PENDING_QUESTION_WAIT`]; after that the caller keeps the plain card. A log read error is
+/// logged once, when the wait ends.
 async fn shown_question(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
@@ -303,20 +308,40 @@ async fn shown_question(
 ) -> Option<(Vec<Question>, usize)> {
     let detection = detection?;
     format_detection_question(detection)?;
+    let wait = detection.contains(QUESTION_DIALOG_MARKER);
     let deadline = tokio::time::Instant::now() + PENDING_QUESTION_WAIT;
+    let mut last_error: Option<String>;
     loop {
-        let questions = capture_for_blocked(snapshot, session).pending_questions;
-        if let Some(index) = questions
-            .iter()
-            .position(|question| dialog_shows_question(detection, question))
-        {
-            return Some((questions, index));
+        match pending_questions(snapshot, session) {
+            Ok(questions) => {
+                last_error = None;
+                if let Some(index) = questions
+                    .iter()
+                    .position(|question| dialog_shows_question(detection, question))
+                {
+                    return Some((questions, index));
+                }
+            }
+            Err(error) => last_error = Some(error),
         }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
+        if !wait || tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PENDING_QUESTION_POLL).await;
     }
+    if let Some(error) = last_error {
+        bridge_eprintln!("agent blocked-context capture error: {error}");
+    }
+    None
+}
+
+fn pending_questions(
+    snapshot: &AgentSnapshot,
+    session: &AgentSession,
+) -> Result<Vec<Question>, String> {
+    let home = std::env::var_os(ENV_HOME).ok_or("HOME is not configured")?;
+    capture_for_with_search_root(snapshot, session, Path::new(&home))
+        .map(|capture| capture.pending_questions)
 }
 
 /// What [`deliver_blocked_messages`] needs to deliver a blocked card, bundled to keep the function
