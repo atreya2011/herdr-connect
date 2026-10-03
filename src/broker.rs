@@ -50,6 +50,9 @@ const NEXT_QUESTION_POLL: Duration = Duration::from_millis(100);
 /// Cheese and Mushrooms and submitted both.
 const DIALOG_SETTLE: Duration = Duration::from_secs(2);
 const INPUT_GAP: Duration = Duration::from_secs(1);
+const FAILED_CARD_TEXT: &str = "failed: answer the question in the terminal";
+const NOT_ADVANCED_CARD_TEXT: &str =
+    "resolved: answer sent, but the next question did not appear; answer it in the terminal";
 #[must_use]
 pub const fn hook_timeout() -> Duration {
     Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
@@ -69,9 +72,12 @@ pub struct PermissionResponder {
 pub enum QuestionOutcome {
     /// The answer was typed into the pane's dialog.
     Sent,
-    /// The pane no longer shows the dialog, so the owner answered in the terminal: nothing was
-    /// sent and the card says so.
+    /// The owner answered in the terminal: nothing was typed, and the card was retired, or moved
+    /// to the call's next question if the dialog is on it.
     AnsweredInTerminal,
+    /// The answer was typed, but the dialog did not show the call's next question in time, so the
+    /// card was retired.
+    SentNotAdvanced,
     /// No open card has this token.
     Unknown,
 }
@@ -202,11 +208,12 @@ impl PermissionResponder {
     /// Types `answer` into the dialog of the pane behind question card `token`.
     ///
     /// The pane is re-read first: it must still be `blocked` and still show the card's question.
-    /// Otherwise the owner answered in the terminal, so the card is edited to say so and nothing is
-    /// sent. When the answered question is not the last of its call, the same card is then edited
+    /// Otherwise the owner answered in the terminal, so nothing is sent and the card is edited to
+    /// say so, or to the call's next question if the dialog already shows it. When the answered question is not the last of its call, the same card is then edited
     /// in place to the next question, once the dialog shows it.
     ///
-    /// A card whose pane could not be read keeps its token, so the owner can tap it again.
+    /// A card whose pane could not be read keeps its token, so the owner can tap it again. A card
+    /// whose typing or advance failed is edited to a failure text instead of keeping its buttons.
     ///
     /// # Errors
     ///
@@ -228,18 +235,22 @@ impl PermissionResponder {
         if self.question_registry.take(token).is_none() {
             return Ok(QuestionOutcome::Unknown);
         }
-        let (pane_id, question) = (pending.pane_id.clone(), pending.question().clone());
-        let showing = blocking(move || dialog_is_showing(&pane_id, &question)).await;
-        match showing {
-            Ok(true) => {}
-            Ok(false) => {
-                expire_informational_card(
-                    self.client.as_ref(),
-                    pending.channel,
-                    pending.message,
-                    "resolved: answered in the terminal",
-                )
-                .await?;
+        let (pane_id, questions, from) = (
+            pending.pane_id.clone(),
+            pending.questions.clone(),
+            pending.index,
+        );
+        let shown = blocking(move || shown_question_index(&pane_id, &questions, from)).await;
+        match shown {
+            Ok(Some(index)) if index == pending.index => {}
+            Ok(Some(index)) => {
+                // The owner answered this question in the terminal and the dialog moved on.
+                self.move_card_to(&pending, index).await?;
+                return Ok(QuestionOutcome::AnsweredInTerminal);
+            }
+            Ok(None) => {
+                self.edit_card(&pending, "resolved: answered in the terminal")
+                    .await?;
                 return Ok(QuestionOutcome::AnsweredInTerminal);
             }
             Err(error) => {
@@ -248,22 +259,44 @@ impl PermissionResponder {
             }
         }
         let pane_id = pending.pane_id.clone();
-        blocking(move || type_steps(&pane_id, &steps)).await?;
-        if !pending.is_last() {
-            self.show_next_question(pending).await?;
+        if let Err(error) = blocking(move || type_steps(&pane_id, &steps)).await {
+            self.fail_card(&pending).await;
+            return Err(error);
         }
-        Ok(QuestionOutcome::Sent)
+        if pending.is_last() {
+            return Ok(QuestionOutcome::Sent);
+        }
+        match self.advance_card(&pending).await {
+            Ok(true) => Ok(QuestionOutcome::Sent),
+            Ok(false) => {
+                self.edit_card(&pending, NOT_ADVANCED_CARD_TEXT).await?;
+                Ok(QuestionOutcome::SentNotAdvanced)
+            }
+            Err(error) => {
+                self.fail_card(&pending).await;
+                Err(error)
+            }
+        }
     }
 
-    /// Waits for the dialog to show the call's next question, then edits the card in place to it
-    /// under a new token.
-    async fn show_next_question(&self, pending: PendingQuestion) -> Result<(), String> {
+    /// Waits for the dialog to show the call's next question and edits the card in place to it.
+    /// Returns `false` when the dialog never showed it.
+    async fn advance_card(&self, pending: &PendingQuestion) -> Result<bool, String> {
+        let next = pending.index + 1;
+        let (pane_id, question) = (pending.pane_id.clone(), pending.questions[next].clone());
+        if !blocking(move || wait_for_dialog(&pane_id, &question)).await? {
+            return Ok(false);
+        }
+        self.move_card_to(pending, next).await?;
+        Ok(true)
+    }
+
+    /// Edits the card in place to `questions[index]` under a new token.
+    async fn move_card_to(&self, pending: &PendingQuestion, index: usize) -> Result<(), String> {
         let next = PendingQuestion {
-            index: pending.index + 1,
-            ..pending
+            index,
+            ..pending.clone()
         };
-        let (pane_id, question) = (next.pane_id.clone(), next.question().clone());
-        blocking(move || wait_for_dialog(&pane_id, &question)).await?;
         let token = generate_token()?;
         update_question_card(
             self.client.as_ref(),
@@ -276,6 +309,23 @@ impl PermissionResponder {
         .await?;
         self.question_registry.insert(token, next);
         Ok(())
+    }
+
+    async fn edit_card(&self, pending: &PendingQuestion, content: &str) -> Result<(), String> {
+        expire_informational_card(
+            self.client.as_ref(),
+            pending.channel,
+            pending.message,
+            content,
+        )
+        .await
+    }
+
+    /// Retires a card whose answer failed partway, so it does not keep live-looking buttons.
+    async fn fail_card(&self, pending: &PendingQuestion) {
+        if let Err(error) = self.edit_card(pending, FAILED_CARD_TEXT).await {
+            bridge_eprintln!("question card edit failed: {error}");
+        }
     }
 
     #[must_use]
@@ -488,32 +538,36 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| format!("question answer task failed: {error}"))?
 }
 
-/// Whether the pane is `blocked` and its dialog shows `question`.
-fn dialog_is_showing(pane_id: &str, question: &Question) -> Result<bool, String> {
+/// The index, from `from` on, of the first of `questions` the pane's dialog shows while the pane
+/// is `blocked`.
+fn shown_question_index(
+    pane_id: &str,
+    questions: &[Question],
+    from: usize,
+) -> Result<Option<usize>, String> {
     let blocked = list_agents()?
         .iter()
         .any(|agent| agent.pane_id == pane_id && agent.agent_status == STATUS_BLOCKED);
-    Ok(blocked && dialog_shows_question(&agent_read_detection(pane_id)?, question))
+    if !blocked {
+        return Ok(None);
+    }
+    let detection = agent_read_detection(pane_id)?;
+    Ok((from..questions.len()).find(|&index| dialog_shows_question(&detection, &questions[index])))
 }
 
-/// Polls until the pane's dialog shows `question`, for at most the next-question wait.
-fn wait_for_dialog(pane_id: &str, question: &Question) -> Result<(), String> {
+/// Polls until the pane's dialog shows `question`, for at most the next-question wait; `false`
+/// when it never did.
+fn wait_for_dialog(pane_id: &str, question: &Question) -> Result<bool, String> {
     let deadline = Instant::now() + NEXT_QUESTION_WAIT;
     while !dialog_shows_question(&agent_read_detection(pane_id)?, question) {
         if Instant::now() >= deadline {
-            return Err(format!(
-                "the dialog never showed the next question {:?}",
-                question.question
-            ));
+            return Ok(false);
         }
         std::thread::sleep(NEXT_QUESTION_POLL);
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Types the steps into the pane's dialog one input at a time: each key is its own
-/// `agent.send_keys` call, the text is one `pane.send_text` call, with [`DIALOG_SETTLE`] before the
-/// first input and [`INPUT_GAP`] between inputs.
 fn type_steps(pane_id: &str, steps: &[AnswerStep]) -> Result<(), String> {
     std::thread::sleep(DIALOG_SETTLE);
     let mut first = true;
@@ -565,6 +619,9 @@ async fn answer_question_component(
     {
         Ok(QuestionOutcome::Sent) => "answer sent",
         Ok(QuestionOutcome::AnsweredInTerminal) => "answered in the terminal",
+        Ok(QuestionOutcome::SentNotAdvanced) => {
+            "answer sent, but the next question did not appear; answer it in the terminal"
+        }
         Ok(QuestionOutcome::Unknown) => "expired",
         Err(error) => {
             bridge_eprintln!("question answer failed: {error}");

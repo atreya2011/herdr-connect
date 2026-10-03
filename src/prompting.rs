@@ -166,6 +166,9 @@ async fn answer_pending_question(
         Ok(QuestionOutcome::AnsweredInTerminal) => {
             "refused: the question was already answered in the terminal".to_owned()
         }
+        Ok(QuestionOutcome::SentNotAdvanced) => {
+            "accepted: answer typed, but the next question did not appear".to_owned()
+        }
         Ok(QuestionOutcome::Unknown) => "refused: the question card is no longer open".to_owned(),
         Err(error) => format!("refused: typing the answer failed: {error}"),
     })
