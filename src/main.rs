@@ -5771,13 +5771,13 @@ mod tests {
         let first = plain_positions(first_reply);
         let queued = plain_positions(queued_reply);
         let ([first], [queued]) = (first.as_slice(), queued.as_slice()) else {
-            return Err(format!(
-                "expected one first reply and one queued reply, found {} and {}; plain messages: {plain:?}",
             let plain: Vec<_> = sorted
                 .iter()
                 .filter(|message| message.webhook_id.is_none())
                 .map(|message| message.content.as_str())
                 .collect();
+            return Err(format!(
+                "expected one first reply and one queued reply, found {} and {}; plain messages: {plain:?}",
                 first.len(),
                 queued.len()
             ));
