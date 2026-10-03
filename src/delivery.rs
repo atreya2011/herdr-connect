@@ -547,6 +547,31 @@ pub async fn deliver_question_card(
         .map_err(|error| error.to_string())
 }
 
+/// Edits the question card `message` in place to show `question`, with its own controls under
+/// `token`.
+///
+/// # Errors
+///
+/// Returns Discord request errors.
+pub async fn update_question_card(
+    client: &twilight_http::Client,
+    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+    question: &Question,
+    token: &str,
+    owner_id: &str,
+) -> Result<(), String> {
+    let payload = question_card_payload(question, token, owner_id)
+        .to_string()
+        .into_bytes();
+    client
+        .update_message(channel, message)
+        .payload_json(&payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn question_card_title(header: &str) -> String {
     let sanitized: String = header.chars().filter(|c| !c.is_control()).collect();
     format!("Claude question: {sanitized}")

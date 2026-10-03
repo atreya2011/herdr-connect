@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -35,12 +35,15 @@ use crate::registry::{
 use crate::{
     TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_card,
     expire_informational_card, fetch_topology_lists, list_agents, route_topology, sync_topology,
-    tab_list_result,
+    tab_list_result, update_question_card,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long, and how often, to poll for the dialog to show the next question after an answer.
+const NEXT_QUESTION_WAIT: Duration = Duration::from_secs(5);
+const NEXT_QUESTION_POLL: Duration = Duration::from_millis(100);
 #[must_use]
 pub const fn hook_timeout() -> Duration {
     Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
@@ -143,8 +146,9 @@ impl PermissionResponder {
         self.registry.has_pending_session(session_id)
     }
 
-    /// Posts the question card for the dialog Claude shows in `pane_id`: one button per option for
-    /// a single-select question, a select menu for a multiSelect question.
+    /// Posts the question card for the dialog Claude shows in `pane_id`, which is on
+    /// `questions[index]`: one button per option for a single-select question, a select menu for a
+    /// multiSelect question.
     ///
     /// # Errors
     ///
@@ -153,19 +157,26 @@ impl PermissionResponder {
         &self,
         channel: Id<ChannelMarker>,
         pane_id: &str,
-        question: &Question,
+        questions: Vec<Question>,
+        index: usize,
     ) -> Result<Id<MessageMarker>, String> {
         let token = generate_token()?;
-        let client = self.client.as_ref();
-        let message =
-            deliver_question_card(client, channel, question, &token, &self.owner_id).await?;
+        let message = deliver_question_card(
+            self.client.as_ref(),
+            channel,
+            &questions[index],
+            &token,
+            &self.owner_id,
+        )
+        .await?;
         self.question_registry.insert(
             token,
             PendingQuestion {
                 channel,
                 message,
                 pane_id: pane_id.to_owned(),
-                question: question.clone(),
+                questions,
+                index,
             },
         );
         Ok(message)
@@ -186,35 +197,74 @@ impl PermissionResponder {
     ///
     /// The pane is re-read first: it must still be `blocked` and still show the card's question.
     /// Otherwise the owner answered in the terminal, so the card is edited to say so and nothing is
-    /// sent.
+    /// sent. When the answered question is not the last of its call, the same card is then edited
+    /// in place to the next question, once the dialog shows it.
+    ///
+    /// A card whose pane could not be read keeps its token, so the owner can tap it again.
     ///
     /// # Errors
     ///
-    /// Returns Herdr or Discord errors.
+    /// Returns Herdr or Discord errors, or a refusal of free text for a multiSelect question.
     pub async fn answer_question(
         &self,
         token: &str,
         answer: &Answer,
     ) -> Result<QuestionOutcome, String> {
-        let Some(pending) = self.question_registry.take(token) else {
+        let Some(pending) = self.question_registry.get(token) else {
             return Ok(QuestionOutcome::Unknown);
         };
-        let steps = answer_steps(&pending.question, true, answer)?;
-        let (pane_id, question) = (pending.pane_id.clone(), pending.question.clone());
-        let sent = tokio::task::spawn_blocking(move || type_answer(&pane_id, &question, &steps))
-            .await
-            .map_err(|error| format!("question answer task failed: {error}"))??;
-        if sent {
-            return Ok(QuestionOutcome::Sent);
+        let steps = answer_steps(pending.question(), pending.is_last(), answer)?;
+        if self.question_registry.take(token).is_none() {
+            return Ok(QuestionOutcome::Unknown);
         }
-        expire_informational_card(
+        let (pane_id, question) = (pending.pane_id.clone(), pending.question().clone());
+        let showing = blocking(move || dialog_is_showing(&pane_id, &question)).await;
+        match showing {
+            Ok(true) => {}
+            Ok(false) => {
+                expire_informational_card(
+                    self.client.as_ref(),
+                    pending.channel,
+                    pending.message,
+                    "resolved: answered in the terminal",
+                )
+                .await?;
+                return Ok(QuestionOutcome::AnsweredInTerminal);
+            }
+            Err(error) => {
+                self.question_registry.insert(token.to_owned(), pending);
+                return Err(error);
+            }
+        }
+        let pane_id = pending.pane_id.clone();
+        blocking(move || type_steps(&pane_id, &steps)).await?;
+        if !pending.is_last() {
+            self.show_next_question(pending).await?;
+        }
+        Ok(QuestionOutcome::Sent)
+    }
+
+    /// Waits for the dialog to show the call's next question, then edits the card in place to it
+    /// under a new token.
+    async fn show_next_question(&self, pending: PendingQuestion) -> Result<(), String> {
+        let next = PendingQuestion {
+            index: pending.index + 1,
+            ..pending
+        };
+        let (pane_id, question) = (next.pane_id.clone(), next.question().clone());
+        blocking(move || wait_for_dialog(&pane_id, &question)).await?;
+        let token = generate_token()?;
+        update_question_card(
             self.client.as_ref(),
-            pending.channel,
-            pending.message,
-            "resolved: answered in the terminal",
+            next.channel,
+            next.message,
+            next.question(),
+            &token,
+            &self.owner_id,
         )
         .await?;
-        Ok(QuestionOutcome::AnsweredInTerminal)
+        self.question_registry.insert(token, next);
+        Ok(())
     }
 
     #[must_use]
@@ -418,15 +468,39 @@ impl PermissionResponder {
     }
 }
 
-/// Types the steps into the pane's dialog and returns `true`, or returns `false` without typing
-/// when the pane is no longer `blocked` on `question`.
-fn type_answer(pane_id: &str, question: &Question, steps: &[AnswerStep]) -> Result<bool, String> {
+/// Runs a blocking Herdr call off the async runtime.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(call)
+        .await
+        .map_err(|error| format!("question answer task failed: {error}"))?
+}
+
+/// Whether the pane is `blocked` and its dialog shows `question`.
+fn dialog_is_showing(pane_id: &str, question: &Question) -> Result<bool, String> {
     let blocked = list_agents()?
         .iter()
         .any(|agent| agent.pane_id == pane_id && agent.agent_status == STATUS_BLOCKED);
-    if !blocked || !dialog_shows_question(&agent_read_detection(pane_id)?, question) {
-        return Ok(false);
+    Ok(blocked && dialog_shows_question(&agent_read_detection(pane_id)?, question))
+}
+
+/// Polls until the pane's dialog shows `question`, for at most the next-question wait.
+fn wait_for_dialog(pane_id: &str, question: &Question) -> Result<(), String> {
+    let deadline = Instant::now() + NEXT_QUESTION_WAIT;
+    while !dialog_shows_question(&agent_read_detection(pane_id)?, question) {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the dialog never showed the next question {:?}",
+                question.question
+            ));
+        }
+        std::thread::sleep(NEXT_QUESTION_POLL);
     }
+    Ok(())
+}
+
+fn type_steps(pane_id: &str, steps: &[AnswerStep]) -> Result<(), String> {
     for step in steps {
         match step {
             AnswerStep::Keys(keys) => {
@@ -438,7 +512,7 @@ fn type_answer(pane_id: &str, question: &Question, steps: &[AnswerStep]) -> Resu
             }
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 pub async fn handle_component(

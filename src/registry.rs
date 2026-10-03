@@ -151,13 +151,28 @@ impl InteractionRegistry {
     }
 }
 
-/// One Discord question card waiting for an answer, and the pane whose dialog it mirrors.
+/// One Discord question card waiting for an answer, and the pane whose dialog it mirrors. The card
+/// shows `questions[index]`; an `AskUserQuestion` call with several questions reuses the one card
+/// for each in turn.
 #[derive(Clone, Debug)]
 pub struct PendingQuestion {
     pub channel: Id<ChannelMarker>,
     pub message: Id<MessageMarker>,
     pub pane_id: String,
-    pub question: Question,
+    pub questions: Vec<Question>,
+    pub index: usize,
+}
+
+impl PendingQuestion {
+    #[must_use]
+    pub fn question(&self) -> &Question {
+        &self.questions[self.index]
+    }
+
+    #[must_use]
+    pub const fn is_last(&self) -> bool {
+        self.index + 1 == self.questions.len()
+    }
 }
 
 /// The open question cards, by the token their components carry.
@@ -171,6 +186,9 @@ impl QuestionRegistry {
     }
     pub fn insert(&self, token: String, pending: PendingQuestion) {
         self.lock_entries().insert(token, pending);
+    }
+    pub fn get(&self, token: &str) -> Option<PendingQuestion> {
+        self.lock_entries().get(token).cloned()
     }
     /// Removes and returns the card, so one card is answered at most once.
     pub fn take(&self, token: &str) -> Option<PendingQuestion> {

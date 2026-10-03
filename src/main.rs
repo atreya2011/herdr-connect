@@ -235,9 +235,9 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let detection = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
         .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten();
-    if let Some(question) = shown_question(snapshot, session, detection.as_deref()) {
+    if let Some((questions, index)) = shown_question(snapshot, session, detection.as_deref()) {
         match responder
-            .deliver_question_card(target, &route.pane_id, &question)
+            .deliver_question_card(target, &route.pane_id, questions, index)
             .await
         {
             Ok(message) => {
@@ -283,18 +283,19 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     .await;
 }
 
-/// The pending `AskUserQuestion` question from the pane's vendor log that its dialog, in Herdr's
-/// detection snapshot, currently shows.
+/// The pending `AskUserQuestion` call from the pane's vendor log, and the index of the question
+/// its dialog, in Herdr's detection snapshot, currently shows.
 fn shown_question(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
     detection: Option<&str>,
-) -> Option<Question> {
+) -> Option<(Vec<Question>, usize)> {
     let detection = detection?;
-    capture_for_blocked(snapshot, session)
-        .pending_questions
-        .into_iter()
-        .find(|question| dialog_shows_question(detection, question))
+    let questions = capture_for_blocked(snapshot, session).pending_questions;
+    let index = questions
+        .iter()
+        .position(|question| dialog_shows_question(detection, question))?;
+    Some((questions, index))
 }
 
 /// What [`deliver_blocked_messages`] needs to deliver a blocked card, bundled to keep the function
@@ -6796,7 +6797,14 @@ mod tests {
                 );
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(240),
-                    question_dialog_exercise(&guild, &tab, &agent_name, prompt, question, action),
+                    Box::pin(question_dialog_exercise(
+                        &guild,
+                        &tab,
+                        &agent_name,
+                        prompt,
+                        question,
+                        action,
+                    )),
                 )
                 .await
                 .unwrap_or_else(|_| Err("question dialog exercise timed out".to_owned()));

@@ -41,7 +41,7 @@ pub use delivery::{
     deliver_activity_message, deliver_live_message, deliver_permission_card, deliver_question_card,
     deliver_transition_card, execute_terminal_prompt_webhook, expire_informational_card,
     fetch_owner_identity, live_message_nonce, resolve_terminal_prompt_webhook,
-    transition_card_nonce, update_activity_message,
+    transition_card_nonce, update_activity_message, update_question_card,
 };
 pub use gateway::{ComponentHandler, GatewayContext, drive_gateway_with_components};
 pub use herdr::{
