@@ -199,7 +199,7 @@ impl PermissionResponder {
         let Some(pending) = self.question_registry.take(token) else {
             return Ok(QuestionOutcome::Unknown);
         };
-        let steps = answer_steps(&pending.question, answer);
+        let steps = answer_steps(&pending.question, true, answer)?;
         let (pane_id, question) = (pending.pane_id.clone(), pending.question.clone());
         let sent = tokio::task::spawn_blocking(move || type_answer(&pane_id, &question, &steps))
             .await

@@ -43,28 +43,43 @@ pub enum AnswerStep {
 }
 
 /// The inputs that give `answer` to Claude's own terminal dialog for `question`, the same ones the
-/// owner would press.
+/// owner would press. `is_last` is whether `question` is the last of its `AskUserQuestion` call.
 ///
 /// Every dialog entry has a number key. A single-select option's number selects and confirms at
-/// once. A multiSelect option's number toggles its checkbox; `right` then moves to the Submit tab
-/// and `enter` submits. The free-text entry is the one numbered after the listed options: its
-/// number focuses it, the text is typed, and `enter` confirms.
-#[must_use]
-pub fn answer_steps(question: &Question, answer: &Answer) -> Vec<AnswerStep> {
+/// once. A multiSelect option's number toggles its checkbox; `right` then moves to the next tab,
+/// which is the next question or, after the last question, the Submit tab, where `enter` submits.
+/// The free-text entry is the one numbered after the listed options: its number focuses it, the
+/// text is typed, and `enter` confirms. Free text is only mapped for a single-select question; how
+/// a multiSelect dialog takes it has not been probed.
+///
+/// # Errors
+///
+/// Returns an error for a free-text answer to a multiSelect question.
+pub fn answer_steps(
+    question: &Question,
+    is_last: bool,
+    answer: &Answer,
+) -> Result<Vec<AnswerStep>, String> {
     let number = |index: usize| (index + 1).to_string();
     match answer {
         Answer::Options(indices) => {
             let mut keys: Vec<String> = indices.iter().map(|&index| number(index)).collect();
             if question.multi_select {
-                keys.extend(["right".to_owned(), "enter".to_owned()]);
+                keys.push("right".to_owned());
+                if is_last {
+                    keys.push("enter".to_owned());
+                }
             }
-            vec![AnswerStep::Keys(keys)]
+            Ok(vec![AnswerStep::Keys(keys)])
         }
-        Answer::Text(text) => vec![
+        Answer::Text(_) if question.multi_select => {
+            Err("free text is not supported for a multiSelect question".to_owned())
+        }
+        Answer::Text(text) => Ok(vec![
             AnswerStep::Keys(vec![number(question.options.len())]),
             AnswerStep::Text(text.clone()),
             AnswerStep::Keys(vec!["enter".to_owned()]),
-        ],
+        ]),
     }
 }
 
@@ -94,33 +109,47 @@ mod tests {
 
     #[test]
     fn a_single_select_choice_is_its_number_key() {
-        assert_eq!(
-            answer_steps(&question(false), &Answer::Options(vec![1])),
-            vec![keys(&["2"])]
-        );
-    }
-
-    #[test]
-    fn a_multi_select_choice_toggles_each_pick_then_submits() {
-        assert_eq!(
-            answer_steps(&question(true), &Answer::Options(vec![0, 2])),
-            vec![keys(&["1", "3", "right", "enter"])]
-        );
-    }
-
-    #[test]
-    fn free_text_focuses_the_entry_after_the_options_types_and_confirms() {
-        for multi_select in [false, true] {
+        for is_last in [false, true] {
             assert_eq!(
-                answer_steps(&question(multi_select), &Answer::Text("purple".to_owned())),
-                vec![
-                    keys(&["4"]),
-                    AnswerStep::Text("purple".to_owned()),
-                    keys(&["enter"])
-                ],
-                "multi_select={multi_select}"
+                answer_steps(&question(false), is_last, &Answer::Options(vec![1])),
+                Ok(vec![keys(&["2"])]),
+                "is_last={is_last}"
             );
         }
+    }
+
+    #[test]
+    fn the_last_multi_select_question_toggles_each_pick_then_submits() {
+        assert_eq!(
+            answer_steps(&question(true), true, &Answer::Options(vec![0, 2])),
+            Ok(vec![keys(&["1", "3", "right", "enter"])])
+        );
+    }
+
+    #[test]
+    fn an_earlier_multi_select_question_toggles_each_pick_then_moves_to_the_next_tab() {
+        assert_eq!(
+            answer_steps(&question(true), false, &Answer::Options(vec![0, 2])),
+            Ok(vec![keys(&["1", "3", "right"])])
+        );
+    }
+
+    #[test]
+    fn free_text_on_a_single_select_question_focuses_the_entry_after_the_options_types_and_confirms()
+     {
+        assert_eq!(
+            answer_steps(&question(false), true, &Answer::Text("purple".to_owned())),
+            Ok(vec![
+                keys(&["4"]),
+                AnswerStep::Text("purple".to_owned()),
+                keys(&["enter"])
+            ])
+        );
+    }
+
+    #[test]
+    fn free_text_on_a_multi_select_question_is_refused() {
+        assert!(answer_steps(&question(true), true, &Answer::Text("purple".to_owned())).is_err());
     }
 
     #[test]
