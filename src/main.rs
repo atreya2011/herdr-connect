@@ -5610,7 +5610,7 @@ mod tests {
     /// Submits `long_prompt` through the bridge's own Discord path, then `queued_prompt` the same
     /// way while the pane is `working` on the first turn, and runs until the thread carries the
     /// reply to `queued_reply` -- the agent queues the second prompt itself and answers it after
-    /// the first turn. The second submission must be acknowledged, not refused.
+    /// the first turn. The second submission must succeed, and its prompt must not be mirrored back.
     #[cfg(unix)]
     async fn run_queued_prompt_turns(
         fixture: &TerminalPromptFixture<'_>,
@@ -5728,8 +5728,10 @@ mod tests {
     ) -> Result<(), String> {
         let vendor = fixture.vendor;
         let long_reply = format!("terminal-origin-{vendor}-long-{nonce}");
+        // The first turn outlasts the former 30 s marker lifetime, so a regression to a timed
+        // marker lets the queued prompt be mirrored back and fails the row.
         let long_prompt =
-            format!("Run the shell command `sleep 25`. Then reply with exactly: {long_reply}");
+            format!("Run the shell command `sleep 45`. Then reply with exactly: {long_reply}");
         let queued_reply = format!("terminal-origin-{vendor}-queued-{nonce}");
         let queued_prompt = format!("Reply with exactly: {queued_reply}");
         run_queued_prompt_turns(
