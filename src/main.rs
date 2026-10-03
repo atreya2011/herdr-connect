@@ -8199,15 +8199,45 @@ mod tests {
             .ok_or_else(|| "sync did not create the second tab's thread".to_owned())
     }
 
-    /// Whether the parent channel still holds the system message Discord posted when it created
-    /// `thread_id`: a `THREAD_CREATED` message whose reference points at the thread.
+    /// Checks that the parent channel holds, or no longer holds, the system message Discord posted
+    /// when it created `thread_id`. The listing is independent of the production lookup. When the
+    /// message is expected present, the production lookup must also find it. A mismatch reports
+    /// the facts of both.
     #[cfg(unix)]
-    async fn thread_created_message_survives(
+    async fn expect_thread_created_message(
         guild: &BlockedCaptureGuild,
         parent: Id<ChannelMarker>,
         thread_id: Id<ChannelMarker>,
-    ) -> Result<bool, String> {
-        let messages = guild
+        present: bool,
+    ) -> Result<(), String> {
+        let listed = !thread_created_messages(guild, parent, thread_id)
+            .await?
+            .is_empty();
+        let found = present
+            && herdr_connect_rs::find_thread_created_message(
+                guild.client.as_ref(),
+                parent,
+                thread_id,
+            )
+            .await?
+            .is_some();
+        if listed == present && (!present || found) {
+            return Ok(());
+        }
+        Err(format!(
+            "started-a-thread message expected {}: {}",
+            if present { "present" } else { "deleted" },
+            thread_created_facts(guild, parent, thread_id).await
+        ))
+    }
+
+    #[cfg(unix)]
+    async fn thread_created_messages(
+        guild: &BlockedCaptureGuild,
+        parent: Id<ChannelMarker>,
+        thread_id: Id<ChannelMarker>,
+    ) -> Result<Vec<twilight_model::channel::Message>, String> {
+        Ok(guild
             .client
             .channel_messages(parent)
             .limit(100)
@@ -8215,14 +8245,40 @@ mod tests {
             .map_err(|error| error.to_string())?
             .models()
             .await
-            .map_err(|error| error.to_string())?;
-        Ok(messages.iter().any(|message| {
-            message.kind == twilight_model::channel::message::MessageType::ThreadCreated
-                && message
-                    .reference
-                    .as_ref()
-                    .is_some_and(|reference| reference.channel_id == Some(thread_id))
-        }))
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|message| {
+                message.kind == twilight_model::channel::message::MessageType::ThreadCreated
+                    && message
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.channel_id == Some(thread_id))
+            })
+            .collect())
+    }
+
+    /// The thread id, the system messages found by the independent listing with their ids and
+    /// references, and what the production lookup returns, for a failure message.
+    #[cfg(unix)]
+    async fn thread_created_facts(
+        guild: &BlockedCaptureGuild,
+        parent: Id<ChannelMarker>,
+        thread_id: Id<ChannelMarker>,
+    ) -> String {
+        let listed = thread_created_messages(guild, parent, thread_id).await;
+        let found =
+            herdr_connect_rs::find_thread_created_message(guild.client.as_ref(), parent, thread_id)
+                .await
+                .map(|message| message.map(|message| message.id));
+        let listed = listed.map(|messages| {
+            messages
+                .iter()
+                .map(|message| (message.id, message.reference.clone()))
+                .collect::<Vec<_>>()
+        });
+        format!(
+            "thread id {thread_id}; system messages listed {listed:?}; production lookup {found:?}"
+        )
     }
 
     /// Deletes every thread named `... [<tab_id>]` under the channel whose topic is `topic`, active
@@ -8468,11 +8524,7 @@ mod tests {
         )
         .await
         .map_err(|_| "snapshot doorbell was interrupted".to_owned())?;
-        if !thread_created_message_survives(guild, channel.id, second_thread_id).await? {
-            return Err(
-                "the parent channel holds no started-a-thread message to delete".to_owned(),
-            );
-        }
+        expect_thread_created_message(guild, channel.id, second_thread_id, true).await?;
         close_tab(&second_tab.tab_id);
         let tab_closed = wait_for_event(
             &mut runtime.lifecycle,
@@ -8495,9 +8547,7 @@ mod tests {
         if thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
             return Err("tab close did not delete the tab's thread".to_owned());
         }
-        if thread_created_message_survives(guild, channel.id, second_thread_id).await? {
-            return Err("tab close left the started-a-thread message in the parent".to_owned());
-        }
+        expect_thread_created_message(guild, channel.id, second_thread_id, false).await?;
         if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
             return Err("tab close deleted the root tab's thread".to_owned());
         }
@@ -8696,11 +8746,7 @@ mod tests {
         let second_suffix = format!(" [{}]", second_route.tab_id);
         let root_suffix = format!(" [{}]", root_route.tab_id);
         let thread = active_tab_thread(guild, channel.id, &second_suffix).await?;
-        if !thread_created_message_survives(guild, channel.id, thread.id).await? {
-            return Err(
-                "the parent channel holds no started-a-thread message to delete".to_owned(),
-            );
-        }
+        expect_thread_created_message(guild, channel.id, thread.id, true).await?;
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
@@ -8735,9 +8781,7 @@ mod tests {
         if !errors.is_empty() {
             return Err(format!("gateway reported errors: {errors:?}"));
         }
-        if thread_created_message_survives(guild, channel.id, thread.id).await? {
-            return Err("owner thread delete left the started-a-thread message".to_owned());
-        }
+        expect_thread_created_message(guild, channel.id, thread.id, false).await?;
 
         if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
             return Err("the sibling tab's thread did not survive".to_owned());

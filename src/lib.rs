@@ -75,10 +75,11 @@ pub use readers::{
 pub use topology::{
     TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
     delete_thread_created_message, delete_topology_absent_from_herdr, delete_workspace_channel,
-    fetch_topology_lists, forget_owned, owned_thread_parent, reconcile_topology_cache,
-    register_archived_tab_threads, remember_tab_threads, remember_workspace_channels,
-    resolve_owner_deleted_tab, resolve_owner_deleted_workspace, route_topology, sync_topology,
-    take_self_deletion, workspace_channel_id, workspace_channel_name,
+    fetch_topology_lists, find_thread_created_message, forget_owned, owned_thread_parent,
+    reconcile_topology_cache, register_archived_tab_threads, remember_tab_threads,
+    remember_workspace_channels, resolve_owner_deleted_tab, resolve_owner_deleted_workspace,
+    route_topology, sync_topology, take_self_deletion, workspace_channel_id,
+    workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};
 
