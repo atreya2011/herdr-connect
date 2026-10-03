@@ -21,18 +21,24 @@ pub struct Question {
 
 /// Whether Herdr's detection snapshot still shows Claude's dialog for `question`.
 ///
-/// The screen wraps the question at the pane width and prefixes continuation lines, so both sides
-/// are compared after keeping only lowercase ASCII alphanumeric characters.
+/// The screen wraps the question at the pane width and prefixes lines with a box character, so
+/// those prefixes are removed before whitespace is collapsed.
 #[must_use]
 pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
-    let normalize = |text: &str| {
-        text.chars()
-            .filter(char::is_ascii_alphanumeric)
-            .map(|ch| ch.to_ascii_lowercase())
-            .collect::<String>()
+    let normalize_dialog = |text: &str| {
+        text.lines()
+            .map(|line| {
+                line.strip_prefix("│ ")
+                    .or_else(|| line.strip_prefix('│'))
+                    .unwrap_or(line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
-    format_detection_question(detection)
-        .is_some_and(|dialog| normalize(&dialog).contains(&normalize(&question.question)))
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    format_detection_question(detection).is_some_and(|dialog| {
+        collapse(&normalize_dialog(&dialog)).contains(&collapse(&question.question))
+    })
 }
 
 /// What the owner chose on a question card.
@@ -220,11 +226,9 @@ mod tests {
         let dialog = include_str!("../tests/fixtures/claude-detection-blocked-question.txt");
         let no_dialog = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
         let mut asked = question(false);
-        let mut different = question(false);
         asked.question = "Which color do you prefer?".to_owned();
-        different.question = "Which animal do you prefer?".to_owned();
         assert!(dialog_shows_question(dialog, &asked));
-        assert!(!dialog_shows_question(dialog, &different));
+        assert!(!dialog_shows_question(dialog, &question(false)));
         assert!(!dialog_shows_question(no_dialog, &asked));
     }
 
