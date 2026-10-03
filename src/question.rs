@@ -19,10 +19,14 @@ pub struct Question {
     pub multi_select: bool,
 }
 
-/// Whether Herdr's detection snapshot of a pane still shows Claude's dialog for `question`.
+/// Whether Herdr's detection snapshot of a pane still shows Claude's dialog for `question`. The
+/// screen wraps the question at the pane width, so both sides are compared with every run of
+/// whitespace collapsed to one space.
 #[must_use]
 pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
-    format_detection_question(detection).is_some_and(|dialog| dialog.contains(&question.question))
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    format_detection_question(detection)
+        .is_some_and(|dialog| collapse(&dialog).contains(&collapse(&question.question)))
 }
 
 /// What the owner chose on a question card.
@@ -214,5 +218,14 @@ mod tests {
         assert!(dialog_shows_question(dialog, &asked));
         assert!(!dialog_shows_question(dialog, &question(false)));
         assert!(!dialog_shows_question(no_dialog, &asked));
+    }
+
+    #[test]
+    fn the_dialog_check_ignores_how_the_screen_wraps_the_question() {
+        let dialog = include_str!("../tests/fixtures/claude-detection-blocked-question.txt")
+            .replace("Which color do you prefer?", "Which color do\nyou  prefer?");
+        let mut asked = question(false);
+        asked.question = "Which color do you prefer?".to_owned();
+        assert!(dialog_shows_question(&dialog, &asked));
     }
 }
