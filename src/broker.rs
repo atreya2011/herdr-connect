@@ -219,7 +219,12 @@ impl PermissionResponder {
         let Some(pending) = self.question_registry.get(token) else {
             return Ok(QuestionOutcome::Unknown);
         };
-        let steps = answer_steps(pending.question(), pending.is_last(), answer)?;
+        let steps = answer_steps(
+            pending.question(),
+            pending.index,
+            pending.questions.len(),
+            answer,
+        )?;
         if self.question_registry.take(token).is_none() {
             return Ok(QuestionOutcome::Unknown);
         }
