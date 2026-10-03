@@ -2,8 +2,9 @@ use twilight_model::channel::Channel;
 use twilight_model::id::{Id, marker::ChannelMarker};
 
 use crate::{
-    TopologyCache, forget_owned, resolve_owner_deleted_tab, resolve_owner_deleted_workspace,
-    tab_close, take_self_deletion, workspace_close,
+    TopologyCache, delete_thread_created_message, forget_owned, owned_thread_parent,
+    resolve_owner_deleted_tab, resolve_owner_deleted_workspace, tab_close, take_self_deletion,
+    workspace_close,
 };
 
 /// A guild channel or thread the Discord gateway reported deleted.
@@ -58,19 +59,26 @@ pub fn decide_close(deletion: &GuildDeletion) -> Option<Close> {
 /// closed the tab or workspace and the deleted ids have left the cache, so a delivery or sync
 /// that runs after this handler took the lock finds the tab gone. A delivery that raced ahead of
 /// the gateway event can create one replacement thread first; the close then ends the tab and the
-/// bridge's own tab-closed handling deletes that replacement.
+/// bridge's own tab-closed handling deletes that replacement. A deleted tab thread also has its
+/// "started a thread" system message deleted from its parent workspace channel, before the close.
 ///
 /// # Errors
 ///
-/// Returns the `herdr` close failure.
+/// Returns the `herdr` close failure, or else the failure to delete the system message.
 pub async fn handle_guild_deletion(
+    client: &twilight_http::Client,
     topology_cache: &TopologyCache,
     deletion: GuildDeletion,
 ) -> Result<(), String> {
     let id = deletion.id();
+    let parent = owned_thread_parent(id);
     let close = decide_close(&deletion);
     let Some(close) = close else {
         return Ok(());
+    };
+    let message = match (&close, parent) {
+        (Close::Tab(_), Some(parent)) => delete_thread_created_message(client, parent, id).await,
+        _ => Ok(()),
     };
     let mut guard = topology_cache.lock().await;
     if let Some((channels, threads)) = guard.as_mut() {
@@ -84,7 +92,8 @@ pub async fn handle_guild_deletion(
     .await
     .map_err(|error| error.to_string())?;
     drop(guard);
-    result.map(|_| forget_owned(id))
+    result.map(|_| forget_owned(id))?;
+    message
 }
 
 #[cfg(test)]
@@ -148,6 +157,7 @@ mod tests {
     #[tokio::test]
     async fn deletions_that_decide_nothing_return_without_reaching_herdr() {
         let cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let client = twilight_http::Client::new(String::new());
         let cases = [
             (
                 "a thread the registry never held",
@@ -162,7 +172,7 @@ mod tests {
         ];
         for (name, deletion) in cases {
             assert_eq!(
-                handle_guild_deletion(&cache, deletion).await,
+                handle_guild_deletion(&client, &cache, deletion).await,
                 Ok(()),
                 "{name}"
             );

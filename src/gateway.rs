@@ -134,10 +134,13 @@ pub async fn drive_gateway_with_components(
 }
 
 fn spawn_deletion(context: &GatewayContext, notices: &Sender<String>, deletion: GuildDeletion) {
+    let client = Arc::clone(&context.client);
     let responder = Arc::clone(&context.responder);
     let notices = notices.clone();
     tokio::spawn(async move {
-        if let Err(error) = handle_guild_deletion(responder.topology_cache(), deletion).await {
+        if let Err(error) =
+            handle_guild_deletion(&client, responder.topology_cache(), deletion).await
+        {
             let _ = notices.send(format!("discord owner deletion error: {error}"));
         }
     });

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex;
-use twilight_model::channel::Channel;
+use twilight_model::channel::{Channel, message::MessageType};
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker};
 
@@ -434,6 +434,18 @@ pub fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
     )
 }
 
+/// True when a Discord API error means the target message is already gone.
+fn is_unknown_message_error(error: &twilight_http::Error) -> bool {
+    matches!(
+        error.kind(),
+        twilight_http::error::ErrorType::Response {
+            status,
+            error: twilight_http::api_error::ApiError::General(api_error),
+            ..
+        } if *status == twilight_http::response::StatusCode::NOT_FOUND && api_error.code == 10008
+    )
+}
+
 /// True when a Discord API error means the target webhook is already gone (deleting its channel
 /// deletes its webhooks with it, so a cached webhook can go stale independently of its channel).
 pub fn is_unknown_webhook_error(error: &twilight_http::Error) -> bool {
@@ -469,6 +481,45 @@ pub fn record_self_deletion(id: Id<ChannelMarker>) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(id);
+}
+
+/// Deletes the `THREAD_CREATED` system message Discord posted in `parent` when it created
+/// `thread_id`, so deleting the thread leaves no "started a thread" line behind.
+///
+/// That message has its own id, not the thread's; it is the one in the page of messages right
+/// after the thread id whose reference points at the thread. No such message, or one already
+/// deleted, is not an error.
+///
+/// # Errors
+///
+/// Returns Discord request or response errors.
+pub async fn delete_thread_created_message(
+    client: &twilight_http::Client,
+    parent: Id<ChannelMarker>,
+    thread_id: Id<ChannelMarker>,
+) -> Result<(), String> {
+    let messages = client
+        .channel_messages(parent)
+        .after(Id::new(thread_id.get()))
+        .limit(100)
+        .await
+        .map_err(|error| error.to_string())?
+        .models()
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(message) = messages.iter().find(|message| {
+        message.kind == MessageType::ThreadCreated
+            && message
+                .reference
+                .as_ref()
+                .is_some_and(|reference| reference.channel_id == Some(thread_id))
+    }) else {
+        return Ok(());
+    };
+    match client.delete_message(parent, message.id).await {
+        Err(error) if !is_unknown_message_error(&error) => Err(error.to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// Deletes one Discord channel or thread, treating an already-deleted target as done.
@@ -604,6 +655,15 @@ pub fn resolve_owner_deleted_tab(thread_id: Id<ChannelMarker>) -> Option<String>
         .map(|thread| thread.tab_id.clone())
 }
 
+/// The workspace channel that parented a bridge-owned tab thread, from the durable registry.
+#[must_use]
+pub fn owned_thread_parent(thread_id: Id<ChannelMarker>) -> Option<Id<ChannelMarker>> {
+    owned_topology()
+        .threads
+        .get(&thread_id)
+        .map(|thread| thread.parent)
+}
+
 /// The Herdr workspace id a deleted channel's `herdr workspace [id]` topic named, if it had one.
 #[must_use]
 pub fn resolve_owner_deleted_workspace(deleted: &Channel) -> Option<String> {
@@ -652,6 +712,7 @@ pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
         return Ok(());
     };
     delete_channel_if_present(client, thread.id).await?;
+    delete_thread_created_message(client, workspace_channel, thread.id).await?;
     active_threads.retain(|entry| entry.id != thread.id);
     Ok(())
 }
@@ -726,6 +787,7 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
             // owner-made thread name coincidence, not a bridge-owned tab thread; leave it alone.
             if tab_id.starts_with(&tab_id_prefix) && !live_tab_ids.contains(tab_id) {
                 delete_channel_if_present(client, thread.id).await?;
+                delete_thread_created_message(client, workspace_channel, thread.id).await?;
                 active_threads.retain(|entry| entry.id != thread.id);
             }
         }
