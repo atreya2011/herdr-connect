@@ -63,7 +63,7 @@ pub use prompting::{
     forget_departed_owner_prompt_suppressions, maintain_typing_until_settled,
     should_handle_owner_message, submit_owner_prompt, take_owner_prompt_suppression,
 };
-pub use question::{Question, QuestionOption};
+pub use question::{Answer, AnswerStep, Question, QuestionOption, answer_steps};
 pub use readers::{
     AgentLog, format_detection_question, read_agent_log, read_claude_incremental,
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,

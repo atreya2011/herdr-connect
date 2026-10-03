@@ -239,6 +239,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         |question| AgentLogCapture {
             message: question.clone(),
             question: Some(question),
+            pending_questions: Vec::new(),
             failure: None,
         },
     );
@@ -573,6 +574,7 @@ fn capture_for_with_search_root(
         message: log.message,
         failure: log.failure,
         question: log.question,
+        pending_questions: log.pending_questions,
     })
 }
 
@@ -1533,6 +1535,7 @@ fn capture_for_blocked(snapshot: &AgentSnapshot, session: &AgentSession) -> Agen
             message: "blocked context unavailable: HOME is not configured".to_owned(),
             failure: None,
             question: None,
+            pending_questions: Vec::new(),
         },
         |home| capture_for_blocked_with_search_root(snapshot, session, Path::new(&home)),
     )
@@ -1551,6 +1554,7 @@ fn capture_for_blocked_with_search_root(
                 message: format!("blocked context unavailable: {error}"),
                 failure: None,
                 question: None,
+                pending_questions: Vec::new(),
             }
         }
     }

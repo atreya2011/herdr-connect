@@ -1,4 +1,5 @@
 use crate::herdr::{STATUS_BLOCKED, is_numeric_label};
+use crate::question::Question;
 use crate::watcher::Transition;
 
 const MAX_PART_LENGTH: usize = 1_900;
@@ -15,6 +16,7 @@ pub struct AgentLogCapture {
     pub message: String,
     pub failure: Option<String>,
     pub question: Option<String>,
+    pub pending_questions: Vec<Question>,
 }
 
 #[must_use]

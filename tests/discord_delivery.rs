@@ -83,6 +83,7 @@ mod real_guild {
                 message: "blocked".into(),
                 failure: None,
                 question: Some("choose".into()),
+                pending_questions: Vec::new(),
             },
             &owner.to_string(),
         )
@@ -110,6 +111,7 @@ mod real_guild {
                 message: "blocked".into(),
                 failure: None,
                 question: Some("second choice".into()),
+                pending_questions: Vec::new(),
             },
             &owner.to_string(),
         )

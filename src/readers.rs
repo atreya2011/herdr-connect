@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::herdr::AgentSession;
 use crate::permission::{VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR};
+use crate::question::Question;
 
 /// Key for a vendor log record's own type field (Claude: `user`/`assistant`; Codex: `turn_context`/`event_msg`).
 const RECORD_TYPE_KEY: &str = "type";
@@ -36,6 +37,8 @@ const USER_RECORD_TYPE_VALUE: &str = "user";
 pub struct AgentLog {
     pub message: String,
     pub question: Option<String>,
+    /// The structured questions of the pending `AskUserQuestion` call, empty when none is pending.
+    pub pending_questions: Vec<Question>,
     pub failure: Option<String>,
 }
 
@@ -574,6 +577,7 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         .collect();
     let mut message = None;
     let mut question = None;
+    let mut pending_questions = Vec::new();
     let mut failure = None;
     for record in tail {
         if let Some(contents) = record
@@ -598,6 +602,13 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
                             .is_some_and(|id| answered.contains(id))
                         {
                             question = format_question(part.get("input"));
+                            pending_questions = part
+                                .get("input")
+                                .and_then(|input| input.get("questions"))
+                                .and_then(|questions| {
+                                    serde_json::from_value(questions.clone()).ok()
+                                })
+                                .unwrap_or_default();
                         }
                     }
                     Some("tool_result") if part.get("is_error") == Some(&Value::Bool(true)) => {
@@ -618,6 +629,7 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
     Ok(AgentLog {
         message,
         question,
+        pending_questions,
         failure,
     })
 }
@@ -673,6 +685,7 @@ fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
     Ok(AgentLog {
         message,
         question: None,
+        pending_questions: Vec::new(),
         failure,
     })
 }
@@ -703,6 +716,7 @@ fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
     Ok(AgentLog {
         message: message.into(),
         question: None,
+        pending_questions: Vec::new(),
         failure: None,
     })
 }
@@ -778,7 +792,8 @@ fn format_question(input: Option<&Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_detection_question;
+    use super::{format_detection_question, parse_claude};
+    use crate::question::{Question, QuestionOption};
 
     #[test]
     fn detection_snapshot_with_a_pending_dialog_yields_the_question_and_options() {
@@ -795,5 +810,49 @@ mod tests {
     fn detection_snapshot_with_no_dialog_yields_none() {
         let text = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
         assert_eq!(format_detection_question(text), None);
+    }
+
+    const PENDING_QUESTION_LOG: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"AskUserQuestion","id":"t1","input":{"questions":[{"question":"Which toppings?","header":"Toppings","options":[{"label":"Cheese","description":"Add cheese"},{"label":"Olives","description":"Add olives"}],"multiSelect":true}]}}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_pending_ask_user_question_yields_its_structured_questions() {
+        let log = parse_claude(PENDING_QUESTION_LOG).expect("log parses");
+        assert_eq!(
+            log.pending_questions,
+            vec![Question {
+                question: "Which toppings?".to_owned(),
+                header: "Toppings".to_owned(),
+                options: vec![
+                    QuestionOption {
+                        label: "Cheese".to_owned(),
+                        description: "Add cheese".to_owned(),
+                    },
+                    QuestionOption {
+                        label: "Olives".to_owned(),
+                        description: "Add olives".to_owned(),
+                    },
+                ],
+                multi_select: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_answered_ask_user_question_yields_no_structured_questions() {
+        let answered = format!(
+            "{PENDING_QUESTION_LOG}{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#
+        );
+        let log = parse_claude(&format!(
+            "{answered}{}\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#
+        ))
+        .expect("log parses");
+        assert_eq!(log.pending_questions, Vec::new());
     }
 }
