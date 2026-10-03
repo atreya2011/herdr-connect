@@ -6522,6 +6522,398 @@ mod tests {
         run_activity_hook_test().await;
     }
 
+    #[cfg(unix)]
+    const QUESTION_LABEL: &str = "testrun-question";
+
+    /// Instructs a real `claude --model haiku` agent to call `AskUserQuestion` with exactly the
+    /// single-select shape the rows below expect.
+    #[cfg(unix)]
+    const QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly one \
+        question with header \"Color\", question text \"Which color?\", and exactly two options: \
+        label \"Red\" with description \"The color red\", and label \"Blue\" with description \
+        \"The color blue\". multiSelect must be false. Do not do anything else and do not say \
+        anything else.";
+
+    /// The multiSelect counterpart of [`QUESTION_FORCE_PROMPT`].
+    #[cfg(unix)]
+    const MULTI_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly \
+        one question with header \"Toppings\", question text \"Which toppings?\", and exactly \
+        three options: label \"Cheese\" with description \"Add cheese\", label \"Olives\" with \
+        description \"Add olives\", and label \"Mushrooms\" with description \"Add mushrooms\". \
+        multiSelect must be true. Do not do anything else and do not say anything else.";
+
+    /// Testrun tab cwd fixture for the question rows, mirroring `activity_tab_fixture` under its
+    /// own label so the rows' zero-leftover checks never collide.
+    #[cfg(unix)]
+    fn question_tab_fixture() -> Result<(Tab, PathBuf), String> {
+        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
+            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
+        })?;
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let label = format!("{QUESTION_LABEL}-claude");
+        let cwd_dir = claude_testrun_dir(&home);
+        clear_directory_contents(&cwd_dir)?;
+        let cwd = cwd_dir
+            .to_str()
+            .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
+        create_tab(&label, &workspace_id, cwd).map(|tab| (tab, cwd_dir))
+    }
+
+    /// Builds a `MessageComponent` interaction JSON has no way to synthesize from a real Discord
+    /// client (there is no bot API that simulates a human clicking a button), so this constructs
+    /// the minimal wire shape [`handle_component`] actually reads: guild, a real channel (fetched
+    /// live so its shape is never guessed), the owner as the invoking user, and the tapped
+    /// component's `custom_id` plus any select-menu `values`. Every downstream effect this drives
+    /// -- the pane re-read, the typed keys, the real Discord card edit, the attempted (and
+    /// discarded) interaction response -- is real; only this upstream "a human tapped a button"
+    /// event is synthetic.
+    #[cfg(unix)]
+    fn synthetic_component_interaction(
+        guild_id: Id<GuildMarker>,
+        owner_id: &str,
+        channel: &twilight_model::channel::Channel,
+        custom_id: &str,
+        values: &[&str],
+    ) -> Result<twilight_model::application::interaction::Interaction, String> {
+        let channel_value = serde_json::to_value(channel).map_err(|error| error.to_string())?;
+        let component_type = if values.is_empty() { 2 } else { 3 };
+        let payload = json!({
+            "id": "1",
+            "application_id": "1",
+            "authorizing_integration_owners": {},
+            "token": "synthetic-test-token",
+            "type": 3,
+            "guild_id": guild_id.to_string(),
+            "channel": channel_value,
+            "user": {"id": owner_id, "username": "owner", "discriminator": "0"},
+            "data": {
+                "custom_id": custom_id,
+                "component_type": component_type,
+                "values": values,
+            },
+        });
+        serde_json::from_value(payload).map_err(|error| error.to_string())
+    }
+
+    /// Reads the settled pane's own real Claude session transcript and returns what it recorded
+    /// for the `AskUserQuestion` `toolUseResult.answers[question]`, proving Claude itself received
+    /// the answer.
+    #[cfg(unix)]
+    fn transcript_question_answer(
+        home: &Path,
+        snapshot: &AgentSnapshot,
+        question: &str,
+    ) -> Result<Option<String>, String> {
+        let session = snapshot
+            .session
+            .as_ref()
+            .ok_or_else(|| "settled pane has no reported session".to_owned())?;
+        let path =
+            resolve_session_path(home, snapshot, session).map_err(|error| error.to_string())?;
+        let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        Ok(contents.lines().rev().find_map(|line| {
+            let record: Value = serde_json::from_str(line).ok()?;
+            record
+                .get("toolUseResult")?
+                .get("answers")?
+                .get(question)?
+                .as_str()
+                .map(str::to_owned)
+        }))
+    }
+
+    /// How the owner answers the question card in one row.
+    #[cfg(unix)]
+    enum QuestionAction {
+        /// Taps the single-select button for this option index.
+        Button(usize),
+        /// Picks these option indices in the multiSelect menu.
+        Select(&'static [&'static str]),
+        /// Replies in the thread with this text.
+        Text(&'static str),
+        /// Presses `1` in the pane's own dialog first, then taps option `1` on the now stale card.
+        TerminalThenButton,
+    }
+
+    /// What one question row observed.
+    #[cfg(unix)]
+    struct QuestionOutcome {
+        /// The pane's Herdr status read right before the owner acted: the terminal dialog was
+        /// showing the whole time the card was up.
+        status_before: String,
+        /// The question card's content once the row finished.
+        card: Option<String>,
+        /// What Claude's own session transcript recorded as the answer.
+        answered: Option<String>,
+    }
+
+    /// Drives one real `claude --model haiku` agent with no hook registered through a forced
+    /// question: the pane blocks on Claude's own dialog, the bridge's blocked-card path posts the
+    /// question card, and the owner answers through `action`.
+    #[cfg(unix)]
+    async fn question_dialog_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        agent_name: &str,
+        prompt: &str,
+        question: &str,
+        action: QuestionAction,
+    ) -> Result<QuestionOutcome, String> {
+        let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
+        let responder = Arc::clone(&connection.3);
+
+        start_claude_haiku_agent(agent_name, &tab.pane_id)?;
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let matching = matching_tab(&tab.tab_id)?;
+        let tabs = [matching];
+        let route = route_topology(std::slice::from_ref(&idle), &tabs, &idle.terminal_id)?;
+        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+        let mut state = BridgeState::default();
+        own(&idle, &tabs, &connection, &mut state).await;
+
+        submit_owner_prompt(&tab.pane_id, prompt)?;
+        let blocked = poll_snapshot(&tab.pane_id, Duration::from_secs(90), |snapshot| {
+            snapshot.agent_status == "blocked"
+        })?;
+        if blocked.agent_status != "blocked" {
+            return Err(format!(
+                "pane never blocked on its question dialog, status {}",
+                blocked.agent_status
+            ));
+        }
+        // The pane was `working` while it composed the question; the poll above may not have
+        // sampled that, and only a `working` -> `blocked` transition posts a card.
+        state
+            .previous
+            .insert(blocked.terminal_id.clone(), STATUS_WORKING.to_owned());
+        own(&blocked, &tabs, &connection, &mut state).await;
+        let token = responder
+            .pending_question_token(thread)
+            .ok_or("the blocked-card path posted no question card")?;
+        let status_before = snapshot_for_pane(&tab.pane_id)?.agent_status;
+
+        let channel = guild
+            .client
+            .channel(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let click = |custom_id: String, values: &'static [&'static str]| {
+            synthetic_component_interaction(guild.id, &connection.2, &channel, &custom_id, values)
+        };
+        let terminal_answered = matches!(action, QuestionAction::TerminalThenButton);
+        match action {
+            QuestionAction::Button(index) => {
+                let interaction = click(format!("herdrask:{token}:{index}"), &[])?;
+                super::handle_component(Arc::clone(&responder), interaction).await;
+            }
+            QuestionAction::Select(values) => {
+                let interaction = click(format!("herdrask-multi:{token}"), values)?;
+                super::handle_component(Arc::clone(&responder), interaction).await;
+            }
+            QuestionAction::Text(text) => {
+                let outcome = responder
+                    .answer_question(&token, &herdr_connect_rs::Answer::Text(text.to_owned()))
+                    .await?;
+                if outcome != herdr_connect_rs::QuestionOutcome::Sent {
+                    return Err(format!("free-text answer was not typed: {outcome:?}"));
+                }
+            }
+            QuestionAction::TerminalThenButton => {
+                let status = Command::new("herdr")
+                    .args(["agent", "send-keys", &tab.pane_id, "1"])
+                    .status()
+                    .map_err(|error| error.to_string())?;
+                if !status.success() {
+                    return Err("herdr agent send-keys failed".to_owned());
+                }
+                poll_snapshot(&tab.pane_id, Duration::from_secs(30), |snapshot| {
+                    snapshot.agent_status != "blocked"
+                })?;
+                let interaction = click(format!("herdrask:{token}:1"), &[])?;
+                super::handle_component(Arc::clone(&responder), interaction).await;
+            }
+        }
+
+        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(60), |snapshot| {
+            matches!(snapshot.agent_status.as_str(), "done" | "idle")
+        })?;
+        if !terminal_answered {
+            own(&settled, &tabs, &connection, &mut state).await;
+        }
+        let messages = thread_messages(guild, thread).await?;
+        let card = messages
+            .iter()
+            .find(|(content, _, _)| content.starts_with("resolved:"))
+            .map(|(content, _, _)| content.clone());
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
+        let answered = transcript_question_answer(&home, &settled, question)?;
+        Ok(QuestionOutcome {
+            status_before,
+            card,
+            answered,
+        })
+    }
+
+    /// Runs [`question_dialog_exercise`] inside the real-guild fixture: zero leftovers before, the
+    /// tab and testrun channel cleaned on every path, and a named zero-leftover check after.
+    #[cfg(unix)]
+    async fn run_question_dialog_test(
+        prompt: &str,
+        question: &str,
+        action: QuestionAction,
+    ) -> Option<QuestionOutcome> {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return None;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+        let label = format!("{QUESTION_LABEL}-claude");
+        assert_eq!(
+            remaining_tabs(&label).expect("tab.list succeeds"),
+            0,
+            "named zero-leftover check"
+        );
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set by the real Herdr pane environment");
+        let (tab_id, cwd_dir, result) = match question_tab_fixture() {
+            Ok((tab, cwd_dir)) => {
+                let agent_name = format!(
+                    "question-claude-{}",
+                    agent_name_nonce().expect("system clock is after unix epoch")
+                );
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(240),
+                    question_dialog_exercise(&guild, &tab, &agent_name, prompt, question, action),
+                )
+                .await
+                .unwrap_or_else(|_| Err("question dialog exercise timed out".to_owned()));
+                cleanup_real_claude_session_dir(&home, &tab.pane_id);
+                (Some(tab.tab_id), Some(cwd_dir), outcome)
+            }
+            Err(error) => (None, None, Err(error)),
+        };
+        if let Some(tab_id) = &tab_id {
+            close_tab(tab_id);
+        }
+        if let Some(cwd_dir) = cwd_dir {
+            let _ = clear_directory_contents(&cwd_dir);
+        }
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        let tabs_left =
+            remaining_tabs(&label).expect("tab.list succeeds for the zero-leftover check");
+        let outcome = result.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+        assert_eq!(tabs_left, 0, "named zero-leftover check");
+        Some(outcome)
+    }
+
+    /// Real row: the pane showed its own dialog (`blocked`) while the card was up; the Discord tap
+    /// typed option 2's number key, Claude's transcript records Blue, and the departed-card
+    /// expiry retired the card once the pane left `blocked`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn question_card_tap_types_the_option_into_the_open_dialog() {
+        let Some(outcome) = Box::pin(run_question_dialog_test(
+            QUESTION_FORCE_PROMPT,
+            "Which color?",
+            QuestionAction::Button(1),
+        ))
+        .await
+        else {
+            return;
+        };
+        assert_eq!(outcome.status_before, "blocked");
+        assert_eq!(outcome.answered.as_deref(), Some("Blue"));
+        assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
+    }
+
+    /// Real row: the owner pressed `1` in the pane while the card was up, so the late Discord tap
+    /// types nothing and the card says it was answered in the terminal; Claude's transcript
+    /// records the terminal's Red, not the tapped Blue.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn question_card_answered_in_the_terminal_is_retired_without_typing() {
+        let Some(outcome) = Box::pin(run_question_dialog_test(
+            QUESTION_FORCE_PROMPT,
+            "Which color?",
+            QuestionAction::TerminalThenButton,
+        ))
+        .await
+        else {
+            return;
+        };
+        assert_eq!(outcome.status_before, "blocked");
+        assert_eq!(outcome.answered.as_deref(), Some("Red"));
+        assert_eq!(
+            outcome.card.as_deref(),
+            Some("resolved: answered in the terminal")
+        );
+    }
+
+    /// Real row: the multiSelect menu pick of options 0 and 2 toggles both checkboxes, moves to
+    /// Submit, and submits; Claude's transcript records the comma-joined labels.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn multi_select_question_card_submits_every_picked_option() {
+        let Some(outcome) = Box::pin(run_question_dialog_test(
+            MULTI_QUESTION_FORCE_PROMPT,
+            "Which toppings?",
+            QuestionAction::Select(&["0", "2"]),
+        ))
+        .await
+        else {
+            return;
+        };
+        assert_eq!(outcome.status_before, "blocked");
+        assert_eq!(outcome.answered.as_deref(), Some("Cheese, Mushrooms"));
+        assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
+    }
+
+    /// Real row: a free-text reply presses the "Type something" entry's number (the one after the
+    /// two options), types the text, and presses Enter; Claude's transcript records the text. The
+    /// keys for the free-text entry were not probed live, so this row is their evidence: if the
+    /// dialog takes different keys, record them here and in `answer_steps`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn question_card_free_text_reply_is_typed_into_the_dialog() {
+        let Some(outcome) = Box::pin(run_question_dialog_test(
+            QUESTION_FORCE_PROMPT,
+            "Which color?",
+            QuestionAction::Text("purple"),
+        ))
+        .await
+        else {
+            return;
+        };
+        assert_eq!(outcome.status_before, "blocked");
+        assert!(
+            outcome
+                .answered
+                .as_deref()
+                .is_some_and(|answer| answer.contains("purple")),
+            "transcript answer was {:?}",
+            outcome.answered
+        );
+        assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
+    }
+
     /// The real Codex account's own broker socket, matching its already-installed
     /// `CODEX_HOME/hooks.json` (`PreToolUse` activity hook and `PermissionRequest` hook, both
     /// `--socket /tmp/herdr-claude-broker.sock`), per [examples/codex-hooks.json](../examples/codex-hooks.json)'s
