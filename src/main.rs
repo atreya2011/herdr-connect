@@ -6682,6 +6682,16 @@ mod tests {
         description \"Add olives\", and label \"Mushrooms\" with description \"Add mushrooms\". \
         Do not do anything else and do not say anything else.";
 
+    /// A two-question call of two single-select questions.
+    #[cfg(unix)]
+    const TWO_SINGLE_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now, in a \
+        single call with exactly two questions. First: header \"Color\", question text \"Which \
+        color?\", multiSelect false, and exactly two options: label \"Red\" with description \
+        \"The color red\", and label \"Blue\" with description \"The color blue\". Second: header \
+        \"Size\", question text \"Which size?\", multiSelect false, and exactly two options: label \
+        \"Small\" with description \"A small one\", and label \"Large\" with description \"A large \
+        one\". Do not do anything else and do not say anything else.";
+
     /// How the owner answers the question card in one row.
     #[cfg(unix)]
     enum QuestionAction {
@@ -6691,10 +6701,13 @@ mod tests {
         Select(&'static [&'static str]),
         /// Replies in the thread with this text, through the owner-message handler.
         Text(&'static str),
-        /// Taps option `1` of the first question, then picks options `0` and `2` of the second
-        /// question on the same card.
-        TwoQuestions,
+        /// Taps option `1` of the first question, then answers the second question on the same
+        /// card with the given action.
+        TwoQuestions(&'static QuestionAction),
         /// Presses `1` in the pane's own dialog first, then taps option `1` on the now stale card.
+        /// This is the order where the tap reaches the bridge before it has seen the pane leave
+        /// `blocked`, which is a narrow window; usually the pane's departure retires the card
+        /// first, and a retired card has no controls left to tap.
         TerminalThenButton,
     }
 
@@ -6852,24 +6865,27 @@ mod tests {
                 )
                 .await?;
             }
-            QuestionAction::TwoQuestions => {
+            QuestionAction::TwoQuestions(second) => {
                 let card_before = card_message_ids(guild, thread).await?;
                 let interaction = click(format!("herdrask:{token}:1"), &[])?;
                 super::handle_component(Arc::clone(&responder), interaction).await;
-                let deadline = Instant::now() + Duration::from_secs(20);
-                let second = loop {
-                    match responder.pending_question_token(thread) {
-                        Some(next) if next != token => break next,
-                        _ if Instant::now() >= deadline => {
-                            return Err("the card never moved to the second question".to_owned());
-                        }
-                        _ => tokio::time::sleep(Duration::from_millis(200)).await,
-                    }
-                };
+                // The handler returns only after the card moved on, so the new token is there.
+                let second_token = responder
+                    .pending_question_token(thread)
+                    .filter(|next| next != token)
+                    .ok_or("the card never moved to the second question")?;
                 if card_message_ids(guild, thread).await? != card_before {
                     return Err("the second question was not edited into the same card".to_owned());
                 }
-                let interaction = click(format!("herdrask-multi:{second}"), &["0", "2"])?;
+                let interaction = match second {
+                    QuestionAction::Button(index) => {
+                        click(format!("herdrask:{second_token}:{index}"), &[])?
+                    }
+                    QuestionAction::Select(values) => {
+                        click(format!("herdrask-multi:{second_token}"), values)?
+                    }
+                    _ => return Err("the second answer must be a button or a select".to_owned()),
+                };
                 super::handle_component(Arc::clone(&responder), interaction).await;
             }
             QuestionAction::TerminalThenButton => {
@@ -7071,6 +7087,32 @@ mod tests {
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
+    /// Real row: a two-question call of two single-select questions is answered entirely from
+    /// Discord on one card. The first tap types option 2's number, which answers the question and
+    /// advances the dialog by itself; the card is edited in place to the second question; the
+    /// second tap types option 2's number and then `enter` on the review screen. Claude's
+    /// transcript records both answers.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn two_single_select_question_call_is_answered_from_discord_and_submitted() {
+        let Some(outcome) = Box::pin(run_question_dialog_test(
+            TWO_SINGLE_QUESTION_FORCE_PROMPT,
+            &["Which color?", "Which size?"],
+            QuestionAction::TwoQuestions(&QuestionAction::Button(1)),
+        ))
+        .await
+        else {
+            return;
+        };
+        assert_eq!(outcome.status_before, "blocked");
+        assert_eq!(
+            outcome.answered,
+            [Some("Blue".to_owned()), Some("Large".to_owned())]
+        );
+        assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
+    }
+
     /// Real row: a two-question call (single-select, then multiSelect) is answered entirely from
     /// Discord on one card. The first tap types option 2's number, which moves the dialog on; the
     /// card is edited in place to the second question; its pick of options 0 and 2 toggles both,
@@ -7082,7 +7124,7 @@ mod tests {
         let Some(outcome) = Box::pin(run_question_dialog_test(
             TWO_QUESTION_FORCE_PROMPT,
             &["Which color?", "Which toppings?"],
-            QuestionAction::TwoQuestions,
+            QuestionAction::TwoQuestions(&QuestionAction::Select(&["0", "2"])),
         ))
         .await
         else {
