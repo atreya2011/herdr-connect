@@ -518,7 +518,7 @@ pub async fn deliver_question_button_card(
             "description": question_card_description(&question.question),
             "color": 0x00f1_c40f,
         }],
-        PAYLOAD_COMPONENTS_KEY: question_button_components(&question.options, token, false),
+        PAYLOAD_COMPONENTS_KEY: question_button_components(&question.options, token),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
     let payload = payload.to_string().into_bytes();
@@ -551,7 +551,7 @@ pub async fn deliver_question_select_card(
             "description": question_card_description(&question.question),
             "color": 0x00f1_c40f,
         }],
-        PAYLOAD_COMPONENTS_KEY: question_select_components(&question.options, token, false),
+        PAYLOAD_COMPONENTS_KEY: question_select_components(&question.options, token),
         ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
     });
     let payload = payload.to_string().into_bytes();
@@ -587,7 +587,7 @@ pub fn truncate_with_ellipsis(value: &str, limit: usize) -> String {
 }
 
 /// One action row of up to five option buttons, `herdrask:<token>:<option index>`.
-fn question_button_components(options: &[QuestionOption], token: &str, disabled: bool) -> Value {
+fn question_button_components(options: &[QuestionOption], token: &str) -> Value {
     let buttons: Vec<Value> = options
         .iter()
         .enumerate()
@@ -597,7 +597,6 @@ fn question_button_components(options: &[QuestionOption], token: &str, disabled:
                 "style": 1,
                 "label": truncate_with_ellipsis(&option.label, BUTTON_LABEL_LIMIT),
                 "custom_id": format!("herdrask:{token}:{index}"),
-                "disabled": disabled,
             })
         })
         .collect();
@@ -605,7 +604,7 @@ fn question_button_components(options: &[QuestionOption], token: &str, disabled:
 }
 
 /// One action row holding a `herdrask-multi:<token>` string select menu offering every option.
-fn question_select_components(options: &[QuestionOption], token: &str, disabled: bool) -> Value {
+fn question_select_components(options: &[QuestionOption], token: &str) -> Value {
     let select_options: Vec<Value> = options
         .iter()
         .enumerate()
@@ -625,63 +624,8 @@ fn question_select_components(options: &[QuestionOption], token: &str, disabled:
             "options": select_options,
             "min_values": 1,
             "max_values": options.len(),
-            "disabled": disabled,
         }],
     }])
-}
-
-/// Disables the controls on an expired or resolved single-select question card.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
-pub async fn expire_question_button_card(
-    client: &twilight_http::Client,
-    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
-    options: &[QuestionOption],
-    token: &str,
-    content: &str,
-) -> Result<(), String> {
-    let payload = serde_json::json!({
-        PAYLOAD_CONTENT_KEY: content,
-        PAYLOAD_COMPONENTS_KEY: question_button_components(options, token, true),
-        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
-    });
-    let payload = payload.to_string().into_bytes();
-    client
-        .update_message(channel, message)
-        .payload_json(&payload)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-/// Disables the controls on an expired or resolved multiSelect question card.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
-pub async fn expire_question_select_card(
-    client: &twilight_http::Client,
-    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
-    options: &[QuestionOption],
-    token: &str,
-    content: &str,
-) -> Result<(), String> {
-    let payload = serde_json::json!({
-        PAYLOAD_CONTENT_KEY: content,
-        PAYLOAD_COMPONENTS_KEY: question_select_components(options, token, true),
-        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
-    });
-    let payload = payload.to_string().into_bytes();
-    client
-        .update_message(channel, message)
-        .payload_json(&payload)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 fn allowed_mentions(mention_user: Option<&str>) -> Value {
@@ -964,7 +908,7 @@ mod tests {
     fn question_button_components_truncate_an_oversized_label() {
         let long_label = "x".repeat(BUTTON_LABEL_LIMIT + 1);
         let options = vec![option(&long_label)];
-        let components = question_button_components(&options, "tok", false);
+        let components = question_button_components(&options, "tok");
         let label = components[0]["components"][0]["label"]
             .as_str()
             .expect("button label is a string");
@@ -980,7 +924,7 @@ mod tests {
             label: long_label,
             description: long_description,
         }];
-        let components = super::question_select_components(&options, "tok", false);
+        let components = super::question_select_components(&options, "tok");
         let menu_option = &components[0]["components"][0]["options"][0];
         let label = menu_option["label"].as_str().expect("label is a string");
         let description = menu_option["description"]
@@ -1008,25 +952,23 @@ mod tests {
     #[test]
     fn question_button_components_encode_one_button_per_option_with_the_option_index() {
         let options = vec![option("Red"), option("Blue")];
-        let components = question_button_components(&options, "tok", false);
+        let components = question_button_components(&options, "tok");
         assert_eq!(
             components,
             json!([{
                 "type": 1,
                 "components": [
-                    {"type": 2, "style": 1, "label": "Red", "custom_id": "herdrask:tok:0", "disabled": false},
-                    {"type": 2, "style": 1, "label": "Blue", "custom_id": "herdrask:tok:1", "disabled": false},
+                    {"type": 2, "style": 1, "label": "Red", "custom_id": "herdrask:tok:0"},
+                    {"type": 2, "style": 1, "label": "Blue", "custom_id": "herdrask:tok:1"},
                 ],
             }])
         );
-        let disabled = question_button_components(&options, "tok", true);
-        assert_eq!(disabled[0]["components"][0]["disabled"], json!(true));
     }
 
     #[test]
     fn question_select_components_offer_every_option_with_a_matching_value_range() {
         let options = vec![option("Cheese"), option("Olives"), option("Mushrooms")];
-        let components = super::question_select_components(&options, "tok", false);
+        let components = super::question_select_components(&options, "tok");
         let menu = &components[0]["components"][0];
         assert_eq!(menu["type"], json!(3));
         assert_eq!(menu["custom_id"], json!("herdrask-multi:tok"));

@@ -1,16 +1,16 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::readers::format_detection_question;
 
 /// One option Claude offered for a single question.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
 }
 
 /// One question from an `AskUserQuestion` tool call.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Question {
     pub question: String,
     pub header: String,
