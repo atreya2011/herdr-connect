@@ -44,6 +44,12 @@ const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long, and how often, to poll for the dialog to show the next question after an answer.
 const NEXT_QUESTION_WAIT: Duration = Duration::from_secs(5);
 const NEXT_QUESTION_POLL: Duration = Duration::from_millis(100);
+/// Key pacing for typing into Claude's dialog. In a live probe a number key pressed within about a
+/// second of the dialog appearing was ignored, and keys sent back to back missed toggles. With a
+/// 2 s settle before the first input and 1 s between inputs, `1`, `3`, `right`, `enter` toggled
+/// Cheese and Mushrooms and submitted both.
+const DIALOG_SETTLE: Duration = Duration::from_secs(2);
+const INPUT_GAP: Duration = Duration::from_secs(1);
 #[must_use]
 pub const fn hook_timeout() -> Duration {
     Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
@@ -500,19 +506,73 @@ fn wait_for_dialog(pane_id: &str, question: &Question) -> Result<(), String> {
     Ok(())
 }
 
+/// Types the steps into the pane's dialog one input at a time: each key is its own
+/// `agent.send_keys` call, the text is one `pane.send_text` call, with [`DIALOG_SETTLE`] before the
+/// first input and [`INPUT_GAP`] between inputs.
 fn type_steps(pane_id: &str, steps: &[AnswerStep]) -> Result<(), String> {
+    std::thread::sleep(DIALOG_SETTLE);
+    let mut first = true;
     for step in steps {
-        match step {
-            AnswerStep::Keys(keys) => {
-                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
-                agent_send_keys(pane_id, &keys)?;
+        let inputs = match step {
+            AnswerStep::Keys(keys) => keys.iter().map(|key| (true, key.as_str())).collect(),
+            AnswerStep::Text(text) => vec![(false, text.as_str())],
+        };
+        for (is_key, input) in inputs {
+            if !first {
+                std::thread::sleep(INPUT_GAP);
             }
-            AnswerStep::Text(text) => {
-                pane_send_text(pane_id, text)?;
+            first = false;
+            if is_key {
+                agent_send_keys(pane_id, &[input])?;
+            } else {
+                pane_send_text(pane_id, input)?;
             }
         }
     }
     Ok(())
+}
+
+/// Acknowledges a question tap at once, as an ephemeral deferred reply, because typing the answer
+/// takes longer than the three seconds Discord allows for a response, then fills the reply in.
+async fn answer_question_component(
+    responder: &PermissionResponder,
+    interaction: &DiscordInteraction,
+    token: &str,
+    indices: Vec<usize>,
+) {
+    let interactions = responder.client.interaction(interaction.application_id);
+    let deferral = InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..InteractionResponseData::default()
+        }),
+    };
+    if let Err(error) = interactions
+        .create_response(interaction.id, &interaction.token, &deferral)
+        .await
+    {
+        bridge_eprintln!("interaction response failed: {error}");
+    }
+    let reply = match responder
+        .answer_question(token, &Answer::Options(indices))
+        .await
+    {
+        Ok(QuestionOutcome::Sent) => "answer sent",
+        Ok(QuestionOutcome::AnsweredInTerminal) => "answered in the terminal",
+        Ok(QuestionOutcome::Unknown) => "expired",
+        Err(error) => {
+            bridge_eprintln!("question answer failed: {error}");
+            "answer failed; see the bridge log"
+        }
+    };
+    let update = interactions
+        .update_response(&interaction.token)
+        .content(Some(reply))
+        .await;
+    if let Err(error) = update {
+        bridge_eprintln!("interaction reply failed: {error}");
+    }
 }
 
 pub async fn handle_component(
@@ -537,7 +597,8 @@ pub async fn handle_component(
         let Some(indices) = indices else {
             return;
         };
-        Some(question_component_response(&responder, token, indices).await)
+        answer_question_component(&responder, &interaction, token, indices).await;
+        return;
     } else if let Some(rest) = data.custom_id.strip_prefix("herdrask:") {
         let Some((token, index)) = rest
             .split_once(':')
@@ -545,7 +606,8 @@ pub async fn handle_component(
         else {
             return;
         };
-        Some(question_component_response(&responder, token, vec![index]).await)
+        answer_question_component(&responder, &interaction, token, vec![index]).await;
+        return;
     } else if let Some((action, token)) = data
         .custom_id
         .split_once(':')
@@ -591,25 +653,6 @@ fn permission_component_response(
             }
         },
     )
-}
-
-async fn question_component_response(
-    responder: &PermissionResponder,
-    token: &str,
-    indices: Vec<usize>,
-) -> InteractionResponse {
-    match responder
-        .answer_question(token, &Answer::Options(indices))
-        .await
-    {
-        Ok(QuestionOutcome::Sent) => ephemeral_response("answer sent"),
-        Ok(QuestionOutcome::AnsweredInTerminal) => ephemeral_response("answered in the terminal"),
-        Ok(QuestionOutcome::Unknown) => ephemeral_response("expired"),
-        Err(error) => {
-            bridge_eprintln!("question answer failed: {error}");
-            ephemeral_response("answer failed; see the bridge log")
-        }
-    }
 }
 
 fn ephemeral_response(content: &str) -> InteractionResponse {
