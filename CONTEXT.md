@@ -21,7 +21,7 @@ An observed change in an agent's Herdr lifecycle state.
 _Avoid_: Status event, pane event
 
 **Blocked card**:
-The non-interactive Discord card posted when a pane goes blocked and no live permission or question request covers it, carrying the pending question or the pane's last context and mentioning the owner. Working and done post no card.
+The non-interactive Discord card posted when a pane goes blocked and no live permission request or question card covers it, carrying the pending question or the pane's last context and mentioning the owner. Working and done post no card.
 _Avoid_: Transition card, end card, notification, log dump
 
 **Reported session**:
@@ -45,7 +45,7 @@ The interactive Discord representation of a live permission request.
 _Avoid_: Blocked card, approval message
 
 **Question card**:
-The interactive Discord representation of one pending `AskUserQuestion` question: buttons for a single-select question, a select menu for a multiSelect question.
+The interactive Discord representation of the `AskUserQuestion` question Claude's own terminal dialog shows: buttons for a single-select question, a select menu for a multiSelect question. Answering it types the answer into that dialog; the owner can equally answer in the terminal.
 _Avoid_: Permission card, blocked card, poll
 
 **Live message**:

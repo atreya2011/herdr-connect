@@ -34,7 +34,7 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 
 ## Do not port
 
-- Raw `!keys`, pane key injection, or numbered menu buttons that type terminal input from historical issues #4 and #6. Owner text uses semantic `agent.prompt`; supported permissions use vendor-native hooks and Discord interactions.
+- Raw `!keys` and generic pane key injection from historical issues #4 and #6. Owner text uses semantic `agent.prompt`; supported permissions use vendor-native hooks and Discord interactions. The one exception is answering a Claude question card, which types the answer into Claude's own dialog.
 - The TypeScript delivery scheduler race in historical issue #16. The Rust implementation does not contain that scheduler; require a Rust reproducer before changing Rust delivery.
 - Bun, discord.js, fake-client, pull-request, or TypeScript lint conventions. This repository is Rust, local-only, direct to `main`, and real-services-only.
 - Historical topology counts, pane identifiers, bridge process identifiers, or agent locations. They were observations, not product contracts.
@@ -44,7 +44,7 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 - One workspace channel per Herdr workspace and one tab thread per Herdr tab.
 - A pane whose Herdr integration reports no session identity is not mirrored — no tab thread and no card of any kind — until a later snapshot reports one (its workspace channel is per workspace and may still exist because another pane in it has a session).
 - Topic and tab suffix are identity. Existing channel names and frozen thread names are not reconciled after creation.
-- Reported vendor sessions provide content; pane scraping and guessed session paths are forbidden, except for reading a Claude pane's Herdr detection snapshot to extract a pending blocked question.
+- Reported vendor sessions provide content; pane scraping and guessed session paths are forbidden, except for reading a Claude pane's Herdr detection snapshot to extract a pending blocked question and to confirm the dialog is still showing before an answer is typed.
 - Blocked-only owner mentions; explicit mention allowlists; working and done post nothing.
 - Owner-only semantic prompts inside qualifying mapped threads; all unrelated Discord surfaces remain silent.
 - Permission decisions are correlated, expiring, exactly once, and invalid when the requesting hook disconnects.
