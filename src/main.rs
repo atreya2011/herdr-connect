@@ -414,10 +414,6 @@ async fn process_snapshot(
     state: &mut BridgeState,
 ) {
     let (terminal, status) = (snapshot.terminal_id.clone(), snapshot.agent_status.clone());
-    bridge_println!(
-        "{} {terminal}: {status}",
-        snapshot.agent.as_deref().unwrap_or("none")
-    );
     update_activity_eligibility(state, snapshot, &status);
     maybe_establish_terminal_prompt_baseline(snapshot, state);
     ensure_live_watch_started(discord, snapshot, agents, tabs, state).await;
