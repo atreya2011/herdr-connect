@@ -500,61 +500,42 @@ fn permission_components(token: &str, disabled: bool) -> serde_json::Value {
     }])
 }
 
-/// Delivers a single-select question card: one button per option (Claude's `AskUserQuestion`
-/// schema bounds this to 2-4), plus a "Type an answer" hint for a free-text thread reply.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
-pub async fn deliver_question_button_card(
-    client: &twilight_http::Client,
-    channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-    question: &Question,
-    token: &str,
-) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    let payload = serde_json::json!({
+/// The body of a question card: the question, its controls (one button per option for a
+/// single-select question, a select menu for a multiSelect question), and a mention of the owner,
+/// the same one the plain blocked card carries.
+fn question_card_payload(question: &Question, token: &str, owner_id: &str) -> Value {
+    let components = if question.multi_select {
+        question_select_components(&question.options, token)
+    } else {
+        question_button_components(&question.options, token)
+    };
+    json!({
+        PAYLOAD_CONTENT_KEY: format!("<@{owner_id}>"),
         PAYLOAD_EMBEDS_KEY: [{
             "title": question_card_title(&question.header),
             "description": question_card_description(&question.question),
             "color": 0x00f1_c40f,
         }],
-        PAYLOAD_COMPONENTS_KEY: question_button_components(&question.options, token),
-        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
-    });
-    let payload = payload.to_string().into_bytes();
-    client
-        .create_message(channel)
-        .payload_json(&payload)
-        .await
-        .map_err(|error| error.to_string())?
-        .model()
-        .await
-        .map(|message| message.id)
-        .map_err(|error| error.to_string())
+        PAYLOAD_COMPONENTS_KEY: components,
+        ALLOWED_MENTIONS_KEY: allowed_mentions(Some(owner_id)),
+    })
 }
 
-/// Delivers a multiSelect question card: one Discord string select menu offering every option,
-/// plus a "Type an answer" hint for a free-text thread reply.
+/// Delivers a question card mentioning the owner.
 ///
 /// # Errors
 ///
 /// Returns Discord request or response errors.
-pub async fn deliver_question_select_card(
+pub async fn deliver_question_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
     question: &Question,
     token: &str,
+    owner_id: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>, String> {
-    let payload = serde_json::json!({
-        PAYLOAD_EMBEDS_KEY: [{
-            "title": question_card_title(&question.header),
-            "description": question_card_description(&question.question),
-            "color": 0x00f1_c40f,
-        }],
-        PAYLOAD_COMPONENTS_KEY: question_select_components(&question.options, token),
-        ALLOWED_MENTIONS_KEY: {ALLOWED_MENTIONS_PARSE_KEY: []},
-    });
-    let payload = payload.to_string().into_bytes();
+    let payload = question_card_payload(question, token, owner_id)
+        .to_string()
+        .into_bytes();
     client
         .create_message(channel)
         .payload_json(&payload)
@@ -876,9 +857,10 @@ mod tests {
 
     use super::{
         BUTTON_LABEL_LIMIT, SELECT_OPTION_TEXT_LIMIT, question_button_components,
-        question_card_description, question_card_title, truncate_with_ellipsis,
+        question_card_description, question_card_payload, question_card_title,
+        truncate_with_ellipsis,
     };
-    use crate::question::QuestionOption;
+    use crate::question::{Question, QuestionOption};
 
     fn option(label: &str) -> QuestionOption {
         QuestionOption {
@@ -982,5 +964,28 @@ mod tests {
                 {"label": "Mushrooms", "value": "2", "description": "Mushrooms description"},
             ])
         );
+    }
+
+    #[test]
+    fn a_question_card_mentions_only_the_owner_and_carries_the_controls_for_its_kind() {
+        for (multi_select, control_type) in [(false, 2), (true, 3)] {
+            let question = Question {
+                question: "Which?".to_owned(),
+                header: "Pick".to_owned(),
+                options: vec![option("Red"), option("Blue")],
+                multi_select,
+            };
+            let payload = question_card_payload(&question, "tok", "42");
+            assert_eq!(payload["content"], json!("<@42>"));
+            assert_eq!(
+                payload["allowed_mentions"],
+                json!({"parse": [], "users": ["42"]})
+            );
+            assert_eq!(
+                payload["components"][0]["components"][0]["type"],
+                json!(control_type),
+                "multi_select={multi_select}"
+            );
+        }
     }
 }

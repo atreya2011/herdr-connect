@@ -33,9 +33,9 @@ use crate::registry::{
     generate_token,
 };
 use crate::{
-    TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_button_card,
-    deliver_question_select_card, expire_informational_card, fetch_topology_lists, list_agents,
-    route_topology, sync_topology, tab_list_result,
+    TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_card,
+    expire_informational_card, fetch_topology_lists, list_agents, route_topology, sync_topology,
+    tab_list_result,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -157,11 +157,8 @@ impl PermissionResponder {
     ) -> Result<Id<MessageMarker>, String> {
         let token = generate_token()?;
         let client = self.client.as_ref();
-        let message = if question.multi_select {
-            deliver_question_select_card(client, channel, question, &token).await?
-        } else {
-            deliver_question_button_card(client, channel, question, &token).await?
-        };
+        let message =
+            deliver_question_card(client, channel, question, &token, &self.owner_id).await?;
         self.question_registry.insert(
             token,
             PendingQuestion {
