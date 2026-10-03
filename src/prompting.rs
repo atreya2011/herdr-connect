@@ -249,22 +249,26 @@ fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
 /// submitted it) is recovered with a two-rung ladder: an Enter key press first, since that alone
 /// submits a paste-block-stuck composer; if the pane still has not left `idle` shortly after,
 /// a Ctrl+U clear followed by one fresh `agent.prompt` resubmission. The ladder runs only for a
-/// pane that was not `working` at submission: the agent itself queues a prompt submitted
+/// pane that was `idle` or `done` at submission: the agent itself queues a prompt submitted
 /// mid-turn, where a stalled prompt cannot be told from a queued one and Ctrl+U would clear the
-/// queued text.
+/// queued text, and a `blocked` pane would take the Enter key press as an answer to its dialog.
 ///
 /// # Errors
 ///
 /// Returns Herdr submission, follow-up key press, or pane-state errors.
 pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
-    let was_working = pane_status_is_working(&list_agents()?, target);
+    let status_at_submission = list_agents()?
+        .iter()
+        .find(|agent| agent.pane_id == target)
+        .map(|agent| agent.agent_status.trim().to_owned())
+        .unwrap_or_default();
     record_owner_prompt_submission(target, text);
     let result = agent_prompt(target, text);
     if result.is_err() {
         forget_owner_prompt_submission(target, text);
         return result;
     }
-    if was_working || result.as_deref() != Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED) {
+    if !stall_recovery_applies(&status_at_submission, &result) {
         return result;
     }
     agent_send_keys(target, &["enter"])?;
@@ -273,6 +277,15 @@ pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
     }
     agent_send_keys(target, &["ctrl+u"])?;
     agent_prompt(target, text)
+}
+
+/// Whether a submission needs the stall-recovery ladder: the pane was `idle` or `done` when the
+/// prompt went in and Herdr could not confirm the pane started working. Any other status leaves
+/// the pane alone: a `working` pane queues the prompt itself, so Ctrl+U would clear the queued
+/// text, and a `blocked` pane shows a dialog that an Enter key press would answer.
+fn stall_recovery_applies(status_at_submission: &str, result: &Result<String, String>) -> bool {
+    matches!(status_at_submission, STATUS_IDLE | STATUS_DONE)
+        && result.as_deref() == Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED)
 }
 
 fn record_owner_prompt_submission(pane_id: &str, text: &str) {
@@ -426,9 +439,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        OWNER_PROMPT_SUPPRESSIONS, agent_list_failure_reply, has_prompt_content, is_thread_channel,
-        matching_agent, pane_status_is_working, prompt_surface_markers, resolve_prompt_pane,
-        retain_present_panes, take_owner_prompt_suppression,
+        OWNER_PROMPT_SUPPRESSIONS, PROMPT_ACKNOWLEDGED_UNCONFIRMED, agent_list_failure_reply,
+        has_prompt_content, is_thread_channel, matching_agent, pane_status_is_working,
+        prompt_surface_markers, resolve_prompt_pane, retain_present_panes, stall_recovery_applies,
+        take_owner_prompt_suppression,
     };
     use crate::AgentSnapshot;
 
@@ -482,6 +496,30 @@ mod tests {
         )];
         for (error, expected) in cases {
             assert_eq!(agent_list_failure_reply(error), expected);
+        }
+    }
+
+    #[test]
+    fn stall_recovery_runs_only_for_an_unconfirmed_prompt_to_an_idle_or_done_pane() {
+        let unconfirmed = Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED.to_owned());
+        let confirmed = Ok("acknowledged".to_owned());
+        let failed = Err("agent.prompt failed".to_owned());
+        let cases = [
+            ("idle", &unconfirmed, true),
+            ("done", &unconfirmed, true),
+            ("working", &unconfirmed, false),
+            ("blocked", &unconfirmed, false),
+            ("unknown", &unconfirmed, false),
+            ("", &unconfirmed, false),
+            ("idle", &confirmed, false),
+            ("done", &failed, false),
+        ];
+        for (status, result, expected) in cases {
+            assert_eq!(
+                stall_recovery_applies(status, result),
+                expected,
+                "{status:?} {result:?}"
+            );
         }
     }
 
