@@ -20,11 +20,6 @@ fn is_test_channel(channel: &Channel) -> bool {
         .is_some_and(|name| name.starts_with(PREFIX))
 }
 
-/// Every `testrun-` thread in the guild, active or archived, whichever channel parents it. Suite
-/// threads outlive their tests when they hang off a channel the prefix filter does not delete.
-///
-/// Archived threads are listed only under channels the bridge marks as a herdr workspace, the only
-/// channels it ever creates a thread in. This is the delete pass, so it pays for the full reach.
 async fn testrun_threads(guild: &Guild) -> Result<Vec<Id<ChannelMarker>>, String> {
     let channels = guild
         .client
@@ -58,12 +53,6 @@ async fn testrun_threads(guild: &Guild) -> Result<Vec<Id<ChannelMarker>>, String
         .collect())
 }
 
-/// The `testrun-` threads a leftover recount has to see: the guild-wide active list only.
-///
-/// The recount deliberately skips the per-channel archived listings the delete pass runs. A thread
-/// the delete pass just deleted cannot come back as an archived thread, and a thread the suite
-/// leaked is active, because the suite never archives one. So an archived listing here could only
-/// repeat what the active list already shows.
 async fn testrun_active_threads(guild: &Guild) -> Result<usize, String> {
     Ok(guild
         .client
@@ -79,7 +68,6 @@ async fn testrun_active_threads(guild: &Guild) -> Result<usize, String> {
         .count())
 }
 
-/// Deletes one thread, treating an already-deleted thread as done.
 async fn delete_thread(guild: &Guild, thread: Id<ChannelMarker>) -> Result<(), String> {
     match guild.client.delete_channel(thread).await {
         Ok(_) => Ok(()),

@@ -20,8 +20,6 @@ pub type ComponentHandler = Arc<
         + Sync,
 >;
 
-/// The Discord identity and permission state shared by every owner message the gateway dispatches,
-/// bundled so [`drive_gateway_with_components`] stays under the arity lint.
 #[derive(Clone)]
 pub struct GatewayContext {
     pub client: Arc<Client>,
@@ -69,11 +67,6 @@ async fn process_owner_prompt(request: OwnerPromptRequest) {
     }
 }
 
-/// Connects the Discord gateway and dispatches owner prompts and component taps.
-///
-/// # Errors
-///
-/// Returns an error when the Discord gateway terminates.
 pub async fn drive_gateway_with_components(
     token: String,
     context: GatewayContext,

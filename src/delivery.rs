@@ -9,27 +9,12 @@ use crate::permission::PermissionVendor;
 use crate::question::{Question, QuestionOption};
 use crate::topology::{is_unknown_channel_error, is_unknown_webhook_error};
 
-/// Prefixes a delivery error whose target channel or thread no longer exists on Discord.
-///
-/// Lets a caller holding a cached route tell "the send failed" from "the cached route is stale"
-/// and refetch instead of retrying the same, permanently-invalid target.
 pub const UNKNOWN_CHANNEL_DELIVERY_ERROR: &str = "discord unknown channel";
 
-/// Prefixes a delivery error whose target webhook no longer exists on Discord.
-///
-/// Its channel was deleted, which deletes its webhooks with it, independently of the channel
-/// itself being recreated or still present under a stale cached id. Lets a caller holding a cached
-/// webhook tell "the send failed" from "the cached webhook is stale" and re-resolve instead of
-/// retrying the same, permanently-invalid webhook.
 pub const UNKNOWN_WEBHOOK_DELIVERY_ERROR: &str = "discord unknown webhook";
 
 const MAX_PERMISSION_DESCRIPTION_LENGTH: usize = 3_800;
-/// Discord's select-option description and select-option label length limits
-/// (`twilight-validate`'s `SELECT_OPTION_DESCRIPTION_LENGTH`/label bound); `payload_json` bypasses
-/// twilight's own validation, so this crate enforces them itself before a real question can exceed
-/// them and silently fail to post its card.
 const SELECT_OPTION_TEXT_LIMIT: usize = 100;
-/// Discord's button label length limit (`twilight-validate`'s `COMPONENT_BUTTON_LABEL_LENGTH`).
 const BUTTON_LABEL_LIMIT: usize = 80;
 const STARTUP_COMPONENT_MASK: u64 = (1_u64 << 44) - 1;
 const PAYLOAD_COMPONENT_MASK: u64 = (1_u64 << 52) - 1;
@@ -41,7 +26,6 @@ const ALLOWED_MENTIONS_KEY: &str = "allowed_mentions";
 const ALLOWED_MENTIONS_PARSE_KEY: &str = "parse";
 static PROCESS_START_COMPONENT: OnceLock<u64> = OnceLock::new();
 
-/// Derives one process-stable nonce for a transition card delivery.
 #[must_use]
 pub fn transition_card_nonce(
     terminal_id: &str,
@@ -56,14 +40,6 @@ pub fn transition_card_nonce(
     )
 }
 
-/// Derived from the terminal id, log position, and part index, never from when the process
-/// started.
-///
-/// A watch that reattaches after a restart and resumes at the same position reproduces the same
-/// nonce. Discord's nonce dedupe lasts only a few minutes, so a restart within that window has its
-/// repost of that text suppressed by `enforce_nonce`; a restart after it does not, and the text is
-/// reposted. Distinct in shape (no dash) from [`transition_card_nonce`] so the two can never
-/// collide.
 #[must_use]
 pub fn live_message_nonce(terminal_id: &str, position: i128, part_index: usize) -> String {
     let payload = format!("{terminal_id}-live-{position}-{part_index}");
@@ -73,9 +49,6 @@ pub fn live_message_nonce(terminal_id: &str, position: i128, part_index: usize) 
     format!("{:013x}", payload_component & PAYLOAD_COMPONENT_MASK)
 }
 
-/// Maps a failed Discord send to a plain string, distinguishing "the target channel or thread no
-/// longer exists" ([`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed) and "the target webhook no longer
-/// exists" ([`UNKNOWN_WEBHOOK_DELIVERY_ERROR`]-prefixed) from every other request failure.
 fn map_send_error(error: &twilight_http::Error) -> String {
     if is_unknown_channel_error(error) {
         format!("{UNKNOWN_CHANNEL_DELIVERY_ERROR}: {error}")
@@ -86,12 +59,6 @@ fn map_send_error(error: &twilight_http::Error) -> String {
     }
 }
 
-/// Delivers one plain, content-only message: no embed, no color, no mention, and mentions parsed
-/// from nothing.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn deliver_live_message(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -116,22 +83,12 @@ pub async fn deliver_live_message(
         .map_err(|error| error.to_string())
 }
 
-/// The owner's identity as it should appear on a mirrored terminal prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerIdentity {
     pub display_name: String,
     pub avatar_url: Option<String>,
 }
 
-/// Fetches the owner's identity once from Discord (`GET /users/{owner_id}`), independent of any
-/// guild.
-///
-/// Display name falls back from `global_name` to the account username, and the avatar URL is the
-/// account's own CDN avatar, `None` when it has none.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn fetch_owner_identity(
     client: &twilight_http::Client,
     owner_id: twilight_model::id::Id<twilight_model::id::marker::UserMarker>,
@@ -164,14 +121,6 @@ fn owner_avatar_url(
     ))
 }
 
-/// Resolves the bridge-owned webhook for one workspace channel: the webhook named `webhook_name`
-/// on that channel, creating it when none exists yet.
-///
-/// # Errors
-///
-/// Returns an error when the workspace channel has duplicate named webhooks, the resolved webhook
-/// has no token, or Discord rejects the request, [`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed when
-/// the workspace channel no longer exists.
 pub async fn resolve_terminal_prompt_webhook(
     client: &twilight_http::Client,
     workspace_channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -216,13 +165,6 @@ pub async fn resolve_terminal_prompt_webhook(
     Ok((webhook.id, token))
 }
 
-/// Executes one message through an already-resolved bridge-owned webhook, into a workspace
-/// channel's thread, under the owner's mirrored display name and avatar.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors, [`UNKNOWN_CHANNEL_DELIVERY_ERROR`]-prefixed when
-/// the target thread no longer exists.
 pub async fn execute_terminal_prompt_webhook(
     client: &twilight_http::Client,
     webhook_id: twilight_model::id::Id<twilight_model::id::marker::WebhookMarker>,
@@ -252,12 +194,6 @@ pub async fn execute_terminal_prompt_webhook(
         .map_err(|error| error.to_string())
 }
 
-/// Delivers one plain, content-only activity message: no embed, no nonce -- a turn's activity
-/// message is edited in place rather than deduplicated by nonce.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn deliver_activity_message(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -279,11 +215,6 @@ pub async fn deliver_activity_message(
         .map_err(|error| error.to_string())
 }
 
-/// Edits an existing activity message's content in place.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
 pub async fn update_activity_message(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -303,11 +234,6 @@ pub async fn update_activity_message(
     Ok(())
 }
 
-/// Delivers a complete transition card with its embed color and optional mention.
-///
-/// # Errors
-///
-/// Returns Discord request or validation errors.
 pub async fn deliver_transition_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -352,11 +278,6 @@ pub async fn deliver_transition_card(
         .map_err(|error| error.to_string())
 }
 
-/// Expires an informational blocked-pane card after the pane leaves `blocked`.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
 pub async fn expire_informational_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -378,11 +299,6 @@ pub async fn expire_informational_card(
     Ok(())
 }
 
-/// Delivers an owner decision card with opaque allow and deny component IDs.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn deliver_permission_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -464,11 +380,6 @@ fn permission_card_description(tool: &str, command: &str) -> String {
     format!("{prefix}{bounded_command}{suffix}")
 }
 
-/// Disables the controls on an expired or resolved permission card.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
 pub async fn expire_permission_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -500,9 +411,6 @@ fn permission_components(token: &str, disabled: bool) -> serde_json::Value {
     }])
 }
 
-/// The body of a question card: the question, its controls (one button per option for a
-/// single-select question, a select menu for a multiSelect question), and a mention of the owner,
-/// the same one the plain blocked card carries.
 fn question_card_payload(question: &Question, token: &str, owner_id: &str) -> Value {
     let components = if question.multi_select {
         question_select_components(&question.options, token)
@@ -521,11 +429,6 @@ fn question_card_payload(question: &Question, token: &str, owner_id: &str) -> Va
     })
 }
 
-/// Delivers a question card mentioning the owner.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn deliver_question_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -547,12 +450,6 @@ pub async fn deliver_question_card(
         .map_err(|error| error.to_string())
 }
 
-/// Edits the question card `message` in place to show `question`, with its own controls under
-/// `token`.
-///
-/// # Errors
-///
-/// Returns Discord request errors.
 pub async fn update_question_card(
     client: &twilight_http::Client,
     channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
@@ -582,7 +479,6 @@ fn question_card_description(question: &str) -> String {
     format!("{sanitized}\n\nOr reply in this thread with your own answer.")
 }
 
-/// Truncates `value` to at most `limit` characters, marking a cut with a trailing `…`.
 pub fn truncate_with_ellipsis(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_owned();
@@ -592,7 +488,6 @@ pub fn truncate_with_ellipsis(value: &str, limit: usize) -> String {
     truncated
 }
 
-/// One action row of up to five option buttons, `herdrask:<token>:<option index>`.
 fn question_button_components(options: &[QuestionOption], token: &str) -> Value {
     let buttons: Vec<Value> = options
         .iter()
@@ -609,7 +504,6 @@ fn question_button_components(options: &[QuestionOption], token: &str) -> Value 
     json!([{COMPONENT_TYPE_KEY: 1, PAYLOAD_COMPONENTS_KEY: buttons}])
 }
 
-/// One action row holding a `herdrask-multi:<token>` string select menu offering every option.
 fn question_select_components(options: &[QuestionOption], token: &str) -> Value {
     let select_options: Vec<Value> = options
         .iter()
@@ -686,7 +580,6 @@ mod tests {
     use twilight_model::id::Id;
     use twilight_model::util::ImageHash;
 
-    /// Discord's limit on a message nonce.
     const MAX_DISCORD_NONCE_LENGTH: usize = 25;
 
     #[test]
@@ -731,9 +624,6 @@ mod tests {
     #[test]
     fn live_message_nonce_is_stable_by_position_not_a_counter() {
         let first = live_message_nonce("terminal", 100, 0);
-        // Same terminal and position: identical, whether this is the original read or a watch
-        // restart that resumed at the same log position — the point of keying on position rather
-        // than a resettable counter.
         assert_eq!(first, live_message_nonce("terminal", 100, 0));
         assert_ne!(
             first,

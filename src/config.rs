@@ -10,11 +10,6 @@ pub struct DiscordConfig {
     pub token: String,
 }
 
-/// Loads and validates Discord configuration.
-///
-/// # Errors
-///
-/// Returns all missing or blank required variables.
 pub fn load_discord_config(environment: &[(&str, &str)]) -> Result<DiscordConfig, String> {
     let value = |n: &str| environment.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
     let names = [

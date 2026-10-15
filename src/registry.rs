@@ -18,11 +18,6 @@ use twilight_model::id::{
 use crate::{Decision, Question};
 const TOKEN_BYTES: usize = 24;
 
-/// Generates one opaque, random hex token for a newly issued registry entry.
-///
-/// # Errors
-///
-/// Returns an error when `/dev/urandom` cannot be read.
 pub fn generate_token() -> Result<String, String> {
     let mut token_bytes = [0_u8; TOKEN_BYTES];
     File::open("/dev/urandom")
@@ -66,11 +61,6 @@ impl InteractionRegistry {
     fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    /// Issues one token for a pending permission card.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a token cannot be generated.
     pub fn issue_with_liveness(
         &self,
         request: ApprovalRequest,
@@ -80,7 +70,6 @@ impl InteractionRegistry {
         let token = generate_token()?;
         Ok(self.issue_with_token_and_liveness(token, request, expiry, hook_alive))
     }
-    /// Inserts a supplied token for deterministic state-machine tests.
     #[cfg(test)]
     fn issue_with_token(
         &self,
@@ -113,11 +102,6 @@ impl InteractionRegistry {
             expiry,
         }
     }
-    /// Resolves one pending token exactly once.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejection reason for an unknown, expired, or wrong-channel interaction.
     pub fn resolve(
         &self,
         token: &str,
@@ -151,9 +135,6 @@ impl InteractionRegistry {
     }
 }
 
-/// One Discord question card waiting for an answer, and the pane whose dialog it mirrors. The card
-/// shows `questions[index]`; an `AskUserQuestion` call with several questions reuses the one card
-/// for each in turn.
 #[derive(Clone, Debug)]
 pub struct PendingQuestion {
     pub channel: Id<ChannelMarker>,
@@ -175,7 +156,6 @@ impl PendingQuestion {
     }
 }
 
-/// The open question cards, by the token their components carry.
 #[derive(Default, Debug)]
 pub struct QuestionRegistry {
     entries: Mutex<HashMap<String, PendingQuestion>>,
@@ -190,11 +170,9 @@ impl QuestionRegistry {
     pub fn get(&self, token: &str) -> Option<PendingQuestion> {
         self.lock_entries().get(token).cloned()
     }
-    /// Removes and returns the card, so one card is answered at most once.
     pub fn take(&self, token: &str) -> Option<PendingQuestion> {
         self.lock_entries().remove(token)
     }
-    /// The token of the open card in `channel`, the one a thread reply answers.
     pub fn token_in_channel(&self, channel: Id<ChannelMarker>) -> Option<String> {
         self.lock_entries()
             .iter()

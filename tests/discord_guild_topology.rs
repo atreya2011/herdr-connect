@@ -1,6 +1,3 @@
-//! Multi-page archived pagination remains orchestrator live proof; this file covers real-guild
-//! topology creation, archived reuse, and the duplicate-channel guard.
-
 #[cfg(unix)]
 #[path = "support/discord.rs"]
 mod support;

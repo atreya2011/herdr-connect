@@ -6,12 +6,9 @@ use crate::{
     resolve_owner_deleted_workspace, tab_close, take_self_deletion, workspace_close,
 };
 
-/// A guild channel or thread the Discord gateway reported deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuildDeletion {
-    /// A thread delete event, which carries no name or topic, only the id.
     Thread { id: Id<ChannelMarker> },
-    /// A channel delete event, which carries the deleted channel's last state.
     Channel(Box<Channel>),
 }
 
@@ -24,18 +21,12 @@ impl GuildDeletion {
     }
 }
 
-/// The Herdr object an owner deletion closes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Close {
-    /// The tab id behind the deleted thread and the workspace channel that parented it.
     Tab(String, Id<ChannelMarker>),
     Workspace(String),
 }
 
-/// Decides what an owner deletion closes, without touching Herdr or Discord.
-///
-/// A deletion the bridge made itself is consumed here and decides nothing. A thread that is not
-/// in the registry of live tab threads, and a channel without a workspace topic, decide nothing.
 pub fn decide_close(deletion: &GuildDeletion) -> Option<Close> {
     let id = deletion.id();
     if take_self_deletion(id) {
@@ -52,21 +43,6 @@ pub fn decide_close(deletion: &GuildDeletion) -> Option<Close> {
     }
 }
 
-/// Closes the Herdr tab or workspace behind a Discord deletion the owner made.
-///
-/// A deletion the bridge made itself is ignored once. A deleted thread that is not a live tab's
-/// thread, and a deleted channel that is not a workspace channel, are ignored. A thread is
-/// resolved to its tab from the durable registry of bridge-owned threads, which survives
-/// topology-cache invalidation and refetches. The topology cache lock is held until `herdr` has
-/// closed the tab or workspace and the deleted ids have left the cache, so a delivery or sync
-/// that runs after this handler took the lock finds the tab gone. A delivery that raced ahead of
-/// the gateway event can create one replacement thread first; the close then ends the tab and the
-/// bridge's own tab-closed handling deletes that replacement. A deleted tab thread also has its
-/// "started a thread" system message deleted from its parent workspace channel, before the close.
-///
-/// # Errors
-///
-/// Returns the `herdr` close failure, or else the failure to delete the system message.
 pub async fn handle_guild_deletion(
     client: &twilight_http::Client,
     topology_cache: &TopologyCache,

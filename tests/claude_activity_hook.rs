@@ -51,8 +51,6 @@ fn invoke_activity_for_vendor(payload: &str, vendor: &str, socket: &Path) -> std
         .expect("wait for activity subcommand")
 }
 
-/// Accepts at most one connection on `listener` and reads it to EOF, within a short bound. `None`
-/// means no peer connected (the subcommand wrote nothing).
 async fn recv_frame(listener: &UnixListener) -> Option<Value> {
     let (mut stream, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept())
         .await
@@ -263,9 +261,6 @@ fn invoke_activity_with_args(args: &[&str]) -> std::process::Output {
         .expect("run activity subcommand")
 }
 
-/// An argument error is as much a no-op as a malformed payload or a missing socket: the hook's
-/// fire-and-forget contract promises "always exits 0 with no output" for every input, not just the
-/// ones the subcommand itself considers well-formed.
 #[test]
 fn activity_subcommand_exits_zero_with_no_output_for_every_argument_error() {
     let cases: [(&str, &[&str]); 5] = [

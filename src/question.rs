@@ -2,14 +2,12 @@ use serde::Deserialize;
 
 use crate::readers::format_detection_question;
 
-/// One option Claude offered for a single question.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
 }
 
-/// One question from an `AskUserQuestion` tool call.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Question {
     pub question: String,
@@ -19,10 +17,6 @@ pub struct Question {
     pub multi_select: bool,
 }
 
-/// Whether Herdr's detection snapshot still shows Claude's dialog for `question`.
-///
-/// The screen wraps the question at the pane width and prefixes lines with a box character, so
-/// those prefixes are removed before whitespace is collapsed.
 #[must_use]
 pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
     let normalize_dialog = |text: &str| {
@@ -41,39 +35,18 @@ pub fn dialog_shows_question(detection: &str, question: &Question) -> bool {
     })
 }
 
-/// What the owner chose on a question card.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Answer {
-    /// The zero-based indices of the chosen options: one for a single-select question, any number
-    /// for a multiSelect question.
     Options(Vec<usize>),
-    /// A free-text answer typed into the dialog's "Type something" entry.
     Text(String),
 }
 
-/// One input to the terminal dialog: key presses, or literal text typed into its free-text entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AnswerStep {
     Keys(Vec<String>),
     Text(String),
 }
 
-/// The inputs that give `answer` to Claude's own terminal dialog for `question`, the same ones the
-/// owner would press. `question` is number `index` of the `total` questions of its
-/// `AskUserQuestion` call.
-///
-/// Every dialog entry has a number key. In a one-question call a single-select option's number
-/// confirms at once, and a multiSelect question takes its numbers (each toggles a checkbox), then
-/// `right` to the Submit tab and `enter`. In a call with several questions a single-select number
-/// answers the question and advances to the next tab by itself, a multiSelect question needs
-/// `right` to advance, and after the last question the dialog shows a review screen whose
-/// "Submit answers" `enter` confirms. The free-text entry is the one numbered after the listed
-/// options: its number focuses it, the text is typed, and `enter` confirms. Free text is only
-/// mapped for a single-select question; how a multiSelect dialog takes it has not been probed.
-///
-/// # Errors
-///
-/// Returns an error for a free-text answer to a multiSelect question.
 pub fn answer_steps(
     question: &Question,
     index: usize,

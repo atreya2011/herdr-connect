@@ -78,8 +78,6 @@ pub use topology::{
 };
 pub use watcher::{Transition, is_postable_transition};
 
-/// UTC wall-clock timestamp for one bridge log line, so a later occurrence in the same log can be
-/// lined up against session-log times.
 #[must_use]
 pub fn log_timestamp() -> String {
     time::OffsetDateTime::now_utc()
@@ -87,10 +85,6 @@ pub fn log_timestamp() -> String {
         .unwrap_or_else(|error| format!("<timestamp unavailable: {error}>"))
 }
 
-/// Prefixes a bridge stdout line with [`log_timestamp`].
-///
-/// Use in place of `println!` for every line the bridge process emits, so `bridge_eprintln!` and
-/// this macro are the only sources of bridge log output.
 #[macro_export]
 macro_rules! bridge_println {
     ($($arg:tt)*) => {
@@ -98,8 +92,6 @@ macro_rules! bridge_println {
     };
 }
 
-/// Prefixes a bridge stderr line with [`log_timestamp`]. Use in place of `eprintln!` for every line
-/// the bridge process emits.
 #[macro_export]
 macro_rules! bridge_eprintln {
     ($($arg:tt)*) => {

@@ -8,11 +8,8 @@ use twilight_model::id::marker::{ChannelMarker, GuildMarker};
 
 use crate::{AgentSnapshot, HerdrTab, format_thread_name};
 
-/// Shared, per-process cache of one guild's channel list and active-thread list, reused across
-/// tabs so a startup sweep does not refetch both lists for every tab.
 pub type TopologyCache = Arc<Mutex<Option<(Vec<Channel>, Vec<Channel>)>>>;
 
-/// The Discord topology and sole pane that owns it for one agent transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyRoute {
     pub workspace_id: String,
@@ -22,12 +19,6 @@ pub struct TopologyRoute {
     pub thread_name: String,
 }
 
-/// Resolves one agent transition to an unambiguous workspace, tab, and pane.
-///
-/// # Errors
-///
-/// Returns an error for missing or ambiguous Herdr identity, missing workspace evidence, a
-/// channel naming failure, or a tab label that cannot produce a Discord thread name.
 pub fn route_topology(
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
@@ -82,11 +73,6 @@ pub fn route_topology(
     })
 }
 
-/// Derives the Discord channel name from the most common usable agent cwd.
-///
-/// # Errors
-///
-/// Returns an error when the workspace has no usable cwd evidence or channel name.
 pub fn workspace_channel_name(workspace_id: &str, cwds: &[String]) -> Result<String, String> {
     let mut counts = std::collections::HashMap::new();
     let mut common = None;
@@ -136,11 +122,6 @@ pub fn workspace_channel_name(workspace_id: &str, cwds: &[String]) -> Result<Str
     ))
 }
 
-/// Fetches one guild's channel list and active-thread list.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn fetch_topology_lists(
     client: &twilight_http::Client,
     guild: Id<GuildMarker>,
@@ -165,12 +146,6 @@ pub async fn fetch_topology_lists(
     Ok((channels, active_threads))
 }
 
-/// Installs a freshly fetched list pair into the cache and returns the stored lists.
-///
-/// A cached entry the fetch did not return is carried over only when it is newer than every
-/// entry the fetch did return. Discord snowflake ids increase with creation time, so anything
-/// older than that watermark would have come back in the fetch: its absence means it is gone or
-/// archived, and only a newer entry can be a create this fetch raced.
 pub fn reconcile_topology_cache(
     cached: &mut Option<(Vec<Channel>, Vec<Channel>)>,
     fetched: (Vec<Channel>, Vec<Channel>),
@@ -197,11 +172,6 @@ fn carry_over_recent(fetched: &mut Vec<Channel>, cached: Vec<Channel>) {
     );
 }
 
-/// Resolves the one thread that identifies a tab.
-///
-/// # Errors
-///
-/// Returns an error when more than one thread claims the tab.
 fn single_matching_thread(
     threads: &[Channel],
     workspace_channel: Id<ChannelMarker>,
@@ -224,17 +194,6 @@ fn single_matching_thread(
     Ok(resolved.cloned())
 }
 
-/// Whether the cached channel/thread lists already resolve `route`'s tab thread, without any
-/// Discord request.
-///
-/// `None` means the cache does not (yet) resolve the route: the caller must fetch fresh and let
-/// [`sync_topology`] create whatever is missing. Only the active-thread list is consulted,
-/// matching the existing miss-path contract: archived-thread listing stays a
-/// Discord-request-issuing fallback that only [`sync_topology`] performs, on a miss.
-///
-/// # Errors
-///
-/// Returns an error when the cached active-thread list has duplicate threads for the tab.
 pub fn cached_route(
     channels: &[Channel],
     active_threads: &[Channel],
@@ -253,12 +212,6 @@ pub fn cached_route(
     Ok(resolved.map(|thread| thread.id))
 }
 
-/// Synchronizes the Discord workspace topology against caller-supplied channel and
-/// active-thread lists, extending them in place when a channel or thread is created.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn sync_topology(
     client: &twilight_http::Client,
     guild: twilight_model::id::Id<twilight_model::id::marker::GuildMarker>,
@@ -346,16 +299,6 @@ pub async fn sync_topology(
     Ok(id)
 }
 
-/// Registers the archived tab threads of every workspace channel, independent of any Herdr call
-/// and of the startup delete pass.
-///
-/// A tab whose pane carries no session is not synced, so its auto-archived thread is found only
-/// by this listing. It fetches the guild once and lists each workspace channel's archived threads
-/// once.
-///
-/// # Errors
-///
-/// Returns the first Discord fetch or listing error.
 pub async fn register_archived_tab_threads(
     client: &twilight_http::Client,
     guild: Id<GuildMarker>,
@@ -372,12 +315,6 @@ pub async fn register_archived_tab_threads(
     Ok(())
 }
 
-/// Lists one channel's public archived threads, following every pagination page.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors, and an error when Discord's pagination cursor
-/// does not advance.
 pub async fn archived_threads(
     client: &twilight_http::Client,
     workspace_channel: Id<ChannelMarker>,
@@ -422,7 +359,6 @@ pub async fn archived_threads(
     }
 }
 
-/// True when a Discord API error means the target channel or thread is already gone.
 pub fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
     matches!(
         error.kind(),
@@ -434,7 +370,6 @@ pub fn is_unknown_channel_error(error: &twilight_http::Error) -> bool {
     )
 }
 
-/// True when a Discord API error means the target message is already gone.
 fn is_unknown_message_error(error: &twilight_http::Error) -> bool {
     matches!(
         error.kind(),
@@ -446,8 +381,6 @@ fn is_unknown_message_error(error: &twilight_http::Error) -> bool {
     )
 }
 
-/// True when a Discord API error means the target webhook is already gone (deleting its channel
-/// deletes its webhooks with it, so a cached webhook can go stale independently of its channel).
 pub fn is_unknown_webhook_error(error: &twilight_http::Error) -> bool {
     matches!(
         error.kind(),
@@ -459,15 +392,9 @@ pub fn is_unknown_webhook_error(error: &twilight_http::Error) -> bool {
     )
 }
 
-/// Ids of channels and threads the bridge itself is deleting, so the gateway's matching delete
-/// event is recognised as the bridge's own doing and not forwarded to Herdr as an owner deletion.
 static SELF_DELETIONS: LazyLock<std::sync::Mutex<HashSet<Id<ChannelMarker>>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
-/// Consumes the self-deletion marker for `id`, if one is pending.
-///
-/// `true` means the bridge deleted this channel or thread itself and its gateway delete event must
-/// be ignored; the marker is cleared, so a later event for the same id is not suppressed.
 #[must_use]
 pub fn take_self_deletion(id: Id<ChannelMarker>) -> bool {
     SELF_DELETIONS
@@ -483,14 +410,6 @@ pub fn record_self_deletion(id: Id<ChannelMarker>) {
         .insert(id);
 }
 
-/// Deletes the `THREAD_CREATED` system message Discord posted in `parent` for `thread_id`.
-///
-/// Discord gives that message the thread's own id, so it is deleted directly. This leaves no
-/// "started a thread" line behind a deleted thread. A message already deleted is not an error.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn delete_thread_created_message(
     client: &twilight_http::Client,
     parent: Id<ChannelMarker>,
@@ -505,10 +424,6 @@ pub async fn delete_thread_created_message(
     }
 }
 
-/// Deletes one Discord channel or thread, treating an already-deleted target as done.
-///
-/// The id is recorded as a self-deletion before the request, because the gateway event can arrive
-/// before the response; a failed or already-gone delete forgets the record again.
 async fn delete_channel_if_present(
     client: &twilight_http::Client,
     id: Id<ChannelMarker>,
@@ -531,7 +446,6 @@ async fn delete_channel_if_present(
     }
 }
 
-/// The id of the channel whose topic identifies `workspace_id`, if one is present.
 #[must_use]
 pub fn workspace_channel_id(channels: &[Channel], workspace_id: &str) -> Option<Id<ChannelMarker>> {
     let topic = format!("herdr workspace [{workspace_id}]");
@@ -541,7 +455,6 @@ pub fn workspace_channel_id(channels: &[Channel], workspace_id: &str) -> Option<
         .map(|channel| channel.id)
 }
 
-/// The workspace id named by a channel's `herdr workspace [id]` topic, if it has one.
 fn workspace_topic_id(channel: &Channel) -> Option<&str> {
     channel
         .topic
@@ -550,19 +463,11 @@ fn workspace_topic_id(channel: &Channel) -> Option<&str> {
         .strip_suffix(']')
 }
 
-/// The tab id named by a thread name's trailing ` [id]` suffix, if it has one.
 fn thread_tab_suffix(name: &str) -> Option<&str> {
     let trimmed = name.strip_suffix(']')?;
     trimmed.rfind(" [").map(|start| &trimmed[start + 2..])
 }
 
-/// Bridge-owned topology the gateway's delete events are resolved against.
-///
-/// A gateway thread-delete event carries only ids, so the thread's tab cannot be read from the
-/// event. This registry is filled wherever a workspace channel or tab thread is fetched, created,
-/// or found archived, and it is never cleared by cache invalidation or reconcile: a thread that
-/// left the topology cache (an auto-archive, a failed delivery, a refetch) is still resolvable.
-/// An entry leaves only when its deletion is resolved.
 #[derive(Default)]
 struct OwnedTopology {
     workspaces: HashMap<Id<ChannelMarker>, String>,
@@ -583,7 +488,6 @@ fn owned_topology() -> std::sync::MutexGuard<'static, OwnedTopology> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Records every channel whose topic is `herdr workspace [id]` as a bridge-owned workspace channel.
 pub fn remember_workspace_channels(channels: &[Channel]) {
     let mut owned = owned_topology();
     for channel in channels {
@@ -593,8 +497,6 @@ pub fn remember_workspace_channels(channels: &[Channel]) {
     }
 }
 
-/// Records every thread under a remembered workspace channel whose trailing ` [tab_id]` suffix
-/// starts with that workspace id, the same ownership rule the startup sweep applies.
 pub fn remember_tab_threads(threads: &[Channel]) {
     let mut owned = owned_topology();
     for thread in threads {
@@ -616,8 +518,6 @@ pub fn remember_tab_threads(threads: &[Channel]) {
     }
 }
 
-/// Forgets a resolved or bridge-made deletion: the thread, or the workspace channel with every
-/// thread it parented.
 pub fn forget_owned(id: Id<ChannelMarker>) {
     let mut owned = owned_topology();
     owned.threads.remove(&id);
@@ -626,11 +526,6 @@ pub fn forget_owned(id: Id<ChannelMarker>) {
     }
 }
 
-/// The Herdr tab id behind a deleted thread and the workspace channel that parented it, from the
-/// durable registry.
-///
-/// The registry holds the thread of every live tab, so a thread it does not hold is not a tab
-/// thread (an owner-made thread, or one already forgotten) and is not the bridge's concern.
 #[must_use]
 pub fn resolve_owner_deleted_tab(
     thread_id: Id<ChannelMarker>,
@@ -641,23 +536,11 @@ pub fn resolve_owner_deleted_tab(
         .map(|thread| (thread.tab_id.clone(), thread.parent))
 }
 
-/// The Herdr workspace id a deleted channel's `herdr workspace [id]` topic named, if it had one.
 #[must_use]
 pub fn resolve_owner_deleted_workspace(deleted: &Channel) -> Option<String> {
     workspace_topic_id(deleted).map(ToOwned::to_owned)
 }
 
-/// Deletes the Discord thread identifying one closed Herdr tab.
-///
-/// Searches active threads first and the workspace channel's archived threads on a miss, caching
-/// the archived listing per workspace channel in `archived_cache` so repeated misses against the
-/// same channel within one call site (for example, the startup sweep's delete pass over several
-/// tabs) list it at most once. A missing workspace channel or thread is not an error: the tab is
-/// already gone from Discord.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors, or a duplicate-thread topology error.
 pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
     client: &twilight_http::Client,
     channels: &[Channel],
@@ -693,12 +576,6 @@ pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
     delete_thread_created_message(client, workspace_channel, thread.id).await
 }
 
-/// Deletes the Discord channel representing one closed Herdr workspace, if one exists. Discord
-/// removes the channel's threads with it. A missing channel is not an error.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors.
 pub async fn delete_workspace_channel(
     client: &twilight_http::Client,
     channels: &mut Vec<Channel>,
@@ -712,19 +589,6 @@ pub async fn delete_workspace_channel(
     Ok(())
 }
 
-/// Deletes every guild channel and tab thread that Herdr no longer lists.
-///
-/// A channel whose `herdr workspace [id]` topic names a workspace id absent from
-/// `live_workspace_ids` is deleted, and under each surviving workspace channel, a thread whose
-/// trailing ` [id]` suffix is that channel's own workspace id (Herdr tab ids are
-/// `<workspace_id>:t<...>`) and is absent from `live_tab_ids` is deleted. A thread whose suffix
-/// does not start with the channel's own workspace id is not bridge-owned and survives regardless
-/// of `live_tab_ids`. An empty `live_workspace_ids` or `live_tab_ids` is authoritative: everything
-/// bridge-owned and not named survives on nothing else, so it is deleted.
-///
-/// # Errors
-///
-/// Returns Discord request or response errors, or a duplicate-thread topology error.
 pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>(
     client: &twilight_http::Client,
     channels: &mut Vec<Channel>,
@@ -759,8 +623,6 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
             let Some(tab_id) = thread.name.as_deref().and_then(thread_tab_suffix) else {
                 continue;
             };
-            // A bracket suffix that is not one of this workspace's own tab ids is an
-            // owner-made thread name coincidence, not a bridge-owned tab thread; leave it alone.
             if tab_id.starts_with(&tab_id_prefix) && !live_tab_ids.contains(tab_id) {
                 delete_channel_if_present(client, thread.id).await?;
                 active_threads.retain(|entry| entry.id != thread.id);

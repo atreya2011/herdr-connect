@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// The Claude hook event a tool-activity frame is derived from.
 const ACTIVITY_HOOK_EVENT: &str = "PreToolUse";
 const CURSOR_ACTIVITY_HOOK_EVENT: &str = "preToolUse";
 
-/// Discriminates an activity frame from a permission
-/// [`Interaction`](crate::permission::Interaction) on the shared broker socket.
 pub const ACTIVITY_KIND: &str = "activity";
 
-/// Characters kept from the derived tool summary.
 const MAX_SUMMARY_CHARS: usize = 80;
 
-/// One tool-activity update, forwarded from a harness hook to the bridge over the broker socket.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActivityFrame {
     pub kind: String,
@@ -56,23 +51,12 @@ struct ClaudeToolUseInput {
     description: Option<String>,
 }
 
-/// One Claude `PreToolUse` hook payload decoded into its activity essentials. The caller supplies
-/// the Herdr identity (workspace, tab, pane) from its own environment.
 pub struct ClaudeActivityRequest {
     pub session_id: String,
     pub tool: String,
     pub summary: String,
 }
 
-/// Decodes one Claude `PreToolUse` hook payload into its activity essentials.
-///
-/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`, else
-/// `file_path`, else `pattern`, else `description`, else empty.
-///
-/// # Errors
-///
-/// Returns an error when the payload is not JSON, is missing a required field, or names a
-/// different hook event.
 pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequest, String> {
     let request: ClaudePreToolUseRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
@@ -95,16 +79,6 @@ pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
     })
 }
 
-/// Decodes one Codex `PreToolUse` hook payload into its activity essentials.
-///
-/// `summary` is the first [`MAX_SUMMARY_CHARS`] characters of `tool_input.command`, else empty:
-/// Codex's hook schema declares `tool_input` as any JSON value, so non-Bash tools carry no
-/// `command`.
-///
-/// # Errors
-///
-/// Returns an error when the payload is not JSON, is missing a required field, or names a
-/// different hook event.
 pub fn decode_codex_activity_request(input: &[u8]) -> Result<ClaudeActivityRequest, String> {
     let request: CodexPreToolUseRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
@@ -125,12 +99,6 @@ pub fn decode_codex_activity_request(input: &[u8]) -> Result<ClaudeActivityReque
     })
 }
 
-/// Decodes one Cursor `preToolUse` hook payload into the shared activity essentials.
-///
-/// # Errors
-///
-/// Returns an error when the payload is not JSON, is missing a required field, or names a
-/// different hook event.
 pub fn decode_cursor_activity_request(input: &[u8]) -> Result<ClaudeActivityRequest, String> {
     let request: CursorPreToolUseRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
@@ -148,8 +116,6 @@ fn truncate_chars(value: &str) -> String {
     value.chars().take(MAX_SUMMARY_CHARS).collect()
 }
 
-/// The Discord text for one pane's turn-scoped activity message: `⚙️ {count} · {tool}`, with the
-/// summary appended after a colon when non-empty.
 #[must_use]
 pub fn activity_message_text(count: u32, tool: &str, summary: &str) -> String {
     if summary.is_empty() {
