@@ -45,8 +45,6 @@ use herdr_connect_rs::{
     request_decision, run_broker as run_permission_broker,
 };
 
-/// The Discord client, the guild, the owner's id, the permission responder, and the owner's
-/// mirrored identity, fetched once at startup.
 type DiscordConnection = (
     Arc<Client>,
     Id<GuildMarker>,
@@ -63,8 +61,6 @@ struct InformationalCard {
     message: Id<MessageMarker>,
 }
 
-/// A vendor-log reader and where it resumes from: a byte offset into the Claude or Codex JSONL
-/// log, a `rowid` of the Cursor sqlite store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Follower {
     Claude(u64),
@@ -72,14 +68,10 @@ enum Follower {
     Cursor(i64),
 }
 
-/// Dropping this stops its `notify` watcher.
 struct LiveWatch {
     _watcher: notify::RecommendedWatcher,
     path: PathBuf,
     follower: Follower,
-    /// Resolves the tab thread to post into on every event through the cache-first `sync_route`,
-    /// so the live event loop needs no agent/tab snapshot in scope and a thread deleted outside the
-    /// bridge's own tracking is re-resolved on the next event once the cache is cleared.
     route: TopologyRoute,
 }
 
@@ -89,68 +81,17 @@ struct BridgeState {
     state_change_sequences: HashMap<String, u64>,
     informational_cards: HashMap<String, InformationalCard>,
     live_watches: HashMap<String, LiveWatch>,
-    /// `None` in tests that never wire live capture up.
     live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Live-capture errors -- a read failure, a route failure, or a failed post -- and topology
-    /// route errors already logged for a terminal, keyed by the terminal and the error text
-    /// together so the same error is not repeated on every later event while a different error
-    /// still is. Every entry for a terminal is cleared once a full read-and-deliver for it
-    /// succeeds, so a recurring error after a recovery is logged afresh.
     live_errors_reported: HashSet<(String, String)>,
-    /// Tabs whose generated-name rename failure was already logged, so a persistent failure is
-    /// logged once per tab rather than on every snapshot pass.
     rename_errors_reported: HashSet<String>,
-    /// One turn's activity message per pane, keyed by pane id (the identity an activity frame
-    /// carries; a live watch's terminal id is a different Herdr identity for the same pane).
-    /// Forgotten -- not deleted -- when the pane next reports `working`, so the new turn starts a
-    /// fresh message instead of editing the previous turn's.
     activity_messages: HashMap<String, ActivityMessage>,
-    /// Pane ids the latest Herdr snapshot reports as `working` with a session, kept fresh by
-    /// every [`process_snapshot`] call (whether from the doorbell's `agent.list` sweep or a
-    /// single-pane update). `handle_activity_event` checks this before creating a message: an
-    /// activity frame that outlives its turn, or that names a pane with no reported session, has
-    /// nothing to gate its creation without it.
     activity_eligible_panes: HashSet<String>,
-    /// Per-terminal read baseline, established the first time [`process_snapshot`] sees a
-    /// session-carrying pane in any status: the resolved log path, the prompt reader's start
-    /// position, and the live text watch's start position, all captured at the same moment so the
-    /// two readers agree on where "past everything already there" is and no prompt written between
-    /// them is mirrored without its reply. Existing prompts and replies already in the log at that
-    /// first sight are never replayed, but everything recorded afterward is. Keyed by terminal id,
-    /// re-baselined when a later session on the same terminal (`/clear`, resume, a relaunch, or a
-    /// vendor starting a fresh file or store) resolves a different path, rather than reusing a stale
-    /// position from the old file.
     terminal_prompt_positions: HashMap<String, (PathBuf, Follower, Follower)>,
-    /// Panes seen with a session whose [`live_log_path`] returned `Ok(None)` -- the log does not
-    /// exist on disk yet -- keyed by terminal, valued by that session's identity. A fresh pane, a
-    /// new session after `/clear`, or a relaunch before its first write records its own session
-    /// here. This is rule 1's position-0-when-absent tracker, shared by the prompt reader and the
-    /// live text watch: when this pane's own session log finally appears, both baseline at 0 rather
-    /// than at the current end, so the pane's own first prompt and reply are mirrored.
-    ///
-    /// A pane first seen *without* any session records nothing here but its first sighting in
-    /// [`BridgeState::seen_without_session`]: it may later resolve to an already-populated session
-    /// (a relaunch straight into existing history, or a resume), whose history predates the bridge
-    /// and must never be replayed. A pane can also switch to a
-    /// *different*, already-populated session before its pending one's log ever appears; the
-    /// recorded session identity is compared against the resolved one, so only the same session
-    /// that was pending baselines at 0, and any other session gets the normal
-    /// discard-what-already-exists baseline. Removed the moment a path resolves for this terminal.
     awaiting_first_log: HashMap<String, String>,
-    /// When the bridge first saw each terminal's current agent without a session. Codex creates its log and reports
-    /// its session only when the first prompt is submitted, so a session that first appears with a
-    /// log created after this moment is the pane's own fresh log and is read from position 0; a
-    /// log that predates it is history and is discarded. Removed once the terminal's baseline is
-    /// set.
     seen_without_session: HashMap<String, SystemTime>,
-    /// The bridge-owned terminal-prompt webhook resolved for each workspace channel, so mirroring
-    /// a prompt does not list the channel's webhooks on every call. Cleared for a channel whose
-    /// cached webhook fails delivery with an unknown-channel error, forcing one fresh resolve.
     terminal_prompt_webhooks: HashMap<Id<ChannelMarker>, (Id<WebhookMarker>, String)>,
 }
 
-/// The Discord message tracking one pane's current turn of tool activity: `count` tool calls
-/// edited into it so far.
 struct ActivityMessage {
     message: Id<MessageMarker>,
     count: u32,
@@ -174,8 +115,6 @@ struct BlockedCardContext<'a> {
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// The bridge-owned webhook name every workspace channel's terminal-prompt webhook is looked up or
-/// created under.
 const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
 
 #[must_use]
@@ -198,13 +137,6 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
     }
 }
 
-/// Posts one blocked card for a pane that just entered `blocked`, built from whatever context is
-/// available at that moment. A Claude pane showing an `AskUserQuestion` dialog gets an interactive
-/// question card, built from the pending question in its vendor log; answering it types the answer
-/// into the dialog. Otherwise the card is plain text from the detection snapshot or the vendor log.
-/// A supported vendor whose broker already has a pending permission request for this session is
-/// left to that interactive card and posts nothing here. The card is posted once; there is no
-/// capture retry.
 async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let BlockedCardContext {
         client,
@@ -284,23 +216,11 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     .await;
 }
 
-/// How long, and how often, the blocked-card path re-reads the vendor log for a pending question
-/// the pane's dialog already shows. Herdr reports the pane `blocked` as soon as the dialog renders,
-/// and Claude's `AskUserQuestion` record can reach the log a moment later: in a live run, two of
-/// three single-question rows built the plain card because the first read found no pending
-/// question.
 const PENDING_QUESTION_WAIT: Duration = Duration::from_secs(3);
 const PENDING_QUESTION_POLL: Duration = Duration::from_millis(500);
 
-/// The dialog entry only `AskUserQuestion` has. The wait is for a pane showing it, so every other
-/// blocked dialog (a permission prompt, for one) costs no delay.
 const QUESTION_DIALOG_MARKER: &str = "Type something.";
 
-/// The pending `AskUserQuestion` call from the pane's vendor log, and the index of the question
-/// its dialog, in Herdr's detection snapshot, currently shows. A dialog with the
-/// [`QUESTION_DIALOG_MARKER`] entry whose log has no pending question yet is re-read for
-/// [`PENDING_QUESTION_WAIT`]; after that the caller keeps the plain card. A log read error is
-/// logged once, when the wait ends.
 async fn shown_question(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
@@ -344,18 +264,12 @@ fn pending_questions(
         .map(|capture| capture.pending_questions)
 }
 
-/// What [`deliver_blocked_messages`] needs to deliver a blocked card, bundled to keep the function
-/// under the argument-count lint.
 #[derive(Clone, Copy)]
 struct BlockedDeliveryRoute<'a> {
     client: &'a Client,
     topology_cache: &'a TopologyCache,
 }
 
-/// Delivers each blocked-card message to `target`. A send that finds the cached thread gone
-/// (unknown channel, deleted outside the bridge's own tracking) clears the shared topology cache
-/// and logs; the next blocked event resolves the route again through the cache-first path. It does
-/// not re-resolve and retry inside this call.
 async fn deliver_blocked_messages(
     delivery: &BlockedDeliveryRoute<'_>,
     target: Id<ChannelMarker>,
@@ -435,9 +349,6 @@ async fn expire_departed_card(
     }
 }
 
-/// Split out of [`process_snapshot`] to keep it under the line-count lint. Keeps
-/// `state.activity_eligible_panes` in step with this snapshot's pane: eligible while it reports
-/// `working` with a session, not otherwise.
 fn update_activity_eligibility(state: &mut BridgeState, snapshot: &AgentSnapshot, status: &str) {
     let pane_id = snapshot.pane_id.as_str();
     if status == STATUS_WORKING && snapshot.session.is_some() {
@@ -522,8 +433,6 @@ async fn process_snapshot(
             state,
         )
         .await;
-        // The activity message is forgotten when the pane next reports `working`, so the new turn's
-        // first tool call starts a fresh message instead of editing the previous turn's.
         if status == STATUS_WORKING {
             forget_activity_message(state, &snapshot.pane_id);
         }
@@ -531,7 +440,6 @@ async fn process_snapshot(
     remember_previous_status(state, &terminal, &status);
 }
 
-/// Split out of [`process_snapshot`] to keep it under the line-count lint.
 fn remember_previous_status(state: &mut BridgeState, terminal: &str, status: &str) {
     state
         .previous
@@ -548,10 +456,6 @@ struct PostableTransitionContext<'a> {
     state_change_seq: u64,
 }
 
-/// Delivers a blocked transition's card to Discord: an agent reporting no session is not mirrored
-/// and returns before any topology is routed. A tab whose topology cannot be routed is logged and skipped. Working, done, and idle transitions post nothing --
-/// assistant text reaches Discord live from the pane's vendor-log watch, not as a turn-end card,
-/// and a failed turn shows as the agent's own text the same way.
 async fn deliver_postable_transition(
     context: PostableTransitionContext<'_>,
     state: &mut BridgeState,
@@ -594,8 +498,6 @@ async fn deliver_postable_transition(
     .await;
 }
 
-/// Split out of [`process_snapshot`] to keep it under the line-count lint: delivers a blocked
-/// transition's card. Working, done, and idle transitions post nothing.
 async fn deliver_transition_if_postable(
     context: PostableTransitionContext<'_>,
     state: &mut BridgeState,
@@ -623,17 +525,9 @@ fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
     })
 }
 
-/// Why a Claude/Codex/Cursor session's on-disk log could not be resolved, classified by KIND
-/// rather than by matching the rendered message text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionPathError {
-    /// The log itself does not exist yet (zero candidates matched). Not a real problem: the vendor
-    /// may still write it once its first turn starts, so the caller retries on every later
-    /// snapshot.
     NotFoundYet(String),
-    /// A real, non-transient problem — an ambiguous session (multiple candidate logs), an
-    /// unsupported vendor, or a search directory that cannot be read at all — surfaced as an error
-    /// the caller logs, rather than silently awaited like a log that has simply not appeared yet.
     Permanent(String),
 }
 
@@ -731,7 +625,6 @@ fn resolve_session_path(
                     &mut candidates,
                 )?;
             }
-            // Codex continues a session in a new rollout whose filename timestamp sorts later.
             candidates
                 .into_iter()
                 .max_by(|left, right| left.file_name().cmp(&right.file_name()))
@@ -756,10 +649,6 @@ fn resolve_session_path(
     }
 }
 
-/// Every Claude config directory directly under `search_root`: named `.claude` or starting with
-/// `.claude-`, and containing a `projects` directory. Covers `CLAUDE_CONFIG_DIR` overrides such
-/// as `~/.claude-two` alongside the default `~/.claude` and `~/.claude-one`. Sorted so the
-/// search order is deterministic.
 fn claude_config_roots(search_root: &Path) -> Result<Vec<PathBuf>, SessionPathError> {
     let mut roots = read_entries(search_root, "Claude config directory")?
         .into_iter()
@@ -777,9 +666,6 @@ fn claude_config_roots(search_root: &Path) -> Result<Vec<PathBuf>, SessionPathEr
     Ok(roots)
 }
 
-/// Collapses candidates that are hard links to the same file (same device and inode) into one
-/// path, so a session log hard-linked across Claude config directories (for example `~/.claude`
-/// and `~/.claude-one`) is not mistaken for two distinct session logs.
 fn dedupe_hard_links(candidates: &[PathBuf]) -> Result<Vec<PathBuf>, SessionPathError> {
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
@@ -854,12 +740,6 @@ fn read_entries(
         .map_err(classify)
 }
 
-/// `Ok(None)` means the log does not exist yet ([`SessionPathError::NotFoundYet`]): the caller
-/// retries later rather than treating it as an error.
-///
-/// # Errors
-///
-/// Returns any [`SessionPathError::Permanent`] error, or a misconfigured `HOME`.
 fn live_log_path(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
@@ -872,11 +752,6 @@ fn live_log_path(
     }
 }
 
-/// Registers a `notify` watch on a vendor log path, forwarding the terminal id on every modify
-/// event. Cursor watches the chat directory that holds `store.db` instead of the file itself, so
-/// both the creation of its `-wal` sibling and later writes to it wake the follower; a watch on the
-/// file, set up before the sibling exists (the common case for a freshly started pane), would never
-/// see it appear.
 fn start_notify_watcher(
     follower: Follower,
     path: &Path,
@@ -909,11 +784,6 @@ fn start_notify_watcher(
     Ok(watcher)
 }
 
-/// The position a freshly opened live-capture follower resumes from when its log already exists at
-/// first sight: past every assistant text currently in it, so a bridge that discovers a pane
-/// mid-conversation never replays its history. A follower whose log did not exist yet at first
-/// sight starts at 0 instead (see [`ensure_live_watch_started`]), so the whole log it later writes
-/// is posted. `start` selects the log format and the position the read starts from.
 fn initial_live_position(start: Follower, path: &Path) -> Result<Follower, String> {
     match start {
         Follower::Claude(offset) => {
@@ -928,10 +798,6 @@ fn initial_live_position(start: Follower, path: &Path) -> Result<Follower, Strin
     }
 }
 
-/// The position a terminal's terminal-prompt mirroring starts from the first time it is ever
-/// established for that terminal: past every prompt already in the vendor log, so a bridge that
-/// discovers a pane mid-conversation never replays its history. `start` selects the log format and
-/// the position the read starts from.
 fn initial_terminal_prompt_position(start: Follower, path: &Path) -> Result<Follower, String> {
     match start {
         Follower::Claude(offset) => read_claude_prompts_incremental(path, offset)
@@ -943,12 +809,6 @@ fn initial_terminal_prompt_position(start: Follower, path: &Path) -> Result<Foll
     }
 }
 
-/// Reads new complete owner prompts appended to a terminal's vendor log since `position`, and the
-/// position immediately after the last one read.
-///
-/// # Errors
-///
-/// Returns the incremental reader's error for the follower's vendor.
 fn read_new_terminal_prompts(
     path: &Path,
     position: Follower,
@@ -972,20 +832,6 @@ fn read_new_terminal_prompts(
     }
 }
 
-/// Ensures one live-capture follower per session-carrying pane, opened the first time the bridge
-/// sees the pane's log resolve -- in any status, not only `working` -- and kept open across turns
-/// so every assistant text the log later gains is posted, regardless of status. The watch is
-/// replaced (its `notify` watcher dropped) only when the pane's session resolves to a different log
-/// path; a closed pane's watch is pruned by [`prune_departed_state`]. On every snapshot the watch's
-/// route is refreshed from `route_topology`, before the path check, so a pane moved to a different
-/// tab or workspace mid-session posts to its new thread even though its log path is unchanged. It
-/// follows the same log path the prompt baseline resolved for this snapshot, so the two readers
-/// agree on where "past everything already there" is: the live position baselines at 0 when the log
-/// did not exist at first sight (the prompt baseline is 0 too) and past every existing assistant
-/// text otherwise.
-///
-/// A bridge restart re-follows from the current end and so reposts nothing; a log that grows before
-/// the restart's first read is still picked up from that end.
 async fn ensure_live_watch_started(
     discord: &DiscordConnection,
     snapshot: &AgentSnapshot,
@@ -997,23 +843,17 @@ async fn ensure_live_watch_started(
     let Some(session) = snapshot.session.clone() else {
         return;
     };
-    // Live text exists only for Claude, Codex, and Cursor logs; other vendors are not followed.
     if !matches!(
         session.agent.as_str(),
         VENDOR_CLAUDE | VENDOR_CODEX | VENDOR_CURSOR
     ) {
         return;
     }
-    // The prompt baseline runs first on this snapshot and resolves the log path; the live watch
-    // follows that same path. No entry means the log is not on disk yet (awaiting first log), so
-    // there is nothing to follow until a later snapshot.
     let Some((path, _prompt_position, live_position)) =
         state.terminal_prompt_positions.get(&terminal).cloned()
     else {
         return;
     };
-    // Refresh the route on every snapshot, before the path check, so a pane moved to a different
-    // tab or workspace mid-session posts to its new thread even though its log path is unchanged.
     let route = match route_topology(agents, tabs, &terminal) {
         Ok(route) => route,
         Err(error) => {
@@ -1051,19 +891,9 @@ async fn ensure_live_watch_started(
             route,
         },
     );
-    // Read once immediately: a fresh watch that baselined at 0 posts the whole log the pane just
-    // wrote, and the next `notify` tick may never come if nothing more is written.
     handle_live_event(discord, &terminal, state).await;
 }
 
-/// Does not touch the watch's stored position: the caller advances it only past text it actually
-/// delivers, so a text this read returns but a later delivery attempt drops is re-read and
-/// re-sent rather than skipped. Each text is paired with the position immediately after it, and
-/// the last element is the position after everything read.
-///
-/// # Errors
-///
-/// Returns the incremental reader's error for the follower's vendor.
 fn read_new_live_texts(
     path: &Path,
     position: Follower,
@@ -1096,15 +926,6 @@ fn read_new_live_texts(
     }
 }
 
-/// Resolves both a route's workspace channel and its tab thread, reusing [`sync_route`]'s
-/// cache-first synchronization and then reading the now-populated cache for the workspace channel
-/// alongside it.
-///
-/// # Errors
-///
-/// Returns [`sync_route`]'s error, or a topology error when the cache does not hold the workspace
-/// channel immediately after a successful sync (a topology invariant `sync_route` itself relies
-/// on).
 async fn sync_route_channels(
     client: &Client,
     guild: Id<GuildMarker>,
@@ -1123,13 +944,6 @@ async fn sync_route_channels(
     Ok((workspace_channel, thread))
 }
 
-/// The bridge-owned terminal-prompt webhook for `workspace_channel`, from
-/// [`BridgeState::terminal_prompt_webhooks`] when already resolved, otherwise resolved fresh and
-/// cached.
-///
-/// # Errors
-///
-/// Returns [`resolve_terminal_prompt_webhook`]'s error.
 async fn cached_terminal_prompt_webhook(
     client: &Client,
     workspace_channel: Id<ChannelMarker>,
@@ -1147,8 +961,6 @@ async fn cached_terminal_prompt_webhook(
     Ok(webhook)
 }
 
-/// Everything [`mirror_one_terminal_prompt`] needs to deliver into one already-resolved route,
-/// bundled to stay under the argument-count lint; fixed for the whole mirrored batch.
 #[derive(Clone, Copy)]
 struct TerminalPromptTarget<'a> {
     client: &'a Client,
@@ -1157,14 +969,6 @@ struct TerminalPromptTarget<'a> {
     thread: Id<ChannelMarker>,
 }
 
-/// Resolves (from cache or fresh) the webhook for `target.workspace_channel` and executes one
-/// message into `target.thread`, returning `target` unchanged on success so the caller can chain
-/// further parts or prompts against the same resolved pair.
-///
-/// # Errors
-///
-/// Returns [`cached_terminal_prompt_webhook`]'s or [`execute_terminal_prompt_webhook`]'s error --
-/// covering both webhook resolution and execution.
 async fn deliver_terminal_prompt_part<'a>(
     target: TerminalPromptTarget<'a>,
     identity: &OwnerIdentity,
@@ -1186,19 +990,6 @@ async fn deliver_terminal_prompt_part<'a>(
     Ok(target)
 }
 
-/// Delivers one mirrored terminal prompt through the bridge-owned webhook, split into parts the
-/// same way live text is so Discord's 2000-character message limit never silently drops it, one
-/// webhook message per part, in order.
-///
-/// A delivery failure stops the batch there rather than sending later parts out of order. When the
-/// cached thread is gone (unknown channel) the shared topology cache is cleared, and when the
-/// cached webhook is gone (unknown webhook) that cached webhook is dropped; either way the next
-/// mirrored prompt resolves the route and webhook again through the cache-first path. It does not
-/// re-resolve and retry inside this call.
-///
-/// # Errors
-///
-/// Returns a Discord request or response error.
 async fn mirror_one_terminal_prompt<'a>(
     target: TerminalPromptTarget<'a>,
     identity: &OwnerIdentity,
@@ -1224,36 +1015,6 @@ async fn mirror_one_terminal_prompt<'a>(
     Ok(current)
 }
 
-/// Establishes (or re-establishes, on a session change) the terminal-prompt read baseline for
-/// `snapshot`'s pane, the first time the bridge ever sees it with a session, in any status -- not
-/// only `working`. A prompt typed while the pane is idle, before its turn even starts, is
-/// therefore captured here rather than excluded by a baseline set too late (once the pane finally
-/// reaches `working` and its own initiating prompt is already in the log).
-///
-/// Keyed by terminal id in [`BridgeState::terminal_prompt_positions`], but re-baselined whenever
-/// the freshly resolved log path differs from the one already stored there: a later session on the
-/// same terminal (`/clear`, resume, a relaunch, or a vendor starting a fresh file or store) must
-/// never have the old file's position applied to the new one.
-///
-/// A pane seen with a session whose [`live_log_path`] returns `Ok(None)` (the log or store does not
-/// exist on disk yet -- a fresh pane, or a new session before its first write) records that
-/// session's identity in [`BridgeState::awaiting_first_log`] and retries on the next snapshot. The
-/// first time a path then resolves for this terminal, the baseline is 0 -- not
-/// [`initial_terminal_prompt_position`]'s discard-what-already-exists checkpoint -- only when the
-/// resolved path's session is the SAME one that was recorded pending: its log was created after
-/// this terminal was already being watched, so everything now in it, including the prompt that may
-/// have just created it, postdates first sight and belongs to this bridge run, not a discarded
-/// history. A path resolving for any OTHER session -- one that was never recorded pending (a pane
-/// first seen without a session, then relaunched straight into existing history), or a different
-/// one that superseded the pending session -- gets the normal discard-what-already-exists baseline
-/// instead, and the stale pending record is dropped either way so it cannot later misapply to a
-/// third session. A pane first seen without a session is recorded in
-/// [`BridgeState::seen_without_session`]: Codex creates its log and reports its session only when
-/// the first prompt is submitted, so a log created after that first sighting is also the pane's own
-/// and baselines at 0, while a log that predates it, or that another terminal already follows, is
-/// history and is discarded. The sighting is forgotten once any baseline is set for the terminal,
-/// and when a snapshot reports no agent. A permanent resolution error is logged and retried too, since resolving it costs
-/// only a directory read.
 fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
     let terminal = &snapshot.terminal_id;
     let Some(session) = snapshot.session.as_ref() else {
@@ -1267,8 +1028,6 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
         }
         return;
     };
-    // Claude, Codex, and Cursor are the vendors whose logs are followed; `zero` is the baseline for
-    // a log this terminal is only now seeing resolve for the first time.
     let zero = match session.agent.as_str() {
         VENDOR_CLAUDE => Follower::Claude(0),
         VENDOR_CODEX => Follower::Codex(0),
@@ -1314,13 +1073,6 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     } else {
         false
     };
-    // Capture the prompt reader's and the live text watch's start positions together, from the one
-    // log the pane resolves now, so no prompt written between two separate reads is mirrored
-    // without its reply. When this pane's own session log has only just appeared, both start at 0
-    // to catch everything the pane writes; otherwise both start past everything already there. A
-    // read that errors (Cursor creates its message table lazily on the first write) defers the
-    // whole baseline -- and with it the watch -- to the next snapshot rather than baselining a log
-    // that cannot be read yet.
     let positions = if was_awaiting_this_session || created_after_first_sighting {
         initial_live_position(zero, &path).map(|_| (zero, zero))
     } else {
@@ -1339,11 +1091,6 @@ fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mu
     }
 }
 
-/// Whether `terminal` already has a terminal-prompt baseline for exactly `path`: `false` both when
-/// there is no baseline yet and when there is one for a different path (a session change -- a
-/// `/clear`, resume, relaunch, or a vendor starting a fresh file or store -- must re-baseline
-/// against the new path rather than reuse the old file's position, which the new file may not even
-/// be as long as).
 fn terminal_prompt_baseline_is_current(
     positions: &HashMap<String, (PathBuf, Follower, Follower)>,
     terminal: &str,
@@ -1354,22 +1101,6 @@ fn terminal_prompt_baseline_is_current(
         .is_some_and(|(existing_path, _, _)| existing_path == path)
 }
 
-/// Mirrors newly recorded owner prompts from one terminal's vendor log into its tab thread through
-/// the bridge-owned webhook, in log order, ahead of any assistant text the same `notify` tick
-/// delivers -- the caller runs this before reading live text.
-///
-/// Reads forward from the path and prompt position [`maybe_establish_terminal_prompt_baseline`]
-/// last left in [`BridgeState::terminal_prompt_positions`] -- its own position, advanced only past
-/// prompts, distinct from the live-text watch's position advanced past assistant texts, so each
-/// reader tracks its own progress through the shared log. Does nothing if that baseline is not
-/// established yet: `process_snapshot` always runs it first, for every status, before this function
-/// ever has a `LiveWatch` to be called from.
-///
-/// A prompt equal to a pending [`take_owner_prompt_suppression`] marker is dropped once instead of
-/// mirrored: it is the bridge's own Discord-originated prompt, already posted by the owner in the
-/// thread it came from. No session or no route: dropped silently. A delivery
-/// failure is logged once and the position still advances past it -- a stuck prompt does not block
-/// mirroring later ones.
 async fn mirror_terminal_prompts(
     connection: &DiscordConnection,
     terminal: &str,
@@ -1423,20 +1154,6 @@ async fn mirror_terminal_prompts(
     }
 }
 
-/// Mirrors any new owner terminal prompts via [`mirror_terminal_prompts`] before reading this
-/// tick's live text, so a prompt that started the current turn is posted to Discord ahead of the
-/// assistant text it produced.
-///
-/// Each posted text's nonce is derived from the terminal id and log position, not a counter, so it
-/// survives a watch restart that resumes at the same position. The tab thread is resolved fresh on
-/// every event through the cache-first [`sync_route`], so no channel is cached on the watch.
-///
-/// A read failure, a route failure, or a failed post is logged once per terminal (deduped through
-/// [`BridgeState::live_errors_reported`], cleared on the next full success) and leaves the follower
-/// running at its unchanged position: the stored log position only advances past text that was
-/// actually delivered, so a text that still fails, and everything read after it, is re-read and
-/// re-sent on the next log change. A send that finds the thread gone (unknown channel) also clears
-/// the shared topology cache, so that next event re-resolves the route.
 async fn handle_live_event(
     connection: &DiscordConnection,
     terminal: &str,
@@ -1515,18 +1232,10 @@ async fn handle_live_event(
     }
 }
 
-/// Forgets a pane's tracked activity message, if any, so the next turn's first activity frame
-/// creates a fresh one instead of editing the previous turn's message.
 fn forget_activity_message(state: &mut BridgeState, pane_id: &str) {
     state.activity_messages.remove(pane_id);
 }
 
-/// The route's tab thread from the cached topology only, issuing no Discord request. `Ok(None)`
-/// when the cache is not yet populated or does not resolve the route.
-///
-/// # Errors
-///
-/// Returns the cache's error when it lists duplicate threads for the route's tab.
 async fn cached_route_channel(
     topology_cache: &TopologyCache,
     route: &TopologyRoute,
@@ -1540,15 +1249,6 @@ async fn cached_route_channel(
     channel
 }
 
-/// Applies one activity frame: routes it to its tab's thread purely from the cached topology, then
-/// posts or edits this turn's one activity message for the pane.
-///
-/// A cache not yet populated, or a route the cache does not resolve, drops the frame silently (a
-/// cache that lists duplicate threads for the tab drops it and logs), and
-/// so does a pane the latest snapshot does not report as `working` with a session -- the same
-/// no-session rule every other card follows. A send that finds the cached thread gone (unknown
-/// channel) clears the shared topology cache and logs; the next frame drops until the cache-first
-/// route is repopulated by other traffic. It does not re-resolve and retry inside this call.
 async fn handle_activity_event(
     discord: &DiscordConnection,
     frame: ActivityFrame,
@@ -1571,9 +1271,6 @@ async fn handle_activity_event(
             return;
         }
     };
-    // The eligibility gate covers both editing and creating: a frame that arrives after the pane
-    // left `working` (its activity message still lingering until the next turn) is dropped rather
-    // than editing the settled turn's message.
     if !state.activity_eligible_panes.contains(&frame.pane_id) {
         return;
     }
@@ -1643,12 +1340,6 @@ fn capture_for_blocked_with_search_root(
     }
 }
 
-/// Resolves `route`'s tab thread, serving it straight from `topology_cache` when the cache
-/// already holds both the route's workspace channel and its tab thread. Refetches -- one Discord
-/// round trip instead of one per lifecycle event -- only when the cache is empty, does not yet
-/// hold the route, or (via a caller invalidating it first) held a channel a send just rejected as
-/// unknown. One guard is held for the whole call, across the refetch too, so a concurrent miss on
-/// the same route blocks on the lock instead of racing its own fetch-and-create.
 async fn sync_route(
     client: &Client,
     guild: Id<GuildMarker>,
@@ -1659,11 +1350,6 @@ async fn sync_route(
     sync_route_locked(client, guild, route, &mut guard).await
 }
 
-/// [`sync_route`]'s body, run under a guard the caller acquired and holds for this whole call
-/// (including the refetch): a second concurrent miss on the same route blocks on that same guard
-/// instead of racing its own fetch-and-create. Split into its own function, taking the guard by
-/// reference rather than owning it, purely so `sync_route` itself has one single, unbroken use of
-/// its guard for lint purposes; the locking behavior is identical either way.
 async fn sync_route_locked(
     client: &Client,
     guild: Id<GuildMarker>,
@@ -1693,21 +1379,6 @@ async fn sync_route_locked(
         .map_err(|error| format!("discord topology error: {error}"))
 }
 
-/// Ensures every workspace channel and tab thread exists, then deletes every workspace channel
-/// and tab thread Herdr no longer lists. Runs in a spawned task beside the event loop rather than
-/// blocking it. An agent reporting no session is not mirrored: it is skipped in the create pass,
-/// so no channel or thread is created for it until a later snapshot reports one. A per-tab
-/// routing or naming error is logged and skipped; the lazy sync inside delivery
-/// still covers that tab once a card is due. The sweep refetches both lists once at its start rather than
-/// adopting whatever the shared cache already holds, so a cache that missed an earlier create
-/// cannot make the sweep recreate an existing channel or thread. The reconciliation pass that
-/// follows reuses this same cache rather than refetching per tab; an Ok but empty Herdr
-/// workspace or tab list is authoritative and deletes accordingly, while an Err from either
-/// Herdr call skips the whole delete pass with one logged error line. The delete pass is
-/// unaffected by session: a live tab keeps any thread that already exists. Both passes tolerate
-/// the shared cache going empty mid-sweep -- a concurrent stale-route recovery elsewhere clears
-/// it for microseconds while it re-resolves -- by refetching in place rather than aborting: the
-/// create pass skips just that one agent and continues, and the delete pass still runs.
 async fn sync_startup_topology(
     discord: &DiscordConnection,
     agents: &[AgentSnapshot],
@@ -1798,11 +1469,6 @@ async fn sync_startup_topology(
     }
 }
 
-/// Applies one `tab.closed`/`workspace.closed` Herdr event to Discord from a fresh topology fetch,
-/// deleting only the tab or workspace the fetched lists actually contain. A tab closure with no
-/// match in the active list and no match in its workspace channel's archived listing makes no
-/// further Discord request. The delete error is logged; only a failure of the fetch itself is
-/// returned.
 async fn delete_closed_topology(
     discord: &DiscordConnection,
     closure: &TopologyClosure,
@@ -1851,12 +1517,6 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
-/// Removes every terminal-keyed entry for a terminal absent from `current_terminals`, except
-/// `state_change_sequences`, which keeps counting so a returning terminal never reuses a card
-/// nonce. Also removes every tab-keyed entry (`rename_errors_reported`) for a tab absent from
-/// `current_tabs`, and every pane-keyed entry (`activity_messages`, `activity_eligible_panes`)
-/// for a pane absent from `current_panes` (as are the owner-prompt suppression markers), returning the informational cards that departed so
-/// callers can expire them.
 fn prune_departed_state(
     state: &mut BridgeState,
     current_terminals: &HashSet<String>,
@@ -1989,10 +1649,6 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     };
-    // Cursor fires beforeShellExecution even under --force/--yolo and its payload carries no
-    // run-mode field, so a card that times out would deny every command of a hands-off seat.
-    // The cursor-agent process's own flags are the only signal; anything unreadable falls
-    // through to the card.
     if matches!(interaction.vendor, PermissionVendor::Cursor)
         && cursor_agent_ancestor_argv().is_some_and(|argv| cursor_argv_forces_allow(&argv))
     {
@@ -2018,9 +1674,6 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     write_hook_decision(interaction.vendor, decision.as_ref()).await
 }
 
-/// Returns the argv of the nearest `cursor-agent` ancestor of this hook process, walking the
-/// `/proc` parent chain from the parent upward. Off Linux, at pid 1 or 0, on any `/proc` read
-/// error, or with no such ancestor this returns `None` so the caller keeps the card flow.
 fn cursor_agent_ancestor_argv() -> Option<Vec<String>> {
     let mut pid = proc_parent_pid("self")?;
     while pid > 1 {
@@ -2136,10 +1789,6 @@ fn parse_hook_args(
     Ok((vendor, socket))
 }
 
-/// Reads one harness `PreToolUse` hook payload from stdin and forwards it to the broker as an
-/// activity frame, exiting 0 with no output. Activity display is best-effort, so an undecodable
-/// payload, an unparsable argument list, or an unset broker socket sends nothing. A missing
-/// `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` or `HERDR_PANE_ID` is an error and exits 1.
 async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let Ok((vendor, requested_socket)) = parse_activity_args(args) else {
         return Ok(());
@@ -2234,8 +1883,6 @@ async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         config.owner_id.clone(),
         topology_cache,
     ));
-    // The standalone `broker` subcommand has no bridge event loop to forward activity frames to:
-    // dropping the receiver immediately makes every subsequent send a no-op.
     let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
     drop(activity_rx);
     run_permission_broker(&socket_path, responder, activity_tx)
@@ -2314,7 +1961,6 @@ fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
     }
 }
 
-/// A Herdr `tab.closed`/`workspace.closed` event, naming the Discord topology it deletes.
 #[derive(Debug, PartialEq, Eq)]
 enum TopologyClosure {
     Tab {
@@ -2451,8 +2097,6 @@ async fn bridge_event_loop(
     Ok(())
 }
 
-/// Applies one lifecycle event: its membership change first (a status resubscribe if a pane joined
-/// or left), then its closure if it is one (deleting that tab or workspace), then one doorbell.
 async fn apply_lifecycle_event(
     event: &serde_json::Value,
     discord: &DiscordConnection,
@@ -2489,9 +2133,6 @@ async fn apply_lifecycle_event(
     .await
 }
 
-/// Registers every workspace channel's archived tab threads in a task of its own, independent of
-/// Herdr and of the startup sweep, so an owner deletion of an archived thread whose tab has no
-/// session still resolves. A failure is logged loudly.
 fn spawn_archived_thread_registration(discord: &DiscordConnection) {
     let (client, guild, ..) = discord;
     let (client, guild) = (client.clone(), *guild);
@@ -2504,10 +2145,6 @@ fn spawn_archived_thread_registration(discord: &DiscordConnection) {
     });
 }
 
-/// Spawns the startup topology sweep (one `list_agents`/`tab_list_result` snapshot, then
-/// `sync_startup_topology`) beside the caller rather than blocking it. Runs once, at process
-/// start, after the first doorbell, so it shares that pass's `rename_errors_reported` and logs
-/// no rename failure twice.
 fn spawn_startup_topology_sweep(
     discord: &DiscordConnection,
     rename_errors_reported: &mut HashSet<String>,
@@ -2632,9 +2269,6 @@ async fn subscribe_herdr_events_with_backoff(
     }
 }
 
-/// Resubscribes to per-pane status, rebuilding `pane_ids` from a fresh `list_agents` call before
-/// every attempt so a pane closing between attempts can never leave the subscription frozen on a
-/// stale membership list.
 async fn subscribe_status_with_backoff(
     pane_ids: &mut Vec<String>,
     stop: &mut tokio::signal::unix::Signal,
@@ -2720,13 +2354,6 @@ async fn next_status_event(
     }
 }
 
-/// Fetches the owner's mirrored identity once at startup.
-///
-/// # Errors
-///
-/// Returns an error when `owner_id` is not numeric or the fetch itself fails. Terminal prompt
-/// mirroring has no fallback identity to mirror under, so startup fails on this error rather than
-/// running the rest of the process without it.
 async fn fetch_startup_owner_identity(
     client: &Client,
     owner_id: &str,
@@ -2894,10 +2521,6 @@ mod tests {
                 .expect("initial Codex terminal prompt position resolves");
             assert!(matches!(initial_position, Follower::Codex(1_215)));
 
-            // Codex writes every typed prompt twice: a `response_item` user-message record and an
-            // `event_msg`/`user_message` twin that follows it. Appending both and finding exactly
-            // one prompt proves the reader counts it once, sourced from the `response_item` copy
-            // alone, and ignores its later `event_msg` twin entirely.
             fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
@@ -3025,10 +2648,6 @@ mod tests {
         );
     }
 
-    /// Repro case b (a fresh session's pending marker must not leak onto a later, unrelated,
-    /// already-populated session) and control case c (the same existing session, discovered
-    /// directly, with no intervening fresh session) side by side: both must baseline identically,
-    /// discarding the existing history rather than replaying it.
     #[test]
     fn resumed_session_with_existing_log_is_never_replayed_after_a_fresh_session_was_pending() {
         let original_home = std::env::var_os("HOME");
@@ -3038,8 +2657,6 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&temp_home);
         fs::create_dir_all(&temp_home).expect("create temp HOME");
-        // SAFETY: `cargo test -- --test-threads=1` (this crate's mandated invocation) serializes
-        // every test in this binary, so no other test observes HOME mid-mutation.
         unsafe {
             std::env::set_var("HOME", &temp_home);
         }
@@ -3061,7 +2678,6 @@ mod tests {
             let session_dir = temp_home.join(".claude").join("projects").join(&cwd_slug);
             fs::create_dir_all(&session_dir).expect("create Claude session dir");
 
-            // The existing, already-resumable session: prior history already on disk.
             let old_session_path = session_dir.join("old-session.jsonl");
             fs::write(
                 &old_session_path,
@@ -3088,9 +2704,6 @@ mod tests {
                 }),
             };
 
-            // Case b: a fresh session with no log yet is seen first (marks the terminal
-            // "awaiting"), then the same terminal switches to the existing, already-populated
-            // session before the fresh one's log ever appears.
             let mut replay_state = BridgeState::default();
             maybe_establish_terminal_prompt_baseline(&snapshot_for("fresh-b"), &mut replay_state);
             maybe_establish_terminal_prompt_baseline(
@@ -3113,8 +2726,6 @@ mod tests {
                 "the live watch start must discard the resumed history too, not replay it"
             );
 
-            // Control case c: the same existing session, discovered directly, with no intervening
-            // fresh session -- must baseline identically to case b.
             let mut control_state = BridgeState::default();
             maybe_establish_terminal_prompt_baseline(
                 &snapshot_for("old-session"),
@@ -3172,7 +2783,6 @@ mod tests {
         ]
     }
 
-    /// Reads every prompt and assistant text from the given positions of a Codex rollout.
     fn read_both(
         path: &Path,
         prompt_position: Follower,
@@ -3183,8 +2793,6 @@ mod tests {
         (prompts, texts.into_iter().map(|(text, _)| text).collect())
     }
 
-    /// Creates the continuation rollout of the first-turn fixture, feeds `later` (a snapshot for the
-    /// second session) to the baseline, and asserts the history already in that rollout is discarded.
     fn assert_later_codex_session_discards_history(
         state: &mut BridgeState,
         temp_home: &Path,
@@ -3213,12 +2821,6 @@ mod tests {
         );
     }
 
-    /// Codex creates its rollout and reports its session only when the first prompt is submitted,
-    /// so the bridge first sees the pane with no session and later sees a session whose log
-    /// already holds the prompt. A log created after that first sighting is the pane's own and is
-    /// read from 0; a log that predates the sighting, or that another terminal already follows, is
-    /// history and is discarded. Once a baseline is set the sighting is forgotten, so a later
-    /// session on the terminal is discarded too.
     #[test]
     fn codex_log_created_after_the_pane_was_first_seen_without_a_session_is_read_from_zero() {
         let cases = first_turn_cases();
@@ -3228,8 +2830,6 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&temp_home);
-        // SAFETY: `cargo test -- --test-threads=1` (this crate's mandated invocation) serializes
-        // every test in this binary, so no other test observes HOME mid-mutation.
         unsafe {
             std::env::set_var("HOME", &temp_home);
         }
@@ -3261,8 +2861,6 @@ mod tests {
                 agent: VENDOR_CODEX.to_owned(),
                 value: "00000000-0000-7000-8000-000000000001".to_owned(),
             };
-            // Filesystem timestamps come from a coarse clock, so the creation and the first
-            // sighting are separated by more than its tick.
             let tick = std::time::Duration::from_millis(50);
             for case in &cases {
                 let _ = fs::remove_dir_all(&temp_home);
@@ -3300,8 +2898,6 @@ mod tests {
                 assert_eq!(prompts, expected_prompts, "{}: prompts", case.name);
                 assert_eq!(texts, expected_texts, "{}: live texts", case.name);
 
-                // A later session on the same terminal, whose log is also created after the
-                // first sighting, is not the pane's own fresh log: the sighting was forgotten.
                 std::thread::sleep(tick);
                 assert_later_codex_session_discards_history(
                     &mut state,
@@ -3335,15 +2931,11 @@ mod tests {
         );
     }
 
-    /// A `DISCORD_TOKEN` that is set but not valid UTF-8 fails startup naming the variable, not as
-    /// a missing variable, and without printing its value. The error is raised before any Discord request is made.
     #[tokio::test]
     async fn non_utf8_discord_variable_fails_startup_naming_the_variable() {
         use std::os::unix::ffi::OsStringExt;
 
         let original = std::env::var_os("DISCORD_TOKEN");
-        // SAFETY: `cargo test -- --test-threads=1` (this crate's mandated invocation) serializes
-        // every test in this binary, so no other test observes the variable mid-mutation.
         unsafe {
             std::env::set_var(
                 "DISCORD_TOKEN",
@@ -3351,7 +2943,6 @@ mod tests {
             );
         }
         let result = super::discord_connection(Arc::new(tokio::sync::Mutex::new(None))).await;
-        // SAFETY: as above.
         unsafe {
             match original {
                 Some(value) => std::env::set_var("DISCORD_TOKEN", value),
@@ -3456,7 +3047,6 @@ mod tests {
         ));
         assert_eq!(pane_ids, vec!["w1:p1".to_owned(), "w1:p2".to_owned()]);
 
-        // Captured from the live Herdr socket: closing a tab that is not a workspace's last tab.
         let tab_closed = json!({
             "event": "tab_closed",
             "data": {"tab_id": "w32:t2", "type": "tab_closed", "workspace_id": "w32"}
@@ -3470,7 +3060,6 @@ mod tests {
             })
         );
 
-        // Captured from the live Herdr socket: closing a workspace with a tab still open in it.
         let workspace_closed = json!({
             "event": "workspace_closed",
             "data": {
@@ -3497,8 +3086,6 @@ mod tests {
         );
     }
 
-    /// Builds an `AgentSnapshot`/`AgentSession` pair for a Claude session at `cwd`, for use in
-    /// [`ClaudeSearchRootCase::build`] closures.
     fn claude_session_snapshot(cwd: &str, session_id: &str) -> (AgentSnapshot, AgentSession) {
         let session = AgentSession {
             agent: "claude".to_owned(),
@@ -3517,9 +3104,6 @@ mod tests {
         (snapshot, session)
     }
 
-    /// The project directory a session log for `cwd` resolves under beneath `root/vendor_root`,
-    /// mirroring `resolve_session_path`'s slug so a case can place a fixture where production
-    /// code will read it.
     fn claude_project_dir(root: &Path, vendor_root: &str, cwd: &str) -> PathBuf {
         let cwd_slug: String = cwd
             .chars()
@@ -3534,12 +3118,8 @@ mod tests {
         root.join(vendor_root).join("projects").join(cwd_slug)
     }
 
-    /// One synthetic `$HOME` layout in
-    /// [`claude_search_roots_cover_every_claude_config_directory_under_home`].
     struct ClaudeSearchRootCase {
         name: &'static str,
-        /// Builds the layout under a fresh temp `$HOME` and returns the session to resolve and the
-        /// path it must resolve to.
         build: fn(&Path) -> (AgentSnapshot, AgentSession, PathBuf),
     }
 
@@ -3844,11 +3424,8 @@ mod tests {
         );
     }
 
-    /// One case in [`unique_existing_path_collapses_hard_linked_candidates`].
     enum UniqueExistingPathExpectation {
-        /// Resolves to the candidate at this index.
         Ok(usize),
-        /// A real, non-transient ambiguity: candidates that are not the same file.
         Permanent,
     }
 
@@ -3858,8 +3435,6 @@ mod tests {
         expected: UniqueExistingPathExpectation,
     }
 
-    /// Session logs hard-linked under both `~/.claude` and `~/.claude-one` (real, observed
-    /// on-disk shape) must resolve as the one file they are, not as two ambiguous candidates.
     #[test]
     fn unique_existing_path_collapses_hard_linked_candidates() {
         let cases = [
@@ -3998,8 +3573,6 @@ mod tests {
         id: Id<GuildMarker>,
     }
 
-    /// The real guild every real-guild test runs against, or `None` when its environment is not
-    /// configured.
     #[cfg(unix)]
     fn blocked_capture_guild() -> Option<BlockedCaptureGuild> {
         let guild = BlockedCaptureGuild {
@@ -4022,12 +3595,6 @@ mod tests {
             .is_some_and(|name| name.starts_with("testrun-"))
     }
 
-    /// Every `testrun-` thread in the guild, active or archived, whichever channel parents it. Suite
-    /// threads outlive their tests when they hang off a channel the prefix filter does not delete.
-    ///
-    /// Archived threads are listed only under channels the bridge marks as a herdr workspace, the
-    /// only channels it ever creates a thread in. This is the delete pass, so it pays for the full
-    /// reach.
     #[cfg(unix)]
     async fn blocked_capture_testrun_threads(
         guild: &BlockedCaptureGuild,
@@ -4066,12 +3633,6 @@ mod tests {
             .collect())
     }
 
-    /// The `testrun-` threads a leftover recount has to see: the guild-wide active list only.
-    ///
-    /// The recount deliberately skips the per-channel archived listings the delete pass runs. A
-    /// thread the delete pass just deleted cannot come back as an archived thread, and a thread the
-    /// suite leaked is active, because the suite never archives one. So an archived listing here
-    /// could only repeat what the active list already shows.
     #[cfg(unix)]
     async fn blocked_capture_active_testrun_threads(
         guild: &BlockedCaptureGuild,
@@ -4090,7 +3651,6 @@ mod tests {
             .count())
     }
 
-    /// Deletes one thread, treating an already-deleted thread as done.
     #[cfg(unix)]
     async fn blocked_capture_delete_thread(
         guild: &BlockedCaptureGuild,
@@ -4166,10 +3726,6 @@ mod tests {
     #[cfg(unix)]
     const SUBSCRIBE_LABEL: &str = "testrun-subscribe";
 
-    /// Environment variables passed through to every real-agent test tab and workspace when set
-    /// in the caller's own environment, so an agent started in it authenticates with the same
-    /// account as the test process rather than falling back to its harness's default config
-    /// directory: `CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex.
     #[cfg(unix)]
     const PASSTHROUGH_ENV_VARS: &[&str] = &["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 
@@ -4185,7 +3741,6 @@ mod tests {
             .collect()
     }
 
-    /// Creates a testrun tab, passing the caller's own [`PASSTHROUGH_ENV_VARS`] through to it.
     #[cfg(unix)]
     fn create_tab(label: &str, workspace_id: &str, cwd: &str) -> Result<Tab, String> {
         let mut args = vec![
@@ -4223,31 +3778,21 @@ mod tests {
             .output();
     }
 
-    /// Fixed, owner-pre-trusted cwd for every real-Claude fixture: a fresh directory would trip
-    /// Claude Code's own first-run "trust this folder?" prompt under a personal `CLAUDE_CONFIG_DIR`,
-    /// which blocks the pane from ever reaching ready.
     #[cfg(unix)]
     fn claude_testrun_dir(home: &Path) -> PathBuf {
         home.join(".cache/herdr-connect-testrun/claude")
     }
 
-    /// Fixed, owner-pre-trusted cwd for every real-Cursor fixture, for the same reason as
-    /// [`claude_testrun_dir`]: the Cursor CLI's own one-time "Trust this workspace" prompt has no
-    /// recovery either.
     #[cfg(unix)]
     fn cursor_testrun_dir(home: &Path) -> PathBuf {
         home.join(".cache/herdr-connect-testrun/cursor")
     }
 
-    /// Fixed, owner-pre-trusted cwd for every real-Codex fixture, for the same reason as
-    /// [`claude_testrun_dir`]: the Codex CLI's own one-time trust prompt has no recovery either.
     #[cfg(unix)]
     fn codex_testrun_dir(home: &Path) -> PathBuf {
         home.join(".cache/herdr-connect-testrun/codex")
     }
 
-    /// Empties `directory` without removing it: a fixture's shared, owner-pre-trusted cwd must
-    /// always exist at the same path.
     #[cfg(unix)]
     fn clear_directory_contents(directory: &Path) -> Result<(), String> {
         fs::create_dir_all(directory).map_err(|error| error.to_string())?;
@@ -4320,9 +3865,6 @@ mod tests {
         pane_id: String,
     }
 
-    /// Creates a workspace and renames its root tab to the same label, so both the workspace and
-    /// its root tab are visible to a zero-leftover check by that one label. Passes the caller's
-    /// own [`PASSTHROUGH_ENV_VARS`] through, for the same reason as [`create_tab`].
     #[cfg(unix)]
     fn create_workspace(label: &str, cwd: &str) -> Result<Workspace, String> {
         let mut args = vec![
@@ -4462,7 +4004,6 @@ mod tests {
             owner_id.clone(),
             topology_cache,
         ));
-        // Tests that mirror terminal prompts replace this with the owner's fetched identity.
         let identity = herdr_connect_rs::OwnerIdentity {
             display_name: owner_id.clone(),
             avatar_url: None,
@@ -4652,11 +4193,6 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
-    /// Feeds a real `pane_created` event through the lifecycle handler. The snapshot doorbell that
-    /// follows the event also subscribes to status when the pane list changed, so no outcome tells
-    /// the membership resubscribe apart from the doorbell's own subscribe: the row pins the
-    /// subscription as an outcome of the whole handler, and the recorded snapshot as the
-    /// doorbell's own effect.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -4692,9 +4228,6 @@ mod tests {
             live_events,
             activity_events,
         };
-        // One production doorbell before the fixture tab exists records every live pane as seen
-        // through production code, so the event handler's doorbell does not run a fresh-session
-        // topology sync for the owner's own panes.
         doorbell_snapshot(
             &connection,
             &mut runtime.state,
@@ -4761,8 +4294,6 @@ mod tests {
         assert_eq!(tabs_left, 0, "named zero-leftover check");
     }
 
-    /// After a bridge restart the workspace channel already holds the bridge's webhook: a second
-    /// bridge state with an empty cache must find and reuse it, not create another.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -4942,7 +4473,6 @@ mod tests {
     #[cfg(unix)]
     const LIVE_CAPTURE_LABEL: &str = "testrun-live-capture";
 
-    /// `sleep 12`: an instant tool step lets `haiku` finish before `working` is ever confirmed.
     #[cfg(unix)]
     const LIVE_CAPTURE_FORCE_PROMPT: &str = "Say the word alpha. Then run the shell command \
                                               `sleep 12 && echo beta`. Then say the word gamma.";
@@ -4983,8 +4513,6 @@ mod tests {
         }
     }
 
-    /// Testrun tab cwd, never the repository directory (holds `.env`): the fixed, owner-trusted
-    /// `.../herdr-connect-testrun/{claude,cursor,codex}` — its trust prompt has no recovery.
     #[cfg(unix)]
     fn live_capture_tab_fixture(kind: &str) -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
@@ -5007,7 +4535,6 @@ mod tests {
         Ok((tab, cwd_dir))
     }
 
-    /// The bool is whether the message carries an embed (a card, never live text).
     #[cfg(unix)]
     async fn thread_messages(
         guild: &BlockedCaptureGuild,
@@ -5027,8 +4554,6 @@ mod tests {
             .collect())
     }
 
-    /// Polls until `done` accepts a snapshot or `bound` elapses, tolerating a transient
-    /// `agent.list` deserialization failure within `bound` rather than propagating it at once.
     #[cfg(unix)]
     fn poll_snapshot(
         pane_id: &str,
@@ -5047,7 +4572,6 @@ mod tests {
         }
     }
 
-    /// `process_snapshot` with the two slice args always equal to a single snapshot.
     #[cfg(unix)]
     async fn own(
         snapshot: &AgentSnapshot,
@@ -5065,8 +4589,6 @@ mod tests {
         .await;
     }
 
-    /// Drives one real agent idle -> working -> settled: asserts `working` was observed, `alpha`
-    /// was live before settle, the live message count matches the log, and no card was posted.
     #[cfg(unix)]
     async fn live_capture_exercise(
         guild: &BlockedCaptureGuild,
@@ -5152,8 +4674,6 @@ mod tests {
         while let Ok(terminal_id) = live_events.try_recv() {
             handle_live_event(&connection, &terminal_id, &mut state).await;
         }
-        // The persistent watch has no settle-time read of its own, so read once more here to
-        // deliver any assistant text written just before `done` that no `notify` tick reached.
         handle_live_event(&connection, &terminal, &mut state).await;
 
         let Some(session) = settled.session.clone() else {
@@ -5170,8 +4690,6 @@ mod tests {
         live_texts_match_with_no_card(&messages, expected_count)
     }
 
-    /// Asserts the thread carries exactly `expected_count` live (non-embed) messages and no card
-    /// (embed) message at all: with the end card removed, a settled turn posts only live text.
     #[cfg(unix)]
     fn live_texts_match_with_no_card(
         messages: &[(String, bool, Id<MessageMarker>)],
@@ -5289,9 +4807,6 @@ mod tests {
         run_live_capture_test("codex").await;
     }
 
-    /// A real-schema Claude assistant record, mirroring the shape in
-    /// `tests/fixtures/claude-session.jsonl`, appended to a live session log so the follower reads
-    /// an assistant text the running agent itself did not write.
     #[cfg(unix)]
     fn append_claude_assistant_record(path: &Path, text: &str) -> Result<(), String> {
         let record = json!({
@@ -5305,9 +4820,6 @@ mod tests {
         writeln!(file, "{record}").map_err(|error| error.to_string())
     }
 
-    /// The agent's final text can reach the log after Herdr reports `done`. Reads live text until
-    /// the reply the force prompt asks for is in the thread, then returns the thread's live message
-    /// count, so the caller's baseline excludes that late reply.
     #[cfg(unix)]
     async fn live_count_once_reply_is_posted(
         guild: &BlockedCaptureGuild,
@@ -5337,9 +4849,6 @@ mod tests {
         }
     }
 
-    /// Rule 2 past settle: drives one real Claude turn to `done`/`idle`, then appends a fresh
-    /// assistant record to the pane's session log while it stays settled. The still-open watcher
-    /// posts that text -- status plays no part -- and the turn's own live texts are not reposted.
     #[cfg(unix)]
     async fn live_text_after_settle_exercise(
         guild: &BlockedCaptureGuild,
@@ -5424,7 +4933,6 @@ mod tests {
         let log_path = live_log_path(&settled, &session)?.ok_or("no log path yet")?;
         let marker = format!("post-settle-{agent_name}");
         append_claude_assistant_record(&log_path, &marker)?;
-        // The pane is settled; rule 2 still posts the appended text through the open watcher.
         handle_live_event(&connection, &terminal, &mut state).await;
 
         let messages = thread_messages(guild, thread).await?;
@@ -5506,22 +5014,12 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    /// Which path a terminal-prompt-turn helper submits its prompt through: [`Terminal`] mimics
-    /// the owner typing directly in the Herdr pane (via `herdr agent prompt`, terminal-origin from
-    /// the bridge's point of view); [`Discord`] mimics the bridge's own owner-message path
-    /// (`submit_owner_prompt`, exactly what the Discord gateway handler calls).
-    ///
-    /// [`Terminal`]: TerminalPromptSubmission::Terminal
-    /// [`Discord`]: TerminalPromptSubmission::Discord
     #[cfg(unix)]
     enum TerminalPromptSubmission {
         Terminal,
         Discord,
     }
 
-    /// Everything one [`run_terminal_prompt_turn`] call needs about the fixed pane under test,
-    /// bundled to stay under the argument-count lint; only `submission` and `prompt` change between
-    /// the turns a single exercise drives.
     #[cfg(unix)]
     #[derive(Clone, Copy)]
     struct TerminalPromptFixture<'a> {
@@ -5533,9 +5031,6 @@ mod tests {
         terminal: &'a str,
     }
 
-    /// Cursor's `SQLite` write can commit well after Herdr itself reports `done`; waits for the
-    /// reply to actually be readable before the final live read, so live delivery does not race
-    /// the write and miss the reply.
     #[cfg(unix)]
     async fn wait_for_readable_capture(settled: &AgentSnapshot) -> Result<(), String> {
         let home = std::env::var("HOME").map_err(|error| error.to_string())?;
@@ -5554,10 +5049,6 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real turn to settle, submitting `prompt` through `submission`, then leaves
-    /// `state` ready for the caller to inspect: the turn's own live-capture watch has run at least
-    /// once more after settling, so any terminal prompt or assistant text it produced has already
-    /// been mirrored or delivered.
     #[cfg(unix)]
     async fn run_terminal_prompt_turn(
         fixture: &TerminalPromptFixture<'_>,
@@ -5652,16 +5143,10 @@ mod tests {
         while let Ok(event_terminal) = live_events.try_recv() {
             handle_live_event(connection, &event_terminal, state).await;
         }
-        // The persistent watch has no settle-time read of its own, so read once more here to
-        // deliver the reply written just before `done` that no `notify` tick reached.
         handle_live_event(connection, terminal, state).await;
         Ok(())
     }
 
-    /// Submits `long_prompt` through the bridge's own Discord path, then `queued_prompt` the same
-    /// way while the pane is `working` on the first turn, and runs until the thread carries the
-    /// reply to `queued_reply` -- the agent queues the second prompt itself and answers it after
-    /// the first turn. The second submission must succeed, and its prompt must not be mirrored back.
     #[cfg(unix)]
     async fn run_queued_prompt_turns(
         fixture: &TerminalPromptFixture<'_>,
@@ -5765,12 +5250,6 @@ mod tests {
         Ok(())
     }
 
-    /// Fourth turn of [`terminal_origin_prompt_exercise`]: a second Discord prompt submitted while
-    /// the pane is `working` on a long first turn is acknowledged, answered after the first turn's
-    /// reply, and mirrored back neither as itself nor as the long prompt. The first turn is a long
-    /// generation rather than a shell wait because vendors block or time out shell waits and their
-    /// shell permissions differ; its reply is one plain message holding the whole list, so it is
-    /// matched by containing the long marker.
     #[cfg(unix)]
     async fn queued_prompt_exercise(
         fixture: &TerminalPromptFixture<'_>,
@@ -5782,10 +5261,6 @@ mod tests {
     ) -> Result<(), String> {
         let vendor = fixture.vendor;
         let long_reply = format!("terminal-origin-{vendor}-long-{nonce}");
-        // The first turn is a long generation that needs no tool, not a shell wait: vendors block
-        // or time out shell waits (Claude Code refuses a foreground `sleep`) and their shell
-        // permissions differ per row. Emitting 300 numbers takes well over 10 s on every vendor,
-        // which outlasts the second submission made right after the pane is seen working.
         let long_prompt = format!(
             "List the numbers from 1 to 300, one per line. On the last line write exactly: {long_reply}"
         );
@@ -5807,8 +5282,6 @@ mod tests {
         assert_queued_reply_follows_first_reply(&messages, &long_reply, &queued_reply)
     }
 
-    /// Asserts the plain message equal to `queued_reply` follows the plain message containing
-    /// `first_reply`, and that each is present exactly once.
     #[cfg(unix)]
     fn assert_queued_reply_follows_first_reply(
         messages: &[twilight_model::channel::Message],
@@ -5862,9 +5335,6 @@ mod tests {
             .map_err(|error| error.to_string())
     }
 
-    /// Asserts the thread carries exactly one webhook-authored message with `prompt`'s content,
-    /// under `owner_display_name`, positioned before the plain (non-webhook) message carrying the
-    /// assistant's `reply`.
     #[cfg(unix)]
     fn assert_terminal_prompt_mirrored_before_reply(
         messages: &[twilight_model::channel::Message],
@@ -5904,8 +5374,6 @@ mod tests {
         Ok(())
     }
 
-    /// Asserts no webhook-authored message carries `prompt`'s content: a prompt submitted through
-    /// the bridge's own Discord path must not be mirrored back into the thread it came from.
     #[cfg(unix)]
     fn assert_prompt_was_not_mirrored(
         messages: &[twilight_model::channel::Message],
@@ -5922,13 +5390,6 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real pane through three turns for `vendor`: a first turn -- the new session's
-    /// very first prompt, typed before its log even exists -- whose prompt is mirrored ahead of its
-    /// assistant reply exactly like the second, ordinary terminal-origin turn's is, a third turn
-    /// submitted through the bridge's own Discord path (`submit_owner_prompt`) whose prompt must not
-    /// be mirrored back, and a fourth where a second Discord prompt is submitted while the pane is
-    /// `working` on a long turn: the agent queues it, its reply follows the long turn's, and
-    /// neither prompt is mirrored back.
     #[cfg(unix)]
     async fn terminal_origin_prompt_exercise(
         guild: &BlockedCaptureGuild,
@@ -5961,9 +5422,6 @@ mod tests {
         );
         let identity =
             herdr_connect_rs::fetch_owner_identity(guild.client.as_ref(), owner_id).await?;
-        // `mirror_terminal_prompts` mirrors under the connection's identity, which only the real
-        // startup path (`run_bridge`) fetches; this harness builds its own connection and must set
-        // it too.
         connection.4 = identity.clone();
         let nonce = agent_name_nonce()?;
         let fixture = TerminalPromptFixture {
@@ -6036,8 +5494,6 @@ mod tests {
         Ok(())
     }
 
-    /// Real-service coverage shared by every vendor's terminal-prompt exercise: fixture creation,
-    /// the exercise itself, and the same zero-leftover cleanup regardless of outcome.
     #[cfg(unix)]
     async fn run_terminal_origin_prompt_test(vendor: &'static str) {
         let Some(guild) = blocked_capture_guild() else {
@@ -6123,14 +5579,10 @@ mod tests {
     #[cfg(unix)]
     const ACTIVITY_LABEL: &str = "testrun-activity";
 
-    /// `echo`: an instant tool step, so the turn settles almost immediately after the one activity
-    /// frame it produces.
     #[cfg(unix)]
     const ACTIVITY_FORCE_PROMPT: &str =
         "Run the shell command `echo activity-check`. Then say the word done.";
 
-    /// Testrun tab cwd fixture for the activity hook exercise, mirroring `live_capture_tab_fixture`
-    /// under its own label so the two tests' zero-leftover checks never collide.
     #[cfg(unix)]
     fn activity_tab_fixture() -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
@@ -6149,11 +5601,6 @@ mod tests {
         Ok((tab, cwd_dir))
     }
 
-    /// The freshly built `herdr-connect-rs` binary, resolved at runtime: `CARGO_BIN_EXE_*` is not
-    /// defined at compile time for a bin target's own test harness (only for a separate target
-    /// that depends on it, such as an integration test under `tests/`), so this walks up from the
-    /// running test binary's own path (`target/<profile>/deps/<test-binary>`) to its sibling bin
-    /// artifact (`target/<profile>/herdr-connect-rs`) instead.
     #[cfg(unix)]
     fn activity_binary_path() -> Result<PathBuf, String> {
         let current = std::env::current_exe().map_err(|error| error.to_string())?;
@@ -6174,8 +5621,6 @@ mod tests {
         }
     }
 
-    /// Writes a Claude `--settings` file registering the `PreToolUse` activity hook against
-    /// `broker_socket`, per [examples/claude-hooks.json](../examples/claude-hooks.json)'s shape.
     #[cfg(unix)]
     fn write_activity_settings(broker_socket: &Path) -> Result<PathBuf, String> {
         let binary = activity_binary_path()?;
@@ -6214,8 +5659,6 @@ mod tests {
         Ok(path)
     }
 
-    /// Mirrors `start_claude_haiku_agent`, additionally passing `--settings <settings_path>` so
-    /// the spawned Claude process registers the activity hook under test.
     #[cfg(unix)]
     fn start_claude_haiku_agent_with_settings(
         name: &str,
@@ -6263,12 +5706,6 @@ mod tests {
         }
     }
 
-    /// Submits `prompt`, drives the pane through `working` (marking it activity-eligible via
-    /// `own`, the same as a real doorbell would), drains activity frames into `state` until the
-    /// pane settles, then marks it settled via `own` (forgetting the turn's activity message and
-    /// revoking eligibility, exactly as `process_snapshot` does in production). Returns the
-    /// settled snapshot. `activity` pairs the broker's frame receiver with the diagnostic list that
-    /// records each received frame.
     #[cfg(unix)]
     async fn drive_one_activity_turn(
         pane_id: &str,
@@ -6320,10 +5757,6 @@ mod tests {
         Ok(settled)
     }
 
-    /// One diagnostic line for a frame the broker forwarded: milliseconds since `started`, the
-    /// frame's pane, tool, summary (40 chars) and session (16 chars), and whether the pane was
-    /// activity-eligible when the frame arrived. The production broker socket also carries every
-    /// other live agent's frames, so a failing row needs this list to show which frames it handled.
     #[cfg(unix)]
     fn activity_frame_line(
         started: Instant,
@@ -6341,7 +5774,6 @@ mod tests {
         )
     }
 
-    /// The thread's plain `⚙️`-prefixed messages, in post order.
     #[cfg(unix)]
     fn activity_message_rows(
         messages: &[(String, bool, Id<MessageMarker>)],
@@ -6354,10 +5786,6 @@ mod tests {
         rows
     }
 
-    /// Row 1: asserts `messages` (the thread right after turn one settles) holds exactly one
-    /// activity message naming `Bash` and no card (embed) at all -- a turn that does not block posts
-    /// no card. The exercise wires no live capture, so the turn's own reply text is not in the
-    /// thread; that live-text path is covered by the live-capture rows. Returns the message's id.
     #[cfg(unix)]
     fn assert_first_turn_activity(
         messages: &[(String, bool, Id<MessageMarker>)],
@@ -6382,9 +5810,6 @@ mod tests {
         Ok(*activity_id)
     }
 
-    /// Row 2 continued: asserts `messages` (the thread after turn two settles) holds turn one's
-    /// unchanged activity message plus a second, distinct one that starts its own count at 1 and
-    /// names `Bash` -- not an edit continuing turn one's count, and not the dropped late frame.
     #[cfg(unix)]
     fn assert_second_turn_activity(
         messages: &[(String, bool, Id<MessageMarker>)],
@@ -6417,12 +5842,6 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real `claude --model haiku` agent with the activity hook registered against a
-    /// real bridge broker (bound at `broker_socket`) through two turns, exercising every row of
-    /// the turn-boundary table in one continuous scenario: turn one posts one activity frame and no
-    /// card; a frame injected on the broker socket after the turn settles is dropped (no new
-    /// message, no edit of the settled one); turn two's first frame starts its own fresh message
-    /// rather than continuing turn one's count.
     #[cfg(unix)]
     async fn activity_hook_exercise(
         guild: &BlockedCaptureGuild,
@@ -6451,8 +5870,6 @@ mod tests {
             return Err("test broker did not create its socket".to_owned());
         }
 
-        // The activity hook only connects once Claude registers it at agent start, so the
-        // snapshot -- and everything routed from it -- is only meaningful once the agent exists.
         start_claude_haiku_agent_with_settings(agent_name, &tab.pane_id, settings_path)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
         let terminal = idle.terminal_id.clone();
@@ -6466,7 +5883,6 @@ mod tests {
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
 
-        // Row 1: a frame during the turn posts as an activity message, with no card.
         drive_one_activity_turn(
             &tab.pane_id,
             tabs,
@@ -6480,7 +5896,6 @@ mod tests {
         let after_first_turn = thread_messages(guild, thread).await?;
         let first_activity_id = assert_first_turn_activity(&after_first_turn, &frames)?;
 
-        // Row 2: a frame injected after the turn settled is dropped, not edited or recreated.
         let late_frame = herdr_connect_rs::ActivityFrame {
             kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
             vendor: VENDOR_CLAUDE.to_owned(),
@@ -6507,8 +5922,6 @@ mod tests {
             ));
         }
 
-        // Row 2 continued: the next turn starts its own message with count 1, not a continuation
-        // of the dropped late frame or turn one's count.
         drive_one_activity_turn(
             &tab.pane_id,
             tabs,
@@ -6608,8 +6021,6 @@ mod tests {
     #[cfg(unix)]
     const QUESTION_LABEL: &str = "testrun-question";
 
-    /// Instructs a real `claude --model haiku` agent to call `AskUserQuestion` with exactly the
-    /// single-select shape the rows below expect.
     #[cfg(unix)]
     const QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly one \
         question with header \"Color\", question text \"Which color?\", and exactly two options: \
@@ -6617,16 +6028,12 @@ mod tests {
         \"The color blue\". multiSelect must be false. Do not do anything else and do not say \
         anything else.";
 
-    /// The single-select question used by the wrap regression row, long enough to wrap in the
-    /// real 160-column Claude dialog.
     #[cfg(unix)]
     const WRAPPED_QUESTION: &str = "Your message is only a pasted kickoff for gauntlet run gk1004b on issue #110 (it reads as if another agent wrote it). It asks for discovery, sizing and a dispatch plan before any code is written, so which mode should I run it in?";
 
-    /// The forced single-select call whose question exercises dialog wrapping.
     #[cfg(unix)]
     const WRAPPED_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly one question with header \"Gauntlet mode\", question text \"Your message is only a pasted kickoff for gauntlet run gk1004b on issue #110 (it reads as if another agent wrote it). It asks for discovery, sizing and a dispatch plan before any code is written, so which mode should I run it in?\", and exactly two options: label \"Run it as written\" with description \"Execute the kickoff following its stated objectives for discovery, sizing, and dispatch plan\", and label \"Do not run\" with description \"Do not execute the gauntlet run\". multiSelect must be false. Do not do anything else and do not say anything else.";
 
-    /// The multiSelect counterpart of [`QUESTION_FORCE_PROMPT`].
     #[cfg(unix)]
     const MULTI_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now. Ask exactly \
         one question with header \"Toppings\", question text \"Which toppings?\", and exactly \
@@ -6634,8 +6041,6 @@ mod tests {
         description \"Add olives\", and label \"Mushrooms\" with description \"Add mushrooms\". \
         multiSelect must be true. Do not do anything else and do not say anything else.";
 
-    /// Testrun tab cwd fixture for the question rows, mirroring `activity_tab_fixture` under its
-    /// own label so the rows' zero-leftover checks never collide.
     #[cfg(unix)]
     fn question_tab_fixture() -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
@@ -6653,14 +6058,6 @@ mod tests {
         create_tab(&label, &workspace_id, cwd).map(|tab| (tab, cwd_dir))
     }
 
-    /// Builds a `MessageComponent` interaction JSON has no way to synthesize from a real Discord
-    /// client (there is no bot API that simulates a human clicking a button), so this constructs
-    /// the minimal wire shape [`handle_component`] actually reads: guild, a real channel (fetched
-    /// live so its shape is never guessed), the owner as the invoking user, and the tapped
-    /// component's `custom_id` plus any select-menu `values`. Every downstream effect this drives
-    /// -- the pane re-read, the typed keys, the real Discord card edit, the attempted (and
-    /// discarded) interaction response -- is real; only this upstream "a human tapped a button"
-    /// event is synthetic.
     #[cfg(unix)]
     fn synthetic_component_interaction(
         guild_id: Id<GuildMarker>,
@@ -6689,9 +6086,6 @@ mod tests {
         serde_json::from_value(payload).map_err(|error| error.to_string())
     }
 
-    /// Reads the settled pane's own real Claude session transcript and returns what it recorded
-    /// for the `AskUserQuestion` `toolUseResult.answers[question]`, proving Claude itself received
-    /// the answer.
     #[cfg(unix)]
     fn transcript_question_answer(
         home: &Path,
@@ -6716,7 +6110,6 @@ mod tests {
         }))
     }
 
-    /// A two-question call: a single-select question, then a multiSelect question.
     #[cfg(unix)]
     const TWO_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now, in a single \
         call with exactly two questions. First: header \"Color\", question text \"Which color?\", \
@@ -6727,7 +6120,6 @@ mod tests {
         description \"Add olives\", and label \"Mushrooms\" with description \"Add mushrooms\". \
         Do not do anything else and do not say anything else.";
 
-    /// A two-question call of two single-select questions.
     #[cfg(unix)]
     const TWO_SINGLE_QUESTION_FORCE_PROMPT: &str = "Use the AskUserQuestion tool right now, in a \
         single call with exactly two questions. First: header \"Color\", question text \"Which \
@@ -6737,42 +6129,23 @@ mod tests {
         \"Small\" with description \"A small one\", and label \"Large\" with description \"A large \
         one\". Do not do anything else and do not say anything else.";
 
-    /// How the owner answers the question card in one row.
     #[cfg(unix)]
     enum QuestionAction {
-        /// Taps the single-select button for this option index.
         Button(usize),
-        /// Picks these option indices in the multiSelect menu.
         Select(&'static [&'static str]),
-        /// Replies in the thread with this text, through the owner-message handler.
         Text(&'static str),
-        /// Taps option `1` of the first question, then answers the second question on the same
-        /// card with the given action.
         TwoQuestions(&'static QuestionAction),
-        /// Presses `1` in the pane's own dialog first, then taps option `1` on the now stale card.
-        /// This is the order where the tap reaches the bridge before it has seen the pane leave
-        /// `blocked`, which is a narrow window; usually the pane's departure retires the card
-        /// first, and a retired card has no controls left to tap.
         TerminalThenButton,
     }
 
-    /// What one question row observed.
     #[cfg(unix)]
     struct QuestionOutcome {
-        /// The pane's Herdr status read right before the owner acted: the terminal dialog was
-        /// showing the whole time the card was up.
         status_before: String,
-        /// The question card's content once the row finished.
         card: Option<String>,
-        /// What Claude's own session transcript recorded as the answer to each question.
         answered: Vec<Option<String>>,
-        /// Every message left in the tab thread.
         messages: Vec<String>,
     }
 
-    /// Drives one real `claude --model haiku` agent with no hook registered through a forced
-    /// question: the pane blocks on Claude's own dialog, the bridge's blocked-card path posts the
-    /// question card, and the owner answers through `action`.
     #[cfg(unix)]
     async fn question_dialog_exercise(
         guild: &BlockedCaptureGuild,
@@ -6805,8 +6178,6 @@ mod tests {
                 blocked.agent_status
             ));
         }
-        // The pane was `working` while it composed the question; the poll above may not have
-        // sampled that, and only a `working` -> `blocked` transition posts a card.
         state
             .previous
             .insert(blocked.terminal_id.clone(), STATUS_WORKING.to_owned());
@@ -6856,7 +6227,6 @@ mod tests {
         })
     }
 
-    /// Answers the open question card `token` the way `action` says.
     #[cfg(unix)]
     async fn perform_question_action(
         guild: &BlockedCaptureGuild,
@@ -6881,9 +6251,6 @@ mod tests {
                 super::handle_component(Arc::clone(&responder), interaction).await;
             }
             QuestionAction::Text(text) => {
-                // The gateway hands the handler the owner's message; REST message creation
-                // returns the bridge bot's message without a guild, so it is re-attributed to the
-                // owner the way the gateway event would carry it.
                 let mut message = guild
                     .client
                     .create_message(thread)
@@ -6914,7 +6281,6 @@ mod tests {
                 let card_before = card_message_ids(guild, thread).await?;
                 let interaction = click(format!("herdrask:{token}:1"), &[])?;
                 super::handle_component(Arc::clone(&responder), interaction).await;
-                // The handler returns only after the card moved on, so the new token is there.
                 let second_token = responder
                     .pending_question_token(thread)
                     .filter(|next| next != token)
@@ -6951,7 +6317,6 @@ mod tests {
         Ok(())
     }
 
-    /// The ids of the thread's messages that carry an embed: the open question cards.
     #[cfg(unix)]
     async fn card_message_ids(
         guild: &BlockedCaptureGuild,
@@ -6965,8 +6330,6 @@ mod tests {
             .collect())
     }
 
-    /// Runs [`question_dialog_exercise`] inside the real-guild fixture: zero leftovers before, the
-    /// tab and testrun channel cleaned on every path, and a named zero-leftover check after.
     #[cfg(unix)]
     async fn run_question_dialog_test(
         prompt: &str,
@@ -7030,10 +6393,6 @@ mod tests {
         Some(outcome)
     }
 
-    /// Real row: the pane showed its own wrapped dialog (`blocked`) while the card was up; the
-    /// Discord tap typed option 2's number key, Claude's transcript records Do not run, and the
-    /// blocked-card expiry retired the card once the next snapshot showed the pane had left
-    /// `blocked`.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -7052,9 +6411,6 @@ mod tests {
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
-    /// Real row: the owner pressed `1` in the pane while the card was up, so the late Discord tap
-    /// types nothing and the card says it was answered in the terminal; Claude's transcript
-    /// records the terminal's Red, not the tapped Blue.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -7076,8 +6432,6 @@ mod tests {
         );
     }
 
-    /// Real row: the multiSelect menu pick of options 0 and 2 toggles both checkboxes, moves to
-    /// Submit, and submits; Claude's transcript records the comma-joined labels.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -7096,11 +6450,6 @@ mod tests {
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
-    /// Real row: a thread reply, routed through the owner-message handler, presses the "Type
-    /// something" entry's number (the one after the two options), types the text, and presses
-    /// Enter; Claude's transcript records the text and the handler answers `accepted`. The keys for
-    /// the free-text entry were not probed live, so this row is their evidence: if the dialog takes
-    /// different keys, record them here and in `answer_steps`.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -7133,11 +6482,6 @@ mod tests {
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
-    /// Real row: a two-question call of two single-select questions is answered entirely from
-    /// Discord on one card. The first tap types option 2's number, which answers the question and
-    /// advances the dialog by itself; the card is edited in place to the second question; the
-    /// second tap types option 2's number and then `enter` on the review screen. Claude's
-    /// transcript records both answers.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -7159,10 +6503,6 @@ mod tests {
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
-    /// Real row: a two-question call (single-select, then multiSelect) is answered entirely from
-    /// Discord on one card. The first tap types option 2's number, which moves the dialog on; the
-    /// card is edited in place to the second question; its pick of options 0 and 2 toggles both,
-    /// moves to Submit, and submits. Claude's transcript records both answers.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -7187,25 +6527,9 @@ mod tests {
         assert_eq!(outcome.card.as_deref(), Some("resolved: pane left blocked"));
     }
 
-    /// The real Codex account's own broker socket, matching its already-installed
-    /// `CODEX_HOME/hooks.json` (`PreToolUse` activity hook and `PermissionRequest` hook, both
-    /// `--socket /tmp/herdr-claude-broker.sock`), per [examples/codex-hooks.json](../examples/codex-hooks.json)'s
-    /// shape. Environment precondition, the same way [`codex_testrun_dir`] is: Codex has no
-    /// `--settings` flag like Claude's to inject a hook per run, and a temporary `CODEX_HOME`
-    /// (even one symlinking every file from the real one) never gets a Codex session reported by
-    /// Herdr, so this exercise requires `CODEX_HOME` to already be set to the real account's own
-    /// config directory and binds the hook's own fixed socket instead of a private one. Second
-    /// precondition: the account's hooks must already be trusted -- after `hooks.json` changes,
-    /// Codex shows "Hooks need review" and runs no hooks at all until a pane trusts them, so an
-    /// untrusted `SessionStart` hook silently stops Herdr from ever reporting a session for the
-    /// account.
     #[cfg(unix)]
     const CODEX_ACTIVITY_BROKER_SOCKET: &str = "/tmp/herdr-claude-broker.sock";
 
-    /// Fails fast, naming exactly what is missing, when the Codex activity row's environment
-    /// preconditions are unmet: `CODEX_HOME` is not set, its `hooks.json` lacks the activity hook
-    /// on [`CODEX_ACTIVITY_BROKER_SOCKET`], or a hook entry it declares has no trust record in the
-    /// shared `config.toml`'s `[hooks.state]`.
     #[cfg(unix)]
     fn assert_codex_activity_environment() -> Result<(), String> {
         let codex_home =
@@ -7252,8 +6576,6 @@ mod tests {
         Ok(())
     }
 
-    /// Testrun tab cwd fixture for the Codex activity hook exercise, mirroring `activity_tab_fixture`
-    /// under its own label so the two tests' zero-leftover checks never collide.
     #[cfg(unix)]
     fn codex_activity_tab_fixture(label: &str) -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
@@ -7271,10 +6593,6 @@ mod tests {
         Ok((tab, cwd_dir))
     }
 
-    /// Removes the real on-disk Codex session file a live pane's reported session resolves to, if
-    /// any. Best-effort, mirroring `cleanup_real_claude_session_dir` for Codex's flat session-file
-    /// layout (a session id is one file, not a project directory), the same way
-    /// `live_capture_exercise`'s own Codex cleanup branch does.
     #[cfg(unix)]
     fn cleanup_real_codex_session_file(home: &Path, pane_id: &str) {
         let Ok(snapshot) = snapshot_for_pane(pane_id) else {
@@ -7288,14 +6606,6 @@ mod tests {
         }
     }
 
-    /// Codex counterpart to `activity_hook_exercise`: drives one real `codex --no-daemon --model gpt-5.6-luna`
-    /// agent, started (via the already vendor-generic `start_live_capture_agent`) in a pane on the
-    /// real Codex account, through the same turn-boundary table -- reusing `drive_one_activity_turn`,
-    /// `assert_first_turn_activity`, and `assert_second_turn_activity` verbatim, since none of them
-    /// are vendor-specific. `broker_socket` is [`CODEX_ACTIVITY_BROKER_SOCKET`], the account's own
-    /// pre-installed hook target, not a private socket.
-    /// Deletes the broker socket file on drop, so the Codex activity exercise removes it only
-    /// once this test has confirmed it bound it -- never on an early failure before or during bind.
     #[cfg(unix)]
     struct RemoveSocketOnDrop<'a>(&'a Path);
 
@@ -7342,8 +6652,6 @@ mod tests {
         }
         let _remove_socket_on_drop = RemoveSocketOnDrop(broker_socket);
 
-        // The activity hook only connects once Codex registers it at agent start, so the
-        // snapshot -- and everything routed from it -- is only meaningful once the agent exists.
         start_live_capture_agent("codex", agent_name, &tab.pane_id)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
         let terminal = idle.terminal_id.clone();
@@ -7357,7 +6665,6 @@ mod tests {
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
 
-        // Row 1: a frame during the turn posts as an activity message, with no card.
         drive_one_activity_turn(
             &tab.pane_id,
             tabs,
@@ -7371,7 +6678,6 @@ mod tests {
         let after_first_turn = thread_messages(guild, thread).await?;
         let first_activity_id = assert_first_turn_activity(&after_first_turn, &frames)?;
 
-        // Row 2: a frame injected after the turn settled is dropped, not edited or recreated.
         let late_frame = herdr_connect_rs::ActivityFrame {
             kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
             vendor: VENDOR_CODEX.to_owned(),
@@ -7385,8 +6691,6 @@ mod tests {
         let late_started = Instant::now();
         herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
             .await;
-        // The production socket is shared with the owner's other live panes, so foreign frames
-        // can queue ahead of the synthetic one: handle each, until the synthetic frame arrives.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let received = tokio::time::timeout_at(deadline, activity_rx.recv())
@@ -7409,8 +6713,6 @@ mod tests {
             ));
         }
 
-        // Row 2 continued: the next turn starts its own message with count 1, not a continuation
-        // of the dropped late frame or turn one's count.
         drive_one_activity_turn(
             &tab.pane_id,
             tabs,
@@ -7490,8 +6792,6 @@ mod tests {
         run_codex_activity_hook_test().await;
     }
 
-    /// Reports a real Claude session identity on a pane through Herdr's own
-    /// `pane.report_agent_session` RPC.
     #[cfg(unix)]
     fn report_agent_session(pane_id: &str, session_id: &str) -> Result<(), String> {
         let args = [
@@ -7519,8 +6819,6 @@ mod tests {
         }
     }
 
-    /// Generates a session id shaped like a real Claude session UUID, unique enough for a single
-    /// test run.
     #[cfg(unix)]
     fn generate_claude_session_id() -> Result<String, String> {
         let nanos = SystemTime::now()
@@ -7537,20 +6835,12 @@ mod tests {
         ))
     }
 
-    /// Reports idle then attaches a fresh stub session to a shell pane, for topology/sweep
-    /// fixtures that need a session-carrying agent but never drive a real transition.
     #[cfg(unix)]
     fn report_idle_with_session(pane_id: &str) -> Result<(), String> {
         report_agent_state(pane_id, "idle")?;
         report_agent_session(pane_id, &generate_claude_session_id()?)
     }
 
-    /// Starts a real `claude --model haiku` agent on a pane already at its interactive shell
-    /// prompt, retrying `agent_pane_busy` while a freshly created pane's shell settles (mirrors
-    /// `tests/prompt_stall_followup.rs`'s `start_agent`). Success means Herdr detected the real
-    /// agent and its real Claude-hook-reported session. The pane must never have carried a
-    /// synthetic `report-agent`/`report-agent-session` call: Herdr then treats it as occupied and
-    /// rejects a real `agent start` with `agent_pane_busy` regardless of how long this retries.
     #[cfg(unix)]
     fn start_claude_haiku_agent(name: &str, pane_id: &str) -> Result<(), String> {
         herdr_json(&[
@@ -7594,9 +6884,6 @@ mod tests {
         error.contains("\"code\":\"agent_pane_busy\"")
     }
 
-    /// A short, lowercase, digit-only nonce for building a Herdr agent name: names must match
-    /// `[a-z][a-z0-9_-]{0,31}`, so this is built from the clock, never from a pane or tab id
-    /// (which may contain uppercase letters).
     #[cfg(unix)]
     fn agent_name_nonce() -> Result<String, String> {
         Ok(SystemTime::now()
@@ -7606,8 +6893,6 @@ mod tests {
             .to_string())
     }
 
-    /// Submits one prompt to a real running agent and waits for the resulting settled state,
-    /// through Herdr's own `agent prompt --wait`, not the bridge's prompt-submission path.
     #[cfg(unix)]
     fn prompt_claude_agent_and_wait(name: &str, text: &str) -> Result<(), String> {
         herdr_json(&[
@@ -7622,9 +6907,6 @@ mod tests {
         .map(|_| ())
     }
 
-    /// Removes the real on-disk Claude project directory a live pane's reported session resolves
-    /// under, if any. Best-effort: called from cleanup after a real agent has written its own
-    /// transcript, so nothing is left behind for `resolve_session_path` to find on a later run.
     #[cfg(unix)]
     fn cleanup_real_claude_session_dir(home: &Path, pane_id: &str) {
         let Ok(snapshot) = snapshot_for_pane(pane_id) else {
@@ -7992,9 +7274,6 @@ mod tests {
         assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
-    /// Creates a tab with no `--label`, so Herdr auto-assigns a numeric one. The tab has no
-    /// dedicated label to filter a zero-leftover check by; callers track the returned `tab_id`
-    /// instead.
     #[cfg(unix)]
     fn create_unlabeled_tab(workspace_id: &str, cwd: &str) -> Result<Tab, String> {
         let created = herdr_json(&[
@@ -8017,9 +7296,6 @@ mod tests {
         Ok(Tab { tab_id, pane_id })
     }
 
-    /// Real-Herdr exercise for an unlabeled tab whose agent has reported a session: the bridge's
-    /// first pass renames the tab to its generated name in Herdr and creates the thread under that
-    /// same name.
     #[cfg(unix)]
     async fn unlabeled_tab_gets_a_generated_name_exercise(
         guild: &BlockedCaptureGuild,
@@ -8072,8 +7348,6 @@ mod tests {
         Ok(())
     }
 
-    /// A tab's recorded rename failure is dropped once Herdr no longer lists the tab, and kept
-    /// while it does.
     #[test]
     fn rename_errors_are_pruned_with_their_closed_tab() {
         let mut state = BridgeState::default();
@@ -8426,8 +7700,6 @@ mod tests {
             .ok_or_else(|| format!("no channel found with topic {topic}"))
     }
 
-    /// Whether no channel with `topic` exists, distinguishing a successful empty lookup from a
-    /// transport failure: the latter propagates as `Err` instead of being read as absence.
     #[cfg(unix)]
     async fn channel_with_topic_is_absent(
         guild: &BlockedCaptureGuild,
@@ -8474,8 +7746,6 @@ mod tests {
             .threads)
     }
 
-    /// Whether a thread whose name ends with `suffix` still exists under `channel_id`, active or
-    /// archived.
     #[cfg(unix)]
     async fn thread_with_suffix_survives(
         guild: &BlockedCaptureGuild,
@@ -8500,7 +7770,6 @@ mod tests {
         Ok(archived.iter().any(has_suffix))
     }
 
-    /// The active thread under `channel_id` whose name ends with `suffix`.
     #[cfg(unix)]
     async fn active_tab_thread(
         guild: &BlockedCaptureGuild,
@@ -8520,10 +7789,6 @@ mod tests {
             .ok_or_else(|| "sync did not create the second tab's thread".to_owned())
     }
 
-    /// Checks that the parent channel holds, or no longer holds, the system message Discord posted
-    /// when it created `thread_id`. When it is expected present, it must carry the thread's own id,
-    /// which is what the production direct delete relies on. A mismatch reports the thread id and
-    /// the messages found with their ids and references.
     #[cfg(unix)]
     async fn expect_thread_created_message(
         guild: &BlockedCaptureGuild,
@@ -8574,9 +7839,6 @@ mod tests {
             .collect())
     }
 
-    /// Deletes every thread named `... [<tab_id>]` under the channel whose topic is `topic`, active
-    /// or archived. A tab in the shared real workspace mirrors into a channel that does not start
-    /// with `testrun-`, so the prefix-based cleanup never reaches its thread.
     #[cfg(unix)]
     async fn delete_tab_threads(
         guild: &BlockedCaptureGuild,
@@ -8610,7 +7872,6 @@ mod tests {
     #[cfg(unix)]
     const CLOSED_TOPOLOGY_LABEL: &str = "testrun-closed-topology";
 
-    /// Whether a tab's thread exists, and where, before [`closed_topology_exercise`] runs.
     #[cfg(unix)]
     enum ClosureBatchPresence {
         Active,
@@ -8618,9 +7879,6 @@ mod tests {
         Absent,
     }
 
-    /// One row in [`closed_topology_exercise`]'s table: a tab's thread presence going in, whether
-    /// its closure is applied, and whether the thread is expected to survive (`None` when no
-    /// thread exists to check).
     #[cfg(unix)]
     struct ClosureBatchCase {
         name: &'static str,
@@ -8629,10 +7887,6 @@ mod tests {
         expect_survives: Option<bool>,
     }
 
-    /// Table-driven, against a real Discord guild: applying each `tab.closed` closure on its own
-    /// (as the lifecycle loop now does, one event at a time) deletes only the closed tabs whose
-    /// threads the fetched active list or that channel's archived listing actually contains, and a
-    /// live tab's thread whose closure is never applied survives untouched.
     #[cfg(unix)]
     async fn closed_topology_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
         let nonce = format!(
@@ -8756,12 +8010,6 @@ mod tests {
     #[cfg(unix)]
     const LIVE_CLOSE_LABEL: &str = "testrun-live-close";
 
-    /// Drives a real `tab.closed` then a real `workspace.closed` event through the real lifecycle
-    /// handler and asserts the Discord effects the owner's deletion rule requires.
-    ///
-    /// Closing a workspace's last tab also closes the workspace, so this exercise keeps a second
-    /// tab alive through the tab-close step to observe tab close and workspace close as the two
-    /// separately-observable Discord effects.
     #[cfg(unix)]
     async fn live_close_exercise(
         guild: &BlockedCaptureGuild,
@@ -8805,9 +8053,6 @@ mod tests {
             activity_events,
         };
 
-        // One production doorbell on the fresh runtime records every live pane as seen through
-        // production code, so a later doorbell cannot recreate the root tab's thread and satisfy the
-        // survival check below.
         doorbell_snapshot(
             &connection,
             &mut runtime.state,
@@ -8939,13 +8184,9 @@ mod tests {
     #[cfg(unix)]
     const OWNER_DELETE_LABEL: &str = "testrun-owner-delete";
 
-    /// How long the real gateway needs to identify and receive guild events before a deletion is
-    /// issued; the gateway exposes no readiness signal, and a delete sent earlier is never seen.
     #[cfg(unix)]
     const GATEWAY_READY_WAIT: Duration = Duration::from_secs(8);
 
-    /// Starts the real Discord gateway with the production owner-deletion handling against
-    /// `connection`, returning its task and the notices it logs.
     #[cfg(unix)]
     async fn start_owner_deletion_gateway(
         connection: &super::DiscordConnection,
@@ -8980,10 +8221,6 @@ mod tests {
             .collect()
     }
 
-    /// Waits until the gateway logs `dispatch`, the notice it sends for every delete event it
-    /// handles, then keeps listening for `DELETION_ERROR_WINDOW` and returns the deletion
-    /// dispatch notices and the error notices seen. Errs when `dispatch` never arrives, so a
-    /// missing event is not mistaken for a suppressed one.
     #[cfg(unix)]
     async fn deletion_notices(
         notices: std::sync::mpsc::Receiver<String>,
@@ -9012,8 +8249,6 @@ mod tests {
         Ok((dispatched, errors))
     }
 
-    /// Deletes a tab's Discord thread as the owner would and asserts Herdr closes that tab, the
-    /// sibling tab survives.
     #[cfg(unix)]
     async fn owner_thread_delete_exercise(
         guild: &BlockedCaptureGuild,
@@ -9043,8 +8278,6 @@ mod tests {
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
-        // A delivery that met Unknown Channel clears the topology cache before the gateway
-        // handler runs; the handler must still resolve the tab without any cache.
         *connection.3.topology_cache().lock().await = None;
         let deleted = guild
             .client
@@ -9148,9 +8381,6 @@ mod tests {
         assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
-    /// Registers an archived tab thread through the production archived registration alone, then
-    /// deletes it as the owner would. The thread and its channel are created straight through the
-    /// Discord API, so no sync registers them, and the Herdr tab must close.
     #[cfg(unix)]
     async fn owner_archived_thread_delete_exercise(
         guild: &BlockedCaptureGuild,
@@ -9290,8 +8520,6 @@ mod tests {
         assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
-    /// Deletes a workspace's Discord channel as the owner would and asserts Herdr closes that
-    /// workspace.
     #[cfg(unix)]
     async fn owner_channel_delete_exercise(
         guild: &BlockedCaptureGuild,
@@ -9402,20 +8630,12 @@ mod tests {
     #[cfg(unix)]
     const SELF_DELETE_LABEL: &str = "testrun-self";
 
-    /// How long the gateway is given to dispatch the delete event of a bridge deletion.
     #[cfg(unix)]
     const DELETION_DISPATCH_WAIT: Duration = Duration::from_secs(30);
 
-    /// How long after the dispatch notice a handler that fails to recognise the deletion as the
-    /// bridge's own is given to log its error.
     #[cfg(unix)]
     const DELETION_ERROR_WINDOW: Duration = Duration::from_secs(4);
 
-    /// Deletes a testrun workspace channel, or one of its tab threads, through the production
-    /// delete path while the gateway runs, and returns the delete-event dispatch notices and the
-    /// errors the gateway logged. The ids are
-    /// testrun ids, so a deletion wrongly treated as the owner's makes Herdr refuse to close an id
-    /// it never had; no real tab or workspace can be closed.
     #[cfg(unix)]
     async fn bridge_deletion_gateway_errors(
         guild: &BlockedCaptureGuild,
@@ -9475,8 +8695,6 @@ mod tests {
         seen
     }
 
-    /// The bridge's own deletions of a tab thread and of a workspace channel come back through the
-    /// gateway as delete events and must not be forwarded to Herdr as owner deletions.
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
@@ -9520,9 +8738,6 @@ mod tests {
     #[cfg(unix)]
     const STARTUP_RECONCILE_LABEL: &str = "testrun-startup-reconcile";
 
-    /// Creates an orphan channel/thread pair and an orphan thread under a live workspace channel,
-    /// then runs the startup sweep and asserts it deletes exactly the topology Herdr no longer
-    /// lists.
     #[cfg(unix)]
     async fn startup_reconciliation_exercise(
         guild: &BlockedCaptureGuild,
@@ -9565,8 +8780,6 @@ mod tests {
             &format!("testrun-orphan [{}:t9Z]", route.workspace_id),
         )
         .await?;
-        // An owner-made thread whose bracket suffix is not this workspace's own tab id must
-        // survive: it is not a bridge-owned tab thread.
         let bystander_thread =
             create_guild_thread(guild, live_channel.id, "testrun-notes [staging]").await?;
 
@@ -9684,13 +8897,6 @@ mod tests {
         race_the_clear: bool,
     }
 
-    /// Creates an orphan channel/thread pair Herdr does not list, then runs the startup sweep's
-    /// delete pass against a `topology_cache` starting at `None`. When `race_the_clear` is set, a
-    /// second task hammers that same cache back to `None` on a separate worker thread for the
-    /// sweep's whole run -- mimicking a concurrent stale-route recovery (`deliver_to_route`,
-    /// `deliver_blocked_messages`, `handle_live_event`) clearing it mid-sweep. Either way the
-    /// orphan must still be deleted: the reconciliation pass must not abort just because it
-    /// observed an empty cache.
     #[cfg(unix)]
     async fn startup_sweep_survives_concurrent_clear_exercise(
         guild: &BlockedCaptureGuild,
@@ -9793,8 +8999,6 @@ mod tests {
     #[cfg(unix)]
     const NO_SESSION_LABEL: &str = "testrun-no-session";
 
-    /// Drives one pane through a working -> settled round-trip via `process_snapshot`, returning
-    /// the settled snapshot. Used by `drive_idle_working_done`'s second half.
     #[cfg(unix)]
     async fn drive_working_then_settled(
         workspace: &Workspace,
@@ -9832,10 +9036,6 @@ mod tests {
         Ok(settled)
     }
 
-    /// Drives one pane through a full idle -> working -> done round-trip via `process_snapshot`,
-    /// returning its route and the settled snapshot. Shared by `session_less_pane_exercise` and
-    /// `session_less_pane_stays_silent_while_session_pane_is_mirrored_exercise`'s silent-pane
-    /// half, which both start with this same silent phase.
     #[cfg(unix)]
     async fn drive_idle_working_done(
         workspace: &Workspace,
@@ -9853,11 +9053,6 @@ mod tests {
         Ok((route, settled))
     }
 
-    /// Drives a session-less pane through idle -> working -> done and asserts the owner's rule
-    /// that a pane reporting no session is not mirrored: no tab thread and no card of any kind is
-    /// created or posted for it (README's "Herdr -> Discord" bullet). This test's workspace is
-    /// dedicated to the one pane, so its channel stays absent too, though the rule itself allows
-    /// a workspace channel to exist because another pane in it has a session.
     #[cfg(unix)]
     async fn session_less_pane_exercise(
         guild: &BlockedCaptureGuild,
@@ -9946,8 +9141,6 @@ mod tests {
     #[cfg(unix)]
     const STARTUP_SESSION_SKIP_LABEL: &str = "testrun-startup-session-skip";
 
-    /// Runs the startup sweep over one session-less agent and one session-carrying agent sharing
-    /// a workspace, and asserts the create pass mirrors only the session-carrying one.
     #[cfg(unix)]
     async fn startup_topology_session_skip_exercise(
         guild: &BlockedCaptureGuild,
@@ -10197,9 +9390,6 @@ mod tests {
                         ));
                     }
 
-                    // Delete the synced thread and the cached topology so that a second sync
-                    // would have to recreate the thread; a repeated idle snapshot is not a
-                    // transition and must not sync again.
                     guild
                         .client
                         .delete_channel(matching_threads[0].id)
@@ -10245,15 +9435,6 @@ mod tests {
     #[cfg(unix)]
     const SESSION_REPORTED_LATER_LABEL: &str = "testrun-session-reported-later";
 
-    /// Two-pane design, proving the owner's two rules in one exercise on two separate panes: a
-    /// session-less shell pane drives idle -> working -> done (mirroring `session_less_pane_exercise`)
-    /// to prove silence, while a separate, never-synthetically-reported pane starts a real
-    /// `claude --model haiku` agent and drives one real turn to prove that a session-carrying
-    /// pane's next qualifying transition creates the topology and posts its reply as live text. The two halves
-    /// cannot share one pane: Herdr treats a pane it has been told carries a synthetic agent (via
-    /// `report-agent`/`report-agent-session`) as occupied and rejects a real `agent start` on it
-    /// with `agent_pane_busy`. Status on the Claude pane comes only from its own live
-    /// `agent.list` snapshots; nothing is set by hand.
     #[cfg(unix)]
     async fn session_less_pane_stays_silent_while_session_pane_is_mirrored_exercise(
         guild: &BlockedCaptureGuild,
@@ -10331,8 +9512,6 @@ mod tests {
         while let Ok(terminal_id) = live_events.try_recv() {
             handle_live_event(&connection, &terminal_id, &mut state).await;
         }
-        // The persistent watch has no settle-time read of its own, so read once more to deliver the
-        // reply written just before `done`.
         handle_live_event(&connection, &claude_terminal, &mut state).await;
 
         let channel = guild_channel_with_topic(guild, &claude_topic)
