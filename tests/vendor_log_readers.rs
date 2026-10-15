@@ -42,12 +42,6 @@ fn read_captured_vendor_logs() {
     }
 }
 
-/// The checkpoint this test expects is the position [`read_claude_prompts_incremental`] itself
-/// scans through, not the position of the last prompt found in range: round-1 finding 6 measured
-/// checkpoint-at-last-prompt as a defect (a 21.9 MB turn re-read on every tick, 20 ticks costing
-/// 3.26 s instead of scanning through once), and the frozen expectation of `335` encoded exactly
-/// that defect. The orchestrator ruled it a genuinely wrong test under the AGENTS.md red-green law
-/// and authorized updating this expected checkpoint value alone.
 #[test]
 fn read_captured_claude_terminal_prompt_with_position() {
     let cases = [(
@@ -70,19 +64,6 @@ fn read_captured_claude_terminal_prompt_with_position() {
     }
 }
 
-/// `codex-session.jsonl`'s "current" prompt exists only as an `event_msg`/`user_message` record,
-/// with no `response_item` twin: the shape written by the 2 old (`cli` 0.144) and vscode sessions in
-/// the round-1-finding-1 scan, not by the interactive `cli` 0.147-0.154 sessions Herdr panes
-/// actually run. Now that the reader reads only `response_item` user `input_text` and ignores
-/// `event_msg`/`user_message` entirely, that case can never return a prompt from this fixture, so it
-/// is removed rather than pinned to an empty expectation; the fixture itself is untouched (still
-/// byte-identical to main).
-///
-/// The restored case below (`codex-session-response-item.jsonl`, offset `695`) is the frozen
-/// sub-case round-1 finding 1 originally covered and f593132 deleted when the round-4 reader still
-/// ignored `response_item` records; its checkpoint is the scanned-through offset, not the position
-/// of the last prompt found in range, for the same reason given in
-/// [`read_captured_claude_terminal_prompt_with_position`].
 #[test]
 fn read_captured_codex_terminal_prompts_once_with_position() {
     let cases = [(

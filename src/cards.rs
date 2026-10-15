@@ -58,8 +58,6 @@ pub fn create_transition_messages(
         })
         .collect()
 }
-/// Splits a live-captured assistant text at the same boundary transition cards use, with no part
-/// numbering: each part is posted as its own plain message.
 #[must_use]
 pub fn split_live_message(text: &str) -> Vec<String> {
     split_body(text)
@@ -150,13 +148,6 @@ fn chars_chunks(text: &str, limit: usize) -> Vec<String> {
     out
 }
 
-/// Formats a bounded Discord thread name from a tab's label.
-///
-/// # Errors
-///
-/// Returns an error when the label is empty or still Herdr's auto-assigned number (the bridge
-/// renames such tabs before routing, so a numeric label here means that rename failed), or when
-/// the tab id suffix cannot fit.
 pub fn format_thread_name(label: &str, tab_id: &str) -> Result<String, String> {
     let base = label.trim();
     if base.is_empty() {

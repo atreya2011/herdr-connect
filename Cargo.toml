@@ -17,6 +17,7 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+missing-errors-doc = { level = "allow", priority = 1 }
 # Twilight and Rustls bring unavoidable duplicate transitive versions.
 multiple-crate-versions = { level = "allow", priority = 1 }
 

@@ -1,8 +1,3 @@
-//! Owner-message routing is restricted to mapped Discord threads.
-//!
-//! The owner-authored end-to-end path is deferred to the orchestrator's live proof because REST
-//! message creation responses do not carry the guild identifier required by the gateway handler.
-
 use std::collections::HashSet;
 use std::future::Future;
 use std::hash::BuildHasher;
@@ -31,26 +26,11 @@ const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
 const STALL_RECOVERY_POLL_BOUND: Duration = Duration::from_secs(5);
 const STALL_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// One pending "the bridge itself submitted this text to this pane" marker: `(pane_id, text)`.
 type OwnerPromptSuppression = (String, String);
 
-/// Prompts the bridge submitted to Herdr on the owner's behalf, not yet observed back in the
-/// pane's vendor log. Consulted by every vendor's terminal-prompt mirroring so a prompt the owner
-/// typed in Discord is never mirrored back into the same thread it came from. A prompt queued
-/// behind a running turn reaches the log only when the agent starts it, so a marker lives until it
-/// is consumed or its pane departs ([`forget_departed_owner_prompt_suppressions`]).
 static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Handles one Discord owner message after gateway-level filtering.
-///
-/// A thread reply while a question card is open in that thread is typed into the pane's dialog as
-/// its free-text answer instead of being submitted as an `agent.prompt`: the pane is `blocked`
-/// then, and [`resolve_prompt_pane`] would refuse it.
-///
-/// # Errors
-///
-/// Returns Discord, Herdr, or task-dispatch errors.
 pub async fn handle_owner_message(
     client: Arc<Client>,
     guild: Id<GuildMarker>,
@@ -153,8 +133,6 @@ pub async fn handle_owner_message(
     }
 }
 
-/// Types `message` into the dialog of the question card open in its thread and returns the reply to
-/// post; `None` when no card is open there.
 async fn answer_pending_question(
     responder: &PermissionResponder,
     message: &Message,
@@ -205,9 +183,6 @@ fn prompt_surface_markers<'a, 'b>(
     Some((tab_id, workspace_id))
 }
 
-/// The one pane mapped to `tab_id`/`workspace_id`, independent of its Herdr status: shared by
-/// [`resolve_prompt_pane`] (which additionally gates on status) and the pending-question check in
-/// [`handle_owner_message`] (which must not gate on status).
 fn matching_agent<'agents>(
     tab_id: &str,
     workspace_id: &str,
@@ -235,26 +210,6 @@ fn resolve_prompt_pane(agent: &AgentSnapshot) -> Result<String, String> {
     }
 }
 
-/// Submits an owner prompt to a Herdr agent pane.
-///
-/// Records a suppression marker for `(target, text)` before submitting, so a terminal-prompt
-/// mirror that observes this exact text land in the pane's vendor log drops it instead of
-/// mirroring the bridge's own Discord-originated prompt back into the thread it came from. The
-/// marker is withdrawn only when the first `agent.prompt` fails, since only then the pane never
-/// received the text; once it was accepted, a later recovery failure keeps the marker because the
-/// text may already be submitted.
-///
-/// A pane that reports a stalled submission (the composer received the text but never actually
-/// submitted it) is recovered with a two-rung ladder: an Enter key press first, since that alone
-/// submits a paste-block-stuck composer; if the pane still has not left `idle` shortly after,
-/// a Ctrl+U clear followed by one fresh `agent.prompt` resubmission. The ladder runs only for a
-/// pane that was `idle` or `done` at submission: the agent itself queues a prompt submitted
-/// mid-turn, where a stalled prompt cannot be told from a queued one and Ctrl+U would clear the
-/// queued text, and a `blocked` pane would take the Enter key press as an answer to its dialog.
-///
-/// # Errors
-///
-/// Returns Herdr submission, follow-up key press, or pane-state errors.
 pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
     let status_at_submission = list_agents()?
         .iter()
@@ -278,10 +233,6 @@ pub fn submit_owner_prompt(target: &str, text: &str) -> Result<String, String> {
     agent_prompt(target, text)
 }
 
-/// Whether a submission needs the stall-recovery ladder: the pane was `idle` or `done` when the
-/// prompt went in and Herdr could not confirm the pane started working. Any other status leaves
-/// the pane alone: a `working` pane queues the prompt itself, so Ctrl+U would clear the queued
-/// text, and a `blocked` pane shows a dialog that an Enter key press would answer.
 fn stall_recovery_applies(status_at_submission: &str, result: &Result<String, String>) -> bool {
     matches!(status_at_submission, STATUS_IDLE | STATUS_DONE)
         && result.as_deref() == Ok(PROMPT_ACKNOWLEDGED_UNCONFIRMED)
@@ -294,7 +245,6 @@ fn record_owner_prompt_submission(pane_id: &str, text: &str) {
     suppressions.push((pane_id.to_owned(), text.to_owned()));
 }
 
-/// Drops every suppression marker whose pane is absent from `current_panes`.
 pub fn forget_departed_owner_prompt_suppressions(
     current_panes: &HashSet<String, impl BuildHasher>,
 ) {
@@ -323,11 +273,6 @@ fn forget_owner_prompt_submission(pane_id: &str, text: &str) {
     }
 }
 
-/// Consumes the suppression marker for `(pane_id, text)`, if one is pending.
-///
-/// `true` means this exact text was submitted by the bridge itself and must not be mirrored; the
-/// marker is cleared either way it matches, so a later, unrelated prompt with the same text
-/// mirrors normally.
 #[must_use]
 pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
     let mut suppressions = OWNER_PROMPT_SUPPRESSIONS
@@ -343,13 +288,6 @@ pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
     true
 }
 
-/// Polls `list_agents` for up to `bound`, returning true as soon as `target`'s pane is observed
-/// with an `agent_status` other than `idle`, or false when `bound` elapses first.
-///
-/// # Errors
-///
-/// Returns the `agent.list` error: with the pane's state unknown, the caller must not clear and
-/// resubmit.
 fn pane_left_idle(target: &str, bound: Duration) -> Result<bool, String> {
     let start = Instant::now();
     loop {
@@ -366,9 +304,6 @@ fn pane_left_idle(target: &str, bound: Duration) -> Result<bool, String> {
     }
 }
 
-/// Keeps the Discord typing indicator alive in `channel` while `still_working` reports true.
-///
-/// Re-triggers on `interval` and stops as soon as `still_working` reports false or errors.
 pub async fn maintain_typing_until_settled<F, Fut>(
     client: &Client,
     channel: Id<ChannelMarker>,
@@ -622,7 +557,6 @@ mod tests {
         }
     }
 
-    /// A `working` pane accepts the prompt: the agent queues it and answers after the current turn.
     #[test]
     fn resolve_prompt_pane_accepts_a_working_pane() {
         let value: Value =
@@ -641,9 +575,6 @@ mod tests {
         );
     }
 
-    /// Unlike [`resolve_prompt_pane`], `matching_agent` resolves a pane whatever its status: it
-    /// backs the pending-question check, which has to find a pane's session while a question is
-    /// pending.
     #[test]
     fn matching_agent_ignores_status_unlike_resolve_prompt_pane() {
         let value: Value =

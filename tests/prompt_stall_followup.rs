@@ -69,9 +69,6 @@ fn exercise(kind: &str, pane_id: &str) -> Result<(), String> {
     wait_until_not_idle(pane_id, Duration::from_secs(20))
 }
 
-/// A multi-kilobyte prompt reliably lands as an unsubmitted bracketed-paste block in a freshly
-/// started claude pane's composer, so Herdr reports `agent_prompt_stalled`; the cursor case keeps
-/// the original short prompt since it is only a regression check for the generalized path.
 fn prompt_text_for(kind: &str) -> String {
     if kind == "claude" {
         STALL_SENTENCE.repeat(STALL_SENTENCE_REPEATS)
@@ -108,14 +105,6 @@ fn create_tab(workspace_id: &str, cwd: &str, label: &str) -> Result<TestTab, Str
     Ok(TestTab { tab_id, pane_id })
 }
 
-/// Starts an agent on a freshly created pane, polling against real `agent.start` rejections until
-/// Herdr reports the pane as an available shell.
-///
-/// A freshly created pane's shell briefly forks startup-script subprocesses (oh-my-zsh compinit,
-/// profile hooks, ...) before settling; `agent start` rejects with `agent_pane_busy` while that
-/// window is open, and a plain pre-check of pane process state cannot close the gap because the
-/// state can change again between the check and the follow-up `agent start` call. Retrying the
-/// actual `agent start` call is Herdr's own authoritative answer to "is this pane available".
 fn start_agent(pane_id: &str, name: &str, kind: &str, agent_args: &[&str]) -> Result<(), String> {
     let bound = Duration::from_secs(10);
     let start = Instant::now();

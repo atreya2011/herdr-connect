@@ -1,7 +1,6 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
-/// The Claude hook event name for a synchronous permission request.
 const PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
 
 pub const VENDOR_CLAUDE: &str = "claude";
@@ -158,12 +157,6 @@ impl Decision {
     }
 }
 
-/// Decodes one Claude `PermissionRequest` hook payload into the broker interaction.
-///
-/// # Errors
-///
-/// Returns an error when the payload is not JSON, does not have the fixture's required fields,
-/// or names a different hook event.
 pub fn decode_claude_permission_request(input: &[u8]) -> Result<Interaction, String> {
     let request: ClaudePermissionRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
@@ -179,15 +172,6 @@ pub fn decode_claude_permission_request(input: &[u8]) -> Result<Interaction, Str
     })
 }
 
-/// Decodes one Codex `PermissionRequest` hook payload into the broker interaction.
-///
-/// Codex's `turn_id` is the vendor-neutral request id used by the broker in the existing
-/// `prompt_id` field.
-///
-/// # Errors
-///
-/// Returns an error when the payload is not JSON, does not have the required fields, or names a
-/// different hook event.
 pub fn decode_codex_permission_request(input: &[u8]) -> Result<Interaction, String> {
     let request: CodexPermissionRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
@@ -206,15 +190,6 @@ pub fn decode_codex_permission_request(input: &[u8]) -> Result<Interaction, Stri
     })
 }
 
-/// Decodes one Cursor `beforeShellExecution` hook payload into the broker interaction.
-///
-/// Cursor's `generation_id` is the vendor-neutral request id used by the broker in the existing
-/// `prompt_id` field. Cursor's shell hook supplies the command at the top level.
-///
-/// # Errors
-///
-/// Returns an error when the payload is not JSON, does not have the required fields, or names a
-/// different hook event.
 pub fn decode_cursor_permission_request(input: &[u8]) -> Result<Interaction, String> {
     let request: CursorPermissionRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
@@ -233,23 +208,16 @@ pub fn decode_cursor_permission_request(input: &[u8]) -> Result<Interaction, Str
     })
 }
 
-/// Encodes a broker decision in Claude's object-form hook response schema.
 #[must_use]
 pub fn encode_claude_decision(decision: &Decision) -> Vec<u8> {
     encode_permission_decision(decision)
 }
 
-/// Encodes a broker decision in Codex's object-form `PermissionRequest` hook response schema.
 #[must_use]
 pub fn encode_codex_decision(decision: &Decision) -> Vec<u8> {
     encode_permission_decision(decision)
 }
 
-/// Encodes a broker decision in Cursor's native shell-hook response schema.
-///
-/// # Errors
-///
-/// Returns an error if a deny decision carries no message.
 pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     let output = match decision.behavior {
         DecisionBehavior::Allow => serde_json::json!({"permission": "allow"}),
@@ -264,24 +232,12 @@ pub fn encode_cursor_decision(decision: &Decision) -> Result<Vec<u8>, String> {
     Ok(output.to_string().into_bytes())
 }
 
-/// Returns whether a `cursor-agent` argv runs hands-off.
-///
-/// Cursor's `--force` and its aliases `-f` and `--yolo` allow every shell command unless a hook
-/// explicitly denies it, so the bridge answers those seats itself instead of asking the owner.
-/// Only exact tokens count.
 #[must_use]
 pub fn cursor_argv_forces_allow(argv: &[String]) -> bool {
     argv.iter()
         .any(|arg| matches!(arg.as_str(), "--yolo" | "-f" | "--force"))
 }
 
-/// Returns whether an argv belongs to the `cursor-agent` CLI process.
-///
-/// The installed launcher execs node as `<invoked name> [--use-system-ca]
-/// <install>/cursor-agent/versions/<v>/index.js <flags>`, and the invoked name can be the `agent`
-/// symlink, so the process is recognised by the bundle argument: a path with a `cursor-agent`
-/// component whose file name is `index.js`. Wrappers such as `timeout 120 cursor-agent --yolo` or
-/// `zsh -c` carry `cursor-agent` only as a bare word or inside a string and do not match.
 #[must_use]
 pub fn is_cursor_agent_argv(argv: &[String]) -> bool {
     argv.iter().any(|arg| {

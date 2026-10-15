@@ -2,9 +2,6 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// Runs the built binary with an empty environment and a Herdr socket path that does not exist,
-/// so a process that wrongly starts the bridge cannot reach a real Herdr session. A process still
-/// running after the bound is killed and the test fails.
 fn run_with_empty_environment(args: &[&str]) -> Output {
     let missing_socket: PathBuf = std::env::temp_dir().join(format!(
         "herdr-connect-rs-startup-{}-missing.sock",

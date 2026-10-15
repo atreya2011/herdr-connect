@@ -8,47 +8,29 @@ use crate::herdr::AgentSession;
 use crate::permission::{VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR};
 use crate::question::Question;
 
-/// Key for a vendor log record's own type field (Claude: `user`/`assistant`; Codex: `turn_context`/`event_msg`).
 const RECORD_TYPE_KEY: &str = "type";
-/// Key for a Claude/Cursor content part's type (`text`, `tool_use`, `tool_result`, `tool-call`, `reasoning`).
 const CONTENT_PART_TYPE_KEY: &str = "type";
-/// Key for a Codex payload's type field (e.g. `task_started`, `turn_aborted`).
 const PAYLOAD_TYPE_KEY: &str = "type";
 const CONTENT_KEY: &str = "content";
-/// Key holding a Claude/Codex/Cursor content part's own text payload.
 const TEXT_KEY: &str = "text";
 const CONTENT_PART_TEXT_VALUE: &str = "text";
 const MESSAGE_KEY: &str = "message";
 const PAYLOAD_KEY: &str = "payload";
-/// Key for a Cursor row's author-role field.
 const ROLE_KEY: &str = "role";
-/// Value of a Cursor row's `role` field marking it as user-authored.
 const USER_ROLE_VALUE: &str = "user";
-/// Value of a Cursor row's `role` field marking it as assistant-authored.
 const ASSISTANT_ROLE_VALUE: &str = "assistant";
-/// Value of a Claude/Codex record's own `type` field marking it as assistant-authored.
 const ASSISTANT_RECORD_TYPE_VALUE: &str = "assistant";
-/// Value of a Codex record's own `type` field marking it as an event message.
 const EVENT_MSG_RECORD_TYPE_VALUE: &str = "event_msg";
-/// Value of a Claude record's own `type` field marking it as user-authored.
 const USER_RECORD_TYPE_VALUE: &str = "user";
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct AgentLog {
     pub message: String,
     pub question: Option<String>,
-    /// The structured questions of the pending `AskUserQuestion` call, empty when none is pending.
     pub pending_questions: Vec<Question>,
     pub failure: Option<String>,
 }
 
-/// Reads and parses one vendor session log.
-///
-/// # Errors
-///
-/// Returns the path and the underlying cause when the file cannot be read, is not valid UTF-8,
-/// holds a corrupt non-final record, holds no assistant message, the Cursor store cannot be opened
-/// or read, or the vendor is unsupported.
 pub fn read_agent_log(session: &AgentSession, path: &Path) -> Result<AgentLog, String> {
     let failed = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
     if session.agent == VENDOR_CURSOR {
@@ -67,12 +49,6 @@ pub fn read_agent_log(session: &AgentSession, path: &Path) -> Result<AgentLog, S
     .map_err(|error| failed(&error))
 }
 
-/// Reads bytes after `offset`, plus the byte length of the leading run of complete
-/// (newline-terminated) lines: bytes after the last `\n` are a still-being-written line, excluded.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be opened, seeked, or read.
 fn read_new_bytes(path: &Path, offset: u64) -> Result<(Vec<u8>, usize), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
@@ -88,8 +64,6 @@ fn read_new_bytes(path: &Path, offset: u64) -> Result<(Vec<u8>, usize), String> 
     Ok((bytes, complete_len))
 }
 
-/// One newline-terminated, non-blank line read from a vendor log, paired with the byte offset
-/// immediately after it: where an incremental reader resumes from if this line is consumed.
 struct PositionedLine<'a> {
     text: &'a str,
     end_offset: u64,
@@ -110,16 +84,6 @@ fn positioned_complete_lines(text: &str, start_offset: u64) -> Vec<PositionedLin
     out
 }
 
-/// Parses each positioned line as JSON and extracts zero or more texts (paired with that line's
-/// position) from records `extract` matches.
-///
-/// Tolerates a torn write like [`lines`] tolerates a truncated trailing line: a parse failure on
-/// only the LAST line defers it (offset stops before it, not past it), since its newline can flush
-/// ahead of the record it terminates. A failure on any earlier line is real corruption: an error.
-///
-/// # Errors
-///
-/// Returns the parse error for a non-final line that fails to parse as JSON.
 fn extract_tolerant(
     lines: &[PositionedLine<'_>],
     start_offset: u64,
@@ -142,13 +106,6 @@ fn extract_tolerant(
     Ok((texts, new_offset))
 }
 
-/// Reads new complete Claude assistant text parts appended to a session JSONL log since `offset`,
-/// each paired with the byte offset immediately after its record.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
-/// non-final complete line fails to parse as JSON.
 pub fn read_claude_incremental(
     path: &Path,
     offset: u64,
@@ -181,13 +138,6 @@ pub fn read_claude_incremental(
     })
 }
 
-/// Reads new complete Codex assistant text parts appended to a session JSONL log since `offset`,
-/// each paired with the byte offset immediately after its record.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
-/// non-final complete line fails to parse as JSON.
 pub fn read_codex_incremental(
     path: &Path,
     offset: u64,
@@ -224,13 +174,8 @@ pub fn read_codex_incremental(
     })
 }
 
-/// Marks a Claude user record as a harness-generated compaction continuation summary rather than
-/// owner-typed text, even though it otherwise has the same shape as a real prompt.
 const COMPACT_SUMMARY_KEY: &str = "isCompactSummary";
 
-/// Leading markers of Claude harness-injected text that share a real prompt's record shape:
-/// slash-command and bash-input echoes, tool-output wrappers, interruption notices, and
-/// task-notification wrappers. None of these are text the owner typed to the assistant.
 const INJECTED_CLAUDE_TEXT_PREFIXES: &[&str] = &[
     "<command-name>",
     "<command-message>",
@@ -242,25 +187,12 @@ const INJECTED_CLAUDE_TEXT_PREFIXES: &[&str] = &[
     "[Request interrupted",
 ];
 
-/// Whether a Claude user record's text is one the owner actually typed to the assistant, as
-/// opposed to harness-injected content that happens to share a real prompt's record shape.
 fn is_owner_typed_claude_text(text: &str) -> bool {
     !INJECTED_CLAUDE_TEXT_PREFIXES
         .iter()
         .any(|prefix| text.starts_with(prefix))
 }
 
-/// Reads new complete Claude user text records appended to a session JSONL log since `offset`,
-/// each paired with the byte offset immediately after its record.
-///
-/// Excludes compaction continuation summaries and harness-injected text (slash-command and
-/// bash-input echoes, tool-output wrappers, interruption notices, task notifications): text the
-/// owner never typed to the assistant, even though the record has the same shape as a real prompt.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
-/// non-final complete line fails to parse as JSON.
 pub fn read_claude_prompts_incremental(
     path: &Path,
     offset: u64,
@@ -301,10 +233,6 @@ pub fn read_claude_prompts_incremental(
     })
 }
 
-/// Leading markers of Codex harness-injected text that share a real prompt's `response_item` user
-/// record shape: environment/context injections, the repository's agent instructions, resumed-run
-/// user instructions, subagent notifications, and aborted-turn notices. None of these are text the
-/// owner typed to the assistant.
 const INJECTED_CODEX_TEXT_PREFIXES: &[&str] = &[
     "<environment_context>",
     "# AGENTS.md",
@@ -313,28 +241,12 @@ const INJECTED_CODEX_TEXT_PREFIXES: &[&str] = &[
     "<turn_aborted>",
 ];
 
-/// Whether a Codex `response_item` user record's text is one the owner actually typed to the
-/// assistant, as opposed to harness-injected content that happens to share a real prompt's record
-/// shape.
 fn is_owner_typed_codex_text(text: &str) -> bool {
     !INJECTED_CODEX_TEXT_PREFIXES
         .iter()
         .any(|prefix| text.starts_with(prefix))
 }
 
-/// Reads new complete Codex user text records appended to a session JSONL log since `offset`,
-/// each paired with the byte offset immediately after its record.
-///
-/// Reads `response_item` user `input_text` records: interactive Codex (`session_meta.source`
-/// `cli`, the TUI Herdr panes run) writes every typed prompt only in that shape and never as an
-/// `event_msg`/`user_message` record, so this is the sole prompt source. Excludes harness-injected
-/// text (environment/context injections, `AGENTS.md`, resumed-run user instructions, subagent
-/// notifications, aborted-turn notices) that shares the same record shape.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read, its new complete lines are not valid UTF-8, or a
-/// non-final complete line fails to parse as JSON.
 pub fn read_codex_prompts_incremental(
     path: &Path,
     offset: u64,
@@ -372,15 +284,6 @@ pub fn read_codex_prompts_incremental(
     })
 }
 
-/// Reads new complete Cursor assistant text parts from rows with `rowid` > `last_rowid`, paired
-/// with each row's `rowid` (store opened read-only).
-///
-/// `SQLite` rows are atomic: no torn-write case, a row is either committed and complete or not
-/// yet visible.
-///
-/// # Errors
-///
-/// Returns an error when the store cannot be opened or queried.
 pub fn read_cursor_incremental(
     path: &Path,
     last_rowid: i64,
@@ -426,9 +329,6 @@ pub fn read_cursor_incremental(
     Ok((texts, new_last_rowid))
 }
 
-/// Cursor wraps every real user turn in a `<timestamp>...</timestamp>` / `<user_query>...
-/// </user_query>` envelope before storing it. Returns the query's own text, trimmed, when the
-/// wrapper is present; otherwise the text unchanged.
 fn strip_cursor_user_query_wrapper(text: &str) -> &str {
     const OPEN_TAG: &str = "<user_query>";
     const CLOSE_TAG: &str = "</user_query>";
@@ -443,15 +343,6 @@ fn strip_cursor_user_query_wrapper(text: &str) -> &str {
         .map_or(text, |end| after_open[..end].trim())
 }
 
-/// Reads new complete Cursor user text parts from rows with `rowid` > `last_rowid`, paired with
-/// each row's `rowid` (store opened read-only).
-///
-/// `SQLite` rows are atomic: no torn-write case, a row is either committed and complete or not
-/// yet visible.
-///
-/// # Errors
-///
-/// Returns an error when the store cannot be opened or queried.
 pub fn read_cursor_prompts_incremental(
     path: &Path,
     last_rowid: i64,
@@ -532,8 +423,6 @@ fn lines(text: &str) -> Result<Vec<Value>, serde_json::Error> {
     }
     Ok(records)
 }
-/// Whether a Claude record is a real, non-meta user turn boundary — shared by the whole-log tail
-/// search and the live-capture turn-start position.
 fn is_qualifying_claude_user_record(record: &Value) -> bool {
     if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(USER_RECORD_TYPE_VALUE)
         || record.get("isMeta") == Some(&Value::Bool(true))
@@ -633,8 +522,6 @@ fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
         failure,
     })
 }
-/// Whether a Codex record marks the start of a new turn (`turn_context` or `task_started`) —
-/// shared by the whole-log tail search and the live-capture turn-start position.
 fn is_codex_turn_boundary_record(record: &Value) -> bool {
     record.get(RECORD_TYPE_KEY).and_then(Value::as_str) == Some("turn_context")
         || (record.get(RECORD_TYPE_KEY).and_then(Value::as_str)
@@ -721,10 +608,6 @@ fn parse_cursor_rows(rows: &[Value]) -> Result<AgentLog, serde_json::Error> {
     })
 }
 
-/// Extracts a pending dialog question from a Herdr detection snapshot.
-///
-/// The question is the block between the last two horizontal rules (lines made only of
-/// U+2500), with the checkbox header line and the `❯` cursor glyph dropped.
 #[must_use]
 pub fn format_detection_question(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();

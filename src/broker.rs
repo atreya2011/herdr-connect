@@ -41,13 +41,8 @@ use crate::{
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long, and how often, to poll for the dialog to show the next question after an answer.
 const NEXT_QUESTION_WAIT: Duration = Duration::from_secs(5);
 const NEXT_QUESTION_POLL: Duration = Duration::from_millis(100);
-/// Key pacing for typing into Claude's dialog. In a live probe a number key pressed within about a
-/// second of the dialog appearing was ignored, and keys sent back to back missed toggles. With a
-/// 2 s settle before the first input and 1 s between inputs, `1`, `3`, `right`, `enter` toggled
-/// Cheese and Mushrooms and submitted both.
 const DIALOG_SETTLE: Duration = Duration::from_secs(2);
 const INPUT_GAP: Duration = Duration::from_secs(1);
 const FAILED_CARD_TEXT: &str = "failed: answer the question in the terminal";
@@ -67,18 +62,11 @@ pub struct PermissionResponder {
     topology_cache: TopologyCache,
 }
 
-/// What came of an answer to a question card.
 #[derive(Debug, Eq, PartialEq)]
 pub enum QuestionOutcome {
-    /// The answer was typed into the pane's dialog.
     Sent,
-    /// The owner answered in the terminal: nothing was typed, and the card was retired, or moved
-    /// to the call's next question if the dialog is on it.
     AnsweredInTerminal,
-    /// The answer was typed, but the dialog did not show the call's next question in time, so the
-    /// card was retired.
     SentNotAdvanced,
-    /// No open card has this token.
     Unknown,
 }
 
@@ -120,8 +108,6 @@ where
     })
 }
 
-/// Returns `value` immediately, running `card_edit` to completion in a detached task: a caller
-/// (the hook) never waits on the card's final edit, only on the decision or answer itself.
 fn return_value_before_card_edit<T, F>(value: Option<T>, card_edit: F) -> Option<T>
 where
     T: Send + 'static,
@@ -158,13 +144,6 @@ impl PermissionResponder {
         self.registry.has_pending_session(session_id)
     }
 
-    /// Posts the question card for the dialog Claude shows in `pane_id`, which is on
-    /// `questions[index]`: one button per option for a single-select question, a select menu for a
-    /// multiSelect question.
-    ///
-    /// # Errors
-    ///
-    /// Returns token-generation or Discord delivery errors.
     pub async fn deliver_question_card(
         &self,
         channel: Id<ChannelMarker>,
@@ -194,30 +173,15 @@ impl PermissionResponder {
         Ok(message)
     }
 
-    /// Stops accepting answers for the question card `message`, once its card is retired.
     pub fn forget_question_card(&self, message: Id<MessageMarker>) {
         self.question_registry.forget_message(message);
     }
 
-    /// The token of the open question card in `channel`, the one a thread reply there answers.
     #[must_use]
     pub fn pending_question_token(&self, channel: Id<ChannelMarker>) -> Option<String> {
         self.question_registry.token_in_channel(channel)
     }
 
-    /// Types `answer` into the dialog of the pane behind question card `token`.
-    ///
-    /// The pane is re-read first: it must still be `blocked` and still show the card's question.
-    /// Otherwise the owner answered in the terminal, so nothing is sent and the card is edited to
-    /// say so, or to the call's next question if the dialog already shows it. When the answered question is not the last of its call, the same card is then edited
-    /// in place to the next question, once the dialog shows it.
-    ///
-    /// A card whose pane could not be read keeps its token, so the owner can tap it again. A card
-    /// whose typing or advance failed is edited to a failure text instead of keeping its buttons.
-    ///
-    /// # Errors
-    ///
-    /// Returns Herdr or Discord errors, or a refusal of free text for a multiSelect question.
     pub async fn answer_question(
         &self,
         token: &str,
@@ -244,7 +208,6 @@ impl PermissionResponder {
         match shown {
             Ok(Some(index)) if index == pending.index => {}
             Ok(Some(index)) => {
-                // The owner answered this question in the terminal and the dialog moved on.
                 self.move_card_to(&pending, index).await?;
                 return Ok(QuestionOutcome::AnsweredInTerminal);
             }
@@ -279,8 +242,6 @@ impl PermissionResponder {
         }
     }
 
-    /// Waits for the dialog to show the call's next question and edits the card in place to it.
-    /// Returns `false` when the dialog never showed it.
     async fn advance_card(&self, pending: &PendingQuestion) -> Result<bool, String> {
         let next = pending.index + 1;
         let (pane_id, question) = (pending.pane_id.clone(), pending.questions[next].clone());
@@ -291,7 +252,6 @@ impl PermissionResponder {
         Ok(true)
     }
 
-    /// Edits the card in place to `questions[index]` under a new token.
     async fn move_card_to(&self, pending: &PendingQuestion, index: usize) -> Result<(), String> {
         let next = PendingQuestion {
             index,
@@ -321,7 +281,6 @@ impl PermissionResponder {
         .await
     }
 
-    /// Retires a card whose answer failed partway, so it does not keep live-looking buttons.
     async fn fail_card(&self, pending: &PendingQuestion) {
         if let Err(error) = self.edit_card(pending, FAILED_CARD_TEXT).await {
             bridge_eprintln!("question card edit failed: {error}");
@@ -529,7 +488,6 @@ impl PermissionResponder {
     }
 }
 
-/// Runs a blocking Herdr call off the async runtime.
 async fn blocking<T: Send + 'static>(
     call: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
@@ -538,8 +496,6 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| format!("question answer task failed: {error}"))?
 }
 
-/// The index, from `from` on, of the first of `questions` the pane's dialog shows while the pane
-/// is `blocked`.
 fn shown_question_index(
     pane_id: &str,
     questions: &[Question],
@@ -555,8 +511,6 @@ fn shown_question_index(
     Ok((from..questions.len()).find(|&index| dialog_shows_question(&detection, &questions[index])))
 }
 
-/// Polls until the pane's dialog shows `question`, for at most the next-question wait; `false`
-/// when it never did.
 fn wait_for_dialog(pane_id: &str, question: &Question) -> Result<bool, String> {
     let deadline = Instant::now() + NEXT_QUESTION_WAIT;
     while !dialog_shows_question(&agent_read_detection(pane_id)?, question) {
@@ -591,8 +545,6 @@ fn type_steps(pane_id: &str, steps: &[AnswerStep]) -> Result<(), String> {
     Ok(())
 }
 
-/// Acknowledges a question tap at once, as an ephemeral deferred reply, because typing the answer
-/// takes longer than the three seconds Discord allows for a response, then fills the reply in.
 async fn answer_question_component(
     responder: &PermissionResponder,
     interaction: &DiscordInteraction,
@@ -755,11 +707,6 @@ enum CorrelationError {
     MismatchedRequest,
 }
 
-/// Accepts a broker response only when its session and prompt match the request.
-///
-/// # Errors
-///
-/// Returns `MismatchedRequest` for a response belonging to another or stale request.
 fn correlate_decision(
     interaction: &Interaction,
     response: BrokerResponse,
@@ -800,10 +747,6 @@ pub async fn request_decision(
     .flatten()
 }
 
-/// Sends one activity frame to the broker socket and returns without waiting for a reply.
-///
-/// A connect failure, write failure, or timeout is silently discarded, matching the activity
-/// hook's fire-and-forget contract.
 pub async fn send_activity_frame(
     frame: &ActivityFrame,
     socket_path: &Path,
@@ -850,11 +793,6 @@ impl From<&Interaction> for RequestFingerprint {
     }
 }
 
-/// Serves broker requests from an already-bound Unix listener until shutdown is signaled.
-///
-/// # Errors
-///
-/// Returns an I/O error when accepting a client connection fails.
 async fn serve_broker(
     listener: UnixListener,
     mut shutdown: oneshot::Receiver<()>,
@@ -879,14 +817,6 @@ async fn serve_broker(
     Ok(())
 }
 
-/// Binds and runs the Discord-backed permission broker until Ctrl-C or SIGTERM.
-///
-/// Every accepted activity frame is forwarded on `activity_tx`; a caller with no bridge to
-/// forward to may pass a sender whose receiver it has already dropped.
-///
-/// # Errors
-///
-/// Returns an I/O error when the socket cannot be bound or the listener fails.
 pub async fn run_broker(
     socket_path: &Path,
     responder: Arc<PermissionResponder>,
@@ -1002,10 +932,6 @@ const fn is_valid_interaction(interaction: &Interaction) -> bool {
         && !interaction.tool_input.command.is_empty()
 }
 
-/// Whether a raw initial frame names itself an activity frame, ahead of a typed decode: the
-/// broker socket carries both permission [`Interaction`] frames (untagged) and [`ActivityFrame`]
-/// frames (tagged `"kind":"activity"`), and this is the only way to tell them apart before
-/// choosing which type to deserialize into.
 fn is_activity_frame(bytes: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
