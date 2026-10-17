@@ -19,7 +19,7 @@ use herdr_connect_rs::{
     deliver_activity_message, send_activity_frame, update_activity_message,
 };
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, ENV_DISCORD_GUILD_ID,
+    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, Discord, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, GatewayContext,
     HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE,
     STATUS_WORKING, TopologyCache, TopologyRoute, Transition, TransitionMessage,
@@ -49,7 +49,7 @@ type DiscordConnection = (
     Arc<Client>,
     Id<GuildMarker>,
     String,
-    Arc<PermissionResponder>,
+    Arc<PermissionResponder<Discord>>,
     OwnerIdentity,
 );
 type GatewayTask = tokio::task::JoinHandle<Result<(), String>>;
@@ -101,7 +101,7 @@ struct BlockedCardContext<'a> {
     client: &'a Client,
     guild: Id<GuildMarker>,
     owner_id: &'a str,
-    responder: &'a PermissionResponder,
+    responder: &'a PermissionResponder<Discord>,
     topology_cache: &'a TopologyCache,
     route: &'a TopologyRoute,
     snapshot: &'a AgentSnapshot,
@@ -170,7 +170,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     if let Some((questions, index)) = shown_question(snapshot, session, detection.as_deref()).await
     {
         match responder
-            .deliver_question_card(target, &route.pane_id, questions, index)
+            .deliver_question_card(&target, &route.pane_id, questions, index)
             .await
         {
             Ok(message) => {
@@ -314,7 +314,7 @@ async fn expire_blocked_card(
 ) {
     if let Some(card) = informational_cards.get(terminal).copied() {
         let (client, _, _, responder, _) = discord;
-        responder.forget_question_card(card.message);
+        responder.forget_question_card(&card.message);
         if let Err(error) = expire_informational_card(
             client.as_ref(),
             card.channel,
@@ -336,7 +336,7 @@ async fn expire_departed_card(
     card: InformationalCard,
 ) {
     let (client, _, _, responder, _) = discord;
-    responder.forget_question_card(card.message);
+    responder.forget_question_card(&card.message);
     if let Err(error) = expire_informational_card(
         client.as_ref(),
         card.channel,
@@ -390,8 +390,13 @@ async fn maybe_sync_fresh_session_topology(
         }
     };
     let (client, guild, _, responder, _) = discord;
-    if let Err(error) =
-        sync_route(client.as_ref(), *guild, &route, responder.topology_cache()).await
+    if let Err(error) = sync_route(
+        client.as_ref(),
+        *guild,
+        &route,
+        responder.chat().topology_cache(),
+    )
+    .await
     {
         bridge_eprintln!("{error}");
     }
@@ -486,7 +491,7 @@ async fn deliver_postable_transition(
         guild: *guild,
         owner_id,
         responder: responder.as_ref(),
-        topology_cache: responder.topology_cache(),
+        topology_cache: responder.chat().topology_cache(),
         route: &route,
         snapshot,
         session,
@@ -518,10 +523,15 @@ async fn update_blocked_lifecycle(
     }
 }
 
-fn component_handler(responder: Arc<PermissionResponder>) -> ComponentHandler {
+fn component_handler(responder: Arc<PermissionResponder<Discord>>) -> ComponentHandler {
     Arc::new(move |interaction| {
         let responder = Arc::clone(&responder);
-        Box::pin(async move { handle_component(responder, interaction).await })
+        let component = responder.chat().component(interaction);
+        Box::pin(async move {
+            if let Some(component) = component {
+                handle_component(responder, component).await;
+            }
+        })
     })
 }
 
@@ -1126,7 +1136,7 @@ async fn mirror_terminal_prompts(
         return;
     }
     let (client, guild, _, responder, identity) = connection;
-    let topology_cache = responder.topology_cache();
+    let topology_cache = responder.chat().topology_cache();
     let (workspace_channel, thread) =
         match sync_route_channels(client.as_ref(), *guild, route, topology_cache).await {
             Ok(channels) => channels,
@@ -1177,7 +1187,7 @@ async fn handle_live_event(
             return;
         }
     };
-    let topology_cache = responder.topology_cache();
+    let topology_cache = responder.chat().topology_cache();
     let channel = match sync_route(client.as_ref(), *guild, &route, topology_cache).await {
         Ok(channel) => channel,
         Err(error) => {
@@ -1262,7 +1272,7 @@ async fn handle_activity_event(
         channel_name: String::new(),
         thread_name: String::new(),
     };
-    let topology_cache = responder.topology_cache();
+    let topology_cache = responder.chat().topology_cache();
     let channel = match cached_route_channel(topology_cache, &route).await {
         Ok(Some(channel)) => channel,
         Ok(None) => return,
@@ -1385,7 +1395,7 @@ async fn sync_startup_topology(
     tabs: &[HerdrTab],
 ) {
     let (client, guild, _, responder, _) = discord;
-    let topology_cache = responder.topology_cache();
+    let topology_cache = responder.chat().topology_cache();
     let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
         Ok(lists) => lists,
         Err(error) => {
@@ -1474,7 +1484,7 @@ async fn delete_closed_topology(
     closure: &TopologyClosure,
 ) -> Result<(), String> {
     let (client, guild, _, responder, _) = discord;
-    let topology_cache = responder.topology_cache();
+    let topology_cache = responder.chat().topology_cache();
     let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
     let mut guard = topology_cache.lock().await;
     let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
@@ -1591,12 +1601,12 @@ async fn discord_connection(
             bridge_eprintln!("{notice}");
         }
     });
-    let responder = Arc::new(PermissionResponder::new(
+    let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
         Arc::clone(&client),
         guild,
         config.owner_id.clone(),
         topology_cache,
-    ));
+    ))));
     let gateway = tokio::spawn(drive_gateway_with_components(
         config.token,
         GatewayContext {
@@ -1877,12 +1887,12 @@ async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
     let client = Arc::new(Client::builder().token(config.token.clone()).build());
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
-    let responder = Arc::new(PermissionResponder::new(
+    let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
         Arc::clone(&client),
         guild,
         config.owner_id.clone(),
         topology_cache,
-    ));
+    ))));
     let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
     drop(activity_rx);
     run_permission_broker(&socket_path, responder, activity_tx)
@@ -2443,14 +2453,15 @@ mod tests {
     };
 
     use super::{
-        BridgeRuntime, BridgeState, BrokerTask, Client, Follower, Membership, PermissionResponder,
-        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection, apply_membership,
-        capture_for_with_search_root, create_transition_messages, delete_closed_topology,
-        doorbell_snapshot, fetch_startup_owner_identity, fetch_topology_lists,
-        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
-        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
-        prune_departed_state, read_new_terminal_prompts, resolve_session_path, route_topology,
+        BridgeRuntime, BridgeState, BrokerTask, Client, Discord, Follower, Membership,
+        PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
+        agent_read_detection, apply_membership, capture_for_with_search_root,
+        create_transition_messages, delete_closed_topology, doorbell_snapshot,
+        fetch_startup_owner_identity, fetch_topology_lists, handle_lifecycle_select_result,
+        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
+        next_state_change_sequence, process_snapshot, prune_departed_state,
+        read_new_terminal_prompts, resolve_session_path, route_topology,
         subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
         terminal_prompt_baseline_is_current, unique_existing_path,
     };
@@ -3998,12 +4009,12 @@ mod tests {
         topology_cache: herdr_connect_rs::TopologyCache,
     ) -> super::DiscordConnection {
         let owner_id = std::env::var("DISCORD_OWNER_ID").expect("DISCORD_OWNER_ID is set");
-        let responder = Arc::new(PermissionResponder::new(
+        let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
             Arc::clone(&guild.client),
             guild.id,
             owner_id.clone(),
             topology_cache,
-        ));
+        ))));
         let identity = herdr_connect_rs::OwnerIdentity {
             display_name: owner_id.clone(),
             avatar_url: None,
@@ -6183,7 +6194,7 @@ mod tests {
             .insert(blocked.terminal_id.clone(), STATUS_WORKING.to_owned());
         own(&blocked, &tabs, &connection, &mut state).await;
         let token = responder
-            .pending_question_token(thread)
+            .pending_question_token(&thread)
             .ok_or("the blocked-card path posted no question card")?;
         let status_before = snapshot_for_pane(&tab.pane_id)?.agent_status;
 
@@ -6228,6 +6239,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn click_component(
+        responder: &Arc<PermissionResponder<Discord>>,
+        interaction: twilight_model::application::interaction::Interaction,
+    ) -> Result<(), String> {
+        let component = responder
+            .chat()
+            .component(interaction)
+            .ok_or("not a component")?;
+        Box::pin(super::handle_component(Arc::clone(responder), component)).await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
     async fn perform_question_action(
         guild: &BlockedCaptureGuild,
         connection: &super::DiscordConnection,
@@ -6244,11 +6268,11 @@ mod tests {
         match action {
             QuestionAction::Button(index) => {
                 let interaction = click(format!("herdrask:{token}:{index}"), &[])?;
-                super::handle_component(Arc::clone(&responder), interaction).await;
+                click_component(&responder, interaction).await?;
             }
             QuestionAction::Select(values) => {
                 let interaction = click(format!("herdrask-multi:{token}"), values)?;
-                super::handle_component(Arc::clone(&responder), interaction).await;
+                click_component(&responder, interaction).await?;
             }
             QuestionAction::Text(text) => {
                 let mut message = guild
@@ -6280,9 +6304,9 @@ mod tests {
             QuestionAction::TwoQuestions(second) => {
                 let card_before = card_message_ids(guild, thread).await?;
                 let interaction = click(format!("herdrask:{token}:1"), &[])?;
-                super::handle_component(Arc::clone(&responder), interaction).await;
+                click_component(&responder, interaction).await?;
                 let second_token = responder
-                    .pending_question_token(thread)
+                    .pending_question_token(&thread)
                     .filter(|next| next != token)
                     .ok_or("the card never moved to the second question")?;
                 if card_message_ids(guild, thread).await? != card_before {
@@ -6297,7 +6321,7 @@ mod tests {
                     }
                     _ => return Err("the second answer must be a button or a select".to_owned()),
                 };
-                super::handle_component(Arc::clone(&responder), interaction).await;
+                click_component(&responder, interaction).await?;
             }
             QuestionAction::TerminalThenButton => {
                 let status = Command::new("herdr")
@@ -6311,7 +6335,7 @@ mod tests {
                     snapshot.agent_status != "blocked"
                 })?;
                 let interaction = click(format!("herdrask:{token}:1"), &[])?;
-                super::handle_component(Arc::clone(&responder), interaction).await;
+                click_component(&responder, interaction).await?;
             }
         }
         Ok(())
@@ -8278,7 +8302,7 @@ mod tests {
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
-        *connection.3.topology_cache().lock().await = None;
+        *connection.3.chat().topology_cache().lock().await = None;
         let deleted = guild
             .client
             .delete_channel(thread.id)
@@ -9395,7 +9419,7 @@ mod tests {
                         .delete_channel(matching_threads[0].id)
                         .await
                         .map_err(|error| error.to_string())?;
-                    *connection.3.topology_cache().lock().await = None;
+                    *connection.3.chat().topology_cache().lock().await = None;
                     process_snapshot(
                         &idle,
                         std::slice::from_ref(&idle),

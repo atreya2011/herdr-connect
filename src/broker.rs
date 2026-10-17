@@ -10,21 +10,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
-use twilight_http::Client;
-use twilight_model::application::interaction::{
-    Interaction as DiscordInteraction, InteractionData,
-};
-use twilight_model::channel::message::MessageFlags;
-use twilight_model::http::interaction::{
-    InteractionResponse, InteractionResponseData, InteractionResponseType,
-};
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, GuildMarker, MessageMarker},
-};
 
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
-use crate::delivery::expire_permission_card;
+use crate::chat::{Ack, Chat, Component};
 use crate::herdr::{STATUS_BLOCKED, agent_read_detection, agent_send_keys, pane_send_text};
 use crate::permission::{Decision, DecisionBehavior, Interaction};
 use crate::question::{Answer, AnswerStep, Question, answer_steps, dialog_shows_question};
@@ -32,11 +20,7 @@ use crate::registry::{
     ApprovalRequest, InteractionRegistry, PendingQuestion, QuestionRegistry, ResolveError,
     generate_token,
 };
-use crate::{
-    TopologyCache, bridge_eprintln, deliver_permission_card, deliver_question_card,
-    expire_informational_card, fetch_topology_lists, list_agents, route_topology, sync_topology,
-    tab_list_result, update_question_card,
-};
+use crate::{bridge_eprintln, list_agents, route_topology, tab_list_result};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
@@ -53,13 +37,10 @@ pub const fn hook_timeout() -> Duration {
     Duration::from_secs(PERMISSION_TIMEOUT.as_secs() + 5)
 }
 
-pub struct PermissionResponder {
-    client: Arc<Client>,
-    guild: Id<GuildMarker>,
-    owner_id: String,
-    registry: Arc<InteractionRegistry>,
-    question_registry: QuestionRegistry,
-    topology_cache: TopologyCache,
+pub struct PermissionResponder<C: Chat> {
+    chat: Arc<C>,
+    registry: Arc<InteractionRegistry<C::Route>>,
+    question_registry: QuestionRegistry<C::Route, C::Message>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -121,22 +102,19 @@ where
     value
 }
 
-impl PermissionResponder {
+impl<C: Chat> PermissionResponder<C> {
     #[must_use]
-    pub fn new(
-        client: Arc<Client>,
-        guild: Id<GuildMarker>,
-        owner_id: String,
-        topology_cache: TopologyCache,
-    ) -> Self {
+    pub fn new(chat: Arc<C>) -> Self {
         Self {
-            client,
-            guild,
-            owner_id,
+            chat,
             registry: Arc::new(InteractionRegistry::default()),
             question_registry: QuestionRegistry::default(),
-            topology_cache,
         }
+    }
+
+    #[must_use]
+    pub const fn chat(&self) -> &Arc<C> {
+        &self.chat
     }
 
     #[must_use]
@@ -146,25 +124,21 @@ impl PermissionResponder {
 
     pub async fn deliver_question_card(
         &self,
-        channel: Id<ChannelMarker>,
+        channel: &C::Route,
         pane_id: &str,
         questions: Vec<Question>,
         index: usize,
-    ) -> Result<Id<MessageMarker>, String> {
+    ) -> Result<C::Message, String> {
         let token = generate_token()?;
-        let message = deliver_question_card(
-            self.client.as_ref(),
-            channel,
-            &questions[index],
-            &token,
-            &self.owner_id,
-        )
-        .await?;
+        let message = self
+            .chat
+            .post_question_card(channel, &questions[index], &token)
+            .await?;
         self.question_registry.insert(
             token,
             PendingQuestion {
-                channel,
-                message,
+                channel: channel.clone(),
+                message: message.clone(),
                 pane_id: pane_id.to_owned(),
                 questions,
                 index,
@@ -173,12 +147,12 @@ impl PermissionResponder {
         Ok(message)
     }
 
-    pub fn forget_question_card(&self, message: Id<MessageMarker>) {
+    pub fn forget_question_card(&self, message: &C::Message) {
         self.question_registry.forget_message(message);
     }
 
     #[must_use]
-    pub fn pending_question_token(&self, channel: Id<ChannelMarker>) -> Option<String> {
+    pub fn pending_question_token(&self, channel: &C::Route) -> Option<String> {
         self.question_registry.token_in_channel(channel)
     }
 
@@ -242,7 +216,10 @@ impl PermissionResponder {
         }
     }
 
-    async fn advance_card(&self, pending: &PendingQuestion) -> Result<bool, String> {
+    async fn advance_card(
+        &self,
+        pending: &PendingQuestion<C::Route, C::Message>,
+    ) -> Result<bool, String> {
         let next = pending.index + 1;
         let (pane_id, question) = (pending.pane_id.clone(), pending.questions[next].clone());
         if !blocking(move || wait_for_dialog(&pane_id, &question)).await? {
@@ -252,44 +229,38 @@ impl PermissionResponder {
         Ok(true)
     }
 
-    async fn move_card_to(&self, pending: &PendingQuestion, index: usize) -> Result<(), String> {
+    async fn move_card_to(
+        &self,
+        pending: &PendingQuestion<C::Route, C::Message>,
+        index: usize,
+    ) -> Result<(), String> {
         let next = PendingQuestion {
             index,
             ..pending.clone()
         };
         let token = generate_token()?;
-        update_question_card(
-            self.client.as_ref(),
-            next.channel,
-            next.message,
-            next.question(),
-            &token,
-            &self.owner_id,
-        )
-        .await?;
+        self.chat
+            .edit_question_card(&next.channel, &next.message, next.question(), &token)
+            .await?;
         self.question_registry.insert(token, next);
         Ok(())
     }
 
-    async fn edit_card(&self, pending: &PendingQuestion, content: &str) -> Result<(), String> {
-        expire_informational_card(
-            self.client.as_ref(),
-            pending.channel,
-            pending.message,
-            content,
-        )
-        .await
+    async fn edit_card(
+        &self,
+        pending: &PendingQuestion<C::Route, C::Message>,
+        content: &str,
+    ) -> Result<(), String> {
+        self.chat
+            .expire_card(&pending.channel, &pending.message, content)
+            .await
+            .map_err(String::from)
     }
 
-    async fn fail_card(&self, pending: &PendingQuestion) {
+    async fn fail_card(&self, pending: &PendingQuestion<C::Route, C::Message>) {
         if let Err(error) = self.edit_card(pending, FAILED_CARD_TEXT).await {
             bridge_eprintln!("question card edit failed: {error}");
         }
-    }
-
-    #[must_use]
-    pub const fn topology_cache(&self) -> &TopologyCache {
-        &self.topology_cache
     }
 
     async fn request(&self, interaction: &Interaction, liveness: HookLiveness) -> Option<Decision> {
@@ -300,7 +271,7 @@ impl PermissionResponder {
             .registry
             .issue_with_liveness(
                 ApprovalRequest {
-                    channel_id: channel.get(),
+                    channel_id: channel.clone(),
                     session_id: interaction.session_id.clone(),
                 },
                 created_at + PERMISSION_TIMEOUT,
@@ -309,7 +280,7 @@ impl PermissionResponder {
             .ok()?;
         let message = self
             .deliver_card(
-                channel,
+                &channel,
                 interaction.vendor,
                 &interaction.tool_name,
                 &interaction.tool_input.command,
@@ -318,7 +289,7 @@ impl PermissionResponder {
             )
             .await?;
         let token = issued.token.clone();
-        let decision = Self::wait_decision(
+        let decision = wait_decision(
             issued.receiver,
             &liveness,
             tokio::time::sleep(
@@ -341,9 +312,11 @@ impl PermissionResponder {
                 }
             }
         };
-        let client = Arc::clone(&self.client);
+        let chat = Arc::clone(&self.chat);
         return_value_before_card_edit(decision, async move {
-            expire_permission_card(client.as_ref(), channel, message, &token, card_text).await
+            chat.expire_permission_card(&channel, &message, &token, card_text)
+                .await
+                .map_err(String::from)
         })
     }
 
@@ -391,13 +364,8 @@ impl PermissionResponder {
         &self,
         route: &crate::TopologyRoute,
         liveness: &HookLiveness,
-    ) -> Option<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>> {
-        let channel_task = Self::sync_channel_with_fresh_lists(
-            self.client.as_ref(),
-            self.guild,
-            &self.topology_cache,
-            route,
-        );
+    ) -> Option<C::Route> {
+        let channel_task = self.chat.sync_route_fresh(route);
         let channel = tokio::select! {
             result = channel_task => result.map_err(|error| {
                 bridge_eprintln!("{error}");
@@ -408,29 +376,18 @@ impl PermissionResponder {
         liveness.is_alive().then_some(channel)
     }
 
-    async fn sync_channel_with_fresh_lists(
-        client: &Client,
-        guild: Id<GuildMarker>,
-        topology_cache: &TopologyCache,
-        route: &crate::TopologyRoute,
-    ) -> Result<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>, String> {
-        let fetched = fetch_topology_lists(client, guild).await?;
-        let mut guard = topology_cache.lock().await;
-        let (channels, active_threads) = crate::reconcile_topology_cache(&mut guard, fetched);
-        sync_topology(client, guild, channels, active_threads, route).await
-    }
-
     async fn deliver_card(
         &self,
-        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
+        channel: &C::Route,
         vendor: crate::permission::PermissionVendor,
         tool: &str,
         command: &str,
         token: &str,
         liveness: &HookLiveness,
-    ) -> Option<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>> {
-        let delivery =
-            deliver_permission_card(self.client.as_ref(), channel, vendor, tool, command, token);
+    ) -> Option<C::Message> {
+        let delivery = self
+            .chat
+            .post_permission_card(channel, vendor, tool, command, token);
         tokio::pin!(delivery);
         tokio::select! {
             result = &mut delivery => {
@@ -445,14 +402,14 @@ impl PermissionResponder {
                 if liveness.is_alive() {
                     Some(message)
                 } else {
-                    self.expire_card(channel, message, token, "expired: hook disconnected").await;
+                    self.expire_card(channel, &message, token, "expired: hook disconnected").await;
                     None
                 }
             }
             () = liveness.wait_closed() => {
                 let message = delivery.await.ok();
                 if let Some(message) = message {
-                    self.expire_card(channel, message, token, "expired: hook disconnected").await;
+                    self.expire_card(channel, &message, token, "expired: hook disconnected").await;
                 } else {
                     self.registry.remove(token);
                 }
@@ -461,30 +418,32 @@ impl PermissionResponder {
         }
     }
 
-    async fn wait_decision(
-        receiver: oneshot::Receiver<Decision>,
-        liveness: &HookLiveness,
-        expiry: tokio::time::Sleep,
-    ) -> Option<Decision> {
-        tokio::pin!(expiry);
-        tokio::select! {
-            biased;
-            result = receiver => result.ok(),
-            () = liveness.wait_closed() => None,
-            () = &mut expiry => None,
-        }
-    }
-
     async fn expire_card(
         &self,
-        channel: twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>,
-        message: twilight_model::id::Id<twilight_model::id::marker::MessageMarker>,
+        channel: &C::Route,
+        message: &C::Message,
         token: &str,
         content: &str,
     ) {
         self.registry.remove(token);
-        let _ =
-            expire_permission_card(self.client.as_ref(), channel, message, token, content).await;
+        let _ = self
+            .chat
+            .expire_permission_card(channel, message, token, content)
+            .await;
+    }
+}
+
+async fn wait_decision(
+    receiver: oneshot::Receiver<Decision>,
+    liveness: &HookLiveness,
+    expiry: tokio::time::Sleep,
+) -> Option<Decision> {
+    tokio::pin!(expiry);
+    tokio::select! {
+        biased;
+        result = receiver => result.ok(),
+        () = liveness.wait_closed() => None,
+        () = &mut expiry => None,
     }
 }
 
@@ -545,24 +504,13 @@ fn type_steps(pane_id: &str, steps: &[AnswerStep]) -> Result<(), String> {
     Ok(())
 }
 
-async fn answer_question_component(
-    responder: &PermissionResponder,
-    interaction: &DiscordInteraction,
+async fn answer_question_component<C: Chat>(
+    responder: &PermissionResponder<C>,
+    interaction: &C::Interaction,
     token: &str,
     indices: Vec<usize>,
 ) {
-    let interactions = responder.client.interaction(interaction.application_id);
-    let deferral = InteractionResponse {
-        kind: InteractionResponseType::DeferredChannelMessageWithSource,
-        data: Some(InteractionResponseData {
-            flags: Some(MessageFlags::EPHEMERAL),
-            ..InteractionResponseData::default()
-        }),
-    };
-    if let Err(error) = interactions
-        .create_response(interaction.id, &interaction.token, &deferral)
-        .await
-    {
+    if let Err(error) = responder.chat.acknowledge(interaction, Ack::Defer).await {
         bridge_eprintln!("interaction response failed: {error}");
     }
     let reply = match responder
@@ -580,104 +528,80 @@ async fn answer_question_component(
             "answer failed; see the bridge log"
         }
     };
-    let update = interactions
-        .update_response(&interaction.token)
-        .content(Some(reply))
+    let update = responder
+        .chat
+        .acknowledge(interaction, Ack::EditDeferred(reply))
         .await;
     if let Err(error) = update {
         bridge_eprintln!("interaction reply failed: {error}");
     }
 }
 
-pub async fn handle_component(
-    responder: Arc<PermissionResponder>,
-    interaction: DiscordInteraction,
+pub async fn handle_component<C: Chat>(
+    responder: Arc<PermissionResponder<C>>,
+    component: Component<C>,
 ) {
-    let Some(InteractionData::MessageComponent(data)) = interaction.data.as_ref() else {
-        return;
-    };
-    let Some(channel) = interaction.channel.as_ref() else {
-        return;
-    };
-    let authorized = interaction.guild_id == Some(responder.guild)
-        && interaction
-            .author_id()
-            .is_some_and(|id| id.to_string() == responder.owner_id);
-    let response = if !authorized {
-        Some(ephemeral_response("not authorized"))
-    } else if let Some(token) = data.custom_id.strip_prefix("herdrask-multi:") {
-        let indices: Option<Vec<usize>> =
-            data.values.iter().map(|value| value.parse().ok()).collect();
+    let text = if !component.authorized {
+        Some("not authorized")
+    } else if let Some(token) = component.custom_id.strip_prefix("herdrask-multi:") {
+        let indices: Option<Vec<usize>> = component
+            .values
+            .iter()
+            .map(|value| value.parse().ok())
+            .collect();
         let Some(indices) = indices else {
             return;
         };
-        answer_question_component(&responder, &interaction, token, indices).await;
+        answer_question_component(&responder, &component.interaction, token, indices).await;
         return;
-    } else if let Some(rest) = data.custom_id.strip_prefix("herdrask:") {
+    } else if let Some(rest) = component.custom_id.strip_prefix("herdrask:") {
         let Some((token, index)) = rest
             .split_once(':')
             .and_then(|(token, index)| Some((token, index.parse().ok()?)))
         else {
             return;
         };
-        answer_question_component(&responder, &interaction, token, vec![index]).await;
+        answer_question_component(&responder, &component.interaction, token, vec![index]).await;
         return;
-    } else if let Some((action, token)) = data
+    } else if let Some((action, token)) = component
         .custom_id
         .split_once(':')
         .and_then(|(prefix, rest)| prefix.strip_prefix("herdr").map(|_| rest))
         .and_then(|rest| rest.split_once(':'))
     {
-        permission_component_response(&responder, action, token, channel.id.get())
+        permission_component_response(&responder.registry, action, token, &component.route)
     } else {
         return;
     };
-    let Some(response) = response else {
+    let Some(text) = text else {
         return;
     };
     if let Err(error) = responder
-        .client
-        .interaction(interaction.application_id)
-        .create_response(interaction.id, &interaction.token, &response)
+        .chat
+        .acknowledge(&component.interaction, Ack::Ephemeral(text))
         .await
     {
         bridge_eprintln!("interaction response failed: {error}");
     }
 }
 
-fn permission_component_response(
-    responder: &PermissionResponder,
+fn permission_component_response<R: Eq>(
+    registry: &InteractionRegistry<R>,
     action: &str,
     token: &str,
-    channel_id: u64,
-) -> Option<InteractionResponse> {
+    channel: &R,
+) -> Option<&'static str> {
     let decision = match action {
         "allow" => Decision::allow(),
         "deny" => Decision::deny("operator denied this request".to_owned()),
         _ => return None,
     };
     Some(
-        match responder
-            .registry
-            .resolve(token, channel_id, decision, std::time::Instant::now())
-        {
-            Ok(()) => ephemeral_response("decision recorded"),
-            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => {
-                ephemeral_response("expired")
-            }
+        match registry.resolve(token, channel, decision, std::time::Instant::now()) {
+            Ok(()) => "decision recorded",
+            Err(ResolveError::UnknownOrExpired | ResolveError::WrongChannel) => "expired",
         },
     )
-}
-
-fn ephemeral_response(content: &str) -> InteractionResponse {
-    InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(InteractionResponseData {
-            content: Some(content.to_owned()),
-            flags: Some(MessageFlags::EPHEMERAL),
-            ..InteractionResponseData::default()
-        }),
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -793,10 +717,10 @@ impl From<&Interaction> for RequestFingerprint {
     }
 }
 
-async fn serve_broker(
+async fn serve_broker<C: Chat>(
     listener: UnixListener,
     mut shutdown: oneshot::Receiver<()>,
-    responder: Arc<PermissionResponder>,
+    responder: Arc<PermissionResponder<C>>,
     activity_tx: mpsc::UnboundedSender<ActivityFrame>,
 ) -> io::Result<()> {
     let pending = Arc::new(PendingRequests::default());
@@ -817,9 +741,9 @@ async fn serve_broker(
     Ok(())
 }
 
-pub async fn run_broker(
+pub async fn run_broker<C: Chat>(
     socket_path: &Path,
-    responder: Arc<PermissionResponder>,
+    responder: Arc<PermissionResponder<C>>,
     activity_tx: mpsc::UnboundedSender<ActivityFrame>,
 ) -> io::Result<()> {
     remove_stale_socket(socket_path)?;
@@ -863,10 +787,10 @@ fn remove_stale_socket(socket_path: &Path) -> io::Result<()> {
     }
 }
 
-async fn handle_connection(
+async fn handle_connection<C: Chat>(
     mut stream: UnixStream,
     pending: Arc<PendingRequests>,
-    responder: Arc<PermissionResponder>,
+    responder: Arc<PermissionResponder<C>>,
     activity_tx: mpsc::UnboundedSender<ActivityFrame>,
 ) {
     let bytes = match tokio::time::timeout(INITIAL_FRAME_TIMEOUT, read_json_line_bytes(&mut stream))
@@ -1000,9 +924,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingRequests, PermissionResponder,
-        RequestFingerprint, correlate_decision, hook_timeout, read_json_line,
-        return_value_before_card_edit, spawn_hook_monitor,
+        BrokerResponse, HookLiveness, PERMISSION_TIMEOUT, PendingRequests, RequestFingerprint,
+        correlate_decision, hook_timeout, read_json_line, return_value_before_card_edit,
+        spawn_hook_monitor, wait_decision,
     };
     use crate::permission::{ClaudePermissionToolInput, Decision, Interaction, PermissionVendor};
     use crate::registry::ApprovalRequest;
@@ -1099,7 +1023,7 @@ mod tests {
             let expiry = tokio::time::sleep(Duration::ZERO);
             tokio::time::sleep(Duration::from_millis(2)).await;
             assert_eq!(
-                PermissionResponder::wait_decision(receiver, &HookLiveness::new(), expiry).await,
+                wait_decision(receiver, &HookLiveness::new(), expiry).await,
                 Some(Decision::allow())
             );
         }
@@ -1120,34 +1044,14 @@ mod tests {
     }
 
     use super::permission_component_response;
+    use crate::registry::InteractionRegistry;
     use std::time::Instant;
-    use twilight_http::Client;
-    use twilight_model::http::interaction::InteractionResponse;
-    use twilight_model::id::Id;
 
-    fn test_responder() -> PermissionResponder {
-        PermissionResponder::new(
-            Arc::new(Client::builder().token("test-token".to_owned()).build()),
-            Id::new(1),
-            "owner-id".to_owned(),
-            Arc::new(tokio::sync::Mutex::new(None)),
-        )
-    }
-
-    fn response_content(response: Option<InteractionResponse>) -> String {
-        response
-            .expect("component dispatch replies")
-            .data
-            .and_then(|data| data.content)
-            .expect("ephemeral reply has content")
-    }
-
-    #[tokio::test]
-    async fn permission_component_dispatch_records_allow_and_rejects_unknown_actions() {
-        let responder = test_responder();
+    #[test]
+    fn permission_component_dispatch_records_allow_and_rejects_unknown_actions() {
+        let registry = InteractionRegistry::<u64>::default();
         let now = Instant::now();
-        let issued = responder
-            .registry
+        let issued = registry
             .issue_with_liveness(
                 ApprovalRequest {
                     channel_id: 7,
@@ -1158,11 +1062,11 @@ mod tests {
             )
             .expect("issue token");
 
-        let unknown = permission_component_response(&responder, "snooze", &issued.token, 7);
+        let unknown = permission_component_response(&registry, "snooze", &issued.token, &7);
         assert_eq!(unknown, None);
-        let allowed = permission_component_response(&responder, "allow", &issued.token, 7);
-        assert_eq!(response_content(allowed), "decision recorded");
-        let replay = permission_component_response(&responder, "allow", &issued.token, 7);
-        assert_eq!(response_content(replay), "expired");
+        let allowed = permission_component_response(&registry, "allow", &issued.token, &7);
+        assert_eq!(allowed, Some("decision recorded"));
+        let replay = permission_component_response(&registry, "allow", &issued.token, &7);
+        assert_eq!(replay, Some("expired"));
     }
 }

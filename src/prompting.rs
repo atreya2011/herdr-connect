@@ -19,7 +19,7 @@ use crate::herdr::{
     agent_prompt, agent_send_keys,
 };
 use crate::question::Answer;
-use crate::{AgentSnapshot, list_agents};
+use crate::{AgentSnapshot, Discord, list_agents};
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
@@ -36,7 +36,7 @@ pub async fn handle_owner_message(
     guild: Id<GuildMarker>,
     owner_id: &str,
     message: Message,
-    responder: &PermissionResponder,
+    responder: &PermissionResponder<Discord>,
 ) -> Result<(), String> {
     if message.guild_id != Some(guild)
         || !should_handle_owner_message(
@@ -134,10 +134,10 @@ pub async fn handle_owner_message(
 }
 
 async fn answer_pending_question(
-    responder: &PermissionResponder,
+    responder: &PermissionResponder<Discord>,
     message: &Message,
 ) -> Option<String> {
-    let token = responder.pending_question_token(message.channel_id)?;
+    let token = responder.pending_question_token(&message.channel_id)?;
     let answer = Answer::Text(message.content.clone());
     Some(match responder.answer_question(&token, &answer).await {
         Ok(QuestionOutcome::Sent) => "accepted: answer typed into the dialog".to_owned(),
