@@ -9,6 +9,7 @@ use twilight_gateway::{
 use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
 
+use crate::Discord;
 use crate::broker::PermissionResponder;
 use crate::deletion::{GuildDeletion, handle_guild_deletion};
 
@@ -25,7 +26,7 @@ pub struct GatewayContext {
     pub client: Arc<Client>,
     pub guild: Id<GuildMarker>,
     pub owner_id: String,
-    pub responder: Arc<PermissionResponder>,
+    pub responder: Arc<PermissionResponder<Discord>>,
 }
 
 struct OwnerPromptRequest {
@@ -132,7 +133,7 @@ fn spawn_deletion(context: &GatewayContext, notices: &Sender<String>, deletion: 
     let notices = notices.clone();
     tokio::spawn(async move {
         if let Err(error) =
-            handle_guild_deletion(&client, responder.topology_cache(), deletion).await
+            handle_guild_deletion(&client, responder.chat().topology_cache(), deletion).await
         {
             let _ = notices.send(format!("discord owner deletion error: {error}"));
         }
