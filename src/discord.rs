@@ -80,10 +80,6 @@ impl Chat for Discord {
     type Message = Id<MessageMarker>;
     type Interaction = DiscordInteraction;
 
-    fn owner_id(&self) -> &str {
-        &self.owner_id
-    }
-
     async fn sync_route_fresh(&self, route: &TopologyRoute) -> Result<Self::Route, ChatError> {
         let fetched = fetch_topology_lists(&self.client, self.guild).await?;
         let mut guard = self.topology_cache.lock().await;

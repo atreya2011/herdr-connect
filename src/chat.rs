@@ -44,9 +44,7 @@ pub struct Component<C: Chat> {
 pub trait Chat: Send + Sync + Sized + 'static {
     type Route: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Message: Clone + Eq + Hash + Debug + Send + Sync + 'static;
-    type Interaction: Send + Sync + 'static;
-
-    fn owner_id(&self) -> &str;
+    type Interaction: Clone + Send + Sync + 'static;
 
     fn sync_route_fresh(
         &self,
