@@ -19,7 +19,7 @@ Stop the bridge service before running the suite. Never print or commit `.env`. 
 - **Barebones**: overengineering is evil. No abstractions beyond what tests force, no speculative configurability.
 - **No fallbacks**: mandatory behavior that fails must fail fast through the error surface. Placeholder values, invented defaults, and silent recovery are forbidden.
 - **No reinvented wheels**: use battle-tested crates where they replace real hand-rolled complexity — and only then. A crate earns its place; speculative dependencies are overengineering.
-- **Strictest lints**: no lint `allow` anywhere in source. The single exception is `multiple_crate_versions` in the manifest, justified by a comment.
+- **Strictest lints**: no lint `allow` anywhere in source. The manifest has two exceptions: `multiple_crate_versions`, justified by a comment, and `missing_errors_doc`, because this repository has no code comments.
 - **Idiomatic Rust**: `Result` errors, no panics in library paths, no `block_on` in library code, references where callers keep using values.
 - **Reproduction or rejection**: a bug claim without a reproducing failing test or exact command evidence is rejected unread.
 - **Honest reporting**: no green claim without pasting the run that proves it. The orchestrator independently re-runs all gates; false green claims are treated as defects.
