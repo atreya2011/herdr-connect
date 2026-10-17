@@ -12,9 +12,9 @@ set -a; . ./.env >/dev/null 2>&1; set +a; cargo test -- --test-threads=1
 
 Stop the bridge service before running the suite. Never print or commit `.env`. Real-guild tests create only `testrun-` channels, clean up on every path, and end with a named zero-leftover check.
 
-## Laws (locked by the owner)
+## Laws
 
-- **Red-green**: a failing test is written before any behavior. Tests are the contract — assertions, inputs, expected values, and fixtures are frozen; adapting a test to force green is forbidden. A genuinely wrong test stops work and gets reported, not edited.
+- **Red-green**: a failing test is written before any behavior.
 - **Real services only**: no mocked, stubbed, faked, or emulated service clients or responses, and no test-run servers posing as a service. Socket tests connect to the real running herdr socket. Discord tests run against the real guild. Vendor-log tests use committed fixtures mirroring real on-disk records.
 - **Barebones**: overengineering is evil. No abstractions beyond what tests force, no speculative configurability.
 - **No fallbacks**: mandatory behavior that fails must fail fast through the error surface. Placeholder values, invented defaults, and silent recovery are forbidden.

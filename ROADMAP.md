@@ -1,6 +1,6 @@
 # Rust implementation resume
 
-This file preserves the product information needed after the historical TypeScript worktrees are removed. Current Rust code, tests, fixtures, and owner-locked laws remain authoritative.
+This file preserves the product information needed after the historical TypeScript worktrees are removed. Current Rust code, tests, fixtures, and laws remain authoritative.
 
 ## Resume gate
 
