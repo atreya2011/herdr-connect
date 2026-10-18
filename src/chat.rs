@@ -58,6 +58,7 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Message: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Interaction: Clone + Send + Sync + 'static;
 
+    fn owner_id(&self) -> &str;
     fn sync_route(
         &self,
         route: &TopologyRoute,

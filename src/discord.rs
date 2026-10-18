@@ -182,6 +182,10 @@ impl Chat for Discord {
     type Message = Id<MessageMarker>;
     type Interaction = DiscordInteraction;
 
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
     async fn sync_route(&self, route: &TopologyRoute) -> Result<Self::Route, ChatError> {
         Ok(sync_route(&self.client, self.guild, route, &self.topology_cache).await?)
     }
