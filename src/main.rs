@@ -10,28 +10,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twilight_http::Client;
 use twilight_model::id::{
     Id,
-    marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker, WebhookMarker},
+    marker::{ChannelMarker, GuildMarker, MessageMarker},
 };
 
 use herdr_connect_rs::{
     ACTIVITY_KIND, ActivityFrame, activity_message_text, bridge_eprintln, bridge_println,
     decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
-    deliver_activity_message, send_activity_frame, update_activity_message,
+    send_activity_frame,
 };
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ComponentHandler, Discord,
+    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, ComponentHandler, Discord,
     ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY,
     GatewayContext, HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED,
     STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyClosure, TopologyRoute,
-    Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR,
-    agent_read_detection, create_transition_messages, deliver_live_message,
-    deliver_transition_card, dialog_shows_question, drive_gateway_with_components,
-    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
-    forget_departed_owner_prompt_suppressions, format_detection_question, hook_timeout,
-    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
-    load_discord_config, name_unlabeled_tabs, read_claude_incremental,
-    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
-    read_cursor_incremental, read_cursor_prompts_incremental, resolve_terminal_prompt_webhook,
+    Transition, TransitionMessage, agent_read_detection, create_transition_messages,
+    dialog_shows_question, drive_gateway_with_components, expire_informational_card,
+    fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
+    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, live_message_nonce, load_discord_config, name_unlabeled_tabs,
+    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
+    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
     route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
     tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
 };
@@ -87,7 +85,6 @@ struct BridgeState {
     terminal_prompt_positions: HashMap<String, (PathBuf, Follower, Follower)>,
     awaiting_first_log: HashMap<String, String>,
     seen_without_session: HashMap<String, SystemTime>,
-    terminal_prompt_webhooks: HashMap<Id<ChannelMarker>, (Id<WebhookMarker>, String)>,
 }
 
 struct ActivityMessage {
@@ -96,10 +93,8 @@ struct ActivityMessage {
 }
 
 struct BlockedCardContext<'a> {
-    client: &'a Client,
     owner_id: &'a str,
     responder: &'a PermissionResponder<Discord>,
-    topology_cache: &'a TopologyCache,
     route: &'a TopologyRoute,
     snapshot: &'a AgentSnapshot,
     session: &'a AgentSession,
@@ -111,8 +106,6 @@ struct BlockedCardContext<'a> {
 
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
-
-const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
 
 #[must_use]
 fn vendor_is_supported(agent: Option<&str>) -> bool {
@@ -136,10 +129,8 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
 
 async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let BlockedCardContext {
-        client,
         owner_id,
         responder,
-        topology_cache,
         route,
         snapshot,
         session,
@@ -199,10 +190,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     };
     let messages = create_transition_messages(&transition, &capture, owner_id);
     deliver_blocked_messages(
-        &BlockedDeliveryRoute {
-            client,
-            topology_cache,
-        },
+        responder.chat(),
         target,
         terminal,
         state_change_seq,
@@ -260,33 +248,20 @@ fn pending_questions(
         .map(|capture| capture.pending_questions)
 }
 
-#[derive(Clone, Copy)]
-struct BlockedDeliveryRoute<'a> {
-    client: &'a Client,
-    topology_cache: &'a TopologyCache,
-}
-
 async fn deliver_blocked_messages(
-    delivery: &BlockedDeliveryRoute<'_>,
+    chat: &Discord,
     target: Id<ChannelMarker>,
     terminal: &str,
     state_change_seq: u64,
     messages: &[TransitionMessage],
     informational_cards: &mut HashMap<String, InformationalCard>,
 ) {
-    let BlockedDeliveryRoute {
-        client,
-        topology_cache,
-    } = *delivery;
     let mut last = None;
     for (index, message) in messages.iter().enumerate() {
         let nonce = transition_card_nonce(terminal, state_change_seq, index);
-        match deliver_transition_card(client, target, message, &nonce).await {
+        match chat.post_transition_card(&target, message, &nonce).await {
             Ok(id) => last = Some(id),
             Err(error) => {
-                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
-                    *topology_cache.lock().await = None;
-                }
                 bridge_eprintln!("discord delivery error: {error}");
                 return;
             }
@@ -474,12 +449,10 @@ async fn deliver_postable_transition(
             return;
         }
     };
-    let (client, _, owner_id, responder, _) = discord;
+    let (_, _, owner_id, responder, _) = discord;
     handle_blocked_card(BlockedCardContext {
-        client: client.as_ref(),
         owner_id,
         responder: responder.as_ref(),
-        topology_cache: responder.chat().topology_cache(),
         route: &route,
         snapshot,
         session,
@@ -924,75 +897,18 @@ fn read_new_live_texts(
     }
 }
 
-async fn cached_terminal_prompt_webhook(
-    client: &Client,
-    workspace_channel: Id<ChannelMarker>,
-    state: &mut BridgeState,
-) -> Result<(Id<WebhookMarker>, String), String> {
-    if let Some(webhook) = state.terminal_prompt_webhooks.get(&workspace_channel) {
-        return Ok(webhook.clone());
-    }
-    let webhook =
-        resolve_terminal_prompt_webhook(client, workspace_channel, TERMINAL_PROMPT_WEBHOOK_NAME)
-            .await?;
-    state
-        .terminal_prompt_webhooks
-        .insert(workspace_channel, webhook.clone());
-    Ok(webhook)
-}
-
-#[derive(Clone, Copy)]
-struct TerminalPromptTarget<'a> {
-    client: &'a Client,
-    topology_cache: &'a TopologyCache,
-    workspace_channel: Id<ChannelMarker>,
+async fn mirror_one_terminal_prompt(
+    chat: &Discord,
+    parent: Id<ChannelMarker>,
     thread: Id<ChannelMarker>,
-}
-
-async fn deliver_terminal_prompt_part<'a>(
-    target: TerminalPromptTarget<'a>,
-    identity: &OwnerIdentity,
-    part: &str,
-    state: &mut BridgeState,
-) -> Result<TerminalPromptTarget<'a>, String> {
-    let (webhook_id, webhook_token) =
-        cached_terminal_prompt_webhook(target.client, target.workspace_channel, state).await?;
-    execute_terminal_prompt_webhook(
-        target.client,
-        webhook_id,
-        &webhook_token,
-        target.thread,
-        &identity.display_name,
-        identity.avatar_url.as_deref(),
-        part,
-    )
-    .await?;
-    Ok(target)
-}
-
-async fn mirror_one_terminal_prompt<'a>(
-    target: TerminalPromptTarget<'a>,
     identity: &OwnerIdentity,
     content: &str,
-    state: &mut BridgeState,
-) -> Result<TerminalPromptTarget<'a>, String> {
-    let mut current = target;
+) -> Result<(), ChatError> {
     for part in split_live_message(content) {
-        match deliver_terminal_prompt_part(current, identity, &part, state).await {
-            Ok(delivered) => current = delivered,
-            Err(error) => {
-                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
-                    *current.topology_cache.lock().await = None;
-                } else if error.starts_with(UNKNOWN_WEBHOOK_DELIVERY_ERROR) {
-                    state
-                        .terminal_prompt_webhooks
-                        .remove(&current.workspace_channel);
-                }
-                return Err(error);
-            }
-        }
+        chat.post_as_owner(&parent, &thread, identity, &part)
+            .await?;
     }
-    Ok(current)
+    Ok(())
 }
 
 fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
@@ -1105,8 +1021,7 @@ async fn mirror_terminal_prompts(
     if prompts.is_empty() {
         return;
     }
-    let (client, _, _, responder, identity) = connection;
-    let topology_cache = responder.chat().topology_cache();
+    let (_, _, _, responder, identity) = connection;
     let (workspace_channel, thread) = match responder.chat().sync_route_with_parent(route).await {
         Ok(channels) => channels,
         Err(error) => {
@@ -1114,21 +1029,15 @@ async fn mirror_terminal_prompts(
             return;
         }
     };
-    let mut target = TerminalPromptTarget {
-        client: client.as_ref(),
-        topology_cache,
-        workspace_channel,
-        thread,
-    };
     for text in prompts {
         if take_owner_prompt_suppression(&route.pane_id, &text) {
             continue;
         }
-        match mirror_one_terminal_prompt(target, identity, &text, state).await {
-            Ok(delivered) => target = delivered,
-            Err(error) => {
-                bridge_eprintln!("terminal prompt delivery error for {terminal}: {error}");
-            }
+        if let Err(error) =
+            mirror_one_terminal_prompt(responder.chat(), workspace_channel, thread, identity, &text)
+                .await
+        {
+            bridge_eprintln!("terminal prompt delivery error for {terminal}: {error}");
         }
     }
 }
@@ -1138,7 +1047,7 @@ async fn handle_live_event(
     terminal: &str,
     state: &mut BridgeState,
 ) {
-    let (client, _, _, responder, _) = connection;
+    let (_, _, _, responder, _) = connection;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
@@ -1156,7 +1065,6 @@ async fn handle_live_event(
             return;
         }
     };
-    let topology_cache = responder.chat().topology_cache();
     let channel = match responder.chat().sync_route(&route).await {
         Ok(channel) => channel,
         Err(error) => {
@@ -1179,11 +1087,8 @@ async fn handle_live_event(
         };
         for (part_index, part) in split_live_message(&text).into_iter().enumerate() {
             let nonce = live_message_nonce(terminal, nonce_position, part_index);
-            if let Err(error) = deliver_live_message(client.as_ref(), channel, &part, &nonce).await
-            {
-                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
-                    *topology_cache.lock().await = None;
-                }
+            if let Err(error) = responder.chat().post_live(&channel, &part, &nonce).await {
+                let error = error.to_string();
                 if state
                     .live_errors_reported
                     .insert((terminal.to_owned(), error.clone()))
@@ -1220,7 +1125,7 @@ async fn handle_activity_event(
     frame: ActivityFrame,
     state: &mut BridgeState,
 ) {
-    let (client, _, _, responder, _) = discord;
+    let (_, _, _, responder, _) = discord;
     let route = TopologyRoute {
         workspace_id: frame.workspace_id,
         tab_id: frame.tab_id,
@@ -1228,7 +1133,6 @@ async fn handle_activity_event(
         channel_name: String::new(),
         thread_name: String::new(),
     };
-    let topology_cache = responder.chat().topology_cache();
     let channel = match responder.chat().cached_route(&route).await {
         Ok(Some(channel)) => channel,
         Ok(None) => return,
@@ -1242,12 +1146,13 @@ async fn handle_activity_event(
     }
     if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
         let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
-        match update_activity_message(client.as_ref(), channel, existing.message, &text).await {
+        match responder
+            .chat()
+            .edit_activity(&channel, &existing.message, &text)
+            .await
+        {
             Ok(()) => existing.count += 1,
             Err(error) => {
-                if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
-                    *topology_cache.lock().await = None;
-                }
                 bridge_eprintln!(
                     "activity edit delivery error for pane {}: {error}",
                     frame.pane_id
@@ -1257,16 +1162,13 @@ async fn handle_activity_event(
         return;
     }
     let text = activity_message_text(1, &frame.tool, &frame.summary);
-    match deliver_activity_message(client.as_ref(), channel, &text).await {
+    match responder.chat().post_activity(&channel, &text).await {
         Ok(message) => {
             state
                 .activity_messages
                 .insert(frame.pane_id, ActivityMessage { message, count: 1 });
         }
         Err(error) => {
-            if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
-                *topology_cache.lock().await = None;
-            }
             bridge_eprintln!(
                 "activity create delivery error for pane {}: {error}",
                 frame.pane_id
@@ -2164,18 +2066,6 @@ async fn next_status_event(
         Some(stream) => stream.next_event().await,
         None => std::future::pending().await,
     }
-}
-
-async fn fetch_startup_owner_identity(
-    client: &Client,
-    owner_id: &str,
-) -> Result<OwnerIdentity, String> {
-    let owner_id = owner_id.parse::<u64>().map_err(|error| {
-        format!("owner identity fetch error: DISCORD_OWNER_ID is not numeric: {error}")
-    })?;
-    fetch_owner_identity(client, Id::<UserMarker>::new(owner_id))
-        .await
-        .map_err(|error| format!("owner identity fetch error: {error}"))
 }
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
@@ -4128,16 +4018,16 @@ mod tests {
                 .model()
                 .await
                 .map_err(|error| error.to_string())?;
-            let first = super::cached_terminal_prompt_webhook(
+            let first = herdr_connect_rs::resolve_terminal_prompt_webhook(
                 guild.client.as_ref(),
                 channel.id,
-                &mut BridgeState::default(),
+                herdr_connect_rs::TERMINAL_PROMPT_WEBHOOK_NAME,
             )
             .await?;
-            let second = super::cached_terminal_prompt_webhook(
+            let second = herdr_connect_rs::resolve_terminal_prompt_webhook(
                 guild.client.as_ref(),
                 channel.id,
-                &mut BridgeState::default(),
+                herdr_connect_rs::TERMINAL_PROMPT_WEBHOOK_NAME,
             )
             .await?;
             if first.0 != second.0 {
@@ -4153,7 +4043,7 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .iter()
                 .filter(|webhook| {
-                    webhook.name.as_deref() == Some(super::TERMINAL_PROMPT_WEBHOOK_NAME)
+                    webhook.name.as_deref() == Some(herdr_connect_rs::TERMINAL_PROMPT_WEBHOOK_NAME)
                 })
                 .count();
             if owned != 1 {
