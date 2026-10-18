@@ -16,26 +16,25 @@ use herdr_connect_rs::{
     send_activity_frame,
 };
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, ComponentHandler, Discord,
-    ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY,
-    GatewayContext, HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED,
-    STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyClosure, TopologyRoute,
-    Transition, TransitionMessage, agent_read_detection, create_transition_messages,
-    dialog_shows_question, drive_gateway_with_components, fetch_startup_owner_identity,
-    forget_departed_owner_prompt_suppressions, format_detection_question, hook_timeout,
-    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
-    load_discord_config, name_unlabeled_tabs, read_claude_incremental,
-    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
-    read_cursor_incremental, read_cursor_prompts_incremental, route_topology, split_live_message,
-    status_subscriptions, subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression,
-    transition_card_nonce, workspace_list_result,
+    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, Discord, ENV_DISCORD_GUILD_ID,
+    ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
+    OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
+    TopologyCache, TopologyClosure, TopologyRoute, Transition, TransitionMessage,
+    agent_read_detection, create_transition_messages, dialog_shows_question, drive_gateway,
+    fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
+    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
+    list_agents, live_message_nonce, load_discord_config, name_unlabeled_tabs,
+    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
+    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
+    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
+    tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
     VENDOR_CURSOR, cursor_argv_forces_allow, decode_claude_permission_request,
     decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
-    encode_codex_decision, encode_cursor_decision, handle_component, is_cursor_agent_argv,
-    request_decision, run_broker as run_permission_broker,
+    encode_codex_decision, encode_cursor_decision, is_cursor_agent_argv, request_decision,
+    run_broker as run_permission_broker,
 };
 
 type ChatConnection<C> = (Arc<C>, Arc<PermissionResponder<C>>, OwnerIdentity);
@@ -494,18 +493,6 @@ async fn update_blocked_lifecycle<C: Chat>(
     if leaving_blocked {
         expire_blocked_card(discord, terminal, &mut state.informational_cards).await;
     }
-}
-
-fn component_handler(responder: Arc<PermissionResponder<Discord>>) -> ComponentHandler {
-    Arc::new(move |interaction| {
-        let responder = Arc::clone(&responder);
-        let component = responder.chat().component(interaction);
-        Box::pin(async move {
-            if let Some(component) = component {
-                handle_component(responder, component).await;
-            }
-        })
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1336,22 +1323,13 @@ async fn discord_connection(
     });
     let chat = Arc::new(Discord::new(
         Arc::clone(&client),
+        config.token,
         guild,
-        config.owner_id.clone(),
+        config.owner_id,
         topology_cache,
     ));
     let responder = Arc::new(PermissionResponder::new(Arc::clone(&chat)));
-    let gateway = tokio::spawn(drive_gateway_with_components(
-        config.token,
-        GatewayContext {
-            client: Arc::clone(&client),
-            guild,
-            owner_id: config.owner_id.clone(),
-            responder: Arc::clone(&responder),
-        },
-        notices_tx,
-        component_handler(Arc::clone(&responder)),
-    ));
+    let gateway = tokio::spawn(drive_gateway(Arc::clone(&responder), notices_tx));
     Ok(((chat, responder, identity), gateway))
 }
 
@@ -1620,8 +1598,9 @@ async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
         Arc::clone(&client),
+        config.token,
         guild,
-        config.owner_id.clone(),
+        config.owner_id,
         topology_cache,
     ))));
     let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3719,6 +3698,7 @@ mod tests {
         let owner_id = std::env::var("DISCORD_OWNER_ID").expect("DISCORD_OWNER_ID is set");
         let chat = Arc::new(Discord::new(
             Arc::clone(&guild.client),
+            std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN is set"),
             guild.id,
             owner_id.clone(),
             topology_cache,
@@ -5950,7 +5930,11 @@ mod tests {
             .chat()
             .component(interaction)
             .ok_or("not a component")?;
-        Box::pin(super::handle_component(Arc::clone(responder), component)).await;
+        Box::pin(herdr_connect_rs::handle_component(
+            Arc::clone(responder),
+            component,
+        ))
+        .await;
         Ok(())
     }
 
@@ -6002,14 +5986,7 @@ mod tests {
                 );
                 message.author.bot = false;
                 message.guild_id = Some(guild.id);
-                herdr_connect_rs::handle_owner_message(
-                    Arc::clone(&guild.client),
-                    guild.id,
-                    connection.0.owner_id(),
-                    message,
-                    &responder,
-                )
-                .await?;
+                herdr_connect_rs::handle_owner_message(&responder, message).await?;
             }
             QuestionAction::TwoQuestions(second) => {
                 let card_before = card_message_ids(guild, thread).await?;
@@ -7926,7 +7903,6 @@ mod tests {
 
     #[cfg(unix)]
     async fn start_owner_deletion_gateway(
-        guild: &BlockedCaptureGuild,
         connection: &super::ChatConnection<Discord>,
     ) -> Result<
         (
@@ -7936,16 +7912,9 @@ mod tests {
         String,
     > {
         let (notices_tx, notices_rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(herdr_connect_rs::drive_gateway_with_components(
-            std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
-            herdr_connect_rs::GatewayContext {
-                client: Arc::clone(&guild.client),
-                guild: guild.id,
-                owner_id: connection.0.owner_id().to_owned(),
-                responder: Arc::clone(&connection.1),
-            },
+        let task = tokio::spawn(herdr_connect_rs::drive_gateway(
+            Arc::clone(&connection.1),
             notices_tx,
-            super::component_handler(Arc::clone(&connection.1)),
         ));
         tokio::time::sleep(GATEWAY_READY_WAIT).await;
         Ok((task, notices_rx))
@@ -8015,7 +7984,7 @@ mod tests {
         expect_thread_created_message(guild, channel.id, thread.id, true).await?;
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         *connection.1.chat().topology_cache().lock().await = None;
         let deleted = guild
             .client
@@ -8157,7 +8126,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = guild
             .client
             .delete_channel(thread.id)
@@ -8275,7 +8244,7 @@ mod tests {
         let channel = guild_channel_with_topic(guild, &topic).await?;
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = guild
             .client
             .delete_channel(channel.id)
@@ -8403,7 +8372,7 @@ mod tests {
             fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
 
         let connection = discord_tuple(guild);
-        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = if delete_thread {
             herdr_connect_rs::delete_tab_thread(
                 guild.client.as_ref(),

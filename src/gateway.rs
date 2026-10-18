@@ -1,37 +1,16 @@
-use std::pin::Pin;
+use std::future::Future;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::{future::Future, sync::Arc};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use twilight_gateway::{
-    ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
-};
-use twilight_http::Client;
-use twilight_model::id::{Id, marker::GuildMarker};
 
-use crate::Discord;
-use crate::broker::PermissionResponder;
-use crate::deletion::{GuildDeletion, handle_guild_deletion};
+use crate::broker::{PermissionResponder, handle_component};
+use crate::chat::{Chat, Closed, Inbound};
+use crate::{tab_close, workspace_close};
 
-pub type ComponentHandler = Arc<
-    dyn Fn(
-            twilight_model::application::interaction::Interaction,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
-
-#[derive(Clone)]
-pub struct GatewayContext {
-    pub client: Arc<Client>,
-    pub guild: Id<GuildMarker>,
-    pub owner_id: String,
-    pub responder: Arc<PermissionResponder<Discord>>,
-}
-
-struct OwnerPromptRequest {
-    context: GatewayContext,
-    message: twilight_model::channel::Message,
+struct OwnerPromptRequest<C: Chat> {
+    responder: Arc<PermissionResponder<C>>,
+    posted: C::Posted,
     notices: Sender<String>,
 }
 
@@ -46,21 +25,15 @@ where
     }
 }
 
-fn spawn_owner_prompt_consumer() -> UnboundedSender<OwnerPromptRequest> {
+fn spawn_owner_prompt_consumer<C: Chat>() -> UnboundedSender<OwnerPromptRequest<C>> {
     let (sender, receiver) = unbounded_channel();
-    tokio::spawn(consume_in_order(receiver, process_owner_prompt));
+    tokio::spawn(consume_in_order(receiver, process_owner_prompt::<C>));
     sender
 }
 
-async fn process_owner_prompt(request: OwnerPromptRequest) {
-    let result = crate::prompting::handle_owner_message(
-        request.context.client,
-        request.context.guild,
-        &request.context.owner_id,
-        request.message,
-        request.context.responder.as_ref(),
-    )
-    .await;
+async fn process_owner_prompt<C: Chat>(request: OwnerPromptRequest<C>) {
+    let result =
+        crate::prompting::handle_owner_message(request.responder.as_ref(), request.posted).await;
     if let Err(error) = result {
         let _ = request
             .notices
@@ -68,30 +41,25 @@ async fn process_owner_prompt(request: OwnerPromptRequest) {
     }
 }
 
-pub async fn drive_gateway_with_components(
-    token: String,
-    context: GatewayContext,
+pub fn close_in_herdr(closed: Closed) -> Result<(), String> {
+    match closed {
+        Closed::Tab(tab_id) => tab_close(&tab_id),
+        Closed::Workspace(workspace_id) => workspace_close(&workspace_id),
+    }
+    .map(drop)
+}
+
+pub async fn drive_gateway<C: Chat>(
+    responder: Arc<PermissionResponder<C>>,
     notices: Sender<String>,
-    components: ComponentHandler,
 ) -> Result<(), String> {
-    let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
-    let config = ConfigBuilder::new(token, intents).build();
-    let mut shard = Shard::with_config(ShardId::ONE, config);
-    let owner_prompt_sender = spawn_owner_prompt_consumer();
-    while let Some(item) = shard
-        .next_event(
-            EventTypeFlags::MESSAGE_CREATE
-                | EventTypeFlags::INTERACTION_CREATE
-                | EventTypeFlags::THREAD_DELETE
-                | EventTypeFlags::CHANNEL_DELETE,
-        )
-        .await
-    {
+    let owner_prompt_sender = spawn_owner_prompt_consumer::<C>();
+    while let Some(item) = responder.chat().next_event().await {
         let notice = match item {
-            Ok(Event::MessageCreate(message)) => {
+            Ok(Inbound::Posted(posted)) => {
                 let request = OwnerPromptRequest {
-                    context: context.clone(),
-                    message: message.0,
+                    responder: Arc::clone(&responder),
+                    posted,
                     notices: notices.clone(),
                 };
                 if owner_prompt_sender.send(request).is_err() {
@@ -100,24 +68,15 @@ pub async fn drive_gateway_with_components(
                     continue;
                 }
             }
-            Ok(Event::InteractionCreate(interaction)) => {
-                let handler = Arc::clone(&components);
-                tokio::spawn(async move { handler(interaction.0).await });
+            Ok(Inbound::Component(component)) => {
+                tokio::spawn(handle_component(Arc::clone(&responder), component));
                 continue;
             }
-            Ok(Event::ThreadDelete(thread)) if thread.guild_id == context.guild => {
-                spawn_deletion(&context, &notices, GuildDeletion::Thread { id: thread.id });
-                "discord gateway deletion: THREAD_DELETE".to_owned()
+            Ok(Inbound::Deleted(deletion)) => {
+                let label = deletion.to_string();
+                spawn_deletion(&responder, &notices, deletion);
+                format!("discord gateway deletion: {label}")
             }
-            Ok(Event::ChannelDelete(channel)) if channel.guild_id == Some(context.guild) => {
-                spawn_deletion(
-                    &context,
-                    &notices,
-                    GuildDeletion::Channel(Box::new(channel.0)),
-                );
-                "discord gateway deletion: CHANNEL_DELETE".to_owned()
-            }
-            Ok(_) => continue,
             Err(error) => format!("discord gateway error: {error}"),
         };
         if notices.send(notice).is_err() {
@@ -127,13 +86,18 @@ pub async fn drive_gateway_with_components(
     Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
 }
 
-fn spawn_deletion(context: &GatewayContext, notices: &Sender<String>, deletion: GuildDeletion) {
-    let client = Arc::clone(&context.client);
-    let responder = Arc::clone(&context.responder);
+fn spawn_deletion<C: Chat>(
+    responder: &Arc<PermissionResponder<C>>,
+    notices: &Sender<String>,
+    deletion: C::Deletion,
+) {
+    let responder = Arc::clone(responder);
     let notices = notices.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            handle_guild_deletion(&client, responder.chat().topology_cache(), deletion).await
+        if let Err(error) = responder
+            .chat()
+            .handle_deletion(deletion, close_in_herdr)
+            .await
         {
             let _ = notices.send(format!("discord owner deletion error: {error}"));
         }

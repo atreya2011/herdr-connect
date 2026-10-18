@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use twilight_gateway::{
+    ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
+};
 use twilight_http::Client;
 use twilight_model::application::interaction::{
     Interaction as DiscordInteraction, InteractionData,
 };
-use twilight_model::channel::message::MessageFlags;
+use twilight_model::channel::{ChannelType, message::MessageFlags};
 use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
@@ -15,7 +18,10 @@ use twilight_model::id::{
     marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker, WebhookMarker},
 };
 
-use crate::chat::{Ack, Chat, ChatError, Component, TopologyClosure};
+use crate::chat::{
+    Ack, Chat, ChatError, Closed, Component, Inbound, OwnerMessage, TopologyClosure,
+};
+use crate::deletion::{GuildDeletion, handle_guild_deletion};
 use crate::delivery::expire_permission_card;
 use crate::{
     OwnerIdentity, PermissionVendor, Question, TopologyCache, TopologyRoute, TransitionMessage,
@@ -24,8 +30,8 @@ use crate::{
     deliver_activity_message, deliver_live_message, deliver_permission_card, deliver_question_card,
     deliver_transition_card, execute_terminal_prompt_webhook, expire_informational_card,
     fetch_owner_identity, fetch_topology_lists, reconcile_topology_cache,
-    register_archived_tab_threads, resolve_terminal_prompt_webhook, sync_topology,
-    update_activity_message, update_question_card, workspace_channel_id,
+    register_archived_tab_threads, resolve_terminal_prompt_webhook, should_handle_owner_message,
+    sync_topology, update_activity_message, update_question_card, workspace_channel_id,
 };
 
 pub const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
@@ -38,6 +44,7 @@ pub struct Discord {
     owner_id: String,
     topology_cache: TopologyCache,
     webhooks: Mutex<WebhookCache>,
+    shard: tokio::sync::Mutex<Shard>,
 }
 
 pub async fn fetch_startup_owner_identity(
@@ -99,16 +106,20 @@ impl Discord {
     #[must_use]
     pub fn new(
         client: Arc<Client>,
+        token: String,
         guild: Id<GuildMarker>,
         owner_id: String,
         topology_cache: TopologyCache,
     ) -> Self {
+        let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
+        let shard = Shard::with_config(ShardId::ONE, ConfigBuilder::new(token, intents).build());
         Self {
             client,
             guild,
             owner_id,
             topology_cache,
             webhooks: Mutex::new(HashMap::new()),
+            shard: tokio::sync::Mutex::new(shard),
         }
     }
 
@@ -181,6 +192,8 @@ impl Chat for Discord {
     type Route = Id<ChannelMarker>;
     type Message = Id<MessageMarker>;
     type Interaction = DiscordInteraction;
+    type Posted = twilight_model::channel::Message;
+    type Deletion = GuildDeletion;
 
     fn owner_id(&self) -> &str {
         &self.owner_id
@@ -514,6 +527,187 @@ impl Chat for Discord {
                 .await
                 .map(drop)
                 .map_err(chat_error),
+        }
+    }
+
+    async fn typing(&self, route: &Self::Route) -> Result<(), ChatError> {
+        self.client
+            .create_typing_trigger(*route)
+            .await
+            .map(drop)
+            .map_err(chat_error)
+    }
+
+    async fn reply(
+        &self,
+        route: &Self::Route,
+        message: &Self::Message,
+        text: &str,
+    ) -> Result<(), ChatError> {
+        self.client
+            .create_message(*route)
+            .content(text)
+            .reply(*message)
+            .await
+            .map(drop)
+            .map_err(chat_error)
+    }
+
+    async fn owner_message(
+        &self,
+        posted: Self::Posted,
+    ) -> Result<Option<OwnerMessage<Self>>, ChatError> {
+        if posted.guild_id != Some(self.guild)
+            || !should_handle_owner_message(
+                &posted.author.id.to_string(),
+                posted.author.bot,
+                &self.owner_id,
+            )
+        {
+            return Ok(None);
+        }
+        let thread = self
+            .client
+            .channel(posted.channel_id)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        if !is_thread_channel(thread.kind) {
+            return Ok(None);
+        }
+        let Some(parent_id) = thread.parent_id else {
+            return Ok(None);
+        };
+        let parent = self
+            .client
+            .channel(parent_id)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        let Some(thread_name) = thread.name.as_deref() else {
+            return Ok(None);
+        };
+        let Some(topic) = parent.topic.as_deref() else {
+            return Ok(None);
+        };
+        let Some((tab_id, workspace_id)) = prompt_surface_markers(thread_name, topic) else {
+            return Ok(None);
+        };
+        Ok(Some(OwnerMessage {
+            route: posted.channel_id,
+            message: posted.id,
+            content: posted.content,
+            tab_id: tab_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+        }))
+    }
+
+    async fn next_event(&self) -> Option<Result<Inbound<Self>, ChatError>> {
+        loop {
+            let event = self
+                .shard
+                .lock()
+                .await
+                .next_event(
+                    EventTypeFlags::MESSAGE_CREATE
+                        | EventTypeFlags::INTERACTION_CREATE
+                        | EventTypeFlags::THREAD_DELETE
+                        | EventTypeFlags::CHANNEL_DELETE,
+                )
+                .await?;
+            match event {
+                Ok(Event::MessageCreate(message)) => return Some(Ok(Inbound::Posted(message.0))),
+                Ok(Event::InteractionCreate(interaction)) => {
+                    if let Some(component) = self.component(interaction.0) {
+                        return Some(Ok(Inbound::Component(component)));
+                    }
+                }
+                Ok(Event::ThreadDelete(thread)) if thread.guild_id == self.guild => {
+                    return Some(Ok(Inbound::Deleted(GuildDeletion::Thread {
+                        id: thread.id,
+                    })));
+                }
+                Ok(Event::ChannelDelete(channel)) if channel.guild_id == Some(self.guild) => {
+                    return Some(Ok(Inbound::Deleted(GuildDeletion::Channel(Box::new(
+                        channel.0,
+                    )))));
+                }
+                Ok(_) => {}
+                Err(error) => return Some(Err(chat_error(error))),
+            }
+        }
+    }
+
+    async fn handle_deletion<F>(&self, deletion: Self::Deletion, close: F) -> Result<(), ChatError>
+    where
+        F: FnOnce(Closed) -> Result<(), String> + Send + 'static,
+    {
+        Ok(handle_guild_deletion(&self.client, &self.topology_cache, deletion, close).await?)
+    }
+}
+
+#[must_use]
+const fn is_thread_channel(kind: ChannelType) -> bool {
+    kind.is_thread()
+}
+
+#[must_use]
+fn prompt_surface_markers<'a, 'b>(
+    thread_name: &'a str,
+    topic: &'b str,
+) -> Option<(&'a str, &'b str)> {
+    let tab_id = thread_name
+        .rsplit_once(" [")
+        .and_then(|(_, suffix)| suffix.strip_suffix(']'))
+        .filter(|value| !value.trim().is_empty())?;
+    let workspace_id = topic
+        .strip_prefix("herdr workspace [")
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| !value.trim().is_empty())?;
+    Some((tab_id, workspace_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use twilight_model::channel::ChannelType;
+
+    use super::{is_thread_channel, prompt_surface_markers};
+
+    #[test]
+    fn only_thread_channel_kinds_are_prompt_surfaces() {
+        let cases = [
+            (ChannelType::GuildText, false),
+            (ChannelType::GuildCategory, false),
+            (ChannelType::GuildForum, false),
+            (ChannelType::AnnouncementThread, true),
+            (ChannelType::PublicThread, true),
+            (ChannelType::PrivateThread, true),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(is_thread_channel(kind), expected);
+        }
+    }
+
+    #[test]
+    fn qualifying_prompt_surface_requires_both_discord_markers() {
+        let cases = [
+            (
+                "bridge [real-workspace:tab-1]",
+                "herdr workspace [real-workspace]",
+                true,
+            ),
+            ("bridge", "herdr workspace [real-workspace]", false),
+            ("bridge [real-workspace:tab-1]", "workspace", false),
+        ];
+        for (thread_name, topic, expected) in cases {
+            assert_eq!(
+                prompt_surface_markers(thread_name, topic).is_some(),
+                expected
+            );
         }
     }
 }
