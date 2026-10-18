@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use twilight_http::Client;
 use twilight_model::application::interaction::{
@@ -12,24 +12,44 @@ use twilight_model::http::interaction::{
 };
 use twilight_model::id::{
     Id,
-    marker::{ChannelMarker, GuildMarker, MessageMarker},
+    marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker, WebhookMarker},
 };
 
 use crate::chat::{Ack, Chat, ChatError, Component, TopologyClosure};
 use crate::delivery::expire_permission_card;
 use crate::{
-    PermissionVendor, Question, TopologyCache, TopologyRoute, bridge_eprintln, cached_route,
+    OwnerIdentity, PermissionVendor, Question, TopologyCache, TopologyRoute, TransitionMessage,
+    UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, bridge_eprintln, cached_route,
     delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
-    deliver_permission_card, deliver_question_card, expire_informational_card,
-    fetch_topology_lists, reconcile_topology_cache, register_archived_tab_threads, sync_topology,
-    update_question_card, workspace_channel_id,
+    deliver_activity_message, deliver_live_message, deliver_permission_card, deliver_question_card,
+    deliver_transition_card, execute_terminal_prompt_webhook, expire_informational_card,
+    fetch_owner_identity, fetch_topology_lists, reconcile_topology_cache,
+    register_archived_tab_threads, resolve_terminal_prompt_webhook, sync_topology,
+    update_activity_message, update_question_card, workspace_channel_id,
 };
+
+pub const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
+
+type WebhookCache = HashMap<Id<ChannelMarker>, (Id<WebhookMarker>, String)>;
 
 pub struct Discord {
     client: Arc<Client>,
     guild: Id<GuildMarker>,
     owner_id: String,
     topology_cache: TopologyCache,
+    webhooks: Mutex<WebhookCache>,
+}
+
+pub async fn fetch_startup_owner_identity(
+    client: &Client,
+    owner_id: &str,
+) -> Result<OwnerIdentity, String> {
+    let owner_id = owner_id.parse::<u64>().map_err(|error| {
+        format!("owner identity fetch error: DISCORD_OWNER_ID is not numeric: {error}")
+    })?;
+    fetch_owner_identity(client, Id::<UserMarker>::new(owner_id))
+        .await
+        .map_err(|error| format!("owner identity fetch error: {error}"))
 }
 
 fn chat_error(error: impl Display) -> ChatError {
@@ -77,7 +97,7 @@ async fn sync_route_locked(
 
 impl Discord {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         client: Arc<Client>,
         guild: Id<GuildMarker>,
         owner_id: String,
@@ -88,12 +108,52 @@ impl Discord {
             guild,
             owner_id,
             topology_cache,
+            webhooks: Mutex::new(HashMap::new()),
         }
     }
 
     #[must_use]
     pub const fn topology_cache(&self) -> &TopologyCache {
         &self.topology_cache
+    }
+
+    async fn gone(&self, error: String, webhook_channel: Option<Id<ChannelMarker>>) -> ChatError {
+        if error.starts_with(UNKNOWN_CHANNEL_DELIVERY_ERROR) {
+            *self.topology_cache.lock().await = None;
+        } else if let Some(channel) = webhook_channel
+            && error.starts_with(UNKNOWN_WEBHOOK_DELIVERY_ERROR)
+        {
+            self.webhooks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&channel);
+        }
+        ChatError::from(error)
+    }
+
+    fn cached_webhook(&self, channel: Id<ChannelMarker>) -> Option<(Id<WebhookMarker>, String)> {
+        self.webhooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&channel)
+            .cloned()
+    }
+
+    async fn terminal_prompt_webhook(
+        &self,
+        channel: Id<ChannelMarker>,
+    ) -> Result<(Id<WebhookMarker>, String), String> {
+        if let Some(webhook) = self.cached_webhook(channel) {
+            return Ok(webhook);
+        }
+        let webhook =
+            resolve_terminal_prompt_webhook(&self.client, channel, TERMINAL_PROMPT_WEBHOOK_NAME)
+                .await?;
+        self.webhooks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(channel, webhook.clone());
+        Ok(webhook)
     }
 
     #[must_use]
@@ -275,6 +335,80 @@ impl Chat for Discord {
         let mut guard = self.topology_cache.lock().await;
         let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
         Ok(sync_topology(&self.client, self.guild, channels, active_threads, route).await?)
+    }
+
+    async fn post_live(
+        &self,
+        route: &Self::Route,
+        text: &str,
+        nonce: &str,
+    ) -> Result<(), ChatError> {
+        match deliver_live_message(&self.client, *route, text, nonce).await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.gone(error, None).await),
+        }
+    }
+
+    async fn post_transition_card(
+        &self,
+        route: &Self::Route,
+        card: &TransitionMessage,
+        nonce: &str,
+    ) -> Result<Self::Message, ChatError> {
+        match deliver_transition_card(&self.client, *route, card, nonce).await {
+            Ok(message) => Ok(message),
+            Err(error) => Err(self.gone(error, None).await),
+        }
+    }
+
+    async fn post_activity(
+        &self,
+        route: &Self::Route,
+        text: &str,
+    ) -> Result<Self::Message, ChatError> {
+        match deliver_activity_message(&self.client, *route, text).await {
+            Ok(message) => Ok(message),
+            Err(error) => Err(self.gone(error, None).await),
+        }
+    }
+
+    async fn edit_activity(
+        &self,
+        route: &Self::Route,
+        message: &Self::Message,
+        text: &str,
+    ) -> Result<(), ChatError> {
+        match update_activity_message(&self.client, *route, *message, text).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.gone(error, None).await),
+        }
+    }
+
+    async fn post_as_owner(
+        &self,
+        parent: &Self::Route,
+        thread: &Self::Route,
+        owner: &OwnerIdentity,
+        text: &str,
+    ) -> Result<(), ChatError> {
+        let result = async {
+            let (webhook_id, webhook_token) = self.terminal_prompt_webhook(*parent).await?;
+            execute_terminal_prompt_webhook(
+                &self.client,
+                webhook_id,
+                &webhook_token,
+                *thread,
+                &owner.display_name,
+                owner.avatar_url.as_deref(),
+                text,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.gone(error, Some(*parent)).await),
+        }
     }
 
     async fn expire_card(

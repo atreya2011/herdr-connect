@@ -3,7 +3,7 @@ use std::fmt::{self, Debug, Display};
 use std::future::Future;
 use std::hash::Hash;
 
-use crate::{PermissionVendor, Question, TopologyRoute};
+use crate::{OwnerIdentity, PermissionVendor, Question, TopologyRoute, TransitionMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatError(String);
@@ -85,6 +85,36 @@ pub trait Chat: Send + Sync + Sized + 'static {
     fn close_topology(
         &self,
         closure: &TopologyClosure,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn post_live(
+        &self,
+        route: &Self::Route,
+        text: &str,
+        nonce: &str,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn post_transition_card(
+        &self,
+        route: &Self::Route,
+        card: &TransitionMessage,
+        nonce: &str,
+    ) -> impl Future<Output = Result<Self::Message, ChatError>> + Send;
+    fn post_activity(
+        &self,
+        route: &Self::Route,
+        text: &str,
+    ) -> impl Future<Output = Result<Self::Message, ChatError>> + Send;
+    fn edit_activity(
+        &self,
+        route: &Self::Route,
+        message: &Self::Message,
+        text: &str,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn post_as_owner(
+        &self,
+        parent: &Self::Route,
+        thread: &Self::Route,
+        owner: &OwnerIdentity,
+        text: &str,
     ) -> impl Future<Output = Result<(), ChatError>> + Send;
     fn expire_card(
         &self,
