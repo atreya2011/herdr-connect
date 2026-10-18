@@ -19,23 +19,21 @@ use herdr_connect_rs::{
     deliver_activity_message, send_activity_frame, update_activity_message,
 };
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, ComponentHandler, Discord, ENV_DISCORD_GUILD_ID,
-    ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, GatewayContext,
-    HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE,
-    STATUS_WORKING, TopologyCache, TopologyRoute, Transition, TransitionMessage,
-    UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, agent_read_detection,
-    cached_route, create_transition_messages, delete_tab_thread, delete_topology_absent_from_herdr,
-    delete_workspace_channel, deliver_live_message, deliver_transition_card, dialog_shows_question,
-    drive_gateway_with_components, execute_terminal_prompt_webhook, expire_informational_card,
-    fetch_owner_identity, fetch_topology_lists, forget_departed_owner_prompt_suppressions,
-    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, live_message_nonce, load_discord_config, name_unlabeled_tabs,
-    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
-    reconcile_topology_cache, register_archived_tab_threads, resolve_terminal_prompt_webhook,
+    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ComponentHandler, Discord,
+    ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY,
+    GatewayContext, HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED,
+    STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyClosure, TopologyRoute,
+    Transition, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR,
+    agent_read_detection, create_transition_messages, deliver_live_message,
+    deliver_transition_card, dialog_shows_question, drive_gateway_with_components,
+    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
+    forget_departed_owner_prompt_suppressions, format_detection_question, hook_timeout,
+    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
+    load_discord_config, name_unlabeled_tabs, read_claude_incremental,
+    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
+    read_cursor_incremental, read_cursor_prompts_incremental, resolve_terminal_prompt_webhook,
     route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
-    sync_topology, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
-    workspace_channel_id, workspace_list_result,
+    tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -99,7 +97,6 @@ struct ActivityMessage {
 
 struct BlockedCardContext<'a> {
     client: &'a Client,
-    guild: Id<GuildMarker>,
     owner_id: &'a str,
     responder: &'a PermissionResponder<Discord>,
     topology_cache: &'a TopologyCache,
@@ -140,7 +137,6 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
 async fn handle_blocked_card(context: BlockedCardContext<'_>) {
     let BlockedCardContext {
         client,
-        guild,
         owner_id,
         responder,
         topology_cache,
@@ -152,7 +148,7 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         state_change_seq,
         informational_cards,
     } = context;
-    let target = match sync_route(client, guild, route, topology_cache).await {
+    let target = match responder.chat().sync_route(route).await {
         Ok(target) => target,
         Err(error) => {
             bridge_eprintln!("{error}");
@@ -389,15 +385,8 @@ async fn maybe_sync_fresh_session_topology(
             return;
         }
     };
-    let (client, guild, _, responder, _) = discord;
-    if let Err(error) = sync_route(
-        client.as_ref(),
-        *guild,
-        &route,
-        responder.chat().topology_cache(),
-    )
-    .await
-    {
+    let (_, _, _, responder, _) = discord;
+    if let Err(error) = responder.chat().sync_route(&route).await {
         bridge_eprintln!("{error}");
     }
 }
@@ -485,10 +474,9 @@ async fn deliver_postable_transition(
             return;
         }
     };
-    let (client, guild, owner_id, responder, _) = discord;
+    let (client, _, owner_id, responder, _) = discord;
     handle_blocked_card(BlockedCardContext {
         client: client.as_ref(),
-        guild: *guild,
         owner_id,
         responder: responder.as_ref(),
         topology_cache: responder.chat().topology_cache(),
@@ -936,24 +924,6 @@ fn read_new_live_texts(
     }
 }
 
-async fn sync_route_channels(
-    client: &Client,
-    guild: Id<GuildMarker>,
-    route: &TopologyRoute,
-    topology_cache: &TopologyCache,
-) -> Result<(Id<ChannelMarker>, Id<ChannelMarker>), String> {
-    let thread = sync_route(client, guild, route, topology_cache).await?;
-    let guard = topology_cache.lock().await;
-    let found = guard
-        .as_ref()
-        .and_then(|(channels, _)| workspace_channel_id(channels, &route.workspace_id));
-    drop(guard);
-    let workspace_channel = found.ok_or_else(|| {
-        "herdr topology error: workspace channel missing from cache after sync".to_owned()
-    })?;
-    Ok((workspace_channel, thread))
-}
-
 async fn cached_terminal_prompt_webhook(
     client: &Client,
     workspace_channel: Id<ChannelMarker>,
@@ -1135,16 +1105,15 @@ async fn mirror_terminal_prompts(
     if prompts.is_empty() {
         return;
     }
-    let (client, guild, _, responder, identity) = connection;
+    let (client, _, _, responder, identity) = connection;
     let topology_cache = responder.chat().topology_cache();
-    let (workspace_channel, thread) =
-        match sync_route_channels(client.as_ref(), *guild, route, topology_cache).await {
-            Ok(channels) => channels,
-            Err(error) => {
-                bridge_eprintln!("terminal prompt route error for {terminal}: {error}");
-                return;
-            }
-        };
+    let (workspace_channel, thread) = match responder.chat().sync_route_with_parent(route).await {
+        Ok(channels) => channels,
+        Err(error) => {
+            bridge_eprintln!("terminal prompt route error for {terminal}: {error}");
+            return;
+        }
+    };
     let mut target = TerminalPromptTarget {
         client: client.as_ref(),
         topology_cache,
@@ -1169,7 +1138,7 @@ async fn handle_live_event(
     terminal: &str,
     state: &mut BridgeState,
 ) {
-    let (client, guild, _, responder, _) = connection;
+    let (client, _, _, responder, _) = connection;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
@@ -1188,12 +1157,12 @@ async fn handle_live_event(
         }
     };
     let topology_cache = responder.chat().topology_cache();
-    let channel = match sync_route(client.as_ref(), *guild, &route, topology_cache).await {
+    let channel = match responder.chat().sync_route(&route).await {
         Ok(channel) => channel,
         Err(error) => {
             if state
                 .live_errors_reported
-                .insert((terminal.to_owned(), error.clone()))
+                .insert((terminal.to_owned(), error.to_string()))
             {
                 bridge_eprintln!("live capture route error for {terminal}: {error}");
             }
@@ -1246,19 +1215,6 @@ fn forget_activity_message(state: &mut BridgeState, pane_id: &str) {
     state.activity_messages.remove(pane_id);
 }
 
-async fn cached_route_channel(
-    topology_cache: &TopologyCache,
-    route: &TopologyRoute,
-) -> Result<Option<Id<ChannelMarker>>, String> {
-    let guard = topology_cache.lock().await;
-    let Some((channels, active_threads)) = guard.as_ref() else {
-        return Ok(None);
-    };
-    let channel = cached_route(channels, active_threads, route);
-    drop(guard);
-    channel
-}
-
 async fn handle_activity_event(
     discord: &DiscordConnection,
     frame: ActivityFrame,
@@ -1273,7 +1229,7 @@ async fn handle_activity_event(
         thread_name: String::new(),
     };
     let topology_cache = responder.chat().topology_cache();
-    let channel = match cached_route_channel(topology_cache, &route).await {
+    let channel = match responder.chat().cached_route(&route).await {
         Ok(Some(channel)) => channel,
         Ok(None) => return,
         Err(error) => {
@@ -1350,171 +1306,27 @@ fn capture_for_blocked_with_search_root(
     }
 }
 
-async fn sync_route(
-    client: &Client,
-    guild: Id<GuildMarker>,
-    route: &TopologyRoute,
-    topology_cache: &TopologyCache,
-) -> Result<Id<ChannelMarker>, String> {
-    let mut guard = topology_cache.lock().await;
-    sync_route_locked(client, guild, route, &mut guard).await
-}
-
-async fn sync_route_locked(
-    client: &Client,
-    guild: Id<GuildMarker>,
-    route: &TopologyRoute,
-    guard: &mut tokio::sync::MutexGuard<
-        '_,
-        Option<(
-            Vec<twilight_model::channel::Channel>,
-            Vec<twilight_model::channel::Channel>,
-        )>,
-    >,
-) -> Result<Id<ChannelMarker>, String> {
-    let cached = match guard.as_ref() {
-        Some((channels, active_threads)) => cached_route(channels, active_threads, route)
-            .map_err(|error| format!("discord topology error: {error}"))?,
-        None => None,
-    };
-    if let Some(channel) = cached {
-        return Ok(channel);
-    }
-    let fetched = fetch_topology_lists(client, guild)
-        .await
-        .map_err(|error| format!("discord topology error: {error}"))?;
-    let (channels, active_threads) = reconcile_topology_cache(guard, fetched);
-    sync_topology(client, guild, channels, active_threads, route)
-        .await
-        .map_err(|error| format!("discord topology error: {error}"))
-}
-
-async fn sync_startup_topology(
-    discord: &DiscordConnection,
-    agents: &[AgentSnapshot],
-    tabs: &[HerdrTab],
-) {
-    let (client, guild, _, responder, _) = discord;
-    let topology_cache = responder.chat().topology_cache();
-    let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
-        Ok(lists) => lists,
-        Err(error) => {
-            bridge_eprintln!("herdr startup topology error: {error}");
-            return;
-        }
-    };
-    let mut guard = topology_cache.lock().await;
-    reconcile_topology_cache(&mut guard, fetched);
-    drop(guard);
+async fn sync_startup_topology<C: Chat>(chat: &C, agents: &[AgentSnapshot], tabs: &[HerdrTab]) {
     let mut synced_tabs = HashSet::new();
-    for agent in agents {
-        if agent.session.is_none() {
-            continue;
-        }
-        if !synced_tabs.insert(agent.tab_id.clone()) {
-            continue;
-        }
-        let route = match route_topology(agents, tabs, &agent.terminal_id) {
-            Ok(route) => route,
-            Err(error) => {
-                bridge_eprintln!("herdr startup topology error: {error}");
-                continue;
-            }
-        };
-        let mut guard = topology_cache.lock().await;
-        let (channels, active_threads) = if let Some((channels, active_threads)) = guard.as_mut() {
-            (channels, active_threads)
-        } else {
-            let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
-                Ok(fetched) => fetched,
-                Err(error) => {
-                    bridge_eprintln!("herdr startup topology error: {error}");
-                    continue;
-                }
-            };
-            reconcile_topology_cache(&mut guard, fetched)
-        };
-        let result = sync_topology(client.as_ref(), *guild, channels, active_threads, &route).await;
-        drop(guard);
-        if let Err(error) = result {
-            bridge_eprintln!("herdr startup topology error: {error}");
-        }
-    }
-    let (workspaces, live_tabs) = match (workspace_list_result(), tab_list_result()) {
-        (Ok(workspaces), Ok(live_tabs)) => (workspaces, live_tabs),
-        (Err(error), _) | (_, Err(error)) => {
-            bridge_eprintln!("herdr startup topology reconciliation error: {error}");
-            return;
-        }
-    };
-    let live_workspace_ids: HashSet<&str> = workspaces
+    let routes = agents
         .iter()
-        .map(|workspace| workspace.workspace_id.as_str())
+        .filter(|agent| agent.session.is_some())
+        .filter(|agent| synced_tabs.insert(agent.tab_id.clone()))
+        .map(|agent| route_topology(agents, tabs, &agent.terminal_id))
         .collect();
-    let live_tab_ids: HashSet<&str> = live_tabs.iter().map(|tab| tab.tab_id.as_str()).collect();
-    let mut guard = topology_cache.lock().await;
-    let (channels, active_threads) = if let Some((channels, active_threads)) = guard.as_mut() {
-        (channels, active_threads)
-    } else {
-        let fetched = match fetch_topology_lists(client.as_ref(), *guild).await {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                bridge_eprintln!("herdr startup topology error: {error}");
-                return;
-            }
-        };
-        reconcile_topology_cache(&mut guard, fetched)
-    };
-    let result = delete_topology_absent_from_herdr(
-        client.as_ref(),
-        channels,
-        active_threads,
-        &live_workspace_ids,
-        &live_tab_ids,
-    )
+    chat.startup_sweep(routes, || {
+        match (workspace_list_result(), tab_list_result()) {
+            (Ok(workspaces), Ok(live_tabs)) => Ok((
+                workspaces
+                    .into_iter()
+                    .map(|workspace| workspace.workspace_id)
+                    .collect(),
+                live_tabs.into_iter().map(|tab| tab.tab_id).collect(),
+            )),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    })
     .await;
-    drop(guard);
-    if let Err(error) = result {
-        bridge_eprintln!("herdr startup topology reconciliation error: {error}");
-    }
-}
-
-async fn delete_closed_topology(
-    discord: &DiscordConnection,
-    closure: &TopologyClosure,
-) -> Result<(), String> {
-    let (client, guild, _, responder, _) = discord;
-    let topology_cache = responder.chat().topology_cache();
-    let fetched = fetch_topology_lists(client.as_ref(), *guild).await?;
-    let mut guard = topology_cache.lock().await;
-    let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
-    let result = match closure {
-        TopologyClosure::Tab {
-            workspace_id,
-            tab_id,
-        } => {
-            let mut archived_cache: HashMap<
-                Id<ChannelMarker>,
-                Vec<twilight_model::channel::Channel>,
-            > = HashMap::new();
-            delete_tab_thread(
-                client.as_ref(),
-                channels,
-                active_threads,
-                &mut archived_cache,
-                workspace_id,
-                tab_id,
-            )
-            .await
-        }
-        TopologyClosure::Workspace { workspace_id } => {
-            delete_workspace_channel(client.as_ref(), channels, workspace_id).await
-        }
-    };
-    if let Err(error) = result {
-        bridge_eprintln!("herdr topology closure error: {error}");
-    }
-    Ok(())
 }
 
 fn next_state_change_sequence(
@@ -1971,17 +1783,6 @@ fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum TopologyClosure {
-    Tab {
-        workspace_id: String,
-        tab_id: String,
-    },
-    Workspace {
-        workspace_id: String,
-    },
-}
-
 fn lifecycle_closure(event: &serde_json::Value) -> Option<TopologyClosure> {
     match event.get(EVENT_KEY)?.as_str()? {
         "tab_closed" => Some(TopologyClosure::Tab {
@@ -2127,7 +1928,7 @@ async fn apply_lifecycle_event(
     }
 
     if let Some(closure) = lifecycle_closure(event)
-        && let Err(error) = delete_closed_topology(discord, &closure).await
+        && let Err(error) = discord.3.chat().close_topology(&closure).await
     {
         bridge_eprintln!("herdr topology closure error: {error}");
     }
@@ -2144,10 +1945,9 @@ async fn apply_lifecycle_event(
 }
 
 fn spawn_archived_thread_registration(discord: &DiscordConnection) {
-    let (client, guild, ..) = discord;
-    let (client, guild) = (client.clone(), *guild);
+    let chat = discord.3.chat().clone();
     tokio::spawn(async move {
-        if let Err(error) = register_archived_tab_threads(client.as_ref(), guild).await {
+        if let Err(error) = chat.register_archived().await {
             bridge_eprintln!(
                 "herdr archived thread registration FAILED, owner deletion of an archived tab thread may be ignored: {error}"
             );
@@ -2164,9 +1964,11 @@ fn spawn_startup_topology_sweep(
             for error in name_unlabeled_tabs(&agents, &mut tabs, rename_errors_reported) {
                 bridge_eprintln!("herdr startup topology error: {error}");
             }
-            let discord = discord.clone();
+            let chat = discord.3.chat().clone();
             let startup_task =
-                tokio::spawn(async move { sync_startup_topology(&discord, &agents, &tabs).await });
+                tokio::spawn(
+                    async move { sync_startup_topology(chat.as_ref(), &agents, &tabs).await },
+                );
             tokio::spawn(async move {
                 if let Err(error) = startup_task.await {
                     bridge_eprintln!("herdr startup topology task error: {error}");
@@ -2456,21 +2258,20 @@ mod tests {
         BridgeRuntime, BridgeState, BrokerTask, Client, Discord, Follower, Membership,
         PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
         agent_read_detection, apply_membership, capture_for_with_search_root,
-        create_transition_messages, delete_closed_topology, doorbell_snapshot,
-        fetch_startup_owner_identity, fetch_topology_lists, handle_lifecycle_select_result,
-        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
-        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
-        next_state_change_sequence, process_snapshot, prune_departed_state,
-        read_new_terminal_prompts, resolve_session_path, route_topology,
-        subscribe_status_with_backoff, sync_route, sync_startup_topology, tab_list_result,
+        create_transition_messages, doorbell_snapshot, fetch_startup_owner_identity,
+        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
+        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
+        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
+        prune_departed_state, read_new_terminal_prompts, resolve_session_path, route_topology,
+        subscribe_status_with_backoff, sync_startup_topology, tab_list_result,
         terminal_prompt_baseline_is_current, unique_existing_path,
     };
     use herdr_connect_rs::{
-        AgentSession, AgentSnapshot, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
-        VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, lifecycle_subscriptions, name_unlabeled_tabs,
-        read_claude_incremental, read_codex_incremental, read_cursor_incremental,
-        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, transition_card_nonce,
-        workspace_list_result,
+        AgentSession, AgentSnapshot, Chat, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Transition,
+        VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, fetch_topology_lists, lifecycle_subscriptions,
+        name_unlabeled_tabs, read_claude_incremental, read_codex_incremental,
+        read_cursor_incremental, status_subscriptions, submit_owner_prompt, subscribe_herdr_events,
+        sync_route, transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -6966,7 +6767,7 @@ mod tests {
             return Err("the workspace channel existed before the startup sync".to_owned());
         }
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, agents, tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), agents, tabs).await;
 
         let channel = guild
             .client
@@ -7175,7 +6976,7 @@ mod tests {
             return Err("the workspace channel existed before the startup sync".to_owned());
         }
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
         let matching_channels: Vec<_> = guild
             .client
             .guild_channels(guild.id)
@@ -7475,7 +7276,7 @@ mod tests {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
 
-        let startup = sync_startup_topology(&connection, agents, tabs);
+        let startup = sync_startup_topology(connection.3.chat().as_ref(), agents, tabs);
         let delivery = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache);
         let ((), delivery_result) = tokio::join!(startup, delivery);
         delivery_result?;
@@ -7593,7 +7394,10 @@ mod tests {
         let shared: herdr_connect_rs::TopologyCache =
             Arc::new(tokio::sync::Mutex::new(Some(stale)));
         sync_startup_topology(
-            &discord_tuple_with_cache(guild, Arc::clone(&shared)),
+            discord_tuple_with_cache(guild, Arc::clone(&shared))
+                .3
+                .chat()
+                .as_ref(),
             agents,
             tabs,
         )
@@ -7992,7 +7796,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         for closure in &closures {
-            delete_closed_topology(&connection, closure).await?;
+            connection.3.chat().close_topology(closure).await?;
         }
 
         for (case, suffix) in cases.iter().zip(suffixes.iter()) {
@@ -8050,7 +7854,7 @@ mod tests {
         let agents = [root_agent.clone(), second_agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
 
@@ -8290,7 +8094,7 @@ mod tests {
         let agents = [root_agent.clone(), second_agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", second_route.workspace_id);
@@ -8555,7 +8359,7 @@ mod tests {
         let agents = [agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
         let route = route_topology(&agents, &tabs, &agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
@@ -8775,7 +8579,7 @@ mod tests {
         let route = route_topology(agents, tabs, &listed.terminal_id)?;
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, agents, tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), agents, tabs).await;
 
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let live_channel = guild_channel_with_topic(guild, &topic).await?;
@@ -8807,7 +8611,7 @@ mod tests {
         let bystander_thread =
             create_guild_thread(guild, live_channel.id, "testrun-notes [staging]").await?;
 
-        sync_startup_topology(&connection, agents, tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), agents, tabs).await;
 
         let channels_after = guild_channels_for_guild(guild).await?;
         if channels_after
@@ -8966,7 +8770,7 @@ mod tests {
             None
         };
 
-        sync_startup_topology(&connection, &[], &[]).await;
+        sync_startup_topology(connection.3.chat().as_ref(), &[], &[]).await;
 
         if let Some((handle, done)) = racer {
             done.store(true, Ordering::Relaxed);
@@ -9196,7 +9000,7 @@ mod tests {
         let agents = [no_session_agent.clone(), session_agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(&connection, &agents, &tabs).await;
+        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
 
         let no_session_route = route_topology(&agents, &tabs, &no_session_agent.terminal_id)?;
         let session_route = route_topology(&agents, &tabs, &session_agent.terminal_id)?;

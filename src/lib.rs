@@ -33,7 +33,7 @@ pub use cards::{
     AgentLogCapture, TransitionMessage, create_transition_messages, format_thread_name,
     split_live_message,
 };
-pub use chat::{Ack, Chat, ChatError, Component};
+pub use chat::{Ack, Chat, ChatError, Component, TopologyClosure};
 pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,
     load_discord_config,
@@ -46,7 +46,7 @@ pub use delivery::{
     fetch_owner_identity, live_message_nonce, resolve_terminal_prompt_webhook,
     transition_card_nonce, update_activity_message, update_question_card,
 };
-pub use discord::Discord;
+pub use discord::{Discord, sync_route};
 pub use gateway::{ComponentHandler, GatewayContext, drive_gateway_with_components};
 pub use herdr::{
     AgentSession, AgentSnapshot, EVENT_KEY, HerdrSubscription, HerdrTab, HerdrWorkspace,
