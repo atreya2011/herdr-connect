@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 use twilight_model::channel::Channel;
 use twilight_model::id::Id;
-use twilight_model::id::marker::{ChannelMarker, GuildMarker};
+use twilight_model::id::marker::{ChannelMarker, GuildMarker, UserMarker};
 
 use crate::{AgentSnapshot, HerdrTab, format_thread_name};
 
@@ -218,6 +218,7 @@ pub async fn sync_topology(
     channels: &mut Vec<Channel>,
     active_threads: &mut Vec<Channel>,
     route: &TopologyRoute,
+    owner_id: &str,
 ) -> Result<twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>, String> {
     let TopologyRoute {
         workspace_id,
@@ -282,6 +283,9 @@ pub async fn sync_topology(
         }
         return Ok(thread.id);
     }
+    let owner = owner_id
+        .parse::<Id<UserMarker>>()
+        .map_err(|error| format!("DISCORD_OWNER_ID is not numeric: {error}"))?;
     let created = client
         .create_thread(
             workspace_channel,
@@ -296,6 +300,10 @@ pub async fn sync_topology(
     let id = created.id;
     remember_tab_threads(std::slice::from_ref(&created));
     active_threads.push(created);
+    client
+        .add_thread_member(id, owner)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(id)
 }
 

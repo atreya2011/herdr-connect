@@ -68,9 +68,10 @@ pub async fn sync_route(
     guild: Id<GuildMarker>,
     route: &TopologyRoute,
     topology_cache: &TopologyCache,
+    owner_id: &str,
 ) -> Result<Id<ChannelMarker>, String> {
     let mut guard = topology_cache.lock().await;
-    sync_route_locked(client, guild, route, &mut guard).await
+    sync_route_locked(client, guild, route, &mut guard, owner_id).await
 }
 
 async fn sync_route_locked(
@@ -84,6 +85,7 @@ async fn sync_route_locked(
             Vec<twilight_model::channel::Channel>,
         )>,
     >,
+    owner_id: &str,
 ) -> Result<Id<ChannelMarker>, String> {
     let cached = match guard.as_ref() {
         Some((channels, active_threads)) => cached_route(channels, active_threads, route)
@@ -97,7 +99,7 @@ async fn sync_route_locked(
         .await
         .map_err(|error| format!("discord topology error: {error}"))?;
     let (channels, active_threads) = reconcile_topology_cache(guard, fetched);
-    sync_topology(client, guild, channels, active_threads, route)
+    sync_topology(client, guild, channels, active_threads, route, owner_id)
         .await
         .map_err(|error| format!("discord topology error: {error}"))
 }
@@ -200,14 +202,28 @@ impl Chat for Discord {
     }
 
     async fn sync_route(&self, route: &TopologyRoute) -> Result<Self::Route, ChatError> {
-        Ok(sync_route(&self.client, self.guild, route, &self.topology_cache).await?)
+        Ok(sync_route(
+            &self.client,
+            self.guild,
+            route,
+            &self.topology_cache,
+            &self.owner_id,
+        )
+        .await?)
     }
 
     async fn sync_route_with_parent(
         &self,
         route: &TopologyRoute,
     ) -> Result<(Self::Route, Self::Route), ChatError> {
-        let thread = sync_route(&self.client, self.guild, route, &self.topology_cache).await?;
+        let thread = sync_route(
+            &self.client,
+            self.guild,
+            route,
+            &self.topology_cache,
+            &self.owner_id,
+        )
+        .await?;
         let guard = self.topology_cache.lock().await;
         let found = guard
             .as_ref()
@@ -271,8 +287,15 @@ impl Chat for Discord {
                     };
                     reconcile_topology_cache(&mut guard, fetched)
                 };
-            let result =
-                sync_topology(&self.client, self.guild, channels, active_threads, &route).await;
+            let result = sync_topology(
+                &self.client,
+                self.guild,
+                channels,
+                active_threads,
+                &route,
+                &self.owner_id,
+            )
+            .await;
             drop(guard);
             if let Err(error) = result {
                 bridge_eprintln!("herdr startup topology error: {error}");
@@ -351,7 +374,15 @@ impl Chat for Discord {
         let fetched = fetch_topology_lists(&self.client, self.guild).await?;
         let mut guard = self.topology_cache.lock().await;
         let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
-        Ok(sync_topology(&self.client, self.guild, channels, active_threads, route).await?)
+        Ok(sync_topology(
+            &self.client,
+            self.guild,
+            channels,
+            active_threads,
+            route,
+            &self.owner_id,
+        )
+        .await?)
     }
 
     async fn post_live(

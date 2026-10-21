@@ -28,6 +28,7 @@ mod real_guild {
     }
 
     async fn exercise(guild: &Guild) -> Result<(), String> {
+        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
         let route = TopologyRoute {
             workspace_id: "testrun-ws".to_owned(),
             tab_id: "testrun-tab".to_owned(),
@@ -43,6 +44,7 @@ mod real_guild {
             &mut channels,
             &mut active_threads,
             &route,
+            &owner_id,
         )
         .await?;
         guild
@@ -63,6 +65,7 @@ mod real_guild {
             &mut channels,
             &mut active_threads,
             &route,
+            &owner_id,
         )
         .await?;
         if first != second {
@@ -101,6 +104,7 @@ mod real_guild {
             &mut channels,
             &mut active_threads,
             &route,
+            &owner_id,
         )
         .await
         else {
@@ -132,6 +136,7 @@ mod real_guild {
     }
 
     async fn stale_active_list_exercise(guild: &Guild) -> Result<(), String> {
+        let owner_id = std::env::var("DISCORD_OWNER_ID").map_err(|e| e.to_string())?;
         let route = TopologyRoute {
             workspace_id: "testrun-stale".to_owned(),
             tab_id: "testrun-stale-tab".to_owned(),
@@ -147,6 +152,7 @@ mod real_guild {
             &mut channels,
             &mut active_threads,
             &route,
+            &owner_id,
         )
         .await?;
         guild
@@ -161,6 +167,7 @@ mod real_guild {
             &mut channels,
             &mut active_threads,
             &route,
+            &owner_id,
         )
         .await?;
         if second != first {
