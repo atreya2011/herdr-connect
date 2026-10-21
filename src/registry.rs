@@ -10,11 +10,6 @@ use std::time::Instant;
 
 use tokio::sync::oneshot;
 
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, MessageMarker},
-};
-
 use crate::{Decision, Question};
 const TOKEN_BYTES: usize = 24;
 
@@ -31,8 +26,8 @@ pub fn generate_token() -> Result<String, String> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalRequest {
-    pub channel_id: u64,
+pub struct ApprovalRequest<R> {
+    pub channel_id: R,
     pub session_id: String,
 }
 #[derive(Debug)]
@@ -42,8 +37,8 @@ pub struct IssuedApproval {
     pub expiry: Instant,
 }
 #[derive(Debug)]
-struct Entry {
-    request: ApprovalRequest,
+struct Entry<R> {
+    request: ApprovalRequest<R>,
     expiry: Instant,
     hook_alive: Arc<AtomicBool>,
     sender: oneshot::Sender<Decision>,
@@ -53,17 +48,24 @@ pub enum ResolveError {
     UnknownOrExpired,
     WrongChannel,
 }
-#[derive(Default, Debug)]
-pub struct InteractionRegistry {
-    entries: Mutex<HashMap<String, Entry>>,
+#[derive(Debug)]
+pub struct InteractionRegistry<R> {
+    entries: Mutex<HashMap<String, Entry<R>>>,
 }
-impl InteractionRegistry {
-    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
+impl<R> Default for InteractionRegistry<R> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+        }
+    }
+}
+impl<R: Eq> InteractionRegistry<R> {
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, Entry<R>>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub fn issue_with_liveness(
         &self,
-        request: ApprovalRequest,
+        request: ApprovalRequest<R>,
         expiry: Instant,
         hook_alive: Arc<AtomicBool>,
     ) -> Result<IssuedApproval, String> {
@@ -74,7 +76,7 @@ impl InteractionRegistry {
     fn issue_with_token(
         &self,
         token: String,
-        request: ApprovalRequest,
+        request: ApprovalRequest<R>,
         expiry: Instant,
     ) -> IssuedApproval {
         self.issue_with_token_and_liveness(token, request, expiry, Arc::new(AtomicBool::new(true)))
@@ -82,7 +84,7 @@ impl InteractionRegistry {
     fn issue_with_token_and_liveness(
         &self,
         token: String,
-        request: ApprovalRequest,
+        request: ApprovalRequest<R>,
         expiry: Instant,
         hook_alive: Arc<AtomicBool>,
     ) -> IssuedApproval {
@@ -105,7 +107,7 @@ impl InteractionRegistry {
     pub fn resolve(
         &self,
         token: &str,
-        channel_id: u64,
+        channel_id: &R,
         decision: Decision,
         now: Instant,
     ) -> Result<(), ResolveError> {
@@ -117,7 +119,7 @@ impl InteractionRegistry {
         if now >= entry.expiry || !entry.hook_alive.load(Ordering::Acquire) {
             return Err(ResolveError::UnknownOrExpired);
         }
-        if channel_id != entry.request.channel_id {
+        if *channel_id != entry.request.channel_id {
             return Err(ResolveError::WrongChannel);
         }
         let sender = occupied.remove().sender;
@@ -136,15 +138,15 @@ impl InteractionRegistry {
 }
 
 #[derive(Clone, Debug)]
-pub struct PendingQuestion {
-    pub channel: Id<ChannelMarker>,
-    pub message: Id<MessageMarker>,
+pub struct PendingQuestion<R, M> {
+    pub channel: R,
+    pub message: M,
     pub pane_id: String,
     pub questions: Vec<Question>,
     pub index: usize,
 }
 
-impl PendingQuestion {
+impl<R, M> PendingQuestion<R, M> {
     #[must_use]
     pub fn question(&self) -> &Question {
         &self.questions[self.index]
@@ -156,32 +158,39 @@ impl PendingQuestion {
     }
 }
 
-#[derive(Default, Debug)]
-pub struct QuestionRegistry {
-    entries: Mutex<HashMap<String, PendingQuestion>>,
+#[derive(Debug)]
+pub struct QuestionRegistry<R, M> {
+    entries: Mutex<HashMap<String, PendingQuestion<R, M>>>,
 }
-impl QuestionRegistry {
-    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, PendingQuestion>> {
+impl<R, M> Default for QuestionRegistry<R, M> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+        }
+    }
+}
+impl<R: Clone + Eq, M: Clone + Eq> QuestionRegistry<R, M> {
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, PendingQuestion<R, M>>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    pub fn insert(&self, token: String, pending: PendingQuestion) {
+    pub fn insert(&self, token: String, pending: PendingQuestion<R, M>) {
         self.lock_entries().insert(token, pending);
     }
-    pub fn get(&self, token: &str) -> Option<PendingQuestion> {
+    pub fn get(&self, token: &str) -> Option<PendingQuestion<R, M>> {
         self.lock_entries().get(token).cloned()
     }
-    pub fn take(&self, token: &str) -> Option<PendingQuestion> {
+    pub fn take(&self, token: &str) -> Option<PendingQuestion<R, M>> {
         self.lock_entries().remove(token)
     }
-    pub fn token_in_channel(&self, channel: Id<ChannelMarker>) -> Option<String> {
+    pub fn token_in_channel(&self, channel: &R) -> Option<String> {
         self.lock_entries()
             .iter()
-            .find(|(_, pending)| pending.channel == channel)
+            .find(|(_, pending)| pending.channel == *channel)
             .map(|(token, _)| token.clone())
     }
-    pub fn forget_message(&self, message: Id<MessageMarker>) {
+    pub fn forget_message(&self, message: &M) {
         self.lock_entries()
-            .retain(|_, pending| pending.message != message);
+            .retain(|_, pending| pending.message != *message);
     }
 }
 
@@ -193,7 +202,7 @@ mod tests {
 
     use super::{ApprovalRequest, InteractionRegistry, ResolveError};
     use crate::Decision;
-    fn request(channel_id: u64, session_id: &str) -> ApprovalRequest {
+    fn request(channel_id: u64, session_id: &str) -> ApprovalRequest<u64> {
         ApprovalRequest {
             channel_id,
             session_id: session_id.to_owned(),
@@ -202,7 +211,7 @@ mod tests {
     #[test]
     fn registry_state_machine_rejects_invalid_taps() {
         let now = Instant::now();
-        let cases = [("wrong channel", 8, ResolveError::WrongChannel)];
+        let cases = [("wrong channel", 8_u64, ResolveError::WrongChannel)];
         for (_, channel, expected) in cases {
             let registry = InteractionRegistry::default();
             let issued = registry.issue_with_token(
@@ -211,7 +220,7 @@ mod tests {
                 now + Duration::from_secs(30),
             );
             assert_eq!(
-                registry.resolve(&issued.token, channel, Decision::allow(), now,),
+                registry.resolve(&issued.token, &channel, Decision::allow(), now,),
                 Err(expected)
             );
         }
@@ -240,11 +249,11 @@ mod tests {
             now + Duration::from_secs(30),
         );
         registry
-            .resolve(&issued.token, 7, Decision::deny("no".to_owned()), now)
+            .resolve(&issued.token, &7, Decision::deny("no".to_owned()), now)
             .expect("first tap resolves");
         assert_eq!(issued.receiver.await, Ok(Decision::deny("no".to_owned())));
         assert_eq!(
-            registry.resolve("opaque-token", 7, Decision::allow(), now,),
+            registry.resolve("opaque-token", &7, Decision::allow(), now,),
             Err(ResolveError::UnknownOrExpired)
         );
     }
@@ -262,7 +271,7 @@ mod tests {
 
         hook_alive.store(false, Ordering::Release);
         assert_eq!(
-            registry.resolve(&issued.token, 7, Decision::allow(), now,),
+            registry.resolve(&issued.token, &7, Decision::allow(), now,),
             Err(ResolveError::UnknownOrExpired)
         );
     }
