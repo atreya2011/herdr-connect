@@ -46,7 +46,9 @@ pub use delivery::{
     fetch_owner_identity, live_message_nonce, resolve_terminal_prompt_webhook,
     transition_card_nonce, update_activity_message, update_question_card,
 };
-pub use discord::{Discord, sync_route};
+pub use discord::{
+    Discord, TERMINAL_PROMPT_WEBHOOK_NAME, fetch_startup_owner_identity, sync_route,
+};
 pub use gateway::{ComponentHandler, GatewayContext, drive_gateway_with_components};
 pub use herdr::{
     AgentSession, AgentSnapshot, EVENT_KEY, HerdrSubscription, HerdrTab, HerdrWorkspace,
