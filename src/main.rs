@@ -8,10 +8,7 @@ use std::time::{Duration, SystemTime};
 use notify::Watcher;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twilight_http::Client;
-use twilight_model::id::{
-    Id,
-    marker::{ChannelMarker, GuildMarker, MessageMarker},
-};
+use twilight_model::id::{Id, marker::GuildMarker};
 
 use herdr_connect_rs::{
     ACTIVITY_KIND, ActivityFrame, activity_message_text, bridge_eprintln, bridge_println,
@@ -24,14 +21,14 @@ use herdr_connect_rs::{
     GatewayContext, HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED,
     STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TopologyCache, TopologyClosure, TopologyRoute,
     Transition, TransitionMessage, agent_read_detection, create_transition_messages,
-    dialog_shows_question, drive_gateway_with_components, expire_informational_card,
-    fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
-    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, live_message_nonce, load_discord_config, name_unlabeled_tabs,
-    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
-    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
-    tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
+    dialog_shows_question, drive_gateway_with_components, fetch_startup_owner_identity,
+    forget_departed_owner_prompt_suppressions, format_detection_question, hook_timeout,
+    is_postable_transition, lifecycle_subscriptions, list_agents, live_message_nonce,
+    load_discord_config, name_unlabeled_tabs, read_claude_incremental,
+    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
+    read_cursor_incremental, read_cursor_prompts_incremental, route_topology, split_live_message,
+    status_subscriptions, subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression,
+    transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -41,20 +38,22 @@ use herdr_connect_rs::{
     request_decision, run_broker as run_permission_broker,
 };
 
-type DiscordConnection = (
-    Arc<Client>,
-    Id<GuildMarker>,
-    String,
-    Arc<PermissionResponder<Discord>>,
-    OwnerIdentity,
-);
+type ChatConnection<C> = (Arc<C>, Arc<PermissionResponder<C>>, OwnerIdentity);
 type GatewayTask = tokio::task::JoinHandle<Result<(), String>>;
 type BrokerTask = tokio::task::JoinHandle<Result<(), String>>;
 
-#[derive(Clone, Copy)]
-struct InformationalCard {
-    channel: Id<ChannelMarker>,
-    message: Id<MessageMarker>,
+struct InformationalCard<C: Chat> {
+    channel: C::Route,
+    message: C::Message,
+}
+
+impl<C: Chat> Clone for InformationalCard<C> {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+            message: self.message.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,37 +70,54 @@ struct LiveWatch {
     route: TopologyRoute,
 }
 
-#[derive(Default)]
-struct BridgeState {
+struct BridgeState<C: Chat> {
     previous: HashMap<String, String>,
     state_change_sequences: HashMap<String, u64>,
-    informational_cards: HashMap<String, InformationalCard>,
+    informational_cards: HashMap<String, InformationalCard<C>>,
     live_watches: HashMap<String, LiveWatch>,
     live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     live_errors_reported: HashSet<(String, String)>,
     rename_errors_reported: HashSet<String>,
-    activity_messages: HashMap<String, ActivityMessage>,
+    activity_messages: HashMap<String, ActivityMessage<C>>,
     activity_eligible_panes: HashSet<String>,
     terminal_prompt_positions: HashMap<String, (PathBuf, Follower, Follower)>,
     awaiting_first_log: HashMap<String, String>,
     seen_without_session: HashMap<String, SystemTime>,
 }
 
-struct ActivityMessage {
-    message: Id<MessageMarker>,
+impl<C: Chat> Default for BridgeState<C> {
+    fn default() -> Self {
+        Self {
+            previous: HashMap::new(),
+            state_change_sequences: HashMap::new(),
+            informational_cards: HashMap::new(),
+            live_watches: HashMap::new(),
+            live_tx: None,
+            live_errors_reported: HashSet::new(),
+            rename_errors_reported: HashSet::new(),
+            activity_messages: HashMap::new(),
+            activity_eligible_panes: HashSet::new(),
+            terminal_prompt_positions: HashMap::new(),
+            awaiting_first_log: HashMap::new(),
+            seen_without_session: HashMap::new(),
+        }
+    }
+}
+
+struct ActivityMessage<C: Chat> {
+    message: C::Message,
     count: u32,
 }
 
-struct BlockedCardContext<'a> {
-    owner_id: &'a str,
-    responder: &'a PermissionResponder<Discord>,
+struct BlockedCardContext<'a, C: Chat> {
+    responder: &'a PermissionResponder<C>,
     route: &'a TopologyRoute,
     snapshot: &'a AgentSnapshot,
     session: &'a AgentSession,
     terminal: &'a str,
     from_status: &'a str,
     state_change_seq: u64,
-    informational_cards: &'a mut HashMap<String, InformationalCard>,
+    informational_cards: &'a mut HashMap<String, InformationalCard<C>>,
 }
 
 const SUBSCRIBE_RETRY_INITIAL: Duration = Duration::from_millis(250);
@@ -127,9 +143,8 @@ async fn wait_for_broker(broker: Option<&mut BrokerTask>) -> Result<(), String> 
     }
 }
 
-async fn handle_blocked_card(context: BlockedCardContext<'_>) {
+async fn handle_blocked_card<C: Chat>(context: BlockedCardContext<'_, C>) {
     let BlockedCardContext {
-        owner_id,
         responder,
         route,
         snapshot,
@@ -188,9 +203,9 @@ async fn handle_blocked_card(context: BlockedCardContext<'_>) {
         to: STATUS_BLOCKED.to_owned(),
         terminal_id: terminal.to_owned(),
     };
-    let messages = create_transition_messages(&transition, &capture, owner_id);
+    let messages = create_transition_messages(&transition, &capture, responder.chat().owner_id());
     deliver_blocked_messages(
-        responder.chat(),
+        responder.chat().as_ref(),
         target,
         terminal,
         state_change_seq,
@@ -248,13 +263,13 @@ fn pending_questions(
         .map(|capture| capture.pending_questions)
 }
 
-async fn deliver_blocked_messages(
-    chat: &Discord,
-    target: Id<ChannelMarker>,
+async fn deliver_blocked_messages<C: Chat>(
+    chat: &C,
+    target: C::Route,
     terminal: &str,
     state_change_seq: u64,
     messages: &[TransitionMessage],
-    informational_cards: &mut HashMap<String, InformationalCard>,
+    informational_cards: &mut HashMap<String, InformationalCard<C>>,
 ) {
     let mut last = None;
     for (index, message) in messages.iter().enumerate() {
@@ -278,21 +293,18 @@ async fn deliver_blocked_messages(
     }
 }
 
-async fn expire_blocked_card(
-    discord: &DiscordConnection,
+async fn expire_blocked_card<C: Chat>(
+    discord: &ChatConnection<C>,
     terminal: &str,
-    informational_cards: &mut HashMap<String, InformationalCard>,
+    informational_cards: &mut HashMap<String, InformationalCard<C>>,
 ) {
-    if let Some(card) = informational_cards.get(terminal).copied() {
-        let (client, _, _, responder, _) = discord;
+    if let Some(card) = informational_cards.get(terminal).cloned() {
+        let (_, responder, _) = discord;
         responder.forget_question_card(&card.message);
-        if let Err(error) = expire_informational_card(
-            client.as_ref(),
-            card.channel,
-            card.message,
-            "resolved: pane left blocked",
-        )
-        .await
+        if let Err(error) = responder
+            .chat()
+            .expire_card(&card.channel, &card.message, "resolved: pane left blocked")
+            .await
         {
             bridge_eprintln!("discord blocked-card expiry error: {error}");
         } else {
@@ -301,26 +313,27 @@ async fn expire_blocked_card(
     }
 }
 
-async fn expire_departed_card(
-    discord: &DiscordConnection,
+async fn expire_departed_card<C: Chat>(
+    discord: &ChatConnection<C>,
     terminal: &str,
-    card: InformationalCard,
+    card: InformationalCard<C>,
 ) {
-    let (client, _, _, responder, _) = discord;
+    let (_, responder, _) = discord;
     responder.forget_question_card(&card.message);
-    if let Err(error) = expire_informational_card(
-        client.as_ref(),
-        card.channel,
-        card.message,
-        "resolved: pane left blocked",
-    )
-    .await
+    if let Err(error) = responder
+        .chat()
+        .expire_card(&card.channel, &card.message, "resolved: pane left blocked")
+        .await
     {
         bridge_eprintln!("discord blocked-card expiry error for {terminal}: {error}");
     }
 }
 
-fn update_activity_eligibility(state: &mut BridgeState, snapshot: &AgentSnapshot, status: &str) {
+fn update_activity_eligibility<C: Chat>(
+    state: &mut BridgeState<C>,
+    snapshot: &AgentSnapshot,
+    status: &str,
+) {
     let pane_id = snapshot.pane_id.as_str();
     if status == STATUS_WORKING && snapshot.session.is_some() {
         state.activity_eligible_panes.insert(pane_id.to_owned());
@@ -329,12 +342,12 @@ fn update_activity_eligibility(state: &mut BridgeState, snapshot: &AgentSnapshot
     }
 }
 
-async fn maybe_sync_fresh_session_topology(
+async fn maybe_sync_fresh_session_topology<C: Chat>(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
-    discord: &DiscordConnection,
-    state: &mut BridgeState,
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
 ) {
     let previous_status = state
         .previous
@@ -360,18 +373,18 @@ async fn maybe_sync_fresh_session_topology(
             return;
         }
     };
-    let (_, _, _, responder, _) = discord;
+    let (_, responder, _) = discord;
     if let Err(error) = responder.chat().sync_route(&route).await {
         bridge_eprintln!("{error}");
     }
 }
 
-async fn process_snapshot(
+async fn process_snapshot<C: Chat>(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
-    discord: &DiscordConnection,
-    state: &mut BridgeState,
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
 ) {
     let (terminal, status) = (snapshot.terminal_id.clone(), snapshot.agent_status.clone());
     update_activity_eligibility(state, snapshot, &status);
@@ -409,25 +422,25 @@ async fn process_snapshot(
     remember_previous_status(state, &terminal, &status);
 }
 
-fn remember_previous_status(state: &mut BridgeState, terminal: &str, status: &str) {
+fn remember_previous_status<C: Chat>(state: &mut BridgeState<C>, terminal: &str, status: &str) {
     state
         .previous
         .insert(terminal.to_owned(), status.to_owned());
 }
 
-struct PostableTransitionContext<'a> {
+struct PostableTransitionContext<'a, C: Chat> {
     snapshot: &'a AgentSnapshot,
     agents: &'a [AgentSnapshot],
     tabs: &'a [HerdrTab],
-    discord: &'a DiscordConnection,
+    discord: &'a ChatConnection<C>,
     terminal: &'a str,
     transition: &'a Transition,
     state_change_seq: u64,
 }
 
-async fn deliver_postable_transition(
-    context: PostableTransitionContext<'_>,
-    state: &mut BridgeState,
+async fn deliver_postable_transition<C: Chat>(
+    context: PostableTransitionContext<'_, C>,
+    state: &mut BridgeState<C>,
 ) {
     let PostableTransitionContext {
         snapshot,
@@ -449,9 +462,8 @@ async fn deliver_postable_transition(
             return;
         }
     };
-    let (_, _, owner_id, responder, _) = discord;
+    let (_, responder, _) = discord;
     handle_blocked_card(BlockedCardContext {
-        owner_id,
         responder: responder.as_ref(),
         route: &route,
         snapshot,
@@ -464,20 +476,20 @@ async fn deliver_postable_transition(
     .await;
 }
 
-async fn deliver_transition_if_postable(
-    context: PostableTransitionContext<'_>,
-    state: &mut BridgeState,
+async fn deliver_transition_if_postable<C: Chat>(
+    context: PostableTransitionContext<'_, C>,
+    state: &mut BridgeState<C>,
 ) {
     if is_postable_transition(context.transition) {
         deliver_postable_transition(context, state).await;
     }
 }
 
-async fn update_blocked_lifecycle(
-    discord: &DiscordConnection,
+async fn update_blocked_lifecycle<C: Chat>(
+    discord: &ChatConnection<C>,
     terminal: &str,
     leaving_blocked: bool,
-    state: &mut BridgeState,
+    state: &mut BridgeState<C>,
 ) {
     if leaving_blocked {
         expire_blocked_card(discord, terminal, &mut state.informational_cards).await;
@@ -803,12 +815,12 @@ fn read_new_terminal_prompts(
     }
 }
 
-async fn ensure_live_watch_started(
-    discord: &DiscordConnection,
+async fn ensure_live_watch_started<C: Chat>(
+    discord: &ChatConnection<C>,
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
-    state: &mut BridgeState,
+    state: &mut BridgeState<C>,
 ) {
     let terminal = snapshot.terminal_id.clone();
     let Some(session) = snapshot.session.clone() else {
@@ -897,21 +909,23 @@ fn read_new_live_texts(
     }
 }
 
-async fn mirror_one_terminal_prompt(
-    chat: &Discord,
-    parent: Id<ChannelMarker>,
-    thread: Id<ChannelMarker>,
+async fn mirror_one_terminal_prompt<C: Chat>(
+    chat: &C,
+    parent: &C::Route,
+    thread: &C::Route,
     identity: &OwnerIdentity,
     content: &str,
 ) -> Result<(), ChatError> {
     for part in split_live_message(content) {
-        chat.post_as_owner(&parent, &thread, identity, &part)
-            .await?;
+        chat.post_as_owner(parent, thread, identity, &part).await?;
     }
     Ok(())
 }
 
-fn maybe_establish_terminal_prompt_baseline(snapshot: &AgentSnapshot, state: &mut BridgeState) {
+fn maybe_establish_terminal_prompt_baseline<C: Chat>(
+    snapshot: &AgentSnapshot,
+    state: &mut BridgeState<C>,
+) {
     let terminal = &snapshot.terminal_id;
     let Some(session) = snapshot.session.as_ref() else {
         if snapshot.agent.is_some() {
@@ -997,11 +1011,11 @@ fn terminal_prompt_baseline_is_current(
         .is_some_and(|(existing_path, _, _)| existing_path == path)
 }
 
-async fn mirror_terminal_prompts(
-    connection: &DiscordConnection,
+async fn mirror_terminal_prompts<C: Chat>(
+    connection: &ChatConnection<C>,
     terminal: &str,
     route: &TopologyRoute,
-    state: &mut BridgeState,
+    state: &mut BridgeState<C>,
 ) {
     let Some((path, prompt_position, live_position)) =
         state.terminal_prompt_positions.get(terminal).cloned()
@@ -1021,7 +1035,7 @@ async fn mirror_terminal_prompts(
     if prompts.is_empty() {
         return;
     }
-    let (_, _, _, responder, identity) = connection;
+    let (_, responder, identity) = connection;
     let (workspace_channel, thread) = match responder.chat().sync_route_with_parent(route).await {
         Ok(channels) => channels,
         Err(error) => {
@@ -1033,21 +1047,26 @@ async fn mirror_terminal_prompts(
         if take_owner_prompt_suppression(&route.pane_id, &text) {
             continue;
         }
-        if let Err(error) =
-            mirror_one_terminal_prompt(responder.chat(), workspace_channel, thread, identity, &text)
-                .await
+        if let Err(error) = mirror_one_terminal_prompt(
+            responder.chat().as_ref(),
+            &workspace_channel,
+            &thread,
+            identity,
+            &text,
+        )
+        .await
         {
             bridge_eprintln!("terminal prompt delivery error for {terminal}: {error}");
         }
     }
 }
 
-async fn handle_live_event(
-    connection: &DiscordConnection,
+async fn handle_live_event<C: Chat>(
+    connection: &ChatConnection<C>,
     terminal: &str,
-    state: &mut BridgeState,
+    state: &mut BridgeState<C>,
 ) {
-    let (_, _, _, responder, _) = connection;
+    let (_, responder, _) = connection;
     let Some(watch) = state.live_watches.get(terminal) else {
         return;
     };
@@ -1116,16 +1135,16 @@ async fn handle_live_event(
     }
 }
 
-fn forget_activity_message(state: &mut BridgeState, pane_id: &str) {
+fn forget_activity_message<C: Chat>(state: &mut BridgeState<C>, pane_id: &str) {
     state.activity_messages.remove(pane_id);
 }
 
-async fn handle_activity_event(
-    discord: &DiscordConnection,
+async fn handle_activity_event<C: Chat>(
+    discord: &ChatConnection<C>,
     frame: ActivityFrame,
-    state: &mut BridgeState,
+    state: &mut BridgeState<C>,
 ) {
-    let (_, _, _, responder, _) = discord;
+    let (_, responder, _) = discord;
     let route = TopologyRoute {
         workspace_id: frame.workspace_id,
         tab_id: frame.tab_id,
@@ -1241,12 +1260,12 @@ fn next_state_change_sequence(
         .or_insert(1)
 }
 
-fn prune_departed_state(
-    state: &mut BridgeState,
+fn prune_departed_state<C: Chat>(
+    state: &mut BridgeState<C>,
     current_terminals: &HashSet<String>,
     current_panes: &HashSet<String>,
     current_tabs: &HashSet<String>,
-) -> Vec<(String, InformationalCard)> {
+) -> Vec<(String, InformationalCard<C>)> {
     state
         .live_watches
         .retain(|terminal, _| current_terminals.contains(terminal));
@@ -1276,7 +1295,7 @@ fn prune_departed_state(
         .informational_cards
         .iter()
         .filter(|(terminal, _)| !current_terminals.contains(*terminal))
-        .map(|(terminal, card)| (terminal.clone(), *card))
+        .map(|(terminal, card)| (terminal.clone(), card.clone()))
         .collect();
     state
         .informational_cards
@@ -1286,7 +1305,7 @@ fn prune_departed_state(
 
 async fn discord_connection(
     topology_cache: TopologyCache,
-) -> Result<(DiscordConnection, GatewayTask), Box<dyn std::error::Error>> {
+) -> Result<(ChatConnection<Discord>, GatewayTask), Box<dyn std::error::Error>> {
     let mut environment: Vec<(&str, String)> = Vec::new();
     for name in [
         ENV_DISCORD_TOKEN,
@@ -1315,12 +1334,13 @@ async fn discord_connection(
             bridge_eprintln!("{notice}");
         }
     });
-    let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
+    let chat = Arc::new(Discord::new(
         Arc::clone(&client),
         guild,
         config.owner_id.clone(),
         topology_cache,
-    ))));
+    ));
+    let responder = Arc::new(PermissionResponder::new(Arc::clone(&chat)));
     let gateway = tokio::spawn(drive_gateway_with_components(
         config.token,
         GatewayContext {
@@ -1332,10 +1352,7 @@ async fn discord_connection(
         notices_tx,
         component_handler(Arc::clone(&responder)),
     ));
-    Ok((
-        (client, guild, config.owner_id, responder, identity),
-        gateway,
-    ))
+    Ok(((chat, responder, identity), gateway))
 }
 
 #[tokio::main]
@@ -1624,12 +1641,12 @@ fn socket_path(args: &[String]) -> Option<std::path::PathBuf> {
     }
 }
 
-fn start_broker(
-    connection: &DiscordConnection,
+fn start_broker<C: Chat>(
+    connection: &ChatConnection<C>,
     activity_tx: tokio::sync::mpsc::UnboundedSender<ActivityFrame>,
 ) -> Option<BrokerTask> {
     socket_path(&[]).map(|socket| {
-        let responder = Arc::clone(&connection.3);
+        let responder = Arc::clone(&connection.1);
         tokio::spawn(async move {
             run_permission_broker(&socket, responder, activity_tx)
                 .await
@@ -1748,18 +1765,18 @@ fn unwrap_or_shutdown<T>(
     )
 }
 
-struct BridgeRuntime {
+struct BridgeRuntime<C: Chat> {
     lifecycle: HerdrSubscription,
     pane_ids: Vec<String>,
     status: Option<HerdrSubscription>,
-    state: BridgeState,
+    state: BridgeState<C>,
     live_events: tokio::sync::mpsc::UnboundedReceiver<String>,
     activity_events: tokio::sync::mpsc::UnboundedReceiver<ActivityFrame>,
 }
 
-async fn doorbell_unless_shutdown(
-    discord: &DiscordConnection,
-    state: &mut BridgeState,
+async fn doorbell_unless_shutdown<C: Chat>(
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
     pane_ids: &mut Vec<String>,
     status: &mut Option<HerdrSubscription>,
     stop: &mut tokio::signal::unix::Signal,
@@ -1772,12 +1789,12 @@ async fn doorbell_unless_shutdown(
     .is_some()
 }
 
-async fn bridge_event_loop(
-    discord: &DiscordConnection,
+async fn bridge_event_loop<C: Chat>(
+    discord: &ChatConnection<C>,
     gateway: &mut GatewayTask,
     broker: &mut Option<BrokerTask>,
     stop: &mut tokio::signal::unix::Signal,
-    runtime: &mut BridgeRuntime,
+    runtime: &mut BridgeRuntime<C>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
@@ -1810,12 +1827,12 @@ async fn bridge_event_loop(
     Ok(())
 }
 
-async fn apply_lifecycle_event(
+async fn apply_lifecycle_event<C: Chat>(
     event: &serde_json::Value,
-    discord: &DiscordConnection,
+    discord: &ChatConnection<C>,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
-    runtime: &mut BridgeRuntime,
+    runtime: &mut BridgeRuntime<C>,
 ) -> bool {
     if let Some(change) = lifecycle_membership(event)
         && apply_membership(&mut runtime.pane_ids, change)
@@ -1830,7 +1847,7 @@ async fn apply_lifecycle_event(
     }
 
     if let Some(closure) = lifecycle_closure(event)
-        && let Err(error) = discord.3.chat().close_topology(&closure).await
+        && let Err(error) = discord.1.chat().close_topology(&closure).await
     {
         bridge_eprintln!("herdr topology closure error: {error}");
     }
@@ -1846,8 +1863,8 @@ async fn apply_lifecycle_event(
     .await
 }
 
-fn spawn_archived_thread_registration(discord: &DiscordConnection) {
-    let chat = discord.3.chat().clone();
+fn spawn_archived_thread_registration<C: Chat>(discord: &ChatConnection<C>) {
+    let chat = discord.1.chat().clone();
     tokio::spawn(async move {
         if let Err(error) = chat.register_archived().await {
             bridge_eprintln!(
@@ -1857,8 +1874,8 @@ fn spawn_archived_thread_registration(discord: &DiscordConnection) {
     });
 }
 
-fn spawn_startup_topology_sweep(
-    discord: &DiscordConnection,
+fn spawn_startup_topology_sweep<C: Chat>(
+    discord: &ChatConnection<C>,
     rename_errors_reported: &mut HashSet<String>,
 ) {
     match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
@@ -1866,7 +1883,7 @@ fn spawn_startup_topology_sweep(
             for error in name_unlabeled_tabs(&agents, &mut tabs, rename_errors_reported) {
                 bridge_eprintln!("herdr startup topology error: {error}");
             }
-            let chat = discord.3.chat().clone();
+            let chat = discord.1.chat().clone();
             let startup_task =
                 tokio::spawn(
                     async move { sync_startup_topology(chat.as_ref(), &agents, &tabs).await },
@@ -1881,12 +1898,12 @@ fn spawn_startup_topology_sweep(
     }
 }
 
-async fn handle_lifecycle_subscribe_error(
+async fn handle_lifecycle_subscribe_error<C: Chat>(
     error: String,
-    discord: &DiscordConnection,
+    discord: &ChatConnection<C>,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
-    runtime: &mut BridgeRuntime,
+    runtime: &mut BridgeRuntime<C>,
 ) -> bool {
     bridge_eprintln!("herdr lifecycle subscribe error: {error}");
     let Some(next_lifecycle) = unwrap_or_shutdown(
@@ -1907,12 +1924,12 @@ async fn handle_lifecycle_subscribe_error(
     .await
 }
 
-async fn handle_lifecycle_select_result(
+async fn handle_lifecycle_select_result<C: Chat>(
     result: Result<serde_json::Value, String>,
-    discord: &DiscordConnection,
+    discord: &ChatConnection<C>,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
-    runtime: &mut BridgeRuntime,
+    runtime: &mut BridgeRuntime<C>,
 ) -> bool {
     match result {
         Ok(event) => apply_lifecycle_event(&event, discord, stop, broker, runtime).await,
@@ -1920,12 +1937,12 @@ async fn handle_lifecycle_select_result(
     }
 }
 
-async fn handle_status_select_result(
+async fn handle_status_select_result<C: Chat>(
     result: Result<serde_json::Value, String>,
-    discord: &DiscordConnection,
+    discord: &ChatConnection<C>,
     stop: &mut tokio::signal::unix::Signal,
     broker: &mut Option<BrokerTask>,
-    runtime: &mut BridgeRuntime,
+    runtime: &mut BridgeRuntime<C>,
 ) -> bool {
     match result {
         Ok(_event) => {
@@ -2015,9 +2032,9 @@ async fn subscribe_status_with_backoff(
     }
 }
 
-async fn apply_herdr_snapshot(
-    discord: &DiscordConnection,
-    state: &mut BridgeState,
+async fn apply_herdr_snapshot<C: Chat>(
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
 ) -> Result<Vec<String>, String> {
     let agents = list_agents()?;
     let mut tabs = tab_list_result()?;
@@ -2041,9 +2058,9 @@ async fn apply_herdr_snapshot(
     Ok(pane_ids_from_agents(&agents))
 }
 
-async fn doorbell_snapshot(
-    discord: &DiscordConnection,
-    state: &mut BridgeState,
+async fn doorbell_snapshot<C: Chat>(
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
     pane_ids: &mut Vec<String>,
     status: &mut Option<HerdrSubscription>,
     stop: &mut tokio::signal::unix::Signal,
@@ -2406,7 +2423,7 @@ mod tests {
                 }),
             };
 
-            let mut replay_state = BridgeState::default();
+            let mut replay_state = BridgeState::<Discord>::default();
             maybe_establish_terminal_prompt_baseline(&snapshot_for("fresh-b"), &mut replay_state);
             maybe_establish_terminal_prompt_baseline(
                 &snapshot_for("old-session"),
@@ -2428,7 +2445,7 @@ mod tests {
                 "the live watch start must discard the resumed history too, not replay it"
             );
 
-            let mut control_state = BridgeState::default();
+            let mut control_state = BridgeState::<Discord>::default();
             maybe_establish_terminal_prompt_baseline(
                 &snapshot_for("old-session"),
                 &mut control_state,
@@ -2496,7 +2513,7 @@ mod tests {
     }
 
     fn assert_later_codex_session_discards_history(
-        state: &mut BridgeState,
+        state: &mut BridgeState<Discord>,
         temp_home: &Path,
         later: &AgentSnapshot,
         name: &str,
@@ -2566,7 +2583,7 @@ mod tests {
             let tick = std::time::Duration::from_millis(50);
             for case in &cases {
                 let _ = fs::remove_dir_all(&temp_home);
-                let mut state = BridgeState::default();
+                let mut state = BridgeState::<Discord>::default();
                 if case.log_predates_first_sighting {
                     write_log();
                     std::thread::sleep(tick);
@@ -2681,7 +2698,7 @@ mod tests {
     #[test]
     fn state_change_nonce_survives_terminal_departure_and_return() {
         let terminal = "terminal";
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
 
         let pre_departure_nonce = transition_card_nonce(
             terminal,
@@ -3690,7 +3707,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn discord_tuple(guild: &BlockedCaptureGuild) -> super::DiscordConnection {
+    fn discord_tuple(guild: &BlockedCaptureGuild) -> super::ChatConnection<Discord> {
         discord_tuple_with_cache(guild, Arc::new(tokio::sync::Mutex::new(None)))
     }
 
@@ -3698,25 +3715,20 @@ mod tests {
     fn discord_tuple_with_cache(
         guild: &BlockedCaptureGuild,
         topology_cache: herdr_connect_rs::TopologyCache,
-    ) -> super::DiscordConnection {
+    ) -> super::ChatConnection<Discord> {
         let owner_id = std::env::var("DISCORD_OWNER_ID").expect("DISCORD_OWNER_ID is set");
-        let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
+        let chat = Arc::new(Discord::new(
             Arc::clone(&guild.client),
             guild.id,
             owner_id.clone(),
             topology_cache,
-        ))));
+        ));
+        let responder = Arc::new(PermissionResponder::new(Arc::clone(&chat)));
         let identity = herdr_connect_rs::OwnerIdentity {
-            display_name: owner_id.clone(),
+            display_name: owner_id,
             avatar_url: None,
         };
-        (
-            Arc::clone(&guild.client),
-            guild.id,
-            owner_id,
-            responder,
-            identity,
-        )
+        (chat, responder, identity)
     }
 
     #[cfg(unix)]
@@ -3926,7 +3938,7 @@ mod tests {
             lifecycle,
             pane_ids: Vec::new(),
             status: None,
-            state: BridgeState::default(),
+            state: BridgeState::<Discord>::default(),
             live_events,
             activity_events,
         };
@@ -4278,8 +4290,8 @@ mod tests {
     async fn own(
         snapshot: &AgentSnapshot,
         tabs: &[herdr_connect_rs::HerdrTab],
-        connection: &super::DiscordConnection,
-        state: &mut BridgeState,
+        connection: &super::ChatConnection<Discord>,
+        state: &mut BridgeState<Discord>,
     ) {
         process_snapshot(
             snapshot,
@@ -4304,7 +4316,7 @@ mod tests {
 
         let matching = matching_tab(&tab.tab_id)?;
         let (tabs, agents) = (std::slice::from_ref(&matching), std::slice::from_ref(&idle));
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
         state.live_tx = Some(live_tx);
         let connection = discord_tuple(guild);
@@ -4526,9 +4538,9 @@ mod tests {
     async fn live_count_once_reply_is_posted(
         guild: &BlockedCaptureGuild,
         thread: Id<ChannelMarker>,
-        connection: &super::DiscordConnection,
+        connection: &super::ChatConnection<Discord>,
         terminal: &str,
-        state: &mut BridgeState,
+        state: &mut BridgeState<Discord>,
     ) -> Result<usize, String> {
         let reply_deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -4562,7 +4574,7 @@ mod tests {
         let terminal = idle.terminal_id.clone();
         let matching = matching_tab(&tab.tab_id)?;
         let tabs = std::slice::from_ref(&matching);
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
         state.live_tx = Some(live_tx);
         let connection = discord_tuple(guild);
@@ -4728,7 +4740,7 @@ mod tests {
         tab: &'a Tab,
         agent_name: &'a str,
         vendor: &'static str,
-        connection: &'a super::DiscordConnection,
+        connection: &'a super::ChatConnection<Discord>,
         tabs: &'a [herdr_connect_rs::HerdrTab],
         terminal: &'a str,
     }
@@ -4754,7 +4766,7 @@ mod tests {
     #[cfg(unix)]
     async fn run_terminal_prompt_turn(
         fixture: &TerminalPromptFixture<'_>,
-        state: &mut BridgeState,
+        state: &mut BridgeState<Discord>,
         live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         submission: TerminalPromptSubmission,
         prompt: &str,
@@ -4854,7 +4866,7 @@ mod tests {
         fixture: &TerminalPromptFixture<'_>,
         guild: &BlockedCaptureGuild,
         thread: Id<ChannelMarker>,
-        state: &mut BridgeState,
+        state: &mut BridgeState<Discord>,
         live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         prompts: [&str; 2],
         queued_reply: &str,
@@ -4957,7 +4969,7 @@ mod tests {
         fixture: &TerminalPromptFixture<'_>,
         guild: &BlockedCaptureGuild,
         thread: Id<ChannelMarker>,
-        state: &mut BridgeState,
+        state: &mut BridgeState<Discord>,
         live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
         nonce: &str,
     ) -> Result<(), String> {
@@ -5107,7 +5119,7 @@ mod tests {
         let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
         let mut state = BridgeState {
             live_tx: Some(live_tx),
-            ..BridgeState::default()
+            ..BridgeState::<Discord>::default()
         };
         let mut connection = discord_tuple(guild);
         own(&idle, tabs, &connection, &mut state).await;
@@ -5124,7 +5136,7 @@ mod tests {
         );
         let identity =
             herdr_connect_rs::fetch_owner_identity(guild.client.as_ref(), owner_id).await?;
-        connection.4 = identity.clone();
+        connection.2 = identity.clone();
         let nonce = agent_name_nonce()?;
         let fixture = TerminalPromptFixture {
             tab,
@@ -5413,8 +5425,8 @@ mod tests {
         pane_id: &str,
         tabs: &[herdr_connect_rs::HerdrTab],
         sub: &mut herdr_connect_rs::HerdrSubscription,
-        connection: &super::DiscordConnection,
-        state: &mut BridgeState,
+        connection: &super::ChatConnection<Discord>,
+        state: &mut BridgeState<Discord>,
         (activity_rx, frames): (
             &mut tokio::sync::mpsc::UnboundedReceiver<herdr_connect_rs::ActivityFrame>,
             &mut Vec<String>,
@@ -5463,7 +5475,7 @@ mod tests {
     fn activity_frame_line(
         started: Instant,
         frame: &herdr_connect_rs::ActivityFrame,
-        state: &BridgeState,
+        state: &BridgeState<Discord>,
     ) -> String {
         format!(
             "+{}ms pane={} tool={} summary={:?} session={:?} eligible={}",
@@ -5554,11 +5566,11 @@ mod tests {
     ) -> Result<(), String> {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         let mut frames = Vec::new();
 
         let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
-        let responder = Arc::clone(&connection.3);
+        let responder = Arc::clone(&connection.1);
         let broker_socket_owned = broker_socket.to_path_buf();
         let broker_task = tokio::spawn(async move {
             super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
@@ -5859,7 +5871,7 @@ mod tests {
     ) -> Result<QuestionOutcome, String> {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
-        let responder = Arc::clone(&connection.3);
+        let responder = Arc::clone(&connection.1);
 
         start_claude_haiku_agent(agent_name, &tab.pane_id)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
@@ -5867,7 +5879,7 @@ mod tests {
         let tabs = [matching];
         let route = route_topology(std::slice::from_ref(&idle), &tabs, &idle.terminal_id)?;
         let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         own(&idle, &tabs, &connection, &mut state).await;
 
         submit_owner_prompt(&tab.pane_id, prompt)?;
@@ -5945,16 +5957,22 @@ mod tests {
     #[cfg(unix)]
     async fn perform_question_action(
         guild: &BlockedCaptureGuild,
-        connection: &super::DiscordConnection,
+        connection: &super::ChatConnection<Discord>,
         tab: &Tab,
         channel: &twilight_model::channel::Channel,
         token: &str,
         action: QuestionAction,
     ) -> Result<(), String> {
-        let responder = Arc::clone(&connection.3);
+        let responder = Arc::clone(&connection.1);
         let thread = channel.id;
         let click = |custom_id: String, values: &'static [&'static str]| {
-            synthetic_component_interaction(guild.id, &connection.2, channel, &custom_id, values)
+            synthetic_component_interaction(
+                guild.id,
+                connection.0.owner_id(),
+                channel,
+                &custom_id,
+                values,
+            )
         };
         match action {
             QuestionAction::Button(index) => {
@@ -5977,7 +5995,8 @@ mod tests {
                     .map_err(|error| error.to_string())?;
                 message.author.id = Id::<UserMarker>::new(
                     connection
-                        .2
+                        .0
+                        .owner_id()
                         .parse::<u64>()
                         .map_err(|error| error.to_string())?,
                 );
@@ -5986,7 +6005,7 @@ mod tests {
                 herdr_connect_rs::handle_owner_message(
                     Arc::clone(&guild.client),
                     guild.id,
-                    &connection.2,
+                    connection.0.owner_id(),
                     message,
                     &responder,
                 )
@@ -6340,11 +6359,11 @@ mod tests {
     ) -> Result<(), String> {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         let mut frames = Vec::new();
 
         let (activity_tx, mut activity_rx) = tokio::sync::mpsc::unbounded_channel();
-        let responder = Arc::clone(&connection.3);
+        let responder = Arc::clone(&connection.1);
         let broker_socket_owned = broker_socket.to_path_buf();
         let mut broker_task = tokio::spawn(async move {
             super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
@@ -6657,7 +6676,7 @@ mod tests {
             return Err("the workspace channel existed before the startup sync".to_owned());
         }
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), agents, tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
 
         let channel = guild
             .client
@@ -6807,7 +6826,7 @@ mod tests {
                 }];
                 let agents = [snapshot.clone()];
                 let connection = discord_tuple(&guild);
-                let mut state = BridgeState::default();
+                let mut state = BridgeState::<Discord>::default();
 
                 process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
 
@@ -6866,7 +6885,7 @@ mod tests {
             return Err("the workspace channel existed before the startup sync".to_owned());
         }
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
         let matching_channels: Vec<_> = guild
             .client
             .guild_channels(guild.id)
@@ -7042,7 +7061,7 @@ mod tests {
         }
 
         let connection = discord_tuple(guild);
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
         let topic = format!("herdr workspace [{}]", renamed.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
@@ -7065,7 +7084,7 @@ mod tests {
 
     #[test]
     fn rename_errors_are_pruned_with_their_closed_tab() {
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         state.rename_errors_reported.insert("w-1:3".to_owned());
         state.rename_errors_reported.insert("w-1:4".to_owned());
         let current_tabs = HashSet::from(["w-1:4".to_owned()]);
@@ -7166,7 +7185,7 @@ mod tests {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
 
-        let startup = sync_startup_topology(connection.3.chat().as_ref(), agents, tabs);
+        let startup = sync_startup_topology(connection.1.chat().as_ref(), agents, tabs);
         let delivery = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache);
         let ((), delivery_result) = tokio::join!(startup, delivery);
         delivery_result?;
@@ -7285,7 +7304,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(Some(stale)));
         sync_startup_topology(
             discord_tuple_with_cache(guild, Arc::clone(&shared))
-                .3
+                .1
                 .chat()
                 .as_ref(),
             agents,
@@ -7686,7 +7705,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         for closure in &closures {
-            connection.3.chat().close_topology(closure).await?;
+            connection.1.chat().close_topology(closure).await?;
         }
 
         for (case, suffix) in cases.iter().zip(suffixes.iter()) {
@@ -7744,7 +7763,7 @@ mod tests {
         let agents = [root_agent.clone(), second_agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
 
@@ -7766,7 +7785,7 @@ mod tests {
             lifecycle,
             pane_ids: Vec::new(),
             status: None,
-            state: BridgeState::default(),
+            state: BridgeState::<Discord>::default(),
             live_events,
             activity_events,
         };
@@ -7907,7 +7926,8 @@ mod tests {
 
     #[cfg(unix)]
     async fn start_owner_deletion_gateway(
-        connection: &super::DiscordConnection,
+        guild: &BlockedCaptureGuild,
+        connection: &super::ChatConnection<Discord>,
     ) -> Result<
         (
             tokio::task::JoinHandle<Result<(), String>>,
@@ -7919,13 +7939,13 @@ mod tests {
         let task = tokio::spawn(herdr_connect_rs::drive_gateway_with_components(
             std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
             herdr_connect_rs::GatewayContext {
-                client: Arc::clone(&connection.0),
-                guild: connection.1,
-                owner_id: connection.2.clone(),
-                responder: Arc::clone(&connection.3),
+                client: Arc::clone(&guild.client),
+                guild: guild.id,
+                owner_id: connection.0.owner_id().to_owned(),
+                responder: Arc::clone(&connection.1),
             },
             notices_tx,
-            super::component_handler(Arc::clone(&connection.3)),
+            super::component_handler(Arc::clone(&connection.1)),
         ));
         tokio::time::sleep(GATEWAY_READY_WAIT).await;
         Ok((task, notices_rx))
@@ -7984,7 +8004,7 @@ mod tests {
         let agents = [root_agent.clone(), second_agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", second_route.workspace_id);
@@ -7995,8 +8015,8 @@ mod tests {
         expect_thread_created_message(guild, channel.id, thread.id, true).await?;
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
-        *connection.3.chat().topology_cache().lock().await = None;
+        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
+        *connection.1.chat().topology_cache().lock().await = None;
         let deleted = guild
             .client
             .delete_channel(thread.id)
@@ -8137,7 +8157,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
         let deleted = guild
             .client
             .delete_channel(thread.id)
@@ -8249,13 +8269,13 @@ mod tests {
         let agents = [agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
         let route = route_topology(&agents, &tabs, &agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
 
         let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
         let deleted = guild
             .client
             .delete_channel(channel.id)
@@ -8383,7 +8403,7 @@ mod tests {
             fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
 
         let connection = discord_tuple(guild);
-        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(guild, &connection).await?;
         let deleted = if delete_thread {
             herdr_connect_rs::delete_tab_thread(
                 guild.client.as_ref(),
@@ -8469,7 +8489,7 @@ mod tests {
         let route = route_topology(agents, tabs, &listed.terminal_id)?;
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), agents, tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
 
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let live_channel = guild_channel_with_topic(guild, &topic).await?;
@@ -8501,7 +8521,7 @@ mod tests {
         let bystander_thread =
             create_guild_thread(guild, live_channel.id, "testrun-notes [staging]").await?;
 
-        sync_startup_topology(connection.3.chat().as_ref(), agents, tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
 
         let channels_after = guild_channels_for_guild(guild).await?;
         if channels_after
@@ -8660,7 +8680,7 @@ mod tests {
             None
         };
 
-        sync_startup_topology(connection.3.chat().as_ref(), &[], &[]).await;
+        sync_startup_topology(connection.1.chat().as_ref(), &[], &[]).await;
 
         if let Some((handle, done)) = racer {
             done.store(true, Ordering::Relaxed);
@@ -8721,8 +8741,8 @@ mod tests {
     async fn drive_working_then_settled(
         workspace: &Workspace,
         tabs: &[herdr_connect_rs::HerdrTab],
-        connection: &super::DiscordConnection,
-        state: &mut BridgeState,
+        connection: &super::ChatConnection<Discord>,
+        state: &mut BridgeState<Discord>,
     ) -> Result<AgentSnapshot, String> {
         report_agent_state(&workspace.pane_id, "working")?;
         let working =
@@ -8757,8 +8777,8 @@ mod tests {
     #[cfg(unix)]
     async fn drive_idle_working_done(
         workspace: &Workspace,
-        connection: &super::DiscordConnection,
-        state: &mut BridgeState,
+        connection: &super::ChatConnection<Discord>,
+        state: &mut BridgeState<Discord>,
     ) -> Result<(TopologyRoute, AgentSnapshot), String> {
         report_agent_state(&workspace.pane_id, "idle")?;
         let idle = wait_for_status(&workspace.pane_id, &["idle"], Duration::from_secs(10)).await?;
@@ -8776,7 +8796,7 @@ mod tests {
         guild: &BlockedCaptureGuild,
         workspace: &Workspace,
     ) -> Result<(), String> {
-        let mut state = BridgeState::default();
+        let mut state = BridgeState::<Discord>::default();
         let connection = discord_tuple(guild);
         let (route, _settled) = drive_idle_working_done(workspace, &connection, &mut state).await?;
         let topic = format!("herdr workspace [{}]", route.workspace_id);
@@ -8890,7 +8910,7 @@ mod tests {
         let agents = [no_session_agent.clone(), session_agent.clone()];
 
         let connection = discord_tuple(guild);
-        sync_startup_topology(connection.3.chat().as_ref(), &agents, &tabs).await;
+        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
 
         let no_session_route = route_topology(&agents, &tabs, &no_session_agent.terminal_id)?;
         let session_route = route_topology(&agents, &tabs, &session_agent.terminal_id)?;
@@ -9026,7 +9046,7 @@ mod tests {
             Ok(workspace) => {
                 let workspace_id = workspace.id.clone();
                 let outcome = async {
-                    let mut state = BridgeState::default();
+                    let mut state = BridgeState::<Discord>::default();
                     let connection = discord_tuple(&guild);
                     report_agent_state(&workspace.pane_id, "unknown")?;
                     let unknown =
@@ -9113,7 +9133,7 @@ mod tests {
                         .delete_channel(matching_threads[0].id)
                         .await
                         .map_err(|error| error.to_string())?;
-                    *connection.3.chat().topology_cache().lock().await = None;
+                    *connection.1.chat().topology_cache().lock().await = None;
                     process_snapshot(
                         &idle,
                         std::slice::from_ref(&idle),
@@ -9163,7 +9183,7 @@ mod tests {
         let (live_tx, mut live_events) = tokio::sync::mpsc::unbounded_channel();
         let mut state = BridgeState {
             live_tx: Some(live_tx),
-            ..BridgeState::default()
+            ..BridgeState::<Discord>::default()
         };
         let connection = discord_tuple(guild);
         drive_idle_working_done(silent_workspace, &connection, &mut state).await?;
