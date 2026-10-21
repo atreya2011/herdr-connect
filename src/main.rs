@@ -3269,6 +3269,7 @@ mod tests {
     struct BlockedCaptureGuild {
         client: Arc<Client>,
         id: Id<GuildMarker>,
+        owner_id: String,
     }
 
     #[cfg(unix)]
@@ -3281,6 +3282,7 @@ mod tests {
                     .build(),
             ),
             id: Id::new(std::env::var("DISCORD_GUILD_ID").ok()?.parse().ok()?),
+            owner_id: std::env::var("DISCORD_OWNER_ID").ok()?,
         };
         Some(guild)
     }
@@ -4244,6 +4246,9 @@ mod tests {
             .map_err(|error| error.to_string())?;
         Ok(messages
             .into_iter()
+            .filter(|message| {
+                message.kind != twilight_model::channel::message::MessageType::RecipientAdd
+            })
             .map(|message| (message.content, !message.embeds.is_empty(), message.id))
             .collect())
     }
@@ -4304,7 +4309,14 @@ mod tests {
         own(&idle, tabs, &connection, &mut state).await;
         let route = route_topology(agents, tabs, &terminal)?;
         let topology_cache = Arc::new(tokio::sync::Mutex::new(None));
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+        let thread = sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &topology_cache,
+            &guild.owner_id,
+        )
+        .await?;
 
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
@@ -4562,7 +4574,14 @@ mod tests {
         own(&idle, tabs, &connection, &mut state).await;
         let route = route_topology(std::slice::from_ref(&idle), tabs, &terminal)?;
         let topology_cache = Arc::new(tokio::sync::Mutex::new(None));
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+        let thread = sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &topology_cache,
+            &guild.owner_id,
+        )
+        .await?;
 
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
@@ -5106,7 +5125,14 @@ mod tests {
 
         let route = route_topology(std::slice::from_ref(&idle), tabs, &terminal)?;
         let topology_cache = Arc::new(tokio::sync::Mutex::new(None));
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &topology_cache).await?;
+        let thread = sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &topology_cache,
+            &guild.owner_id,
+        )
+        .await?;
 
         let owner_id = Id::<UserMarker>::new(
             std::env::var("DISCORD_OWNER_ID")
@@ -5572,7 +5598,14 @@ mod tests {
 
         own(&idle, tabs, &connection, &mut state).await;
         let route = route_topology(agents, tabs, &terminal)?;
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+        let thread = sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &shared_cache,
+            &guild.owner_id,
+        )
+        .await?;
 
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
@@ -5858,7 +5891,14 @@ mod tests {
         let matching = matching_tab(&tab.tab_id)?;
         let tabs = [matching];
         let route = route_topology(std::slice::from_ref(&idle), &tabs, &idle.terminal_id)?;
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+        let thread = sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &shared_cache,
+            &guild.owner_id,
+        )
+        .await?;
         let mut state = BridgeState::<Discord>::default();
         own(&idle, &tabs, &connection, &mut state).await;
 
@@ -6371,7 +6411,7 @@ mod tests {
 
         own(&idle, tabs, &connection, &mut state).await;
         let route = route_topology(agents, tabs, &terminal)?;
-        let thread = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache).await?;
+        let thread = connection.0.sync_route(&route).await?;
 
         let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
         let mut sub = subscribe_herdr_events(&subs).await?;
@@ -7163,7 +7203,13 @@ mod tests {
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
 
         let startup = sync_startup_topology(connection.1.chat().as_ref(), agents, tabs);
-        let delivery = sync_route(guild.client.as_ref(), guild.id, &route, &shared_cache);
+        let delivery = sync_route(
+            guild.client.as_ref(),
+            guild.id,
+            &route,
+            &shared_cache,
+            &guild.owner_id,
+        );
         let ((), delivery_result) = tokio::join!(startup, delivery);
         delivery_result?;
 
@@ -7275,6 +7321,7 @@ mod tests {
             guild.id,
             &route,
             &Arc::new(tokio::sync::Mutex::new(None)),
+            &guild.owner_id,
         )
         .await?;
         let shared: herdr_connect_rs::TopologyCache =
@@ -7715,6 +7762,63 @@ mod tests {
         );
 
         let result = closed_topology_exercise(&guild).await;
+
+        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(channels_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    const OWNER_THREAD_MEMBER_LABEL: &str = "testrun-owner-thread-member";
+
+    #[cfg(unix)]
+    async fn owner_thread_member_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
+        let workspace_id = format!(
+            "{OWNER_THREAD_MEMBER_LABEL}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        let tab_id = format!("{workspace_id}:t1");
+        let route = TopologyRoute {
+            thread_name: format!("{OWNER_THREAD_MEMBER_LABEL} [{tab_id}]"),
+            channel_name: workspace_id.clone(),
+            pane_id: String::new(),
+            workspace_id,
+            tab_id,
+        };
+        let connection = discord_tuple(guild);
+        let thread = connection.0.sync_route(&route).await?;
+        let owner = connection
+            .0
+            .owner_id()
+            .parse::<Id<UserMarker>>()
+            .map_err(|error| error.to_string())?;
+        guild
+            .client
+            .thread_member(thread, owner)
+            .await
+            .map_err(|error| format!("owner is not a member of the new thread: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn a_new_tab_thread_adds_the_owner_as_a_member() {
+        let Some(guild) = blocked_capture_guild() else {
+            eprintln!("skipped: Discord real-guild environment is not configured");
+            return;
+        };
+        assert_eq!(
+            blocked_capture_cleanup(&guild).await.unwrap(),
+            0,
+            "named zero-leftover check"
+        );
+
+        let result = owner_thread_member_exercise(&guild).await;
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
