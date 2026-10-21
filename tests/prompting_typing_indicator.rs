@@ -12,7 +12,7 @@ mod real_guild {
     use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 
     use super::support::{Guild, channel, cleanup, guild};
-    use herdr_connect_rs::maintain_typing_until_settled;
+    use herdr_connect_rs::{Discord, maintain_typing_until_settled};
 
     #[tokio::test]
     #[serial]
@@ -36,7 +36,7 @@ mod real_guild {
         let channel_id = channel(guild, "testrun-typing-indicator").await?;
         let token = std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?;
         let intents = Intents::GUILDS | Intents::GUILD_MESSAGE_TYPING;
-        let mut shard = Shard::new(ShardId::ONE, token, intents);
+        let mut shard = Shard::new(ShardId::ONE, token.clone(), intents);
         loop {
             match shard.next_event(EventTypeFlags::READY).await {
                 Some(Ok(Event::Ready(_))) => break,
@@ -71,9 +71,16 @@ mod real_guild {
         };
 
         let remaining = Arc::new(AtomicUsize::new(2));
+        let discord = Discord::new(
+            Arc::clone(&guild.client),
+            token,
+            guild.id,
+            String::new(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+        );
         maintain_typing_until_settled(
-            &guild.client,
-            channel_id,
+            &discord,
+            &channel_id,
             Duration::from_millis(300),
             move || {
                 let remaining = Arc::clone(&remaining);

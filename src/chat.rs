@@ -35,6 +35,12 @@ pub enum Ack<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum Closed {
+    Tab(String),
+    Workspace(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum TopologyClosure {
     Tab {
         workspace_id: String,
@@ -53,10 +59,26 @@ pub struct Component<C: Chat> {
     pub authorized: bool,
 }
 
+pub struct OwnerMessage<C: Chat> {
+    pub route: C::Route,
+    pub message: C::Message,
+    pub content: String,
+    pub tab_id: String,
+    pub workspace_id: String,
+}
+
+pub enum Inbound<C: Chat> {
+    Posted(C::Posted),
+    Component(Component<C>),
+    Deleted(C::Deletion),
+}
+
 pub trait Chat: Send + Sync + Sized + 'static {
     type Route: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Message: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Interaction: Clone + Send + Sync + 'static;
+    type Posted: Send + 'static;
+    type Deletion: Display + Send + 'static;
 
     fn owner_id(&self) -> &str;
     fn sync_route(
@@ -156,4 +178,23 @@ pub trait Chat: Send + Sync + Sized + 'static {
         interaction: &Self::Interaction,
         ack: Ack<'_>,
     ) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn typing(&self, route: &Self::Route) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn reply(
+        &self,
+        route: &Self::Route,
+        message: &Self::Message,
+        text: &str,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn owner_message(
+        &self,
+        posted: Self::Posted,
+    ) -> impl Future<Output = Result<Option<OwnerMessage<Self>>, ChatError>> + Send;
+    fn next_event(&self) -> impl Future<Output = Option<Result<Inbound<Self>, ChatError>>> + Send;
+    fn handle_deletion<F>(
+        &self,
+        deletion: Self::Deletion,
+        close: F,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send
+    where
+        F: FnOnce(Closed) -> Result<(), String> + Send + 'static;
 }

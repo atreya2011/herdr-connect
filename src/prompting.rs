@@ -4,22 +4,13 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use twilight_http::Client;
-use twilight_model::{
-    channel::{ChannelType, Message},
-    id::{
-        Id,
-        marker::{ChannelMarker, GuildMarker},
-    },
-};
-
 use crate::broker::{PermissionResponder, QuestionOutcome};
 use crate::herdr::{
     PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
     agent_prompt, agent_send_keys,
 };
 use crate::question::Answer;
-use crate::{AgentSnapshot, Discord, list_agents};
+use crate::{AgentSnapshot, Chat, OwnerMessage, list_agents};
 
 const PROMPT_ACCEPTED_REPLY: &str = "accepted: prompt submitted; Herdr state may be unconfirmed";
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
@@ -31,114 +22,84 @@ type OwnerPromptSuppression = (String, String);
 static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-pub async fn handle_owner_message(
-    client: Arc<Client>,
-    guild: Id<GuildMarker>,
-    owner_id: &str,
-    message: Message,
-    responder: &PermissionResponder<Discord>,
+pub async fn handle_owner_message<C: Chat>(
+    responder: &PermissionResponder<C>,
+    posted: C::Posted,
 ) -> Result<(), String> {
-    if message.guild_id != Some(guild)
-        || !should_handle_owner_message(
-            &message.author.id.to_string(),
-            message.author.bot,
-            owner_id,
-        )
-    {
-        return Ok(());
-    }
-
-    let thread = client
-        .channel(message.channel_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .model()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !is_thread_channel(thread.kind) {
-        return Ok(());
-    }
-    let Some(parent_id) = thread.parent_id else {
+    let chat = responder.chat();
+    let Some(OwnerMessage {
+        route,
+        message,
+        content,
+        tab_id,
+        workspace_id,
+    }) = chat.owner_message(posted).await?
+    else {
         return Ok(());
     };
-    let parent = client
-        .channel(parent_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .model()
-        .await
-        .map_err(|error| error.to_string())?;
-    let Some(thread_name) = thread.name.as_deref() else {
-        return Ok(());
-    };
-    let Some(topic) = parent.topic.as_deref() else {
-        return Ok(());
-    };
-    let Some((tab_id, workspace_id)) = prompt_surface_markers(thread_name, topic) else {
-        return Ok(());
-    };
-    if !has_prompt_content(&message.content) {
-        reply(&client, &message, "refused: prompt content is empty").await?;
+    if !has_prompt_content(&content) {
+        chat.reply(&route, &message, "refused: prompt content is empty")
+            .await?;
         return Ok(());
     }
     let agents = match tokio::task::spawn_blocking(list_agents).await {
         Ok(Ok(agents)) => agents,
         Ok(Err(error)) => {
             let response = agent_list_failure_reply(&error);
-            reply(&client, &message, &response).await?;
+            chat.reply(&route, &message, &response).await?;
             return Err(format!("agent.list failed: {error}"));
         }
         Err(error) => {
             let error = format!("herdr agent.list task failed: {error}");
             let response = agent_list_failure_reply(&error);
-            reply(&client, &message, &response).await?;
+            chat.reply(&route, &message, &response).await?;
             return Err(error);
         }
     };
-    let agent = match matching_agent(tab_id, workspace_id, &agents) {
+    let agent = match matching_agent(&tab_id, &workspace_id, &agents) {
         Ok(agent) => agent,
         Err(reason) => {
-            reply(&client, &message, &reason).await?;
+            chat.reply(&route, &message, &reason).await?;
             return Ok(());
         }
     };
-    if let Some(response) = answer_pending_question(responder, &message).await {
-        reply(&client, &message, &response).await?;
+    if let Some(response) = answer_pending_question(responder, &route, &content).await {
+        chat.reply(&route, &message, &response).await?;
         return Ok(());
     }
     let pane_id = match resolve_prompt_pane(agent) {
         Ok(target) => target,
         Err(reason) => {
-            reply(&client, &message, &reason).await?;
+            chat.reply(&route, &message, &reason).await?;
             return Ok(());
         }
     };
     tokio::spawn(keep_typing_while_working(
-        Arc::clone(&client),
-        message.channel_id,
+        Arc::clone(chat),
+        route.clone(),
         pane_id.clone(),
     ));
-    let text = message.content.clone();
     let prompt_pane = pane_id.clone();
-    let result = tokio::task::spawn_blocking(move || submit_owner_prompt(&prompt_pane, &text))
+    let result = tokio::task::spawn_blocking(move || submit_owner_prompt(&prompt_pane, &content))
         .await
         .map_err(|error| format!("agent.prompt task failed: {error}"))?;
     match result {
-        Ok(_) => reply(&client, &message, PROMPT_ACCEPTED_REPLY).await,
+        Ok(_) => Ok(chat.reply(&route, &message, PROMPT_ACCEPTED_REPLY).await?),
         Err(error) => {
             let response = format!("refused: prompt submission failed: {error}");
-            reply(&client, &message, &response).await?;
+            chat.reply(&route, &message, &response).await?;
             Err(format!("agent.prompt failed: {error}"))
         }
     }
 }
 
-async fn answer_pending_question(
-    responder: &PermissionResponder<Discord>,
-    message: &Message,
+async fn answer_pending_question<C: Chat>(
+    responder: &PermissionResponder<C>,
+    route: &C::Route,
+    content: &str,
 ) -> Option<String> {
-    let token = responder.pending_question_token(&message.channel_id)?;
-    let answer = Answer::Text(message.content.clone());
+    let token = responder.pending_question_token(route)?;
+    let answer = Answer::Text(content.to_owned());
     Some(match responder.answer_question(&token, &answer).await {
         Ok(QuestionOutcome::Sent) => "accepted: answer typed into the dialog".to_owned(),
         Ok(QuestionOutcome::AnsweredInTerminal) => {
@@ -160,27 +121,6 @@ fn has_prompt_content(content: &str) -> bool {
 #[must_use]
 pub fn should_handle_owner_message(author_id: &str, is_bot: bool, owner_id: &str) -> bool {
     !is_bot && author_id == owner_id
-}
-
-#[must_use]
-const fn is_thread_channel(kind: ChannelType) -> bool {
-    kind.is_thread()
-}
-
-#[must_use]
-fn prompt_surface_markers<'a, 'b>(
-    thread_name: &'a str,
-    topic: &'b str,
-) -> Option<(&'a str, &'b str)> {
-    let tab_id = thread_name
-        .rsplit_once(" [")
-        .and_then(|(_, suffix)| suffix.strip_suffix(']'))
-        .filter(|value| !value.trim().is_empty())?;
-    let workspace_id = topic
-        .strip_prefix("herdr workspace [")
-        .and_then(|value| value.strip_suffix(']'))
-        .filter(|value| !value.trim().is_empty())?;
-    Some((tab_id, workspace_id))
 }
 
 fn matching_agent<'agents>(
@@ -304,17 +244,18 @@ fn pane_left_idle(target: &str, bound: Duration) -> Result<bool, String> {
     }
 }
 
-pub async fn maintain_typing_until_settled<F, Fut>(
-    client: &Client,
-    channel: Id<ChannelMarker>,
+pub async fn maintain_typing_until_settled<C, F, Fut>(
+    chat: &C,
+    route: &C::Route,
     interval: Duration,
     mut still_working: F,
 ) where
+    C: Chat,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool, String>>,
 {
     loop {
-        if client.create_typing_trigger(channel).await.is_err() {
+        if chat.typing(route).await.is_err() {
             return;
         }
         tokio::time::sleep(interval).await;
@@ -324,15 +265,16 @@ pub async fn maintain_typing_until_settled<F, Fut>(
     }
 }
 
-async fn keep_typing_while_working(
-    client: Arc<Client>,
-    channel: Id<ChannelMarker>,
-    pane_id: String,
-) {
-    maintain_typing_until_settled(&client, channel, TYPING_KEEPALIVE_INTERVAL, move || {
-        let pane_id = pane_id.clone();
-        async move { pane_still_working(&pane_id).await }
-    })
+async fn keep_typing_while_working<C: Chat>(chat: Arc<C>, route: C::Route, pane_id: String) {
+    maintain_typing_until_settled(
+        chat.as_ref(),
+        &route,
+        TYPING_KEEPALIVE_INTERVAL,
+        move || {
+            let pane_id = pane_id.clone();
+            async move { pane_still_working(&pane_id).await }
+        },
+    )
     .await;
 }
 
@@ -355,28 +297,16 @@ fn agent_list_failure_reply(error: &str) -> String {
     format!("refused: agent.list failed: {error}")
 }
 
-async fn reply(client: &Client, message: &Message, content: &str) -> Result<(), String> {
-    client
-        .create_message(message.channel_id)
-        .content(content)
-        .reply(message.id)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
-    use twilight_model::channel::ChannelType;
 
     use std::collections::HashSet;
 
     use super::{
         OWNER_PROMPT_SUPPRESSIONS, PROMPT_ACKNOWLEDGED_UNCONFIRMED, agent_list_failure_reply,
-        has_prompt_content, is_thread_channel, matching_agent, pane_status_is_working,
-        prompt_surface_markers, resolve_prompt_pane, retain_present_panes, stall_recovery_applies,
-        take_owner_prompt_suppression,
+        has_prompt_content, matching_agent, pane_status_is_working, resolve_prompt_pane,
+        retain_present_panes, stall_recovery_applies, take_owner_prompt_suppression,
     };
     use crate::AgentSnapshot;
 
@@ -385,40 +315,6 @@ mod tests {
         let cases = [("", false), ("   \n\t", false), ("prompt", true)];
         for (content, expected) in cases {
             assert_eq!(has_prompt_content(content), expected, "content={content:?}");
-        }
-    }
-
-    #[test]
-    fn only_thread_channel_kinds_are_prompt_surfaces() {
-        let cases = [
-            (ChannelType::GuildText, false),
-            (ChannelType::GuildCategory, false),
-            (ChannelType::GuildForum, false),
-            (ChannelType::AnnouncementThread, true),
-            (ChannelType::PublicThread, true),
-            (ChannelType::PrivateThread, true),
-        ];
-        for (kind, expected) in cases {
-            assert_eq!(is_thread_channel(kind), expected);
-        }
-    }
-
-    #[test]
-    fn qualifying_prompt_surface_requires_both_discord_markers() {
-        let cases = [
-            (
-                "bridge [real-workspace:tab-1]",
-                "herdr workspace [real-workspace]",
-                true,
-            ),
-            ("bridge", "herdr workspace [real-workspace]", false),
-            ("bridge [real-workspace:tab-1]", "workspace", false),
-        ];
-        for (thread_name, topic, expected) in cases {
-            assert_eq!(
-                prompt_surface_markers(thread_name, topic).is_some(),
-                expected
-            );
         }
     }
 

@@ -1,15 +1,26 @@
+use std::fmt;
+
 use twilight_model::channel::Channel;
 use twilight_model::id::{Id, marker::ChannelMarker};
 
 use crate::{
-    TopologyCache, delete_thread_created_message, forget_owned, resolve_owner_deleted_tab,
-    resolve_owner_deleted_workspace, tab_close, take_self_deletion, workspace_close,
+    Closed, TopologyCache, delete_thread_created_message, forget_owned, resolve_owner_deleted_tab,
+    resolve_owner_deleted_workspace, take_self_deletion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuildDeletion {
     Thread { id: Id<ChannelMarker> },
     Channel(Box<Channel>),
+}
+
+impl fmt::Display for GuildDeletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Thread { .. } => "THREAD_DELETE",
+            Self::Channel(_) => "CHANNEL_DELETE",
+        })
+    }
 }
 
 impl GuildDeletion {
@@ -43,11 +54,15 @@ pub fn decide_close(deletion: &GuildDeletion) -> Option<Close> {
     }
 }
 
-pub async fn handle_guild_deletion(
+pub async fn handle_guild_deletion<F>(
     client: &twilight_http::Client,
     topology_cache: &TopologyCache,
     deletion: GuildDeletion,
-) -> Result<(), String> {
+    closer: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Closed) -> Result<(), String> + Send + 'static,
+{
     let id = deletion.id();
     let close = decide_close(&deletion);
     let Some(close) = close else {
@@ -63,13 +78,13 @@ pub async fn handle_guild_deletion(
         threads.retain(|thread| thread.id != id && thread.parent_id != Some(id));
     }
     let result = tokio::task::spawn_blocking(move || match close {
-        Close::Tab(tab_id, _) => tab_close(&tab_id),
-        Close::Workspace(workspace_id) => workspace_close(&workspace_id),
+        Close::Tab(tab_id, _) => closer(Closed::Tab(tab_id)),
+        Close::Workspace(workspace_id) => closer(Closed::Workspace(workspace_id)),
     })
     .await
     .map_err(|error| error.to_string())?;
     drop(guard);
-    result.map(|_| forget_owned(id))?;
+    result.map(|()| forget_owned(id))?;
     message
 }
 
@@ -79,6 +94,7 @@ mod tests {
 
     use super::{Close, GuildDeletion, decide_close, handle_guild_deletion};
     use crate::TopologyCache;
+    use crate::gateway::close_in_herdr;
     use crate::topology::{
         owner_deletion_tests::channel, record_self_deletion, remember_tab_threads,
         remember_workspace_channels,
@@ -149,7 +165,7 @@ mod tests {
         ];
         for (name, deletion) in cases {
             assert_eq!(
-                handle_guild_deletion(&client, &cache, deletion).await,
+                handle_guild_deletion(&client, &cache, deletion, close_in_herdr).await,
                 Ok(()),
                 "{name}"
             );
