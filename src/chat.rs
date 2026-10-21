@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::{self, Debug, Display};
 use std::future::Future;
 use std::hash::Hash;
@@ -33,6 +34,17 @@ pub enum Ack<'a> {
     EditDeferred(&'a str),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum TopologyClosure {
+    Tab {
+        workspace_id: String,
+        tab_id: String,
+    },
+    Workspace {
+        workspace_id: String,
+    },
+}
+
 pub struct Component<C: Chat> {
     pub interaction: C::Interaction,
     pub route: C::Route,
@@ -46,10 +58,34 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Message: Clone + Eq + Hash + Debug + Send + Sync + 'static;
     type Interaction: Clone + Send + Sync + 'static;
 
+    fn sync_route(
+        &self,
+        route: &TopologyRoute,
+    ) -> impl Future<Output = Result<Self::Route, ChatError>> + Send;
     fn sync_route_fresh(
         &self,
         route: &TopologyRoute,
     ) -> impl Future<Output = Result<Self::Route, ChatError>> + Send;
+    fn sync_route_with_parent(
+        &self,
+        route: &TopologyRoute,
+    ) -> impl Future<Output = Result<(Self::Route, Self::Route), ChatError>> + Send;
+    fn cached_route(
+        &self,
+        route: &TopologyRoute,
+    ) -> impl Future<Output = Result<Option<Self::Route>, ChatError>> + Send;
+    fn register_archived(&self) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn startup_sweep<F>(
+        &self,
+        routes: Vec<Result<TopologyRoute, String>>,
+        live: F,
+    ) -> impl Future<Output = ()> + Send
+    where
+        F: FnOnce() -> Result<(HashSet<String>, HashSet<String>), String> + Send;
+    fn close_topology(
+        &self,
+        closure: &TopologyClosure,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send;
     fn expire_card(
         &self,
         route: &Self::Route,
