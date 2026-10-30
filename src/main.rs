@@ -1527,6 +1527,12 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
     else {
         return Ok(());
     };
+    if ["HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"]
+        .iter()
+        .all(|name| std::env::var_os(name).is_none())
+    {
+        return Ok(());
+    }
     let workspace_id = std::env::var("HERDR_WORKSPACE_ID")?;
     let tab_id = std::env::var("HERDR_TAB_ID")?;
     let pane_id = std::env::var("HERDR_PANE_ID")?;
