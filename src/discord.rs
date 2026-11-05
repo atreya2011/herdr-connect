@@ -677,7 +677,15 @@ impl Chat for Discord {
     where
         F: FnOnce(Closed) -> Result<(), String> + Send + 'static,
     {
-        Ok(handle_guild_deletion(&self.client, &self.topology_cache, deletion, close).await?)
+        Ok(handle_guild_deletion(
+            &self.client,
+            self.guild,
+            &self.owner_id,
+            &self.topology_cache,
+            deletion,
+            close,
+        )
+        .await?)
     }
 }
 

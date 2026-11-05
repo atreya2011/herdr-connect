@@ -400,24 +400,6 @@ pub fn is_unknown_webhook_error(error: &twilight_http::Error) -> bool {
     )
 }
 
-static SELF_DELETIONS: LazyLock<std::sync::Mutex<HashSet<Id<ChannelMarker>>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
-
-#[must_use]
-pub fn take_self_deletion(id: Id<ChannelMarker>) -> bool {
-    SELF_DELETIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&id)
-}
-
-pub fn record_self_deletion(id: Id<ChannelMarker>) {
-    SELF_DELETIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(id);
-}
-
 pub async fn delete_thread_created_message(
     client: &twilight_http::Client,
     parent: Id<ChannelMarker>,
@@ -436,21 +418,16 @@ async fn delete_channel_if_present(
     client: &twilight_http::Client,
     id: Id<ChannelMarker>,
 ) -> Result<(), String> {
-    record_self_deletion(id);
     match client.delete_channel(id).await {
         Ok(_) => {
             forget_owned(id);
             Ok(())
         }
-        Err(error) => {
-            let _ = take_self_deletion(id);
-            if is_unknown_channel_error(&error) {
-                forget_owned(id);
-                Ok(())
-            } else {
-                Err(error.to_string())
-            }
+        Err(error) if is_unknown_channel_error(&error) => {
+            forget_owned(id);
+            Ok(())
         }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -648,8 +625,8 @@ pub mod owner_deletion_tests {
     use twilight_model::id::{Id, marker::ChannelMarker};
 
     use super::{
-        forget_owned, record_self_deletion, remember_tab_threads, remember_workspace_channels,
-        resolve_owner_deleted_tab, resolve_owner_deleted_workspace, take_self_deletion,
+        forget_owned, remember_tab_threads, remember_workspace_channels, resolve_owner_deleted_tab,
+        resolve_owner_deleted_workspace,
     };
 
     pub fn channel(id: u64, name: &str, topic: Option<&str>, parent: Option<u64>) -> Channel {
@@ -763,13 +740,5 @@ pub mod owner_deletion_tests {
                 "{name}"
             );
         }
-    }
-
-    #[test]
-    fn a_self_deletion_is_ignored_once() {
-        record_self_deletion(id(7_000_001));
-        assert!(take_self_deletion(id(7_000_001)));
-        assert!(!take_self_deletion(id(7_000_001)));
-        assert!(!take_self_deletion(id(7_000_002)));
     }
 }
