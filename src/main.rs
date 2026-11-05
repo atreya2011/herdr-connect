@@ -6699,7 +6699,9 @@ mod tests {
             return Err("the workspace channel existed before the startup sync".to_owned());
         }
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
 
         let channel = guild
             .client
@@ -6908,7 +6910,9 @@ mod tests {
             return Err("the workspace channel existed before the startup sync".to_owned());
         }
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
         let matching_channels: Vec<_> = guild
             .client
             .guild_channels(guild.id)
@@ -7208,6 +7212,7 @@ mod tests {
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
 
+        let production = production_topology(guild).await?;
         let startup = sync_startup_topology(connection.1.chat().as_ref(), agents, tabs);
         let delivery = sync_route(
             guild.client.as_ref(),
@@ -7217,6 +7222,7 @@ mod tests {
             &guild.owner_id,
         );
         let ((), delivery_result) = tokio::join!(startup, delivery);
+        expect_production_topology_survives(guild, &production).await?;
         delivery_result?;
 
         let threads = guild
@@ -7332,6 +7338,7 @@ mod tests {
         .await?;
         let shared: herdr_connect_rs::TopologyCache =
             Arc::new(tokio::sync::Mutex::new(Some(stale)));
+        let production = production_topology(guild).await?;
         sync_startup_topology(
             discord_tuple_with_cache(guild, Arc::clone(&shared))
                 .1
@@ -7341,6 +7348,7 @@ mod tests {
             tabs,
         )
         .await;
+        expect_production_topology_survives(guild, &production).await?;
 
         let matching_channels = guild
             .client
@@ -7453,6 +7461,63 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(unix)]
+    async fn production_topology(
+        guild: &BlockedCaptureGuild,
+    ) -> Result<HashSet<Id<ChannelMarker>>, String> {
+        let channels = guild_channels_for_guild(guild).await?;
+        let test_channels: HashSet<Id<ChannelMarker>> = channels
+            .iter()
+            .filter(|channel| is_test_channel(channel))
+            .map(|channel| channel.id)
+            .collect();
+        let mut threads = active_threads_for_guild(guild).await?;
+        for workspace in channels.iter().filter(|channel| {
+            !test_channels.contains(&channel.id)
+                && channel
+                    .topic
+                    .as_deref()
+                    .is_some_and(|topic| topic.starts_with("herdr workspace ["))
+        }) {
+            threads.extend(
+                herdr_connect_rs::archived_threads(guild.client.as_ref(), workspace.id).await?,
+            );
+        }
+        let production_threads = threads.iter().filter(|thread| {
+            !is_test_channel(thread)
+                && thread
+                    .parent_id
+                    .is_none_or(|parent| !test_channels.contains(&parent))
+        });
+        Ok(channels
+            .iter()
+            .filter(|channel| !is_test_channel(channel))
+            .chain(production_threads)
+            .map(|channel| channel.id)
+            .collect())
+    }
+
+    #[cfg(unix)]
+    async fn expect_production_topology_survives(
+        guild: &BlockedCaptureGuild,
+        before: &HashSet<Id<ChannelMarker>>,
+    ) -> Result<(), String> {
+        let after = production_topology(guild).await?;
+        let mut missing = Vec::new();
+        for id in before.difference(&after) {
+            if let Err(error) = guild.client.channel(*id).await {
+                missing.push(format!("{id}: {error}"));
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the startup sweep removed non-testrun channels or threads: {missing:?}"
+            ))
+        }
     }
 
     #[cfg(unix)]
@@ -7850,7 +7915,9 @@ mod tests {
         let agents = [root_agent.clone(), second_agent.clone()];
 
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
 
@@ -8090,7 +8157,9 @@ mod tests {
         let agents = [root_agent.clone(), second_agent.clone()];
 
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", second_route.workspace_id);
@@ -8323,7 +8392,9 @@ mod tests {
         let agents = [agent.clone()];
 
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
         let route = route_topology(&agents, &tabs, &agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
@@ -8531,7 +8602,9 @@ mod tests {
         let route = route_topology(agents, tabs, &listed.terminal_id)?;
 
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
 
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let live_channel = guild_channel_with_topic(guild, &topic).await?;
@@ -8563,7 +8636,9 @@ mod tests {
         let bystander_thread =
             create_guild_thread(guild, live_channel.id, "testrun-notes [staging]").await?;
 
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
 
         let channels_after = guild_channels_for_guild(guild).await?;
         if channels_after
@@ -8722,7 +8797,9 @@ mod tests {
             None
         };
 
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), &[], &[]).await;
+        expect_production_topology_survives(guild, &production).await?;
 
         if let Some((handle, done)) = racer {
             done.store(true, Ordering::Relaxed);
@@ -8952,7 +9029,9 @@ mod tests {
         let agents = [no_session_agent.clone(), session_agent.clone()];
 
         let connection = discord_tuple(guild);
+        let production = production_topology(guild).await?;
         sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        expect_production_topology_survives(guild, &production).await?;
 
         let no_session_route = route_topology(&agents, &tabs, &no_session_agent.terminal_id)?;
         let session_route = route_topology(&agents, &tabs, &session_agent.terminal_id)?;
