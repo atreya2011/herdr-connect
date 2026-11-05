@@ -8006,7 +8006,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const OWNER_DELETE_LABEL: &str = "testrun-owner-delete";
+    const BOT_DELETE_LABEL: &str = "testrun-bot-delete";
 
     #[cfg(unix)]
     const GATEWAY_READY_WAIT: Duration = Duration::from_secs(8);
@@ -8031,11 +8031,18 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn deletion_errors(notices: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
-        notices
-            .try_iter()
-            .filter(|notice| notice.contains("error"))
-            .collect()
+    fn expect_only_audit_log_errors(errors: &[String]) -> Result<(), String> {
+        let other: Vec<&String> = errors
+            .iter()
+            .filter(|error| !error.starts_with("discord owner deletion error: guild audit log: "))
+            .collect();
+        if other.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "gateway reported errors other than an audit log failure: {other:?}"
+            ))
+        }
     }
 
     #[cfg(unix)]
@@ -8067,7 +8074,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn owner_thread_delete_exercise(
+    async fn bot_token_thread_delete_exercise(
         guild: &BlockedCaptureGuild,
         workspace: &Workspace,
         second_tab: &Tab,
@@ -8093,7 +8100,6 @@ mod tests {
         let thread = active_tab_thread(guild, channel.id, &second_suffix).await?;
         expect_thread_created_message(guild, channel.id, thread.id, true).await?;
 
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         *connection.1.chat().topology_cache().lock().await = None;
         let deleted = guild
@@ -8101,30 +8107,14 @@ mod tests {
             .delete_channel(thread.id)
             .await
             .map_err(|error| error.to_string());
-        let closed = if deleted.is_ok() {
-            wait_for_event(
-                &mut lifecycle,
-                "tab_closed",
-                &second_tab.tab_id,
-                "/data/tab_id",
-                None,
-                Duration::from_secs(20),
-            )
-            .await
-            .map(|_| ())
-        } else {
-            Ok(())
-        };
+        let seen = deletion_notices(notices, "discord gateway deletion: THREAD_DELETE").await;
         gateway.abort();
         deleted?;
-        closed.map_err(|error| format!("owner thread delete did not close the tab: {error}"))?;
+        expect_only_audit_log_errors(&seen?.1)?;
+        matching_tab(&second_tab.tab_id)
+            .map_err(|error| format!("a bot token thread delete closed the herdr tab: {error}"))?;
         matching_tab(&workspace.tab_id)
             .map_err(|error| format!("the sibling tab did not survive: {error}"))?;
-        let errors = deletion_errors(&notices);
-        if !errors.is_empty() {
-            return Err(format!("gateway reported errors: {errors:?}"));
-        }
-        expect_thread_created_message(guild, channel.id, thread.id, false).await?;
 
         if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
             return Err("the sibling tab's thread did not survive".to_owned());
@@ -8135,7 +8125,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn owner_thread_delete_closes_the_herdr_tab() {
+    async fn bot_token_thread_delete_leaves_the_herdr_tab_open() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -8146,29 +8136,29 @@ mod tests {
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_tabs(OWNER_DELETE_LABEL).expect("tab.list succeeds"),
+            remaining_tabs(BOT_DELETE_LABEL).expect("tab.list succeeds"),
             0,
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_workspaces(OWNER_DELETE_LABEL).expect("workspace.list succeeds"),
+            remaining_workspaces(BOT_DELETE_LABEL).expect("workspace.list succeeds"),
             0,
             "named zero-leftover check"
         );
 
         let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-owner-delete-{}-{}",
+            "testrun-bot-delete-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         ));
-        fs::create_dir_all(&cwd_dir).expect("create owner-delete test cwd");
+        fs::create_dir_all(&cwd_dir).expect("create bot-delete test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let created = match create_workspace(OWNER_DELETE_LABEL, cwd) {
-            Ok(workspace) => match create_tab(OWNER_DELETE_LABEL, &workspace.id, cwd) {
+        let created = match create_workspace(BOT_DELETE_LABEL, cwd) {
+            Ok(workspace) => match create_tab(BOT_DELETE_LABEL, &workspace.id, cwd) {
                 Ok(second_tab) => Ok((workspace, second_tab)),
                 Err(error) => Err((Some(workspace.id), error)),
             },
@@ -8177,7 +8167,8 @@ mod tests {
         let (workspace_id, result) = match created {
             Ok((workspace, second_tab)) => {
                 let workspace_id = workspace.id.clone();
-                let outcome = owner_thread_delete_exercise(&guild, &workspace, &second_tab).await;
+                let outcome =
+                    bot_token_thread_delete_exercise(&guild, &workspace, &second_tab).await;
                 (Some(workspace_id), outcome)
             }
             Err((workspace_id, error)) => (workspace_id, Err(error)),
@@ -8188,9 +8179,9 @@ mod tests {
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left = remaining_tabs(OWNER_DELETE_LABEL)
+        let tabs_left = remaining_tabs(BOT_DELETE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
-        let workspaces_left = remaining_workspaces(OWNER_DELETE_LABEL)
+        let workspaces_left = remaining_workspaces(BOT_DELETE_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
@@ -8199,7 +8190,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn owner_archived_thread_delete_exercise(
+    async fn bot_token_archived_thread_delete_exercise(
         guild: &BlockedCaptureGuild,
         workspace: &Workspace,
         second_tab: &Tab,
@@ -8209,7 +8200,7 @@ mod tests {
             .create_guild_channel(
                 guild.id,
                 &format!(
-                    "testrun-owner-delete-archived-{}",
+                    "testrun-bot-delete-archived-{}",
                     second_tab.tab_id.replace(':', "-")
                 ),
             )
@@ -8235,45 +8226,28 @@ mod tests {
         }
 
         let connection = discord_tuple(guild);
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = guild
             .client
             .delete_channel(thread.id)
             .await
             .map_err(|error| error.to_string());
-        let closed = if deleted.is_ok() {
-            wait_for_event(
-                &mut lifecycle,
-                "tab_closed",
-                &second_tab.tab_id,
-                "/data/tab_id",
-                None,
-                Duration::from_secs(20),
-            )
-            .await
-            .map(|_| ())
-        } else {
-            Ok(())
-        };
+        let seen = deletion_notices(notices, "discord gateway deletion: THREAD_DELETE").await;
         gateway.abort();
         deleted?;
-        closed.map_err(|error| {
-            format!("owner delete of an archived thread did not close the tab: {error}")
+        expect_only_audit_log_errors(&seen?.1)?;
+        matching_tab(&second_tab.tab_id).map_err(|error| {
+            format!("a bot token delete of an archived thread closed the herdr tab: {error}")
         })?;
         matching_tab(&workspace.tab_id)
             .map_err(|error| format!("the sibling tab did not survive: {error}"))?;
-        let errors = deletion_errors(&notices);
-        if !errors.is_empty() {
-            return Err(format!("gateway reported errors: {errors:?}"));
-        }
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn owner_archived_thread_delete_closes_the_herdr_tab() {
+    async fn bot_token_archived_thread_delete_leaves_the_herdr_tab_open() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -8284,29 +8258,29 @@ mod tests {
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_tabs(OWNER_DELETE_LABEL).expect("tab.list succeeds"),
+            remaining_tabs(BOT_DELETE_LABEL).expect("tab.list succeeds"),
             0,
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_workspaces(OWNER_DELETE_LABEL).expect("workspace.list succeeds"),
+            remaining_workspaces(BOT_DELETE_LABEL).expect("workspace.list succeeds"),
             0,
             "named zero-leftover check"
         );
 
         let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-owner-delete-archived-{}-{}",
+            "testrun-bot-delete-archived-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         ));
-        fs::create_dir_all(&cwd_dir).expect("create owner-delete test cwd");
+        fs::create_dir_all(&cwd_dir).expect("create bot-delete test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let created = match create_workspace(OWNER_DELETE_LABEL, cwd) {
-            Ok(workspace) => match create_tab(OWNER_DELETE_LABEL, &workspace.id, cwd) {
+        let created = match create_workspace(BOT_DELETE_LABEL, cwd) {
+            Ok(workspace) => match create_tab(BOT_DELETE_LABEL, &workspace.id, cwd) {
                 Ok(second_tab) => Ok((workspace, second_tab)),
                 Err(error) => Err((Some(workspace.id), error)),
             },
@@ -8316,7 +8290,8 @@ mod tests {
             Ok((workspace, second_tab)) => {
                 let workspace_id = workspace.id.clone();
                 let outcome =
-                    owner_archived_thread_delete_exercise(&guild, &workspace, &second_tab).await;
+                    bot_token_archived_thread_delete_exercise(&guild, &workspace, &second_tab)
+                        .await;
                 (Some(workspace_id), outcome)
             }
             Err((workspace_id, error)) => (workspace_id, Err(error)),
@@ -8327,9 +8302,9 @@ mod tests {
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left = remaining_tabs(OWNER_DELETE_LABEL)
+        let tabs_left = remaining_tabs(BOT_DELETE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
-        let workspaces_left = remaining_workspaces(OWNER_DELETE_LABEL)
+        let workspaces_left = remaining_workspaces(BOT_DELETE_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
@@ -8338,7 +8313,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn owner_channel_delete_exercise(
+    async fn bot_token_channel_delete_exercise(
         guild: &BlockedCaptureGuild,
         workspace: &Workspace,
     ) -> Result<(), String> {
@@ -8353,35 +8328,21 @@ mod tests {
         let topic = format!("herdr workspace [{}]", route.workspace_id);
         let channel = guild_channel_with_topic(guild, &topic).await?;
 
-        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = guild
             .client
             .delete_channel(channel.id)
             .await
             .map_err(|error| error.to_string());
-        let closed = if deleted.is_ok() {
-            wait_for_event(
-                &mut lifecycle,
-                "workspace_closed",
-                &workspace.id,
-                "/data/workspace_id",
-                None,
-                Duration::from_secs(20),
-            )
-            .await
-            .map(|_| ())
-        } else {
-            Ok(())
-        };
+        let seen = deletion_notices(notices, "discord gateway deletion: CHANNEL_DELETE").await;
         gateway.abort();
         deleted?;
-        closed.map_err(|error| {
-            format!("owner channel delete did not close the workspace: {error}")
-        })?;
-        let errors = deletion_errors(&notices);
-        if !errors.is_empty() {
-            return Err(format!("gateway reported errors: {errors:?}"));
+        expect_only_audit_log_errors(&seen?.1)?;
+        if !herdr_connect_rs::workspace_list_result()?
+            .iter()
+            .any(|listed| listed.workspace_id == workspace.id)
+        {
+            return Err("a bot token channel delete closed the herdr workspace".to_owned());
         }
         Ok(())
     }
@@ -8389,7 +8350,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn owner_channel_delete_closes_the_herdr_workspace() {
+    async fn bot_token_channel_delete_leaves_the_herdr_workspace_open() {
         let Some(guild) = blocked_capture_guild() else {
             eprintln!("skipped: Discord real-guild environment is not configured");
             return;
@@ -8400,30 +8361,30 @@ mod tests {
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_tabs(OWNER_DELETE_LABEL).expect("tab.list succeeds"),
+            remaining_tabs(BOT_DELETE_LABEL).expect("tab.list succeeds"),
             0,
             "named zero-leftover check"
         );
         assert_eq!(
-            remaining_workspaces(OWNER_DELETE_LABEL).expect("workspace.list succeeds"),
+            remaining_workspaces(BOT_DELETE_LABEL).expect("workspace.list succeeds"),
             0,
             "named zero-leftover check"
         );
 
         let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-owner-delete-channel-{}-{}",
+            "testrun-bot-delete-channel-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock is after unix epoch")
                 .as_nanos()
         ));
-        fs::create_dir_all(&cwd_dir).expect("create owner-delete test cwd");
+        fs::create_dir_all(&cwd_dir).expect("create bot-delete test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let (workspace_id, result) = match create_workspace(OWNER_DELETE_LABEL, cwd) {
+        let (workspace_id, result) = match create_workspace(BOT_DELETE_LABEL, cwd) {
             Ok(workspace) => {
-                let outcome = owner_channel_delete_exercise(&guild, &workspace).await;
+                let outcome = bot_token_channel_delete_exercise(&guild, &workspace).await;
                 (Some(workspace.id), outcome)
             }
             Err(error) => (None, Err(error)),
@@ -8434,9 +8395,9 @@ mod tests {
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left = remaining_tabs(OWNER_DELETE_LABEL)
+        let tabs_left = remaining_tabs(BOT_DELETE_LABEL)
             .expect("tab.list succeeds for the zero-leftover check");
-        let workspaces_left = remaining_workspaces(OWNER_DELETE_LABEL)
+        let workspaces_left = remaining_workspaces(BOT_DELETE_LABEL)
             .expect("workspace.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
@@ -8544,8 +8505,10 @@ mod tests {
                 "discord gateway deletion: CHANNEL_DELETE"
             };
             assert_eq!(
-                outcome,
-                Ok((vec![dispatch.to_owned()], Vec::new())),
+                outcome.and_then(|(dispatched, errors)| {
+                    expect_only_audit_log_errors(&errors).map(|()| dispatched)
+                }),
+                Ok(vec![dispatch.to_owned()]),
                 "{name}"
             );
         }
