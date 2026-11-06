@@ -37,7 +37,7 @@ async fn process_owner_prompt<C: Chat>(request: OwnerPromptRequest<C>) {
     if let Err(error) = result {
         let _ = request
             .notices
-            .send(format!("discord owner prompt error: {error}"));
+            .send(format!("chat owner prompt error: {error}"));
     }
 }
 
@@ -63,7 +63,7 @@ pub async fn drive_gateway<C: Chat>(
                     notices: notices.clone(),
                 };
                 if owner_prompt_sender.send(request).is_err() {
-                    "discord owner prompt error: owner prompt queue closed".to_owned()
+                    "chat owner prompt error: owner prompt queue closed".to_owned()
                 } else {
                     continue;
                 }
@@ -75,15 +75,15 @@ pub async fn drive_gateway<C: Chat>(
             Ok(Inbound::Deleted(deletion)) => {
                 let label = deletion.to_string();
                 spawn_deletion(&responder, &notices, deletion);
-                format!("discord gateway deletion: {label}")
+                format!("chat gateway deletion: {label}")
             }
-            Err(error) => format!("discord gateway error: {error}"),
+            Err(error) => format!("chat gateway error: {error}"),
         };
         if notices.send(notice).is_err() {
             break;
         }
     }
-    Err("discord gateway fatally closed; owner prompts are no longer received".to_owned())
+    Err("chat gateway fatally closed; owner prompts are no longer received".to_owned())
 }
 
 fn spawn_deletion<C: Chat>(
@@ -99,7 +99,7 @@ fn spawn_deletion<C: Chat>(
             .handle_deletion(deletion, close_in_herdr)
             .await
         {
-            let _ = notices.send(format!("discord owner deletion error: {error}"));
+            let _ = notices.send(format!("chat owner deletion error: {error}"));
         }
     });
 }

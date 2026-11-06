@@ -74,14 +74,14 @@ impl Slack {
             return Err(error("Slack Socket Mode is already connected"));
         }
         let environment = Arc::new(SlackClientEventsListenerEnvironment::new(Arc::clone(
-            &self.client,
+            &self.state.client,
         )));
         environment
             .user_state
             .write()
             .await
             .set_user_state(SocketState {
-                sender: self.events_tx.clone(),
+                sender: self.state.events_tx.clone(),
                 ready: Notify::new(),
             });
         let callbacks = SlackSocketModeListenerCallbacks::new()
@@ -126,6 +126,7 @@ impl Slack {
 
     pub async fn shutdown_socket(&self) -> Result<(), ChatError> {
         let routes: Vec<_> = self
+            .state
             .working
             .lock()
             .await
@@ -182,8 +183,9 @@ impl Slack {
             return Ok(None);
         };
         let info = self
+            .state
             .client
-            .open_session(&self.token)
+            .open_session(&self.state.token)
             .conversations_info(&SlackApiConversationsInfoRequest::new(channel.clone()))
             .await
             .map_err(error)?
@@ -203,11 +205,11 @@ impl Slack {
             return Ok(None);
         }
         let route = SlackRoute { channel };
-        self.use_status_message(&route, &posted.origin.ts).await?;
         let content = posted
             .content
             .and_then(|content| content.text)
             .unwrap_or_default();
+        let content = decode_message_text(&content);
         Ok(Some((
             route,
             posted.origin.ts,
@@ -235,10 +237,11 @@ impl Slack {
         if event.0.user != self.owner {
             return Ok(());
         }
-        let mut topology = self.topology.lock().await;
+        let mut topology = self.state.topology.lock().await;
         let channel = self
+            .state
             .client
-            .open_session(&self.token)
+            .open_session(&self.state.token)
             .conversations_info(&SlackApiConversationsInfoRequest::new(
                 event.0.channel.clone(),
             ))
@@ -269,4 +272,48 @@ impl Slack {
         drop(topology);
         Ok(())
     }
+}
+
+fn decode_message_text(text: &str) -> String {
+    let mut remaining = text;
+    let mut decoded = String::new();
+    while let Some(start) = remaining.find('<') {
+        decoded.push_str(&remaining[..start]);
+        let tail = &remaining[start + 1..];
+        let Some(end) = tail.find('>') else {
+            decoded.push_str(&remaining[start..]);
+            remaining = "";
+            break;
+        };
+        let tag = &tail[..end];
+        let (target, label) = tag
+            .split_once('|')
+            .map_or((tag, None), |(target, label)| (target, Some(label)));
+        if let Some(user) = target.strip_prefix('@') {
+            decoded.push('@');
+            decoded.push_str(user);
+        } else if let Some(channel) = target.strip_prefix('#') {
+            decoded.push('#');
+            decoded.push_str(label.unwrap_or(channel));
+        } else if target.starts_with("https://") || target.starts_with("http://") {
+            if let Some(label) = label {
+                decoded.push_str(label);
+                decoded.push_str(" (");
+                decoded.push_str(target);
+                decoded.push(')');
+            } else {
+                decoded.push_str(target);
+            }
+        } else {
+            decoded.push('<');
+            decoded.push_str(tag);
+            decoded.push('>');
+        }
+        remaining = &tail[end + 1..];
+    }
+    decoded.push_str(remaining);
+    decoded
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }

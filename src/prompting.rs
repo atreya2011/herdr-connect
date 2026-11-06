@@ -64,6 +64,9 @@ pub async fn handle_owner_message<C: Chat>(
         }
     };
     if let Some(response) = answer_pending_question(responder, &route, &content).await {
+        if response.starts_with("accepted:") {
+            accepted_status(chat.as_ref(), &route, &message).await;
+        }
         chat.reply(&route, &message, &response).await?;
         return Ok(());
     }
@@ -84,12 +87,21 @@ pub async fn handle_owner_message<C: Chat>(
         .await
         .map_err(|error| format!("agent.prompt task failed: {error}"))?;
     match result {
-        Ok(_) => Ok(chat.reply(&route, &message, PROMPT_ACCEPTED_REPLY).await?),
+        Ok(_) => {
+            accepted_status(chat.as_ref(), &route, &message).await;
+            Ok(chat.reply(&route, &message, PROMPT_ACCEPTED_REPLY).await?)
+        }
         Err(error) => {
             let response = format!("refused: prompt submission failed: {error}");
             chat.reply(&route, &message, &response).await?;
             Err(format!("agent.prompt failed: {error}"))
         }
+    }
+}
+
+async fn accepted_status<C: Chat>(chat: &C, route: &C::Route, message: &C::Message) {
+    if let Err(error) = chat.owner_message_accepted(route, message).await {
+        crate::bridge_eprintln!("chat accepted-message status error: {error}");
     }
 }
 

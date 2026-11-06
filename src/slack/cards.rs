@@ -16,9 +16,17 @@ fn question_content(
     owner: &SlackUserId,
 ) -> Result<SlackMessageContent, ChatError> {
     let mut blocks = vec![
-        json!({"type":"section","text":{"type":"mrkdwn","text":format!("<@{owner}> Claude question")}}),
+        json!({"type":"section","text":{"type":"mrkdwn","text":format!("<@{owner}> Claude question: {}", escape(&question.header))}}),
         json!({"type":"section","text":{"type":"plain_text","text":question.question.chars().take(3000).collect::<String>()}}),
     ];
+    let descriptions = question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| format!("{}. {}\n{}", index + 1, option.label, option.description))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    blocks.push(json!({"type":"section","text":{"type":"plain_text","text":descriptions.chars().take(3000).collect::<String>()}}));
     if question.multi_select {
         let options: Vec<_> = question.options.iter().enumerate().map(|(index, option)| json!({"text":{"type":"plain_text","text":option.label.chars().take(75).collect::<String>()},"value":index.to_string()})).collect();
         blocks.push(json!({"type":"section","text":{"type":"plain_text","text":"Choose options, then submit."},"accessory":{"type":"multi_static_select","action_id":format!("herdrask-picks:{token}"),"placeholder":{"type":"plain_text","text":"Choose options"},"options":options}}));

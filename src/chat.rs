@@ -40,7 +40,7 @@ pub enum Closed {
     Workspace(String),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TopologyClosure {
     Tab {
         workspace_id: String,
@@ -81,6 +81,13 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Deletion: Display + Send + 'static;
 
     fn owner_id(&self) -> &str;
+    fn owner_message_accepted(
+        &self,
+        _route: &Self::Route,
+        _message: &Self::Message,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send {
+        async { Ok(()) }
+    }
     fn lifecycle_subscriptions(&self) -> Vec<serde_json::Value> {
         crate::lifecycle_subscriptions()
     }

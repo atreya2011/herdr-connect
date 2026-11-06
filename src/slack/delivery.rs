@@ -1,7 +1,7 @@
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 
-use super::{Slack, SlackRoute, SlackSocketEvent, error};
+use super::{Slack, SlackRoute, SlackSocketEvent, SlackState, error};
 use crate::ChatError;
 
 pub(super) fn escape(text: &str) -> String {
@@ -26,20 +26,22 @@ impl Slack {
             .with_unfurl_links(false)
             .with_unfurl_media(false);
         let result = self
+            .state
             .client
-            .open_session(&self.token)
+            .open_session(&self.state.token)
             .chat_post_message(&request)
             .await;
         match result {
             Ok(response) => {
-                if self
+                let refresh_status = self
+                    .state
                     .working
                     .lock()
                     .await
                     .get(route)
-                    .is_some_and(Option::is_some)
-                {
-                    self.set_working(route, true).await?;
+                    .is_some_and(Option::is_some);
+                if refresh_status && let Err(failure) = self.set_working(route, true).await {
+                    crate::bridge_eprintln!("Slack status refresh error after post: {failure}");
                 }
                 Ok(response.ts)
             }
@@ -72,8 +74,9 @@ impl Slack {
         message: &SlackTs,
         content: SlackMessageContent,
     ) -> Result<(), ChatError> {
-        self.client
-            .open_session(&self.token)
+        self.state
+            .client
+            .open_session(&self.state.token)
             .chat_update(
                 &SlackApiChatUpdateRequest::new(route.channel.clone(), content, message.clone())
                     .with_parse("none".into()),
@@ -90,31 +93,34 @@ impl Slack {
                 "channel_not_found" | "is_archived" | "thread_not_found"
             )
         {
-            let mut topology = self.topology.lock().await;
+            let mut topology = self.state.topology.lock().await;
             topology.loaded = false;
             topology.tabs.clear();
         }
     }
 
     pub async fn mirror_prompt(&self, route: &SlackRoute, text: &str) -> Result<(), ChatError> {
-        self.send_content(
-            route,
-            SlackMessageContent::new().with_text(format!(
-                "Terminal prompt from {}:\n{}",
-                self.owner,
-                escape(text)
-            )),
+        let request = SlackApiChatPostMessageRequest::new(
+            route.channel.clone(),
+            SlackMessageContent::new().with_text(escape(text)),
         )
-        .await?;
+        .with_username(self.owner_identity.display_name.clone())
+        .opt_icon_url(self.owner_identity.avatar_url.clone())
+        .with_parse("none".into())
+        .with_unfurl_links(false)
+        .with_unfurl_media(false);
+        self.state
+            .client
+            .open_session(&self.state.token)
+            .chat_post_message(&request)
+            .await
+            .map_err(error)?;
         Ok(())
     }
 
-    pub(super) async fn use_status_message(
-        &self,
-        route: &SlackRoute,
-        message: &SlackTs,
-    ) -> Result<(), ChatError> {
+    pub(super) async fn use_status_message(&self, route: &SlackRoute, message: &SlackTs) {
         let previous = self
+            .state
             .status_messages
             .lock()
             .await
@@ -123,25 +129,47 @@ impl Slack {
             .as_ref()
             .is_some_and(|previous| previous != message)
         {
-            let task = self.working.lock().await.remove(route);
+            let task = self.state.working.lock().await.remove(route);
             if let Some(Some(task)) = task {
                 task.abort();
             }
-            if let Some(previous) = previous {
-                self.client
-                    .open_session(&self.token)
+            if let Some(previous) = previous
+                && let Err(failure) = self
+                    .state
+                    .client
+                    .open_session(&self.state.token)
                     .assistant_threads_set_status(&SlackApiAssistantThreadsSetStatusRequest::new(
                         route.channel.clone(),
                         String::new(),
                         previous,
                     ))
                     .await
-                    .map_err(error)?;
+            {
+                crate::bridge_eprintln!("Slack previous-message status clear error: {failure}");
             }
         }
-        Ok(())
     }
 
+    pub async fn set_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
+        self.state.set_working(route, working).await
+    }
+    pub async fn track_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
+        self.state.track_working(route, working).await
+    }
+}
+
+impl Drop for SlackState {
+    fn drop(&mut self) {
+        for task in self.working.get_mut().values().flatten() {
+            task.abort();
+        }
+        for (_, task) in self.renames.get_mut().values() {
+            task.abort();
+        }
+    }
+}
+
+impl SlackState {
     pub async fn set_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
         let thread = self
             .status_messages
@@ -181,6 +209,7 @@ impl Slack {
         if let Some(Some(task)) = tasks.remove(route) {
             task.abort();
         }
+        drop(tasks);
         self.set_working(route, working).await?;
         if working {
             let (client, token, route, events) = (
@@ -197,7 +226,7 @@ impl Slack {
                 .cloned()
                 .ok_or_else(|| error("working status needs an owner message"))?;
             let key = route.clone();
-            tasks.insert(
+            self.working.lock().await.insert(
                 key,
                 Some(tokio::spawn(async move {
                     loop {
@@ -220,20 +249,8 @@ impl Slack {
                 })),
             );
         } else {
-            tasks.insert(route.clone(), None);
+            self.working.lock().await.insert(route.clone(), None);
         }
-        drop(tasks);
         Ok(())
-    }
-}
-
-impl Drop for Slack {
-    fn drop(&mut self) {
-        for task in self.working.get_mut().values().flatten() {
-            task.abort();
-        }
-        for (_, task) in self.renames.get_mut().values() {
-            task.abort();
-        }
     }
 }

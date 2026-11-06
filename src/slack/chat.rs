@@ -20,6 +20,13 @@ impl Slack {
         {
             return Ok(None);
         }
+        let Some([pressed]) = action.actions.as_deref() else {
+            return Ok(None);
+        };
+        let custom_id = pressed.action_id.to_string();
+        if custom_id.starts_with("herdrask-picks:") {
+            return Ok(None);
+        }
         let Some(_message) = action
             .message
             .as_ref()
@@ -33,7 +40,7 @@ impl Slack {
         let route = SlackRoute {
             channel: channel.id.clone(),
         };
-        let mut topology = self.topology.lock().await;
+        let mut topology = self.state.topology.lock().await;
         if !topology.tabs.values().any(|entry| entry == &route) {
             self.load(&mut topology).await?;
         }
@@ -57,10 +64,6 @@ impl Slack {
         if self.excluded(&workspace, &tab).await? {
             return Ok(None);
         }
-        let Some([pressed]) = action.actions.as_deref() else {
-            return Ok(None);
-        };
-        let custom_id = pressed.action_id.to_string();
         let values = if let Some(token) = custom_id.strip_prefix("herdrask-multi:") {
             let selector = SlackActionId::from(format!("herdrask-picks:{token}"));
             action
@@ -78,7 +81,12 @@ impl Slack {
         } else {
             Vec::new()
         };
-        if custom_id.starts_with("herdrask-picks:") {
+        if custom_id.starts_with("herdrask-multi:") && values.is_empty() {
+            self.acknowledge(
+                &action,
+                Ack::Ephemeral("refused: choose at least one option"),
+            )
+            .await?;
             return Ok(None);
         }
         Ok(Some(Component {
@@ -100,6 +108,14 @@ impl Chat for Slack {
 
     fn owner_id(&self) -> &str {
         &self.owner.0
+    }
+    async fn owner_message_accepted(
+        &self,
+        route: &SlackRoute,
+        message: &SlackTs,
+    ) -> Result<(), ChatError> {
+        self.use_status_message(route, message).await;
+        self.track_working(route, true).await
     }
     fn lifecycle_subscriptions(&self) -> Vec<serde_json::Value> {
         let mut subscriptions = crate::lifecycle_subscriptions();
@@ -127,7 +143,14 @@ impl Chat for Slack {
         Ok((channel.clone(), channel))
     }
     async fn cached_route(&self, route: &TopologyRoute) -> Result<Option<SlackRoute>, ChatError> {
-        Ok(self.topology.lock().await.tabs.get(&route.tab_id).cloned())
+        Ok(self
+            .state
+            .topology
+            .lock()
+            .await
+            .tabs
+            .get(&route.tab_id)
+            .cloned())
     }
     async fn register_archived(&self) -> Result<(), ChatError> {
         Ok(())
@@ -136,16 +159,21 @@ impl Chat for Slack {
     where
         F: FnOnce() -> Result<(HashSet<String>, HashSet<String>), String> + Send,
     {
-        let result = match live() {
-            Ok(live) => self.sweep(routes, live).await,
-            Err(failure) => Err(error(failure)),
-        };
+        let result = self.sweep(routes, live).await;
         if let Err(failure) = result {
             crate::bridge_eprintln!("Slack startup topology error: {failure}");
         }
     }
     async fn close_topology(&self, closure: &TopologyClosure) -> Result<(), ChatError> {
-        self.close(closure).await
+        let state = self.state.clone();
+        let closure = closure.clone();
+        let ignore_test_runs = self.ignore_test_runs;
+        tokio::spawn(async move {
+            if let Err(failure) = state.close(&closure, ignore_test_runs).await {
+                crate::bridge_eprintln!("Slack topology closure error: {failure}");
+            }
+        });
+        Ok(())
     }
     async fn post_live(
         &self,
@@ -262,8 +290,9 @@ impl Chat for Slack {
             .user
             .as_ref()
             .ok_or_else(|| error("Slack interaction has no user"))?;
-        self.client
-            .open_session(&self.token)
+        self.state
+            .client
+            .open_session(&self.state.token)
             .chat_post_ephemeral(&SlackApiChatPostEphemeralRequest::new(
                 channel.id.clone(),
                 user.id.clone(),
@@ -274,7 +303,7 @@ impl Chat for Slack {
         Ok(())
     }
     async fn typing(&self, route: &SlackRoute) -> Result<(), ChatError> {
-        self.set_working(route, true).await
+        self.track_working(route, true).await
     }
     async fn agent_status(&self, route: &TopologyRoute, working: bool) -> Result<(), ChatError> {
         if let Some(found) = self.cached_route(route).await? {
@@ -289,8 +318,9 @@ impl Chat for Slack {
         text: &str,
     ) -> Result<(), ChatError> {
         if text.starts_with("accepted:") {
-            self.client
-                .open_session(&self.token)
+            self.state
+                .client
+                .open_session(&self.state.token)
                 .chat_post_ephemeral(&SlackApiChatPostEphemeralRequest::new(
                     route.channel.clone(),
                     self.owner.clone(),
