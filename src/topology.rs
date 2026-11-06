@@ -523,7 +523,7 @@ pub fn resolve_owner_deleted_tab(
 
 #[must_use]
 pub fn resolve_owner_deleted_workspace(deleted: &Channel) -> Option<String> {
-    workspace_topic_id(deleted).map(ToOwned::to_owned)
+    owned_topology().workspaces.get(&deleted.id).cloned()
 }
 
 pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
@@ -749,18 +749,38 @@ pub mod owner_deletion_tests {
     }
 
     #[test]
-    fn owner_deleted_channel_resolves_only_a_workspace_topic() {
+    fn owner_deleted_channel_resolves_from_the_registry_not_the_topic() {
+        remember_workspace_channels(&[channel(8_310, "work", Some("herdr workspace [w4]"), None)]);
         let cases = [
             (
-                "workspace channel",
-                Some("herdr workspace [w1]"),
-                Some("w1"),
+                "registered workspace channel",
+                8_310,
+                Some("herdr workspace [w4]"),
+                Some("w4"),
             ),
-            ("channel with another topic", Some("lounge"), None),
-            ("channel without a topic", None, None),
+            (
+                "registered channel with a different workspace topic",
+                8_310,
+                Some("herdr workspace [w9]"),
+                Some("w4"),
+            ),
+            (
+                "registered channel without a topic",
+                8_310,
+                None,
+                Some("w4"),
+            ),
+            (
+                "unregistered channel with a workspace topic",
+                8_311,
+                Some("herdr workspace [w4]"),
+                None,
+            ),
+            ("channel with another topic", 8_312, Some("lounge"), None),
+            ("channel without a topic", 8_313, None, None),
         ];
-        for (name, topic, expected) in cases {
-            let deleted = channel(10, "work", topic, None);
+        for (name, channel_id, topic, expected) in cases {
+            let deleted = channel(channel_id, "work", topic, None);
             assert_eq!(
                 resolve_owner_deleted_workspace(&deleted).as_deref(),
                 expected,
