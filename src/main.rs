@@ -8519,6 +8519,250 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn owner_deletion_audit_probe(
+        guild: &BlockedCaptureGuild,
+        action: twilight_model::guild::audit_log::AuditLogEventType,
+        target: Id<ChannelMarker>,
+    ) -> Result<bool, String> {
+        let owner = guild
+            .owner_id
+            .parse::<Id<UserMarker>>()
+            .map_err(|error| error.to_string())?;
+        let audit = guild
+            .client
+            .audit_log(guild.id)
+            .action_type(action)
+            .user_id(owner)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(audit.entries.iter().any(|entry| {
+            entry.action_type == action
+                && entry.target_id == Some(target.cast())
+                && entry.user_id == Some(owner)
+        }))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_owner_deletion_close(
+        lifecycle: &mut herdr_connect_rs::HerdrSubscription,
+        notices: &tokio::sync::Mutex<std::sync::mpsc::Receiver<String>>,
+        event: &str,
+        id: &str,
+        pointer: &str,
+    ) -> Result<(), String> {
+        let waiting = wait_for_event(
+            lifecycle,
+            event,
+            id,
+            pointer,
+            None,
+            Duration::from_secs(20 * 60),
+        );
+        tokio::pin!(waiting);
+        loop {
+            let errors: Vec<_> = notices
+                .lock()
+                .await
+                .try_iter()
+                .filter(|notice| notice.contains("error"))
+                .collect();
+            expect_no_deletion_errors(&errors)?;
+            tokio::select! {
+                result = &mut waiting => return result.map(drop),
+                () = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn owner_deletions_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+        second_tab: &Tab,
+    ) -> Result<(), String> {
+        use twilight_model::guild::audit_log::AuditLogEventType;
+
+        report_idle_with_session(&workspace.pane_id)?;
+        report_idle_with_session(&second_tab.pane_id)?;
+        let agents = [
+            snapshot_for_pane(&workspace.pane_id)?,
+            snapshot_for_pane(&second_tab.pane_id)?,
+        ];
+        let tabs = [
+            matching_tab(&workspace.tab_id)?,
+            matching_tab(&second_tab.tab_id)?,
+        ];
+        let connection = discord_tuple(guild);
+        sync_test_routes(connection.0.as_ref(), &agents, &tabs).await?;
+        let channel =
+            guild_channel_with_topic(guild, &format!("herdr workspace [{}]", workspace.id)).await?;
+        let thread =
+            active_tab_thread(guild, channel.id, &format!(" [{}]", second_tab.tab_id)).await?;
+        let channel_name = channel
+            .name
+            .as_deref()
+            .ok_or("the test channel has no name")?;
+        let thread_name = thread
+            .name
+            .as_deref()
+            .ok_or("the test thread has no name")?;
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
+        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+        let notices = tokio::sync::Mutex::new(notices);
+        println!("OWNER ACTION: delete thread {thread_name}, then delete channel {channel_name}.");
+        let result = async {
+            let cases = [
+                ("thread", AuditLogEventType::ThreadDelete, thread.id, "tab_closed", second_tab.tab_id.as_str(), "/data/tab_id"),
+                ("channel", AuditLogEventType::ChannelDelete, channel.id, "workspace_closed", workspace.id.as_str(), "/data/workspace_id"),
+            ];
+            for (kind, action, target, event, id, pointer) in cases {
+                let waited = wait_for_owner_deletion_close(&mut lifecycle, &notices, event, id, pointer).await;
+                if waited.is_ok() {
+                    println!("OWNER AUDIT: first gateway read found owner entry for {kind}: true (Herdr close observed)");
+                } else {
+                    println!("OWNER AUDIT: first gateway read for {kind}: unconfirmed; {waited:?}");
+                }
+                let audit = owner_deletion_audit_probe(guild, action, target).await;
+                println!("OWNER AUDIT: independent test query for {kind} found owner entry: {audit:?}");
+                waited?;
+                audit?;
+                if action == AuditLogEventType::ThreadDelete {
+                    let live_tabs = tab_list_result()?;
+                    if live_tabs.iter().any(|tab| tab.tab_id == second_tab.tab_id) {
+                        return Err("the owner-deleted thread left its Herdr tab open".to_owned());
+                    }
+                    matching_tab(&workspace.tab_id)
+                        .map_err(|error| format!("the sibling tab did not survive: {error}"))?;
+                } else if workspace_list_result()?.iter().any(|listed| listed.workspace_id == workspace.id) {
+                    return Err("the owner-deleted channel left its Herdr workspace open".to_owned());
+                }
+            }
+            Ok::<(), String>(())
+        }.await;
+        tokio::time::sleep(DELETION_ERROR_WINDOW).await;
+        gateway.abort();
+        let errors: Vec<_> = notices
+            .lock()
+            .await
+            .try_iter()
+            .filter(|notice| notice.contains("error"))
+            .collect();
+        let no_errors = expect_no_deletion_errors(&errors);
+        result?;
+        no_errors
+    }
+
+    #[cfg(unix)]
+    async fn owner_deletions_cleanup(
+        guild: &BlockedCaptureGuild,
+        label: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut ids: HashSet<String> = workspace_id.into_iter().map(str::to_owned).collect();
+        let mut errors = Vec::new();
+        match workspace_list_result() {
+            Ok(workspaces) => {
+                for workspace in workspaces
+                    .iter()
+                    .filter(|workspace| workspace.label == label)
+                {
+                    ids.insert(workspace.workspace_id.clone());
+                }
+                for workspace in workspaces
+                    .iter()
+                    .filter(|workspace| ids.contains(&workspace.workspace_id))
+                {
+                    if let Err(error) = herdr_json(&["workspace", "close", &workspace.workspace_id])
+                    {
+                        errors.push(error);
+                    }
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+        let topics: HashSet<_> = ids
+            .iter()
+            .map(|id| format!("herdr workspace [{id}]"))
+            .collect();
+        match guild_channels_for_guild(guild).await {
+            Ok(channels) => {
+                for channel in channels.iter().filter(|channel| {
+                    is_test_channel(channel)
+                        && channel
+                            .topic
+                            .as_ref()
+                            .is_some_and(|topic| topics.contains(topic))
+                }) {
+                    if let Err(error) = blocked_capture_delete_thread(guild, channel.id).await {
+                        errors.push(error);
+                    }
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+        if workspace_list_result()?
+            .iter()
+            .any(|workspace| ids.contains(&workspace.workspace_id))
+            || guild_channels_for_guild(guild)
+                .await?
+                .iter()
+                .any(|channel| {
+                    channel
+                        .topic
+                        .as_ref()
+                        .is_some_and(|topic| topics.contains(topic))
+                })
+        {
+            errors
+                .push("named zero-leftover check: owner-deletion test topology remains".to_owned());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("owner-deletion cleanup failed: {errors:?}"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    #[ignore = "needs the owner to delete a thread and a channel by hand"]
+    async fn owner_deletions_close_the_herdr_tab_and_workspace() {
+        let guild = blocked_capture_guild().expect("Discord real-guild environment is configured");
+        let label = format!(
+            "testrun-owner-delete-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after unix epoch")
+                .as_nanos()
+        );
+        assert_eq!(
+            remaining_workspaces(&label).expect("workspace.list succeeds"),
+            0
+        );
+        let cwd_dir = std::env::temp_dir().join(&label);
+        fs::create_dir(&cwd_dir).expect("create owner-deletion test cwd");
+        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
+        let mut workspace_id = None;
+        let result = async {
+            let workspace = create_workspace(&label, cwd)?;
+            workspace_id = Some(workspace.id.clone());
+            let second_tab = create_tab(&label, &workspace.id, cwd)?;
+            owner_deletions_exercise(&guild, &workspace, &second_tab).await
+        }
+        .await;
+        let cleanup = owner_deletions_cleanup(&guild, &label, workspace_id.as_deref()).await;
+        let cwd_cleanup = fs::remove_dir_all(&cwd_dir);
+        assert!(cleanup.is_ok(), "named zero-leftover check: {cleanup:?}");
+        assert!(cwd_cleanup.is_ok(), "{cwd_cleanup:?}");
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(unix)]
     const SELF_DELETE_LABEL: &str = "testrun-self";
 
     #[cfg(unix)]
