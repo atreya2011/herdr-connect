@@ -2,11 +2,11 @@
 name = "herdr-connect-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Rust Discord bridge for Herdr agents"
+description = "Rust Discord and Slack bridge for Herdr agents"
 license = "MIT"
 repository = "https://github.com/atreya2011/herdr-connect"
 readme = "README.md"
-keywords = ["herdr", "discord"]
+keywords = ["herdr", "discord", "slack"]
 categories = ["command-line-utilities"]
 
 [lints.rust]
