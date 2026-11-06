@@ -31,5 +31,5 @@ Never print or commit `.env`. Real-guild tests create only `testrun-` channels, 
 - Commits go to `main` in small atomic chunks.
 - Source is modules under `src/` with crate-root re-exports.
 - Prompts may stall at the Herdr level for any vendor. The bridge acknowledges submission with state unconfirmed and recovers with a two-rung ladder: Enter first; only if the pane is still idle, Ctrl+U then one fresh resubmission. The ladder never runs for a pane that was `working` at submission: the agent queues that prompt.
-- Refusal replies exist only inside threads with a `[tab_id]` suffix whose parent topic is `herdr workspace [workspace_id]`.
+- Refusal replies exist only inside mapped Discord tab threads or Slack tab channels.
 - Use the terms in `CONTEXT.md`. Read `ROADMAP.md` before selecting new implementation work.

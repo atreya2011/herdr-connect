@@ -39,7 +39,7 @@ Text authored by the owner in a Discord tab thread or Slack tab channel for sema
 _Avoid_: Key injection, terminal input
 
 **Terminal prompt**:
-Text the owner types directly into a Herdr pane, mirrored into its Discord tab thread through the workspace webhook under the owner's identity, or into its Slack tab channel as a labeled bot message without impersonating or notifying the owner. A pane's echo of an owner prompt the bridge just submitted is suppressed.
+Text the owner types directly into a Herdr pane, mirrored into its Discord tab thread through the workspace webhook under the owner's identity, or into its Slack tab channel as a bot message customized with the owner's display name and avatar. Both adapters fetch that profile once at startup. A pane's echo of an owner prompt the bridge just submitted is suppressed.
 _Avoid_: Owner prompt, terminal input, key injection
 
 **Permission request**:
@@ -51,7 +51,7 @@ The interactive Discord or Slack representation of a live permission request, wi
 _Avoid_: Blocked card, approval message
 
 **Question card**:
-The interactive representation of the `AskUserQuestion` question Claude's terminal dialog shows: option buttons for a single-select question, a Discord select menu or Slack menu with Submit choices for a multiSelect question. Answering it types into that dialog; the owner can equally answer in the terminal.
+The interactive representation of the `AskUserQuestion` question Claude's terminal dialog shows, including its header and option descriptions: option buttons for a single-select question, a Discord select menu or Slack menu with Submit choices for a multi-select question. An empty Slack submission leaves the card open and gives the owner an ephemeral refusal. Answering it types into that dialog; the owner can equally answer in the terminal.
 _Avoid_: Permission card, blocked card, poll
 
 **Live message**:
