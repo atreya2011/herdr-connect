@@ -3938,6 +3938,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn temporary_workspace_fixture(label: &str) -> Result<(Workspace, PathBuf), String> {
+        let root = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("HOME is required")?
+            .join(".cache/herdr-connect-testrun");
+        fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let cwd = root.join(format!("{label}-{}", agent_name_nonce()?));
+        fs::create_dir(&cwd).map_err(|error| error.to_string())?;
+        let created = create_workspace(label, cwd.to_str().ok_or("test cwd must be UTF-8")?);
+        match created {
+            Ok(workspace) => Ok((workspace, cwd)),
+            Err(error) => {
+                fs::remove_dir_all(&cwd)
+                    .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn cleanup_workspace_fixture(workspace: &Workspace, cwd: &Path) -> Result<(), String> {
+        let owned = TEST_RESOURCES
+            .lock()
+            .map_err(|error| error.to_string())?
+            .workspaces
+            .contains(&workspace.id);
+        if !owned {
+            return Err("refused to close an unowned test workspace".to_owned());
+        }
+        let closed = herdr_json(&["workspace", "close", &workspace.id]).map(drop);
+        let removed = fs::remove_dir_all(cwd).map_err(|error| error.to_string());
+        closed.and(removed)
+    }
+
+    #[cfg(unix)]
     fn close_workspace(workspace_id: &str) {
         let _ = Command::new("herdr")
             .args(["workspace", "close", workspace_id])
@@ -7549,6 +7584,54 @@ mod tests {
     const FRESH_IDLE_SESSION_LABEL: &str = "testrun-fresh-idle-session";
 
     #[cfg(unix)]
+    async fn fresh_idle_session_exercise(
+        guild: &BlockedCaptureGuild,
+        workspace: &Workspace,
+        vendor: &str,
+    ) -> Result<(), String> {
+        let name = format!("fresh-{vendor}-{}", agent_name_nonce()?);
+        start_live_capture_agent(vendor, &name, &workspace.pane_id)?;
+        prompt_claude_agent_and_wait(&name, "Reply with exactly: testrun-first-snapshot-ready")?;
+        let snapshot = wait_for_status(
+            &workspace.pane_id,
+            &[STATUS_IDLE, STATUS_DONE],
+            Duration::from_secs(30),
+        )
+        .await?;
+        if snapshot
+            .session
+            .as_ref()
+            .is_none_or(|session| session.agent != vendor)
+        {
+            return Err(format!(
+                "fresh {vendor} native session is missing: {snapshot:?}"
+            ));
+        }
+        let tabs = [matching_tab(&workspace.tab_id)?];
+        let agents = [snapshot.clone()];
+        let connection = discord_tuple(guild);
+        let mut state = BridgeState::<Discord>::default();
+        process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
+        let route = route_topology(&agents, &tabs, &snapshot.terminal_id)?;
+        let topic = format!("herdr workspace [{}]", route.workspace_id);
+        let channel = guild_channel_with_topic(guild, &topic).await?;
+        let suffix = format!(" [{}]", route.tab_id);
+        let has_thread = active_threads_for_guild(guild).await?.iter().any(|thread| {
+            thread.parent_id == Some(channel.id)
+                && thread
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with(&suffix))
+        });
+        if !has_thread {
+            return Err(format!(
+                "{vendor} fresh idle session did not create its tab thread"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn fresh_idle_session_discovery_is_mirrored_on_first_snapshot() {
@@ -7561,73 +7644,24 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-
-        let cases = [
-            (
-                "claude",
-                "testrun-fresh-idle-claude",
-                "testrun-fresh-idle-claude:t1",
-            ),
-            (
-                "codex",
-                "testrun-fresh-idle-codex",
-                "testrun-fresh-idle-codex:t1",
-            ),
-        ];
-        let result = async {
-            for (agent, workspace_id, tab_id) in cases {
-                let terminal_id = format!("{workspace_id}:terminal");
-                let pane_id = format!("{workspace_id}:pane");
-                let snapshot = AgentSnapshot {
-                    agent: Some(agent.to_owned()),
-                    terminal_id: terminal_id.clone(),
-                    agent_status: STATUS_IDLE.to_owned(),
-                    tab_id: tab_id.to_owned(),
-                    workspace_id: workspace_id.to_owned(),
-                    pane_id,
-                    cwd: Some(format!("/tmp/{FRESH_IDLE_SESSION_LABEL}")),
-                    session: Some(AgentSession {
-                        agent: agent.to_owned(),
-                        value: format!("{agent}-fresh-session"),
-                    }),
-                };
-                let tabs = [herdr_connect_rs::HerdrTab {
-                    tab_id: tab_id.to_owned(),
-                    workspace_id: workspace_id.to_owned(),
-                    label: "fresh".to_owned(),
-                }];
-                let agents = [snapshot.clone()];
-                let connection = discord_tuple(&guild);
-                let mut state = BridgeState::<Discord>::default();
-
-                process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
-
-                let route = route_topology(&agents, &tabs, &terminal_id)?;
-                let topic = format!("herdr workspace [{}]", route.workspace_id);
-                let channel = guild_channel_with_topic(&guild, &topic).await?;
-                let suffix = format!(" [{}]", route.tab_id);
-                let has_thread = active_threads_for_guild(&guild)
-                    .await?
-                    .iter()
-                    .any(|thread| {
-                        thread.parent_id == Some(channel.id)
-                            && thread
-                                .name
-                                .as_deref()
-                                .is_some_and(|name| name.ends_with(&suffix))
-                    });
-                if !has_thread {
-                    return Err(format!(
-                        "{agent} fresh idle session did not create its tab thread"
-                    ));
+        let cases = [VENDOR_CLAUDE, VENDOR_CODEX];
+        let mut outcomes = Vec::new();
+        for vendor in cases {
+            let label = format!("{FRESH_IDLE_SESSION_LABEL}-{vendor}");
+            let outcome = match temporary_workspace_fixture(&label) {
+                Ok((workspace, cwd)) => {
+                    let outcome = fresh_idle_session_exercise(&guild, &workspace, vendor).await;
+                    let cleanup = cleanup_workspace_fixture(&workspace, &cwd);
+                    cleanup.and(outcome)
                 }
-            }
-            Ok::<(), String>(())
+                Err(error) => Err(error),
+            };
+            outcomes.push((vendor, outcome));
         }
-        .await;
-
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        assert!(result.is_ok(), "{result:?}");
+        for (vendor, outcome) in outcomes {
+            assert!(outcome.is_ok(), "{vendor}: {outcome:?}");
+        }
         assert_eq!(channels_left, 0, "named zero-leftover check");
     }
 
@@ -8622,35 +8656,33 @@ mod tests {
 
     #[cfg(unix)]
     async fn owner_thread_member_exercise(guild: &BlockedCaptureGuild) -> Result<(), String> {
-        let workspace_id = format!(
-            "{OWNER_THREAD_MEMBER_LABEL}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        );
-        let tab_id = format!("{workspace_id}:t1");
-        let route = TopologyRoute {
-            thread_name: format!("{OWNER_THREAD_MEMBER_LABEL} [{tab_id}]"),
-            channel_name: workspace_id.clone(),
-            pane_id: String::new(),
-            workspace_id,
-            tab_id,
-        };
-        let connection = discord_tuple(guild);
-        let thread = connection.0.sync_route(&route).await?;
-        let owner = connection
-            .0
-            .owner_id()
-            .parse::<Id<UserMarker>>()
-            .map_err(|error| error.to_string())?;
-        guild
-            .client
-            .thread_member(thread, owner)
-            .await
-            .map_err(|error| format!("owner is not a member of the new thread: {error}"))?;
-        Ok(())
+        let label = format!("{OWNER_THREAD_MEMBER_LABEL}-{}", agent_name_nonce()?);
+        let (workspace, cwd) = temporary_workspace_fixture(&label)?;
+        let result = async {
+            let route = TopologyRoute {
+                thread_name: format!("{OWNER_THREAD_MEMBER_LABEL} [{}]", workspace.tab_id),
+                channel_name: label,
+                pane_id: workspace.pane_id.clone(),
+                workspace_id: workspace.id.clone(),
+                tab_id: workspace.tab_id.clone(),
+            };
+            let connection = discord_tuple(guild);
+            let thread = connection.0.sync_route(&route).await?;
+            let owner = connection
+                .0
+                .owner_id()
+                .parse::<Id<UserMarker>>()
+                .map_err(|error| error.to_string())?;
+            guild
+                .client
+                .thread_member(thread, owner)
+                .await
+                .map_err(|error| format!("owner is not a member of the new thread: {error}"))?;
+            Ok(())
+        }
+        .await;
+        cleanup_workspace_fixture(&workspace, &cwd)?;
+        result
     }
 
     #[cfg(unix)]
@@ -9493,58 +9525,57 @@ mod tests {
         guild: &BlockedCaptureGuild,
         delete_thread: bool,
     ) -> Result<(Vec<String>, Vec<String>), String> {
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        );
-        let workspace_id = format!("{SELF_DELETE_LABEL}-{nonce}");
-        let tab_id = format!("{workspace_id}:t1");
-        let connection = discord_tuple(guild);
-        let route = TopologyRoute {
-            workspace_id: workspace_id.clone(),
-            tab_id: tab_id.clone(),
-            pane_id: String::new(),
-            channel_name: workspace_id.clone(),
-            thread_name: format!("testrun-bridge [{tab_id}]"),
-        };
-        connection.0.sync_route(&route).await?;
-        let (mut channels, mut threads) =
-            fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
-        let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
-        let deleted = if delete_thread {
-            herdr_connect_rs::delete_tab_thread(
-                guild.client.as_ref(),
-                &channels,
-                &mut threads,
-                &mut HashMap::new(),
-                &workspace_id,
-                &tab_id,
-                false,
-            )
-            .await
-        } else {
-            herdr_connect_rs::delete_workspace_channel(
-                guild.client.as_ref(),
-                &mut channels,
-                &threads,
-                &workspace_id,
-                false,
-            )
-            .await
-        };
-        let dispatch = if delete_thread {
-            "chat gateway deletion: THREAD_DELETE"
-        } else {
-            "chat gateway deletion: CHANNEL_DELETE"
-        };
-        let seen = deletion_notices(notices, dispatch).await;
-        gateway.abort();
-        deleted?;
-        seen
+        let label = format!("{SELF_DELETE_LABEL}-{}", agent_name_nonce()?);
+        let (workspace, cwd) = temporary_workspace_fixture(&label)?;
+        let result = async {
+            let connection = discord_tuple(guild);
+            let route = TopologyRoute {
+                workspace_id: workspace.id.clone(),
+                tab_id: workspace.tab_id.clone(),
+                pane_id: workspace.pane_id.clone(),
+                channel_name: label,
+                thread_name: format!("testrun-bridge [{}]", workspace.tab_id),
+            };
+            connection.0.sync_route(&route).await?;
+            let (mut channels, mut threads) =
+                fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
+            let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
+            let deleted = if delete_thread {
+                herdr_connect_rs::delete_tab_thread(
+                    guild.client.as_ref(),
+                    &channels,
+                    &mut threads,
+                    &mut HashMap::new(),
+                    &workspace.id,
+                    &workspace.tab_id,
+                    false,
+                )
+                .await
+            } else {
+                herdr_connect_rs::delete_workspace_channel(
+                    guild.client.as_ref(),
+                    &mut channels,
+                    &threads,
+                    &workspace.id,
+                    false,
+                )
+                .await
+            };
+            let dispatch = if delete_thread {
+                "chat gateway deletion: THREAD_DELETE"
+            } else {
+                "chat gateway deletion: CHANNEL_DELETE"
+            };
+            let seen = deletion_notices(notices, dispatch).await;
+            gateway.abort();
+            deleted?;
+            matching_tab(&workspace.tab_id)
+                .map_err(|error| format!("the bridge deletion closed its Herdr tab: {error}"))?;
+            seen
+        }
+        .await;
+        cleanup_workspace_fixture(&workspace, &cwd)?;
+        result
     }
 
     #[cfg(unix)]
