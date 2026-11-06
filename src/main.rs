@@ -6700,7 +6700,7 @@ mod tests {
         }
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
+        checked_startup_topology(guild, connection.1.chat().as_ref(), agents, tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
 
         let channel = guild
@@ -6911,7 +6911,7 @@ mod tests {
         }
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        checked_startup_topology(guild, connection.1.chat().as_ref(), &agents, &tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
         let matching_channels: Vec<_> = guild
             .client
@@ -7213,7 +7213,7 @@ mod tests {
         let connection = discord_tuple_with_cache(guild, Arc::clone(&shared_cache));
 
         let production = production_topology(guild).await?;
-        let startup = sync_startup_topology(connection.1.chat().as_ref(), agents, tabs);
+        let startup = checked_startup_topology(guild, connection.1.chat().as_ref(), agents, tabs);
         let delivery = sync_route(
             guild.client.as_ref(),
             guild.id,
@@ -7221,7 +7221,8 @@ mod tests {
             &shared_cache,
             &guild.owner_id,
         );
-        let ((), delivery_result) = tokio::join!(startup, delivery);
+        let (startup_result, delivery_result) = tokio::join!(startup, delivery);
+        startup_result?;
         expect_production_topology_survives(guild, &production).await?;
         delivery_result?;
 
@@ -7339,7 +7340,8 @@ mod tests {
         let shared: herdr_connect_rs::TopologyCache =
             Arc::new(tokio::sync::Mutex::new(Some(stale)));
         let production = production_topology(guild).await?;
-        sync_startup_topology(
+        checked_startup_topology(
+            guild,
             discord_tuple_with_cache(guild, Arc::clone(&shared))
                 .1
                 .chat()
@@ -7347,7 +7349,7 @@ mod tests {
             agents,
             tabs,
         )
-        .await;
+        .await?;
         expect_production_topology_survives(guild, &production).await?;
 
         let matching_channels = guild
@@ -7461,6 +7463,65 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(unix)]
+    async fn sync_test_routes<C: Chat>(
+        chat: &C,
+        agents: &[AgentSnapshot],
+        tabs: &[herdr_connect_rs::HerdrTab],
+    ) -> Result<(), String> {
+        let mut synced = HashSet::new();
+        for agent in agents.iter().filter(|agent| agent.session.is_some()) {
+            if synced.insert(&agent.tab_id) {
+                let route = route_topology(agents, tabs, &agent.terminal_id)?;
+                chat.sync_route(&route).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn checked_startup_topology<C: Chat>(
+        guild: &BlockedCaptureGuild,
+        chat: &C,
+        agents: &[AgentSnapshot],
+        tabs: &[herdr_connect_rs::HerdrTab],
+    ) -> Result<(), String> {
+        let workspaces = workspace_list_result()?;
+        let live_tabs = tab_list_result()?;
+        let workspace_ids: HashSet<&str> = workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_id.as_str())
+            .collect();
+        let tab_ids: HashSet<&str> = live_tabs.iter().map(|tab| tab.tab_id.as_str()).collect();
+        let (channels, threads) = fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
+        let absent = herdr_connect_rs::topology_absent_from_herdr(
+            guild.client.as_ref(),
+            &channels,
+            &threads,
+            &workspace_ids,
+            &tab_ids,
+        )
+        .await?;
+        let protected: Vec<_> = absent
+            .iter()
+            .filter(|channel| !is_test_channel(channel))
+            .map(|channel| {
+                format!(
+                    "{} ({})",
+                    channel.name.as_deref().unwrap_or("<unnamed>"),
+                    channel.id
+                )
+            })
+            .collect();
+        if !protected.is_empty() {
+            return Err(format!(
+                "startup sweep refused before deletion of non-testrun topology: {protected:?}"
+            ));
+        }
+        sync_startup_topology(chat, agents, tabs).await;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -7916,7 +7977,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        sync_test_routes(connection.1.chat().as_ref(), &agents, &tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
@@ -7929,34 +7990,11 @@ mod tests {
             .await?
             .id;
 
-        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
-        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|error| error.to_string())?;
-        let mut broker: Option<BrokerTask> = None;
-        let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
-        let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-        let mut runtime = BridgeRuntime {
-            lifecycle,
-            pane_ids: Vec::new(),
-            status: None,
-            state: BridgeState::<Discord>::default(),
-            live_events,
-            activity_events,
-        };
-
-        doorbell_snapshot(
-            &connection,
-            &mut runtime.state,
-            &mut runtime.pane_ids,
-            &mut runtime.status,
-            &mut stop,
-        )
-        .await
-        .map_err(|_| "snapshot doorbell was interrupted".to_owned())?;
+        let mut lifecycle = subscribe_herdr_events(&lifecycle_subscriptions()).await?;
         expect_thread_created_message(guild, channel.id, second_thread_id, true).await?;
         close_tab(&second_tab.tab_id);
         let tab_closed = wait_for_event(
-            &mut runtime.lifecycle,
+            &mut lifecycle,
             "tab_closed",
             &second_tab.tab_id,
             "/data/tab_id",
@@ -7964,14 +8002,9 @@ mod tests {
             Duration::from_secs(15),
         )
         .await?;
-        handle_lifecycle_select_result(
-            Ok(tab_closed),
-            &connection,
-            &mut stop,
-            &mut broker,
-            &mut runtime,
-        )
-        .await;
+        let closure = lifecycle_closure(&tab_closed)
+            .ok_or_else(|| "live close event has no topology closure".to_owned())?;
+        connection.0.close_topology(&closure).await?;
 
         if thread_with_suffix_survives(guild, channel.id, &second_suffix).await? {
             return Err("tab close did not delete the tab's thread".to_owned());
@@ -7983,7 +8016,7 @@ mod tests {
 
         close_workspace(&workspace.id);
         let workspace_closed = wait_for_event(
-            &mut runtime.lifecycle,
+            &mut lifecycle,
             "workspace_closed",
             &workspace.id,
             "/data/workspace_id",
@@ -7991,14 +8024,9 @@ mod tests {
             Duration::from_secs(15),
         )
         .await?;
-        handle_lifecycle_select_result(
-            Ok(workspace_closed),
-            &connection,
-            &mut stop,
-            &mut broker,
-            &mut runtime,
-        )
-        .await;
+        let closure = lifecycle_closure(&workspace_closed)
+            .ok_or_else(|| "live close event has no topology closure".to_owned())?;
+        connection.0.close_topology(&closure).await?;
 
         if guild_channel_with_topic(guild, &topic).await.is_ok() {
             return Err("workspace close did not delete the workspace channel".to_owned());
@@ -8098,17 +8126,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn expect_only_audit_log_errors(errors: &[String]) -> Result<(), String> {
-        let other: Vec<&String> = errors
-            .iter()
-            .filter(|error| !error.starts_with("discord owner deletion error: guild audit log: "))
-            .collect();
-        if other.is_empty() {
+    fn expect_no_deletion_errors(errors: &[String]) -> Result<(), String> {
+        if errors.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "gateway reported errors other than an audit log failure: {other:?}"
-            ))
+            Err(format!("gateway reported deletion errors: {errors:?}"))
         }
     }
 
@@ -8158,7 +8180,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        sync_test_routes(connection.1.chat().as_ref(), &agents, &tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
         let second_route = route_topology(&agents, &tabs, &second_agent.terminal_id)?;
         let root_route = route_topology(&agents, &tabs, &root_agent.terminal_id)?;
@@ -8170,7 +8192,6 @@ mod tests {
         expect_thread_created_message(guild, channel.id, thread.id, true).await?;
 
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
-        *connection.1.chat().topology_cache().lock().await = None;
         let deleted = guild
             .client
             .delete_channel(thread.id)
@@ -8179,11 +8200,33 @@ mod tests {
         let seen = deletion_notices(notices, "discord gateway deletion: THREAD_DELETE").await;
         gateway.abort();
         deleted?;
-        expect_only_audit_log_errors(&seen?.1)?;
+        expect_no_deletion_errors(&seen?.1)?;
         matching_tab(&second_tab.tab_id)
             .map_err(|error| format!("a bot token thread delete closed the herdr tab: {error}"))?;
         matching_tab(&workspace.tab_id)
             .map_err(|error| format!("the sibling tab did not survive: {error}"))?;
+
+        let replacement = connection.0.sync_route(&second_route).await?;
+        let text = format!("testrun-recreated-thread-after-{}", thread.id);
+        connection
+            .0
+            .post_live(&replacement, &text, &thread.id.to_string())
+            .await?;
+        if replacement == thread.id {
+            return Err("the next message reused the deleted thread".to_owned());
+        }
+        let messages = guild
+            .client
+            .channel_messages(replacement)
+            .limit(10)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !messages.iter().any(|message| message.content == text) {
+            return Err("the next message did not arrive in the recreated thread".to_owned());
+        }
 
         if !thread_with_suffix_survives(guild, channel.id, &root_suffix).await? {
             return Err("the sibling tab's thread did not survive".to_owned());
@@ -8264,23 +8307,22 @@ mod tests {
         workspace: &Workspace,
         second_tab: &Tab,
     ) -> Result<(), String> {
-        let channel = guild
-            .client
-            .create_guild_channel(
-                guild.id,
-                &format!(
-                    "testrun-bot-delete-archived-{}",
-                    second_tab.tab_id.replace(':', "-")
-                ),
-            )
-            .topic(&format!("herdr workspace [{}]", workspace.id))
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
+        report_idle_with_session(&workspace.pane_id)?;
+        report_idle_with_session(&second_tab.pane_id)?;
+        let agents = [
+            snapshot_for_pane(&workspace.pane_id)?,
+            snapshot_for_pane(&second_tab.pane_id)?,
+        ];
+        let tabs = [
+            matching_tab(&workspace.tab_id)?,
+            matching_tab(&second_tab.tab_id)?,
+        ];
+        let setup = discord_tuple(guild);
+        sync_test_routes(setup.0.as_ref(), &agents, &tabs).await?;
+        let channel =
+            guild_channel_with_topic(guild, &format!("herdr workspace [{}]", workspace.id)).await?;
         let suffix = format!(" [{}]", second_tab.tab_id);
-        let thread = create_guild_thread(guild, channel.id, &format!("archived{suffix}")).await?;
+        let thread = active_tab_thread(guild, channel.id, &suffix).await?;
         guild
             .client
             .update_thread(thread.id)
@@ -8304,7 +8346,7 @@ mod tests {
         let seen = deletion_notices(notices, "discord gateway deletion: THREAD_DELETE").await;
         gateway.abort();
         deleted?;
-        expect_only_audit_log_errors(&seen?.1)?;
+        expect_no_deletion_errors(&seen?.1)?;
         matching_tab(&second_tab.tab_id).map_err(|error| {
             format!("a bot token delete of an archived thread closed the herdr tab: {error}")
         })?;
@@ -8393,7 +8435,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        sync_test_routes(connection.1.chat().as_ref(), &agents, &tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
         let route = route_topology(&agents, &tabs, &agent.terminal_id)?;
         let topic = format!("herdr workspace [{}]", route.workspace_id);
@@ -8408,7 +8450,7 @@ mod tests {
         let seen = deletion_notices(notices, "discord gateway deletion: CHANNEL_DELETE").await;
         gateway.abort();
         deleted?;
-        expect_only_audit_log_errors(&seen?.1)?;
+        expect_no_deletion_errors(&seen?.1)?;
         if !herdr_connect_rs::workspace_list_result()?
             .iter()
             .any(|listed| listed.workspace_id == workspace.id)
@@ -8500,20 +8542,17 @@ mod tests {
         );
         let workspace_id = format!("{SELF_DELETE_LABEL}-{nonce}");
         let tab_id = format!("{workspace_id}:t1");
-        let channel = guild
-            .client
-            .create_guild_channel(guild.id, &workspace_id)
-            .topic(&format!("herdr workspace [{workspace_id}]"))
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
-        create_guild_thread(guild, channel.id, &format!("bridge [{tab_id}]")).await?;
+        let connection = discord_tuple(guild);
+        let route = TopologyRoute {
+            workspace_id: workspace_id.clone(),
+            tab_id: tab_id.clone(),
+            pane_id: String::new(),
+            channel_name: workspace_id.clone(),
+            thread_name: format!("testrun-bridge [{tab_id}]"),
+        };
+        connection.0.sync_route(&route).await?;
         let (mut channels, mut threads) =
             fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
-
-        let connection = discord_tuple(guild);
         let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
         let deleted = if delete_thread {
             herdr_connect_rs::delete_tab_thread(
@@ -8577,7 +8616,7 @@ mod tests {
             };
             assert_eq!(
                 outcome.and_then(|(dispatched, errors)| {
-                    expect_only_audit_log_errors(&errors).map(|()| dispatched)
+                    expect_no_deletion_errors(&errors).map(|()| dispatched)
                 }),
                 Ok(vec![dispatch.to_owned()]),
                 "{name}"
@@ -8603,7 +8642,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
+        sync_test_routes(connection.1.chat().as_ref(), agents, tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
 
         let topic = format!("herdr workspace [{}]", route.workspace_id);
@@ -8637,7 +8676,7 @@ mod tests {
             create_guild_thread(guild, live_channel.id, "testrun-notes [staging]").await?;
 
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), agents, tabs).await;
+        checked_startup_topology(guild, connection.1.chat().as_ref(), agents, tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
 
         let channels_after = guild_channels_for_guild(guild).await?;
@@ -8798,7 +8837,10 @@ mod tests {
         };
 
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), &[], &[]).await;
+        let agents = list_agents()?;
+        let tabs = tab_list_result()?;
+        let startup_result =
+            checked_startup_topology(guild, connection.1.chat().as_ref(), &agents, &tabs).await;
         expect_production_topology_survives(guild, &production).await?;
 
         if let Some((handle, done)) = racer {
@@ -8806,6 +8848,7 @@ mod tests {
             handle.await.map_err(|error| error.to_string())?;
         }
 
+        startup_result?;
         let channels_after = guild_channels_for_guild(guild).await?;
         if channels_after
             .iter()
@@ -9030,7 +9073,7 @@ mod tests {
 
         let connection = discord_tuple(guild);
         let production = production_topology(guild).await?;
-        sync_startup_topology(connection.1.chat().as_ref(), &agents, &tabs).await;
+        checked_startup_topology(guild, connection.1.chat().as_ref(), &agents, &tabs).await?;
         expect_production_topology_survives(guild, &production).await?;
 
         let no_session_route = route_topology(&agents, &tabs, &no_session_agent.terminal_id)?;
