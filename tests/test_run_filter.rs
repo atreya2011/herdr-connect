@@ -405,7 +405,6 @@ impl Fixture {
     }
 
     async fn sweep(&self, chat: &Discord) -> TestResult<()> {
-        let before = production(&self.client, self.guild).await?;
         let workspaces = workspace_list_result()?;
         let tabs = tab_list_result()?;
         let live_workspaces: HashSet<_> = workspaces
@@ -423,14 +422,27 @@ impl Fixture {
         )
         .await?;
         assert!(
-            absent.iter().all(test_name),
+            absent.iter().all(|channel| test_name(channel)
+                && (self.channels.contains(&channel.id)
+                    || channel
+                        .parent_id
+                        .is_some_and(|parent| self.channels.contains(&parent)))),
             "refusing sweep that could delete non-testrun topology"
         );
-        let live = (
-            live_workspaces.into_iter().map(str::to_owned).collect(),
-            live_tabs.into_iter().map(str::to_owned).collect(),
-        );
-        chat.startup_sweep(Vec::new(), || Ok(live)).await;
+        let before = production(&self.client, self.guild).await?;
+        chat.startup_sweep(Vec::new(), || {
+            Ok((
+                workspace_list_result()?
+                    .into_iter()
+                    .map(|workspace| workspace.workspace_id)
+                    .collect(),
+                tab_list_result()?
+                    .into_iter()
+                    .map(|tab| tab.tab_id)
+                    .collect(),
+            ))
+        })
+        .await;
         preserved(&self.client, &before).await
     }
 

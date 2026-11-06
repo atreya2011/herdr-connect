@@ -84,6 +84,8 @@ struct BridgeState<C: Chat> {
     seen_without_session: HashMap<String, SystemTime>,
     ignore_test_runs: bool,
     mirrored_topology: HashSet<String>,
+    #[cfg(test)]
+    included_panes: Option<HashSet<String>>,
 }
 
 impl<C: Chat> Default for BridgeState<C> {
@@ -103,6 +105,8 @@ impl<C: Chat> Default for BridgeState<C> {
             seen_without_session: HashMap::new(),
             ignore_test_runs: false,
             mirrored_topology: HashSet::new(),
+            #[cfg(test)]
+            included_panes: None,
         }
     }
 }
@@ -1884,12 +1888,7 @@ async fn apply_lifecycle_event<C: Chat>(
         && apply_membership(&mut runtime.pane_ids, change)
     {
         let Some(next_status) = unwrap_or_shutdown(
-            subscribe_status_with_backoff(
-                &mut runtime.pane_ids,
-                stop,
-                runtime.state.ignore_test_runs,
-            )
-            .await,
+            subscribe_snapshot_status(&mut runtime.pane_ids, stop, &runtime.state).await,
             broker,
         ) else {
             return false;
@@ -2028,12 +2027,7 @@ async fn handle_status_select_result<C: Chat>(
         Err(error) => {
             bridge_eprintln!("herdr status subscribe error: {error}");
             let Some(next_status) = unwrap_or_shutdown(
-                subscribe_status_with_backoff(
-                    &mut runtime.pane_ids,
-                    stop,
-                    runtime.state.ignore_test_runs,
-                )
-                .await,
+                subscribe_snapshot_status(&mut runtime.pane_ids, stop, &runtime.state).await,
                 broker,
             ) else {
                 return false;
@@ -2113,6 +2107,11 @@ async fn apply_herdr_snapshot<C: Chat>(
 ) -> Result<Vec<String>, String> {
     let mut agents = list_agents()?;
     let mut tabs = tab_list_result()?;
+    #[cfg(test)]
+    if let Some(panes) = &state.included_panes {
+        agents.retain(|agent| panes.contains(&agent.pane_id));
+        tabs.retain(|tab| agents.iter().any(|agent| agent.tab_id == tab.tab_id));
+    }
     let mut excluded_terminals = HashSet::new();
     if state.ignore_test_runs {
         let workspaces = workspace_list_result()?;
@@ -2181,6 +2180,24 @@ async fn apply_herdr_snapshot<C: Chat>(
     Ok(pane_ids_from_agents(&agents))
 }
 
+async fn subscribe_snapshot_status<C: Chat>(
+    pane_ids: &mut Vec<String>,
+    stop: &mut tokio::signal::unix::Signal,
+    state: &BridgeState<C>,
+) -> Result<Option<HerdrSubscription>, BridgeInterrupt> {
+    #[cfg(test)]
+    if let Some(included) = &state.included_panes {
+        pane_ids.retain(|pane| included.contains(pane));
+        if pane_ids.is_empty() {
+            return Ok(None);
+        }
+        return subscribe_herdr_events_with_backoff(&status_subscriptions(pane_ids), stop)
+            .await
+            .map(Some);
+    }
+    subscribe_status_with_backoff(pane_ids, stop, state.ignore_test_runs).await
+}
+
 async fn doorbell_snapshot<C: Chat>(
     discord: &ChatConnection<C>,
     state: &mut BridgeState<C>,
@@ -2191,8 +2208,7 @@ async fn doorbell_snapshot<C: Chat>(
     match apply_herdr_snapshot(discord, state).await {
         Ok(from_snapshot) => {
             if reconcile_pane_ids(pane_ids, from_snapshot) {
-                *status =
-                    subscribe_status_with_backoff(pane_ids, stop, state.ignore_test_runs).await?;
+                *status = subscribe_snapshot_status(pane_ids, stop, state).await?;
             }
         }
         Err(error) => bridge_eprintln!("herdr snapshot error: {error}"),
@@ -2330,11 +2346,11 @@ mod tests {
         BridgeRuntime, BridgeState, BrokerTask, Client, Discord, Follower, Membership,
         PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
         agent_read_detection, apply_membership, capture_for_with_search_root,
-        create_transition_messages, doorbell_snapshot, fetch_startup_owner_identity,
-        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
-        lifecycle_closure, lifecycle_membership, list_agents, live_log_path,
-        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
-        prune_departed_state, read_new_terminal_prompts, resolve_session_path, route_topology,
+        create_transition_messages, fetch_startup_owner_identity, handle_lifecycle_select_result,
+        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
+        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
+        next_state_change_sequence, process_snapshot, prune_departed_state,
+        read_new_terminal_prompts, resolve_session_path, route_topology,
         subscribe_status_with_backoff, sync_startup_topology, tab_list_result,
         terminal_prompt_baseline_is_current, unique_existing_path,
     };
@@ -3460,7 +3476,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct TestResources {
+        workspaces: HashSet<String>,
+        tabs: HashSet<String>,
+        channels: HashSet<Id<ChannelMarker>>,
+        root_workspaces: HashMap<String, String>,
+    }
+
+    #[cfg(unix)]
+    static TEST_RESOURCES: std::sync::LazyLock<std::sync::Mutex<TestResources>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(TestResources::default()));
+
+    #[cfg(unix)]
+    fn record_test_channel(id: Id<ChannelMarker>) {
+        TEST_RESOURCES
+            .lock()
+            .expect("test ownership lock")
+            .channels
+            .insert(id);
+    }
+
+    #[cfg(unix)]
     fn blocked_capture_guild() -> Option<BlockedCaptureGuild> {
+        *TEST_RESOURCES.lock().expect("test ownership lock") = TestResources::default();
         let guild = BlockedCaptureGuild {
             client: Arc::new(
                 Client::builder()
@@ -3485,7 +3524,7 @@ mod tests {
     #[cfg(unix)]
     async fn blocked_capture_testrun_threads(
         guild: &BlockedCaptureGuild,
-    ) -> Result<Vec<Id<ChannelMarker>>, String> {
+    ) -> Result<Vec<twilight_model::channel::Channel>, String> {
         let channels = guild
             .client
             .guild_channels(guild.id)
@@ -3513,29 +3552,7 @@ mod tests {
                 herdr_connect_rs::archived_threads(guild.client.as_ref(), parent.id).await?,
             );
         }
-        Ok(threads
-            .into_iter()
-            .filter(is_test_channel)
-            .map(|thread| thread.id)
-            .collect())
-    }
-
-    #[cfg(unix)]
-    async fn blocked_capture_active_testrun_threads(
-        guild: &BlockedCaptureGuild,
-    ) -> Result<usize, String> {
-        Ok(guild
-            .client
-            .active_threads(guild.id)
-            .await
-            .map_err(|e| e.to_string())?
-            .model()
-            .await
-            .map_err(|e| e.to_string())?
-            .threads
-            .iter()
-            .filter(|thread| is_test_channel(thread))
-            .count())
+        Ok(threads.into_iter().filter(is_test_channel).collect())
     }
 
     #[cfg(unix)]
@@ -3563,6 +3580,47 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn test_owned_topology(
+        channels: &[twilight_model::channel::Channel],
+        threads: &[twilight_model::channel::Channel],
+    ) -> HashSet<Id<ChannelMarker>> {
+        let resources = TEST_RESOURCES.lock().expect("test ownership lock").clone();
+        let mut parents = resources.channels.clone();
+        parents.extend(
+            channels
+                .iter()
+                .filter(|channel| {
+                    is_test_channel(channel)
+                        && channel.topic.as_deref().is_some_and(|topic| {
+                            resources
+                                .workspaces
+                                .iter()
+                                .any(|workspace| topic == format!("herdr workspace [{workspace}]"))
+                        })
+                })
+                .map(|channel| channel.id),
+        );
+        let mut owned = parents.clone();
+        owned.extend(
+            threads
+                .iter()
+                .filter(|thread| {
+                    thread
+                        .parent_id
+                        .is_some_and(|parent| parents.contains(&parent))
+                        || thread.name.as_deref().is_some_and(|name| {
+                            resources
+                                .tabs
+                                .iter()
+                                .any(|tab| name.ends_with(&format!(" [{tab}]")))
+                        })
+                })
+                .map(|thread| thread.id),
+        );
+        owned
+    }
+
+    #[cfg(unix)]
     async fn blocked_capture_cleanup(guild: &BlockedCaptureGuild) -> Result<usize, String> {
         let channels = guild
             .client
@@ -3572,15 +3630,16 @@ mod tests {
             .model()
             .await
             .map_err(|e| e.to_string())?;
-        for channel in channels.into_iter().filter(is_test_channel) {
-            guild
-                .client
-                .delete_channel(channel.id)
-                .await
-                .map_err(|e| e.to_string())?;
+        let threads = blocked_capture_testrun_threads(guild).await?;
+        let owned = test_owned_topology(&channels, &threads);
+        for channel in channels
+            .iter()
+            .filter(|channel| owned.contains(&channel.id))
+        {
+            blocked_capture_delete_thread(guild, channel.id).await?;
         }
-        for thread in blocked_capture_testrun_threads(guild).await? {
-            blocked_capture_delete_thread(guild, thread).await?;
+        for thread in threads.iter().filter(|thread| owned.contains(&thread.id)) {
+            blocked_capture_delete_thread(guild, thread.id).await?;
         }
         let mut attempt = 0;
         loop {
@@ -3593,9 +3652,13 @@ mod tests {
                 .await
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .filter(is_test_channel)
+                .filter(|channel| owned.contains(&channel.id))
                 .count()
-                + blocked_capture_active_testrun_threads(guild).await?;
+                + blocked_capture_testrun_threads(guild)
+                    .await?
+                    .iter()
+                    .filter(|thread| owned.contains(&thread.id))
+                    .count();
             if leftover == 0 || attempt == 4 {
                 return Ok(leftover);
             }
@@ -3608,6 +3671,47 @@ mod tests {
     struct Tab {
         tab_id: String,
         pane_id: String,
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn test_cleanup_preserves_unregistered_test_channels() -> Result<(), String> {
+        let guild = blocked_capture_guild().ok_or("real Discord test environment is required")?;
+        let nonce = agent_name_nonce()?;
+        let create = async |suffix: &str| {
+            guild
+                .client
+                .create_guild_channel(guild.id, &format!("testrun-owned-cleanup-{nonce}-{suffix}"))
+                .await
+                .map_err(|error| error.to_string())?
+                .model()
+                .await
+                .map_err(|error| error.to_string())
+        };
+        let registered = create("registered").await?;
+        record_test_channel(registered.id);
+        let sentinel = create("sentinel").await?;
+        let result = async {
+            let remaining = blocked_capture_cleanup(&guild).await?;
+            let registered_exists = guild.client.channel(registered.id).await.is_ok();
+            let sentinel_exists = guild.client.channel(sentinel.id).await.is_ok();
+            println!("real owned cleanup: registered_exists={registered_exists} sentinel_exists={sentinel_exists} owned_leftovers={remaining}");
+            Ok::<_, String>((registered_exists, sentinel_exists, remaining))
+        }.await;
+        record_test_channel(sentinel.id);
+        let remaining = blocked_capture_cleanup(&guild).await?;
+        println!("named zero-leftover check: {remaining} owned Discord channels");
+        let (registered_exists, sentinel_exists, owned_leftovers) = result?;
+        for (name, observed, expected) in [
+            ("registered channel deleted", registered_exists, false),
+            ("unregistered channel preserved", sentinel_exists, true),
+        ] {
+            assert_eq!(observed, expected, "{name}");
+        }
+        assert_eq!(owned_leftovers, 0, "named zero-leftover check");
+        assert_eq!(remaining, 0, "named zero-leftover check");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -3634,12 +3738,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn create_isolated_tab(label: &str, cwd: &str, env_args: &[String]) -> Result<Tab, String> {
+        let workspace = create_workspace_with_env(label, cwd, env_args)?;
+        if let Err(error) = herdr_json(&["tab", "rename", &workspace.tab_id, label]) {
+            close_workspace(&workspace.id);
+            return Err(error);
+        }
+        TEST_RESOURCES
+            .lock()
+            .expect("test ownership lock")
+            .root_workspaces
+            .insert(workspace.tab_id.clone(), workspace.id);
+        Ok(Tab {
+            tab_id: workspace.tab_id,
+            pane_id: workspace.pane_id,
+        })
+    }
+
+    #[cfg(unix)]
     fn create_tab_with_env(
         label: &str,
         workspace_id: &str,
         cwd: &str,
         env_args: &[String],
     ) -> Result<Tab, String> {
+        if !TEST_RESOURCES
+            .lock()
+            .expect("test ownership lock")
+            .workspaces
+            .contains(workspace_id)
+        {
+            return create_isolated_tab(label, cwd, env_args);
+        }
         let mut args = vec![
             "tab",
             "create",
@@ -3664,11 +3794,25 @@ mod tests {
             .as_str()
             .ok_or("herdr tab create result missing pane_id")?
             .to_owned();
+        TEST_RESOURCES
+            .lock()
+            .expect("test ownership lock")
+            .tabs
+            .insert(tab_id.clone());
         Ok(Tab { tab_id, pane_id })
     }
 
     #[cfg(unix)]
     fn close_tab(tab_id: &str) {
+        let workspace = TEST_RESOURCES
+            .lock()
+            .expect("test ownership lock")
+            .root_workspaces
+            .remove(tab_id);
+        if let Some(workspace) = workspace {
+            close_workspace(&workspace);
+            return;
+        }
         let _ = Command::new("herdr")
             .args(["tab", "close", tab_id])
             .output();
@@ -3780,6 +3924,18 @@ mod tests {
 
     #[cfg(unix)]
     fn create_workspace_with_numeric_tab(label: &str, cwd: &str) -> Result<Workspace, String> {
+        create_workspace_with_env(label, cwd, &passthrough_env_args())
+    }
+
+    #[cfg(unix)]
+    fn create_workspace_with_env(
+        label: &str,
+        cwd: &str,
+        env_args: &[String],
+    ) -> Result<Workspace, String> {
+        if !label.starts_with("testrun-") {
+            return Err("test workspace label must start with testrun-".to_owned());
+        }
         let mut args = vec![
             "workspace",
             "create",
@@ -3789,8 +3945,7 @@ mod tests {
             label,
             "--no-focus",
         ];
-        let env_args = passthrough_env_args();
-        for env_arg in &env_args {
+        for env_arg in env_args {
             args.push("--env");
             args.push(env_arg);
         }
@@ -3807,6 +3962,11 @@ mod tests {
             .as_str()
             .ok_or("herdr workspace create result missing pane_id")?
             .to_owned();
+        {
+            let mut resources = TEST_RESOURCES.lock().expect("test ownership lock");
+            resources.workspaces.insert(workspace_id.clone());
+            resources.tabs.insert(tab_id.clone());
+        }
         Ok(Workspace {
             id: workspace_id,
             tab_id,
@@ -4119,24 +4279,18 @@ mod tests {
         let mut broker: Option<BrokerTask> = None;
         let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
         let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
+        let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
         let mut runtime = BridgeRuntime {
             lifecycle,
             pane_ids: Vec::new(),
             status: None,
-            state: BridgeState::<Discord>::default(),
+            state: BridgeState {
+                included_panes: Some(HashSet::from([tab.pane_id.clone()])),
+                ..BridgeState::<Discord>::default()
+            },
             live_events,
             activity_events,
         };
-        doorbell_snapshot(
-            &connection,
-            &mut runtime.state,
-            &mut runtime.pane_ids,
-            &mut runtime.status,
-            &mut stop,
-        )
-        .await
-        .unwrap_or_else(|_| panic!("snapshot doorbell was interrupted"));
-        let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
         let result = async {
             let pane_created = wait_for_event(
                 &mut runtime.lifecycle,
@@ -4157,7 +4311,7 @@ mod tests {
                 &mut runtime,
             )
             .await;
-            if !runtime.pane_ids.contains(&tab.pane_id) {
+            if runtime.pane_ids != [tab.pane_id.clone()] {
                 return Err(format!(
                     "pane_created did not add the pane to the runtime: {:?}",
                     runtime.pane_ids
@@ -4215,6 +4369,7 @@ mod tests {
                 .model()
                 .await
                 .map_err(|error| error.to_string())?;
+            record_test_channel(channel.id);
             let first = herdr_connect_rs::resolve_terminal_prompt_webhook(
                 guild.client.as_ref(),
                 channel.id,
@@ -6103,9 +6258,6 @@ mod tests {
 
     #[cfg(unix)]
     fn question_tab_fixture() -> Result<(Tab, PathBuf), String> {
-        let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
-            "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
-        })?;
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| "HOME is set by the real Herdr pane environment".to_owned())?;
@@ -6115,7 +6267,7 @@ mod tests {
         let cwd = cwd_dir
             .to_str()
             .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
-        create_tab(&label, &workspace_id, cwd).map(|tab| (tab, cwd_dir))
+        create_isolated_tab(&label, cwd, &passthrough_env_args()).map(|tab| (tab, cwd_dir))
     }
 
     #[cfg(unix)]
@@ -6612,9 +6764,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const CODEX_HOOK_BINARY: &str = ".cargo/bin/herdr-connect-rs";
-
-    #[cfg(unix)]
     struct CodexTestHome {
         root: PathBuf,
         codex_home: PathBuf,
@@ -6647,7 +6796,7 @@ mod tests {
         }
 
         fn write_files(&self, home: &Path, cwd: &Path) -> Result<(), String> {
-            let binary = home.join(CODEX_HOOK_BINARY);
+            let binary = activity_binary_path()?;
             let binary = binary.to_str().ok_or("hook binary path is valid UTF-8")?;
             let socket = self.socket.to_str().ok_or("socket path is valid UTF-8")?;
             let state_script = home.join(".codex/herdr-agent-state.sh");
@@ -7918,9 +8067,10 @@ mod tests {
             &tab_ids,
         )
         .await?;
+        let owned = test_owned_topology(&channels, &threads);
         let protected: Vec<_> = absent
             .iter()
-            .filter(|channel| !is_test_channel(channel))
+            .filter(|channel| !is_test_channel(channel) || !owned.contains(&channel.id))
             .map(|channel| {
                 format!(
                     "{} ({})",
@@ -8214,6 +8364,7 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
+        record_test_channel(channel.id);
 
         let cases = [
             ClosureBatchCase {
@@ -9326,6 +9477,7 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
+        record_test_channel(orphan_channel.id);
         create_guild_thread(guild, orphan_channel.id, "testrun-orphan [w9Z9:t1]").await?;
         let live_orphan_thread = create_guild_thread(
             guild,
@@ -9476,6 +9628,7 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
+        record_test_channel(orphan_channel.id);
         create_guild_thread(guild, orphan_channel.id, "testrun-orphan [wCC9:tCC]").await?;
 
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
