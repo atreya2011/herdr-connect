@@ -3,7 +3,7 @@ use std::fmt;
 use twilight_model::channel::Channel;
 use twilight_model::guild::audit_log::{AuditLogEntry, AuditLogEventType};
 use twilight_model::id::Id;
-use twilight_model::id::marker::{ChannelMarker, GuildMarker};
+use twilight_model::id::marker::{ChannelMarker, GuildMarker, UserMarker};
 
 use crate::{
     Closed, TopologyCache, delete_thread_created_message, forget_owned, resolve_owner_deleted_tab,
@@ -89,19 +89,30 @@ pub async fn handle_guild_deletion<F>(
 where
     F: FnOnce(Closed) -> Result<(), String> + Send + 'static,
 {
+    let id = deletion.id();
+    {
+        let mut guard = topology_cache.lock().await;
+        if let Some((channels, threads)) = guard.as_mut() {
+            channels.retain(|channel| channel.id != id);
+            threads.retain(|thread| thread.id != id && thread.parent_id != Some(id));
+        }
+    }
     if deletion.owned_close().is_none() {
         return Ok(());
     }
+    let owner = owner_id
+        .parse::<Id<UserMarker>>()
+        .map_err(|error| format!("DISCORD_OWNER_ID is not numeric: {error}"))?;
     let entries = client
         .audit_log(guild)
         .action_type(deletion.audit_log_event())
+        .user_id(owner)
         .await
         .map_err(|error| format!("guild audit log: {error}"))?
         .model()
         .await
         .map_err(|error| format!("guild audit log: {error}"))?
         .entries;
-    let id = deletion.id();
     let Some(close) = decide_close(&deletion, &entries, owner_id) else {
         return Ok(());
     };
@@ -109,11 +120,7 @@ where
         Close::Tab(_, parent) => delete_thread_created_message(client, *parent, id).await,
         Close::Workspace(_) => Ok(()),
     };
-    let mut guard = topology_cache.lock().await;
-    if let Some((channels, threads)) = guard.as_mut() {
-        channels.retain(|channel| channel.id != id);
-        threads.retain(|thread| thread.id != id && thread.parent_id != Some(id));
-    }
+    let guard = topology_cache.lock().await;
     let result = tokio::task::spawn_blocking(move || match close {
         Close::Tab(tab_id, _) => closer(Closed::Tab(tab_id)),
         Close::Workspace(workspace_id) => closer(Closed::Workspace(workspace_id)),
