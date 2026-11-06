@@ -202,10 +202,7 @@ impl Slack {
         if self.excluded(workspace, tab).await? {
             return Ok(None);
         }
-        let route = SlackRoute {
-            channel,
-            thread: None,
-        };
+        let route = SlackRoute { channel };
         self.use_status_message(&route, &posted.origin.ts).await?;
         let content = posted
             .content

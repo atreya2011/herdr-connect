@@ -32,7 +32,6 @@ impl Slack {
         };
         let route = SlackRoute {
             channel: channel.id.clone(),
-            thread: None,
         };
         let mut topology = self.topology.lock().await;
         if !topology.tabs.values().any(|entry| entry == &route) {

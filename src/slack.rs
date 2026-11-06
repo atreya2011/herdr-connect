@@ -12,7 +12,6 @@ pub use socket::{SlackArchive, SlackSocketEvent};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SlackRoute {
     pub channel: SlackChannelId,
-    pub thread: Option<SlackTs>,
 }
 #[derive(Default)]
 struct Topology {
@@ -227,7 +226,6 @@ impl Slack {
                         tab.to_owned(),
                         SlackRoute {
                             channel: channel.id.clone(),
-                            thread: None,
                         },
                     )
                     .is_some()
@@ -288,7 +286,6 @@ impl Slack {
             .channel;
         let found = SlackRoute {
             channel: channel.id.clone(),
-            thread: None,
         };
         topology.channels.retain(|entry| entry.id != channel.id);
         topology.channels.push(channel);
@@ -424,7 +421,6 @@ impl Slack {
         }
         let route = SlackRoute {
             channel: channel.id.clone(),
-            thread: None,
         };
         if self.status_messages.lock().await.contains_key(&channel.id) {
             self.track_working(&route, false).await?;

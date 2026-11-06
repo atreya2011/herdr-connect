@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
     AgentSnapshot, Chat, ChatError, Closed, Inbound, OwnerIdentity, PermissionResponder, Slack,
@@ -25,8 +25,6 @@ use crate::{
     route_topology, tab_list_result,
 };
 
-const OWNER: &str = "U0CEYEYSKT5";
-const TEAM: &str = "T0CF6JNT0KB";
 const STEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 struct Owned {
@@ -52,7 +50,6 @@ enum Goal {
         expected: Vec<String>,
         tap: &'static str,
     },
-    ParentDeleted,
     Archived,
 }
 
@@ -69,17 +66,15 @@ struct Driver {
     activity: UnboundedReceiver<herdr_connect_rs::ActivityFrame>,
     tasks: JoinSet<Result<(), String>>,
     clock: tokio::time::Interval,
-    client: SlackHyperClient,
-    token: SlackApiToken,
     messages: Vec<SlackHistoryMessage>,
     owner_texts: Vec<String>,
     taps: Vec<String>,
     working_confirmed: bool,
     working_observed: bool,
-    parent_deleted: Option<Instant>,
     archived_by_owner: bool,
     goal: Goal,
     directory: PathBuf,
+    team: String,
 }
 
 fn action(text: &str) -> Result<(), String> {
@@ -105,7 +100,7 @@ fn hook_settings(directory: &Path) -> Result<PathBuf, String> {
         script.to_string_lossy().replace('\'', "'\\''")
     );
     let settings = json!({
-        "permissions": {"allow": ["Bash(sleep 180)"], "ask": ["Bash(touch *)"]},
+        "permissions": {"allow": ["Bash(python3 -c *)"], "ask": ["Bash(touch *)"]},
         "hooks": {"PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command, "timeout": 1200}]}]}
     });
     let path = directory.join("settings.json");
@@ -160,6 +155,17 @@ impl Owned {
         });
         let workspace = self.workspace.as_ref().ok_or("test workspace missing")?;
         herdr_json(&["tab", "rename", &workspace.tab_id, &self.label])?;
+        herdr_json(&[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace.id,
+            "--label",
+            "testrun-survivor",
+            "--cwd",
+            cwd,
+            "--no-focus",
+        ])?;
         Ok(())
     }
 
@@ -220,17 +226,12 @@ impl Owned {
             }
         }));
         let (live_tx, live) = unbounded_channel();
-        let token = SlackApiToken::new(
-            std::env::var("SLACK_BOT_TOKEN")
-                .map_err(|error| error.to_string())?
-                .into(),
-        );
         Ok(Driver {
             connection: (
                 self.chat.clone(),
                 responder,
                 OwnerIdentity {
-                    display_name: OWNER.into(),
+                    display_name: self.chat.owner_id().to_owned(),
                     avatar_url: None,
                 },
             ),
@@ -248,19 +249,15 @@ impl Owned {
             activity,
             tasks: JoinSet::new(),
             clock: tokio::time::interval(Duration::from_secs(2)),
-            client: SlackClient::new(
-                SlackClientHyperConnector::new().map_err(|error| error.to_string())?,
-            ),
-            token,
             messages: Vec::new(),
             owner_texts: Vec::new(),
             taps: Vec::new(),
             working_confirmed: false,
             working_observed: false,
-            parent_deleted: None,
             archived_by_owner: false,
             goal: Goal::Message,
             directory: self.directory.clone(),
+            team: std::env::var("SLACK_TEAM_ID").map_err(|error| error.to_string())?,
         })
     }
 
@@ -348,7 +345,16 @@ impl Owned {
             .filter(|channel| {
                 !self.before_channels.contains(&channel.id)
                     && channel.name.as_deref().is_some_and(|name| {
-                        name == self.label || name.starts_with(&format!("{}-archived-", self.label))
+                        name.starts_with("testrun-")
+                            && self.workspace.as_ref().is_some_and(|workspace| {
+                                name.contains(&format!("-{}-", workspace.id.to_lowercase()))
+                                    || channel.topic.as_ref().is_some_and(|topic| {
+                                        topic.value.starts_with(&format!(
+                                            "herdr workspace [{}] tab [",
+                                            workspace.id
+                                        ))
+                                    })
+                            })
                     })
             })
         {
@@ -408,7 +414,7 @@ fn start_agent(name: &str, pane: &str, settings: &Path) -> Result<(), String> {
 
 impl Driver {
     async fn refresh(&mut self) -> Result<(), String> {
-        if self.parent_deleted.is_some() || self.archived_by_owner {
+        if self.archived_by_owner {
             return Ok(());
         }
         self.snapshot = snapshot_for_pane(&self.pane)?;
@@ -432,18 +438,11 @@ impl Driver {
         )
         .await;
         self.messages = self
-            .client
-            .open_session(&self.token)
-            .conversations_replies(&SlackApiConversationsRepliesRequest::new(
-                self.route.channel.clone(),
-                self.route
-                    .thread
-                    .clone()
-                    .ok_or("test route has no parent")?,
-            ))
+            .connection
+            .0
+            .history(&self.route.channel)
             .await
-            .map_err(|error| error.to_string())?
-            .messages;
+            .map_err(String::from)?;
         Ok(())
     }
 
@@ -452,19 +451,12 @@ impl Driver {
             Inbound::Posted(posted)
                 if posted.origin.channel.as_ref() == Some(&self.route.channel) =>
             {
-                if matches!(posted.subtype, Some(SlackMessageEventType::MessageDeleted))
-                    && posted.deleted_ts == self.route.thread
-                {
-                    self.parent_deleted = Some(Instant::now());
-                    return Ok(());
-                }
                 if posted
                     .sender
                     .user
                     .as_ref()
-                    .is_some_and(|user| user.0 == OWNER)
+                    .is_some_and(|user| user.0 == self.connection.0.owner_id())
                     && posted.sender.bot_id.is_none()
-                    && posted.origin.thread_ts == self.route.thread
                     && posted.subtype.is_none()
                 {
                     let text = posted
@@ -473,9 +465,23 @@ impl Driver {
                         .and_then(|content| content.text.clone())
                         .ok_or("owner message has no text")?;
                     self.owner_texts.push(text.clone());
-                    if matches!(self.goal, Goal::Working) && text.trim() == "STATUS VISIBLE" {
-                        self.working_confirmed = self.snapshot.agent_status == "working";
-                        return Ok(());
+                    if matches!(self.goal, Goal::Working) {
+                        match text.trim() {
+                            "STATUS VISIBLE" => {
+                                self.connection
+                                    .0
+                                    .owner_message(posted)
+                                    .await
+                                    .map_err(String::from)?;
+                                self.working_confirmed = self.snapshot.agent_status == "working";
+                                return Ok(());
+                            }
+                            "STATUS NOT VISIBLE" => return Err(
+                                "owner reports working status is not visible in the channel view"
+                                    .into(),
+                            ),
+                            _ => {}
+                        }
                     }
                 }
                 let responder = self.connection.1.clone();
@@ -493,14 +499,15 @@ impl Driver {
                 });
             }
             Inbound::Deleted(archive) if archive.0.channel == self.route.channel => {
-                let owner = archive.0.user.0 == OWNER;
+                let owner = archive.0.user.0 == self.connection.0.owner_id();
+                let expected_tab = self.tab.clone();
                 let expected_workspace = self.workspace.clone();
                 self.connection
                     .0
                     .handle_deletion(archive, move |closed| match closed {
-                        Closed::Workspace(id) if id == expected_workspace => {
+                        Closed::Tab(id) if id == expected_tab => {
                             let permitted = workspace_list_result()?.iter().any(|workspace| {
-                                workspace.workspace_id == id
+                                workspace.workspace_id == expected_workspace
                                     && workspace.label.starts_with("testrun-")
                             });
                             if !permitted {
@@ -508,7 +515,7 @@ impl Driver {
                                     "refused close of a workspace without its testrun label".into(),
                                 );
                             }
-                            workspace_close(&id).map(drop)
+                            herdr_connect_rs::tab_close(&id).map(drop)
                         }
                         _ => Err("refused Herdr close outside the owned workspace".into()),
                     })
@@ -524,14 +531,14 @@ impl Driver {
     async fn pump(&mut self) -> Result<(), String> {
         tokio::select! {
             event = self.events.recv() => {
-                self.inbound(event.ok_or("Slack event reader stopped")?.map_err(String::from)?).await?;
+                Box::pin(self.inbound(event.ok_or("Slack event reader stopped")?.map_err(String::from)?)).await?;
             }
             _ = self.clock.tick() => self.refresh().await?,
             Some(terminal) = self.live.recv() => {
-                if self.parent_deleted.is_none() && !self.archived_by_owner { handle_live_event(&self.connection, &terminal, &mut self.state).await; }
+                if !self.archived_by_owner { handle_live_event(&self.connection, &terminal, &mut self.state).await; }
             }
             Some(frame) = self.activity.recv() => {
-                if frame.pane_id == self.pane && self.parent_deleted.is_none() && !self.archived_by_owner { handle_activity_event(&self.connection, frame, &mut self.state).await; }
+                if frame.pane_id == self.pane && !self.archived_by_owner { handle_activity_event(&self.connection, frame, &mut self.state).await; }
             }
             Some(result) = self.tasks.join_next() => result.map_err(|error| error.to_string())??,
         }
@@ -548,7 +555,6 @@ impl Driver {
     fn bot_said(&self, text: &str) -> bool {
         self.messages.iter().any(|message| {
             message.sender.bot_id.is_some()
-                && self.route.thread.as_ref() != Some(&message.origin.ts)
                 && message
                     .content
                     .text
@@ -622,16 +628,11 @@ impl Driver {
                 };
                 Ok(answered && input && self.settled()?)
             }
-            Goal::ParentDeleted => Ok(self
-                .parent_deleted
-                .is_some_and(|when| when.elapsed() >= Duration::from_secs(5))
-                && tab_list_result()?
-                    .iter()
-                    .any(|tab| tab.tab_id == self.tab && tab.workspace_id == self.workspace)),
             Goal::Archived => Ok(self.archived_by_owner
+                && tab_list_result()?.iter().all(|tab| tab.tab_id != self.tab)
                 && workspace_list_result()?
                     .iter()
-                    .all(|workspace| workspace.workspace_id != self.workspace)),
+                    .any(|workspace| workspace.workspace_id == self.workspace)),
         }
     }
 
@@ -640,7 +641,7 @@ impl Driver {
         let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
         loop {
             if self.observed()? {
-                if !matches!(self.goal, Goal::ParentDeleted | Goal::Archived) {
+                if !matches!(self.goal, Goal::Archived) {
                     self.refresh().await?;
                 }
                 println!("OWNER OBSERVED: step complete");
@@ -656,7 +657,7 @@ impl Driver {
         herdr_json(&["agent", "prompt", &self.pane, prompt]).map(drop)
     }
 
-    async fn questions(&mut self, thread_url: &str) -> Result<(), String> {
+    async fn questions(&mut self, channel_url: &str) -> Result<(), String> {
         let cases = [
             (
                 "single choice",
@@ -688,7 +689,7 @@ impl Driver {
                 json!([{"label":"Red","description":"The color red"},{"label":"Blue","description":"The color blue"}])
             };
             action(&format!(
-                "{name}: in {thread_url}, {instruction}; expected answer: {}. Wait for the next real question card.",
+                "{name}: in {channel_url}, {instruction}; expected answer: {}. Wait for the next real question card.",
                 expected.join(", ")
             ))?;
             self.prompt(&format!("Use AskUserQuestion now with exactly one question: {}. After its answer, reply only ANSWER RECEIVED. Use no other tools.", json!({"header":"Slack test","question":question,"multiSelect":multi,"options":options})))?;
@@ -710,32 +711,20 @@ impl Driver {
                 .map_err(|_| "real agent bootstrap did not settle".to_owned())??;
         }
         self.refresh().await?;
-        let parent = self
-            .route
-            .thread
-            .clone()
-            .ok_or("test route has no parent")?;
-        let thread_url = self
-            .client
-            .open_session(&self.token)
-            .chat_get_permalink(&SlackApiChatGetPermalinkRequest::new(
-                self.route.channel.clone(),
-                parent,
-            ))
-            .await
-            .map_err(|error| error.to_string())?
-            .permalink
-            .to_string();
+        let channel_url = format!(
+            "https://app.slack.com/client/{}/{}",
+            self.team, self.route.channel
+        );
         action(&format!(
-            "message: open {thread_url} and reply exactly: Reply with exactly SLACK OWNER OK and use no tools."
+            "message: open {channel_url} and reply exactly: Reply with exactly SLACK OWNER OK and use no tools."
         ))?;
         self.wait(Goal::Message).await?;
         self.working_observed = false;
         self.goal = Goal::Working;
         action(&format!(
-            "working status: in {thread_url}, watch the next three-minute task; while the working indicator is visible, reply exactly STATUS VISIBLE. Wait for WORKING DONE before the next step."
+            "working status: in {channel_url}, inspect the channel view during the next three-minute task without opening a thread. Reply STATUS VISIBLE if the working indicator is visible there, or STATUS NOT VISIBLE if it is absent. Wait for WORKING DONE before the next step."
         ))?;
-        self.prompt("Use Bash to run exactly sleep 180 in the foreground with timeout 240000. Do not use background execution or any other command. Then reply with exactly WORKING DONE.")?;
+        self.prompt("Use Bash to run exactly python3 -c 'import time; time.sleep(180)' in the foreground with timeout 240000. Do not use background execution or any other command. Then reply with exactly WORKING DONE.")?;
         self.wait(Goal::Working).await?;
         for (button, behavior, filename) in [
             ("Deny", "deny", "testrun-denied"),
@@ -747,7 +736,7 @@ impl Driver {
                 marker.to_string_lossy().replace('\'', "'\\''")
             );
             action(&format!(
-                "permission {button}: in {thread_url}, click {button} on the next real permission card within its normal 45-second lifetime. Do not answer in the terminal."
+                "permission {button}: in {channel_url}, click {button} on the next real permission card within its normal 45-second lifetime. Do not answer in the terminal."
             ))?;
             self.prompt(&format!("Use Bash exactly once to run {command}. Set description to Create the test marker. Do not retry a denied command or use another tool. After the tool result, reply only PERMISSION FINISHED."))?;
             self.wait(Goal::Permission {
@@ -757,14 +746,10 @@ impl Driver {
             })
             .await?;
         }
-        self.questions(&thread_url).await?;
+        self.questions(&channel_url).await?;
         action(&format!(
-            "parent deletion: open {thread_url}, use the parent message menu to delete only the bot parent message; leave its channel unarchived. The test will verify that the Herdr tab remains open."
-        ))?;
-        self.wait(Goal::ParentDeleted).await?;
-        action(&format!(
-            "channel archive: last, open https://app.slack.com/client/{TEAM}/{} and archive only this test channel through channel details. The test will verify that only Herdr workspace {} closes.",
-            self.route.channel, self.workspace
+            "channel archive: last, open {channel_url} and archive only this test tab channel. The test will verify that tab {} closes and its workspace remains open.",
+            self.tab
         ))?;
         self.wait(Goal::Archived).await
     }
@@ -783,15 +768,7 @@ async fn owner_acceptance_runs_in_order() -> Result<(), String> {
             .as_millis()
     );
     let directory = std::env::temp_dir().join(&label);
-    let chat = Arc::new(
-        Slack::new(
-            std::env::var("SLACK_BOT_TOKEN").map_err(|error| error.to_string())?,
-            OWNER.into(),
-            TEAM,
-        )
-        .await
-        .map_err(String::from)?,
-    );
+    let chat = Arc::new(Slack::from_env().await.map_err(String::from)?);
     let before_channels = chat
         .channels()
         .await
