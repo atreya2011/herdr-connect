@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 
 use crate::{ChatError, TopologyClosure, TopologyRoute, workspace_list_result};
 
+mod delivery;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SlackRoute {
     pub channel: SlackChannelId,

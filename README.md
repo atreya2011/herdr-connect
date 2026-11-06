@@ -4,6 +4,8 @@ Two-way Rust bridge between one Discord guild and agents in local Herdr panes.
 
 The Slack adapter uses `slack-morphism` with `SLACK_BOT_TOKEN`. It creates a public workspace channel from the Herdr workspace label, stores `herdr workspace [workspace_id]` in its topic, invites the owner, and posts `<tab label> [<tab id>]` as each tab thread parent. Startup recovers these identities from Slack history. Closing a tab deletes its bot parent message; closing a workspace renames its channel to release the original name, then archives it. Slack tests use the `herdr-connect-test` workspace and count only unarchived `testrun-` channels in their zero-leftover check.
 
+Slack replies and activity messages go into the tab thread. Terminal prompts are labeled bot messages identifying the owner; they do not impersonate the owner. Working status uses `assistant.threads.setStatus`, with an empty status clearing it. A successful API call does not establish that the Slack app displays the indicator; that still needs owner verification.
+
 ## Architecture
 
 Discord and Herdr do not share a socket. This process sits between them.

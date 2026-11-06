@@ -198,3 +198,102 @@ async fn cleanup(
     println!("zero-leftover check: {leftovers} unarchived testrun- Slack channels");
     Ok::<_, Box<dyn std::error::Error>>(leftovers)
 }
+
+fn create_route() -> Result<TopologyRoute, Box<dyn std::error::Error>> {
+    let label = format!(
+        "testrun-slack-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+    );
+    let created = herdr(&[
+        "workspace",
+        "create",
+        "--label",
+        &label,
+        "--cwd",
+        "/tmp",
+        "--no-focus",
+    ])?;
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .ok_or("created workspace has no id")?;
+    let tab = created["result"]["tab"]["tab_id"]
+        .as_str()
+        .ok_or("created tab has no id")?;
+    herdr(&["tab", "rename", tab, "testrun-build"])?;
+    Ok(TopologyRoute {
+        workspace_id: workspace.into(),
+        tab_id: tab.into(),
+        pane_id: created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .ok_or("created pane has no id")?
+            .into(),
+        channel_name: label,
+        thread_name: format!("testrun-build [{tab}]"),
+    })
+}
+
+#[tokio::test]
+async fn slack_delivery_real_thread() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("SLACK_BOT_TOKEN")?;
+    let slack = Slack::new(token.clone(), "U0CEYEYSKT5".into(), "T0CF6JNT0KB").await?;
+    let route = create_route()?;
+    let result = async {
+        let found = slack.sync(&route, false).await?;
+        let reply = slack.send(&found, "testrun agent reply <literal>").await?;
+        slack
+            .mirror_prompt(&found, "testrun terminal prompt")
+            .await?;
+        let activity = slack.send(&found, "testrun activity").await?;
+        slack
+            .update(&found, &activity, "testrun activity updated")
+            .await?;
+        slack.set_working(&found, true).await?;
+        slack.set_working(&found, false).await?;
+        let client = SlackClient::new(SlackClientHyperConnector::new()?);
+        let token = SlackApiToken::new(token.into());
+        let replies = client
+            .open_session(&token)
+            .conversations_replies(&SlackApiConversationsRepliesRequest::new(
+                found.channel.clone(),
+                found.thread.clone().ok_or("no parent")?,
+            ))
+            .await?;
+        let checks = vec![
+            (
+                "agent reply in thread",
+                replies.messages.iter().any(|message| {
+                    message.origin.ts == reply
+                        && message.origin.thread_ts == found.thread
+                        && message.content.text.as_deref()
+                            == Some("testrun agent reply &lt;literal&gt;")
+                }),
+            ),
+            (
+                "terminal prompt from bot",
+                replies.messages.iter().any(|message| {
+                    message.sender.bot_id.is_some()
+                        && message.content.text.as_deref()
+                            == Some("Terminal prompt from <@U0CEYEYSKT5>:\ntestrun terminal prompt")
+                }),
+            ),
+            (
+                "activity updated in place",
+                replies.messages.iter().any(|message| {
+                    message.origin.ts == activity
+                        && message.content.text.as_deref() == Some("testrun activity updated")
+                }),
+            ),
+        ];
+        Ok::<_, Box<dyn std::error::Error>>(checks)
+    }
+    .await;
+    let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    assert_eq!(
+        leftovers, 0,
+        "zero-leftover check: unarchived testrun- Slack channels"
+    );
+    for (name, passed) in result? {
+        assert!(passed, "{name}");
+    }
+    Ok(())
+}
