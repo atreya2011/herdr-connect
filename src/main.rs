@@ -6589,11 +6589,11 @@ mod tests {
             .map_err(|error| error.to_string())?;
             fs::write(self.codex_home.join("config.toml"), config)
                 .map_err(|error| error.to_string())?;
-            std::os::unix::fs::symlink(
-                home.join(".codex/auth.json"),
-                self.codex_home.join("auth.json"),
-            )
-            .map_err(|error| error.to_string())
+            let account = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .ok_or("CODEX_HOME is required for the real Codex account")?;
+            std::os::unix::fs::symlink(account.join("auth.json"), self.codex_home.join("auth.json"))
+                .map_err(|error| error.to_string())
         }
 
         fn env_args(&self) -> Result<Vec<String>, String> {
