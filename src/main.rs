@@ -3568,6 +3568,16 @@ mod tests {
 
     #[cfg(unix)]
     fn create_tab(label: &str, workspace_id: &str, cwd: &str) -> Result<Tab, String> {
+        create_tab_with_env(label, workspace_id, cwd, &passthrough_env_args())
+    }
+
+    #[cfg(unix)]
+    fn create_tab_with_env(
+        label: &str,
+        workspace_id: &str,
+        cwd: &str,
+        env_args: &[String],
+    ) -> Result<Tab, String> {
         let mut args = vec![
             "tab",
             "create",
@@ -3579,8 +3589,7 @@ mod tests {
             label,
             "--no-focus",
         ];
-        let env_args = passthrough_env_args();
-        for env_arg in &env_args {
+        for env_arg in env_args {
             args.push("--env");
             args.push(env_arg);
         }
@@ -6411,56 +6420,166 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const CODEX_ACTIVITY_BROKER_SOCKET: &str = "/tmp/herdr-claude-broker.sock";
+    const CODEX_HOOK_BINARY: &str = ".cargo/bin/herdr-connect-rs";
 
     #[cfg(unix)]
-    fn assert_codex_activity_environment() -> Result<(), String> {
-        let codex_home =
-            std::env::var("CODEX_HOME").map_err(|_| "CODEX_HOME is not set".to_owned())?;
-
-        let hooks_path = Path::new(&codex_home).join("hooks.json");
-        let hooks_raw = std::fs::read_to_string(&hooks_path)
-            .map_err(|error| format!("{}: {error}", hooks_path.display()))?;
-        let hooks: serde_json::Value = serde_json::from_str(&hooks_raw)
-            .map_err(|error| format!("{}: {error}", hooks_path.display()))?;
-        let activity_socket_flag = format!("--socket {CODEX_ACTIVITY_BROKER_SOCKET}");
-        let activity_command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .ok_or_else(|| format!("{}: no PreToolUse activity hook", hooks_path.display()))?;
-        if !activity_command.contains(&activity_socket_flag) {
-            return Err(format!(
-                "{}: PreToolUse hook does not target {CODEX_ACTIVITY_BROKER_SOCKET}: {activity_command}",
-                hooks_path.display()
-            ));
-        }
-
-        let config_path = Path::new(&codex_home).join("config.toml");
-        let config_raw = std::fs::read_to_string(&config_path)
-            .map_err(|error| format!("{}: {error}", config_path.display()))?;
-        let hooks_path_str = hooks_path
-            .to_str()
-            .ok_or_else(|| "hooks.json path is valid UTF-8".to_owned())?;
-        for (pascal_event, snake_event) in [
-            ("SessionStart", "session_start"),
-            ("PermissionRequest", "permission_request"),
-            ("PreToolUse", "pre_tool_use"),
-        ] {
-            if hooks["hooks"][pascal_event].is_null() {
-                continue;
-            }
-            let trust_key = format!("[hooks.state.\"{hooks_path_str}:{snake_event}:0:0\"]");
-            if !config_raw.lines().any(|line| line.trim() == trust_key) {
-                return Err(format!(
-                    "{}: no trust record for {hooks_path_str}:{snake_event}:0:0",
-                    config_path.display()
-                ));
-            }
-        }
-        Ok(())
+    struct CodexTestHome {
+        root: PathBuf,
+        codex_home: PathBuf,
+        socket: PathBuf,
+        original_home: Option<std::ffi::OsString>,
+        home_changed: bool,
     }
 
     #[cfg(unix)]
-    fn codex_activity_tab_fixture(label: &str) -> Result<(Tab, PathBuf), String> {
+    impl CodexTestHome {
+        fn create(home: &Path, cwd: &Path) -> Result<Self, String> {
+            let root = std::env::temp_dir().join(format!(
+                "hcr-codex-{}-{}",
+                std::process::id(),
+                agent_name_nonce()?
+            ));
+            fs::create_dir(&root).map_err(|error| error.to_string())?;
+            let codex_home = root.join(".codex-testrun");
+            let socket = root.join("broker.sock");
+            let created = Self {
+                root,
+                codex_home: codex_home.clone(),
+                socket,
+                original_home: None,
+                home_changed: false,
+            };
+            fs::create_dir_all(&codex_home).map_err(|error| error.to_string())?;
+            created.write_files(home, cwd)?;
+            Ok(created)
+        }
+
+        fn write_files(&self, home: &Path, cwd: &Path) -> Result<(), String> {
+            let binary = home.join(CODEX_HOOK_BINARY);
+            let binary = binary.to_str().ok_or("hook binary path is valid UTF-8")?;
+            let socket = self.socket.to_str().ok_or("socket path is valid UTF-8")?;
+            let state_script = home.join(".codex/herdr-agent-state.sh");
+            let state_script = state_script
+                .to_str()
+                .ok_or("state script path is valid UTF-8")?;
+            let hooks_path = self.codex_home.join("hooks.json");
+            let hooks_path_str = hooks_path.to_str().ok_or("hooks path is valid UTF-8")?;
+            let cwd = cwd.to_str().ok_or("cwd is valid UTF-8")?;
+            let events = [
+                (
+                    "SessionStart",
+                    "session_start",
+                    None,
+                    format!("bash '{state_script}' session"),
+                    10_u64,
+                ),
+                (
+                    "PreToolUse",
+                    "pre_tool_use",
+                    Some(""),
+                    format!("{binary:?} activity --vendor codex --socket {socket:?}"),
+                    5,
+                ),
+                (
+                    "PermissionRequest",
+                    "permission_request",
+                    Some("Bash"),
+                    format!("{binary:?} hook --vendor codex --socket {socket:?}"),
+                    600,
+                ),
+            ];
+            let mut hooks = serde_json::Map::new();
+            let mut config = format!(
+                "[features]\nhooks = true\n\n[projects.{cwd:?}]\ntrust_level = \"trusted\"\n"
+            );
+            for (event, snake, matcher, command, timeout) in events {
+                let handler = serde_json::json!({
+                    "type": "command",
+                    "command": command,
+                    "timeout": timeout,
+                });
+                let mut group = serde_json::json!({ "hooks": [handler] });
+                if let Some(matcher) = matcher {
+                    group["matcher"] = serde_json::json!(matcher);
+                }
+                hooks.insert(event.to_owned(), serde_json::json!([group]));
+                let mut identity = serde_json::json!({
+                    "event_name": snake,
+                    "hooks": [{
+                        "async": false,
+                        "command": command,
+                        "timeout": timeout,
+                        "type": "command",
+                    }],
+                });
+                if let Some(matcher) = matcher {
+                    identity["matcher"] = serde_json::json!(matcher);
+                }
+                let digest =
+                    <sha2::Sha256 as sha2::Digest>::digest(identity.to_string().as_bytes());
+                let hash = hex::encode(digest);
+                std::fmt::Write::write_fmt(
+                    &mut config,
+                    format_args!(
+                        "\n[hooks.state.\"{hooks_path_str}:{snake}:0:0\"]\ntrusted_hash = \"sha256:{hash}\"\n"
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            fs::write(
+                &hooks_path,
+                serde_json::json!({ "hooks": hooks }).to_string(),
+            )
+            .map_err(|error| error.to_string())?;
+            fs::write(self.codex_home.join("config.toml"), config)
+                .map_err(|error| error.to_string())?;
+            std::os::unix::fs::symlink(
+                home.join(".codex/auth.json"),
+                self.codex_home.join("auth.json"),
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        fn env_args(&self) -> Result<Vec<String>, String> {
+            let codex_home = self
+                .codex_home
+                .to_str()
+                .ok_or("codex home path is valid UTF-8")?;
+            let mut args = passthrough_env_args();
+            args.retain(|arg| !arg.starts_with("CODEX_HOME="));
+            args.push(format!("CODEX_HOME={codex_home}"));
+            Ok(args)
+        }
+
+        fn point_home_at_root(&mut self) {
+            self.original_home = std::env::var_os("HOME");
+            self.home_changed = true;
+            unsafe {
+                std::env::set_var("HOME", &self.root);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CodexTestHome {
+        fn drop(&mut self) {
+            if self.home_changed {
+                unsafe {
+                    match self.original_home.take() {
+                        Some(original) => std::env::set_var("HOME", original),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn codex_activity_tab_fixture(
+        label: &str,
+        test_home: &CodexTestHome,
+    ) -> Result<(Tab, PathBuf), String> {
         let workspace_id = std::env::var("HERDR_WORKSPACE_ID").map_err(|_| {
             "HERDR_WORKSPACE_ID is set by the real Herdr pane environment".to_owned()
         })?;
@@ -6472,7 +6591,7 @@ mod tests {
         let cwd = cwd_dir
             .to_str()
             .ok_or_else(|| "temp cwd is valid UTF-8".to_owned())?;
-        let tab = create_tab(label, &workspace_id, cwd)?;
+        let tab = create_tab_with_env(label, &workspace_id, cwd, &test_home.env_args()?)?;
         Ok((tab, cwd_dir))
     }
 
@@ -6490,12 +6609,16 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct RemoveSocketOnDrop<'a>(&'a Path);
+    struct RemoveSocketOnDrop<'a> {
+        socket: &'a Path,
+        broker: tokio::task::AbortHandle,
+    }
 
     #[cfg(unix)]
     impl Drop for RemoveSocketOnDrop<'_> {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(self.0);
+            self.broker.abort();
+            let _ = std::fs::remove_file(self.socket);
         }
     }
 
@@ -6517,13 +6640,16 @@ mod tests {
         let mut broker_task = tokio::spawn(async move {
             super::run_permission_broker(&broker_socket_owned, responder, activity_tx).await
         });
+        let _remove_socket_on_drop = RemoveSocketOnDrop {
+            socket: broker_socket,
+            broker: broker_task.abort_handle(),
+        };
         let broker_deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if broker_socket.exists() {
                 break;
             }
             if Instant::now() >= broker_deadline {
-                broker_task.abort();
                 return Err("test broker did not create its socket".to_owned());
             }
             tokio::select! {
@@ -6533,7 +6659,6 @@ mod tests {
                 }
             }
         }
-        let _remove_socket_on_drop = RemoveSocketOnDrop(broker_socket);
 
         start_live_capture_agent("codex", agent_name, &tab.pane_id)?;
         let idle = snapshot_for_pane(&tab.pane_id)?;
@@ -6629,26 +6754,27 @@ mod tests {
             0,
             "named zero-leftover check"
         );
-        assert_codex_activity_environment().unwrap_or_else(|error| panic!("{error}"));
-
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .expect("HOME is set by the real Herdr pane environment");
-        let broker_socket = Path::new(CODEX_ACTIVITY_BROKER_SOCKET);
-        let created = codex_activity_tab_fixture(&label);
+        let mut test_home = CodexTestHome::create(&home, &codex_testrun_dir(&home))
+            .expect("temporary CODEX_HOME is created");
+        let broker_socket = test_home.socket.clone();
+        let created = codex_activity_tab_fixture(&label, &test_home);
         let (tab_id, cwd_dir, result) = match created {
             Ok((tab, cwd_dir)) => {
                 let agent_name = format!(
                     "activity-codex-{}",
                     agent_name_nonce().expect("system clock is after unix epoch")
                 );
+                test_home.point_home_at_root();
                 let outcome = tokio::time::timeout(
                     Duration::from_secs(300),
-                    codex_activity_hook_exercise(&guild, &tab, &agent_name, broker_socket),
+                    codex_activity_hook_exercise(&guild, &tab, &agent_name, &broker_socket),
                 )
                 .await
                 .unwrap_or_else(|_| Err("codex activity hook exercise timed out".to_owned()));
-                cleanup_real_codex_session_file(&home, &tab.pane_id);
+                cleanup_real_codex_session_file(&test_home.root, &tab.pane_id);
                 (Some(tab.tab_id), Some(cwd_dir), outcome)
             }
             Err(error) => (None, None, Err(error)),
@@ -6659,6 +6785,8 @@ mod tests {
         if let Some(cwd_dir) = cwd_dir {
             let _ = clear_directory_contents(&cwd_dir);
         }
+
+        drop(test_home);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         let tabs_left =
