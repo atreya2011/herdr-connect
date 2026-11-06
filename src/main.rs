@@ -25,9 +25,9 @@ use herdr_connect_rs::{
     format_detection_question, hook_timeout, is_postable_transition, list_agents, list_mirrored,
     live_message_nonce, load_discord_config, name_unlabeled_tabs, read_claude_incremental,
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
-    read_cursor_incremental, read_cursor_prompts_incremental, route_is_test_run, route_topology,
-    split_live_message, status_subscriptions, subscribe_herdr_events, tab_list_result,
-    take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
+    read_cursor_incremental, read_cursor_prompts_incremental, route_topology, split_live_message,
+    status_subscriptions, subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression,
+    transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -392,6 +392,12 @@ async fn maybe_sync_fresh_session_topology<C: Chat>(
     }
 }
 
+fn tab_is_working(agents: &[AgentSnapshot], tab_id: &str) -> bool {
+    agents
+        .iter()
+        .any(|agent| agent.tab_id == tab_id && agent.agent_status == STATUS_WORKING)
+}
+
 async fn process_snapshot<C: Chat>(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
@@ -407,7 +413,7 @@ async fn process_snapshot<C: Chat>(
     if let Some(watch) = state.live_watches.get(&terminal)
         && let Err(error) = discord
             .0
-            .agent_status(&watch.route, status == STATUS_WORKING)
+            .agent_status(&watch.route, tab_is_working(agents, &snapshot.tab_id))
             .await
     {
         bridge_eprintln!("agent status error: {error}");
@@ -1080,15 +1086,11 @@ async fn handle_live_event<C: Chat>(
         return;
     };
     let (path, start_position, route) = (watch.path.clone(), watch.follower, watch.route.clone());
-    if state.ignore_test_runs {
-        match route_is_test_run(&route.workspace_id, &route.tab_id) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                bridge_eprintln!("live capture filter error for {terminal}: {error}");
-                return;
-            }
-        }
+    if state.ignore_test_runs
+        && (!state.mirrored_topology.contains(&route.workspace_id)
+            || !state.mirrored_topology.contains(&route.tab_id))
+    {
+        return;
     }
     mirror_terminal_prompts(connection, terminal, &route, state).await;
     let (texts, read_position) = match read_new_live_texts(&path, start_position) {
@@ -1166,15 +1168,11 @@ async fn handle_activity_event<C: Chat>(
     if !state.activity_eligible_panes.contains(&frame.pane_id) {
         return;
     }
-    if state.ignore_test_runs {
-        match route_is_test_run(&frame.workspace_id, &frame.tab_id) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                bridge_eprintln!("activity filter error for pane {}: {error}", frame.pane_id);
-                return;
-            }
-        }
+    if state.ignore_test_runs
+        && (!state.mirrored_topology.contains(&frame.workspace_id)
+            || !state.mirrored_topology.contains(&frame.tab_id))
+    {
+        return;
     }
     let (_, responder, _) = discord;
     let route = TopologyRoute {
@@ -1710,40 +1708,6 @@ fn pane_ids_from_agents(agents: &[AgentSnapshot]) -> Vec<String> {
     ids
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Membership {
-    Add(String),
-    Remove(String),
-}
-
-fn lifecycle_membership(event: &serde_json::Value) -> Option<Membership> {
-    match event.get(EVENT_KEY)?.as_str()? {
-        "pane_created" => event
-            .pointer("/data/pane/pane_id")
-            .and_then(serde_json::Value::as_str)
-            .map(|id| Membership::Add(id.to_owned())),
-        "pane_closed" => event
-            .pointer("/data/pane_id")
-            .and_then(serde_json::Value::as_str)
-            .map(|id| Membership::Remove(id.to_owned())),
-        "pane_agent_detected" => {
-            let pane_id = event
-                .pointer("/data/pane_id")
-                .and_then(serde_json::Value::as_str)?;
-            if event
-                .pointer("/data/released")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                Some(Membership::Remove(pane_id.to_owned()))
-            } else {
-                Some(Membership::Add(pane_id.to_owned()))
-            }
-        }
-        _ => None,
-    }
-}
-
 fn lifecycle_closure(event: &serde_json::Value) -> Option<TopologyClosure> {
     match event.get(EVENT_KEY)?.as_str()? {
         "tab_closed" => Some(TopologyClosure::Tab {
@@ -1754,23 +1718,6 @@ fn lifecycle_closure(event: &serde_json::Value) -> Option<TopologyClosure> {
             workspace_id: event.pointer("/data/workspace_id")?.as_str()?.to_owned(),
         }),
         _ => None,
-    }
-}
-
-fn apply_membership(pane_ids: &mut Vec<String>, change: Membership) -> bool {
-    match change {
-        Membership::Add(id) => {
-            if let Err(index) = pane_ids.binary_search(&id) {
-                pane_ids.insert(index, id);
-                true
-            } else {
-                false
-            }
-        }
-        Membership::Remove(id) => pane_ids.binary_search(&id).is_ok_and(|index| {
-            pane_ids.remove(index);
-            true
-        }),
     }
 }
 
@@ -1883,19 +1830,6 @@ async fn apply_lifecycle_event<C: Chat>(
     {
         bridge_eprintln!("chat topology rename error: {error}");
     }
-    if !runtime.state.ignore_test_runs
-        && let Some(change) = lifecycle_membership(event)
-        && apply_membership(&mut runtime.pane_ids, change)
-    {
-        let Some(next_status) = unwrap_or_shutdown(
-            subscribe_snapshot_status(&mut runtime.pane_ids, stop, &runtime.state).await,
-            broker,
-        ) else {
-            return false;
-        };
-        runtime.status = next_status;
-    }
-
     if let Some(closure) = lifecycle_closure(event) {
         let id = match &closure {
             TopologyClosure::Tab { tab_id, .. } => tab_id,
@@ -2101,6 +2035,36 @@ async fn subscribe_status_with_backoff(
     }
 }
 
+fn update_mirrored_topology(
+    previous: &mut HashSet<String>,
+    current: HashSet<String>,
+    live_workspaces: &HashSet<String>,
+    live_tabs: &HashSet<String>,
+) -> Vec<TopologyClosure> {
+    let current_workspaces = current
+        .iter()
+        .filter(|id| !id.contains(':'))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let previous = std::mem::replace(previous, current);
+    previous
+        .into_iter()
+        .filter_map(|id| {
+            if let Some((workspace, _)) = id.split_once(':') {
+                (current_workspaces.contains(workspace) && !live_tabs.contains(&id)).then(|| {
+                    TopologyClosure::Tab {
+                        workspace_id: workspace.to_owned(),
+                        tab_id: id.clone(),
+                    }
+                })
+            } else {
+                (!live_workspaces.contains(&id))
+                    .then_some(TopologyClosure::Workspace { workspace_id: id })
+            }
+        })
+        .collect()
+}
+
 async fn apply_herdr_snapshot<C: Chat>(
     discord: &ChatConnection<C>,
     state: &mut BridgeState<C>,
@@ -2119,23 +2083,11 @@ async fn apply_herdr_snapshot<C: Chat>(
             .iter()
             .map(|agent| agent.terminal_id.clone())
             .collect();
-        let test_workspaces: HashSet<&str> = workspaces
+        let live_workspaces = workspaces
             .iter()
-            .filter(|workspace| {
-                workspace
-                    .label
-                    .starts_with(herdr_connect_rs::TEST_RUN_PREFIX)
-            })
-            .map(|workspace| workspace.workspace_id.as_str())
+            .map(|workspace| workspace.workspace_id.clone())
             .collect();
-        state.mirrored_topology.retain(|id| {
-            !test_workspaces.contains(id.as_str())
-                && !tabs.iter().any(|tab| {
-                    &tab.tab_id == id
-                        && (test_workspaces.contains(tab.workspace_id.as_str())
-                            || tab.label.starts_with(herdr_connect_rs::TEST_RUN_PREFIX))
-                })
-        });
+        let live_tabs = tabs.iter().map(|tab| tab.tab_id.clone()).collect();
         herdr_connect_rs::retain_mirrored(&mut agents, &mut tabs, &workspaces);
         let included_terminals: HashSet<String> = agents
             .iter()
@@ -2145,17 +2097,26 @@ async fn apply_herdr_snapshot<C: Chat>(
             .difference(&included_terminals)
             .cloned()
             .collect();
-        state.mirrored_topology.extend(
-            workspaces
-                .into_iter()
-                .filter(|workspace| {
-                    !workspace
-                        .label
-                        .starts_with(herdr_connect_rs::TEST_RUN_PREFIX)
-                })
-                .map(|workspace| workspace.workspace_id)
-                .chain(tabs.iter().map(|tab| tab.tab_id.clone())),
-        );
+        let current = workspaces
+            .into_iter()
+            .filter(|workspace| {
+                !workspace
+                    .label
+                    .starts_with(herdr_connect_rs::TEST_RUN_PREFIX)
+            })
+            .map(|workspace| workspace.workspace_id)
+            .chain(tabs.iter().map(|tab| tab.tab_id.clone()))
+            .collect();
+        for closure in update_mirrored_topology(
+            &mut state.mirrored_topology,
+            current,
+            &live_workspaces,
+            &live_tabs,
+        ) {
+            if let Err(error) = discord.0.close_topology(&closure).await {
+                bridge_eprintln!("chat departed topology error: {error}");
+            }
+        }
     }
     for error in name_unlabeled_tabs(&agents, &mut tabs, &mut state.rename_errors_reported) {
         bridge_eprintln!("{error}");
@@ -2235,10 +2196,7 @@ async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let chat = Arc::new(Slack::from_env().await?.with_ignore_test_runs(true));
     chat.connect_socket(std::env::var("SLACK_APP_TOKEN")?)
         .await?;
-    let identity = OwnerIdentity {
-        display_name: chat.owner_id().to_owned(),
-        avatar_url: None,
-    };
+    let identity = chat.owner_identity().clone();
     let responder = Arc::new(PermissionResponder::new(chat.clone()).with_ignore_test_runs(true));
     let (notices_tx, notices_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -2343,12 +2301,11 @@ mod tests {
     };
 
     use super::{
-        BridgeRuntime, BridgeState, BrokerTask, Client, Discord, Follower, Membership,
-        PermissionResponder, SessionPathError, TopologyClosure, TopologyRoute,
-        agent_read_detection, apply_membership, capture_for_with_search_root,
-        create_transition_messages, fetch_startup_owner_identity, handle_lifecycle_select_result,
-        handle_live_event, initial_terminal_prompt_position, lifecycle_closure,
-        lifecycle_membership, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
+        BridgeRuntime, BridgeState, BrokerTask, Client, Discord, Follower, PermissionResponder,
+        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection,
+        capture_for_with_search_root, create_transition_messages, fetch_startup_owner_identity,
+        handle_lifecycle_select_result, handle_live_event, initial_terminal_prompt_position,
+        lifecycle_closure, list_agents, live_log_path, maybe_establish_terminal_prompt_baseline,
         next_state_change_sequence, process_snapshot, prune_departed_state,
         read_new_terminal_prompts, resolve_session_path, route_topology,
         subscribe_status_with_backoff, sync_startup_topology, tab_list_result,
@@ -2904,55 +2861,13 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_membership_matches_real_payload_shapes() {
+    fn lifecycle_closure_matches_real_payload_shapes() {
         use serde_json::json;
-
-        let created = json!({"event": "pane_created", "data": {"pane": {"pane_id": "w1:p1"}}});
-        assert_eq!(
-            lifecycle_membership(&created),
-            Some(Membership::Add("w1:p1".to_owned()))
-        );
-
-        let closed = json!({"event": "pane_closed", "data": {"pane_id": "w1:p2"}});
-        assert_eq!(
-            lifecycle_membership(&closed),
-            Some(Membership::Remove("w1:p2".to_owned()))
-        );
-
-        let detected = json!({
-            "event": "pane_agent_detected",
-            "data": {"pane_id": "w1:p3", "released": false}
-        });
-        assert_eq!(
-            lifecycle_membership(&detected),
-            Some(Membership::Add("w1:p3".to_owned()))
-        );
-
-        let released = json!({
-            "event": "pane_agent_detected",
-            "data": {"pane_id": "w1:p4", "released": true}
-        });
-        assert_eq!(
-            lifecycle_membership(&released),
-            Some(Membership::Remove("w1:p4".to_owned()))
-        );
-
-        let mut pane_ids = vec!["w1:p1".to_owned()];
-        assert!(!apply_membership(
-            &mut pane_ids,
-            Membership::Add("w1:p1".to_owned())
-        ));
-        assert!(apply_membership(
-            &mut pane_ids,
-            Membership::Add("w1:p2".to_owned())
-        ));
-        assert_eq!(pane_ids, vec!["w1:p1".to_owned(), "w1:p2".to_owned()]);
 
         let tab_closed = json!({
             "event": "tab_closed",
             "data": {"tab_id": "w32:t2", "type": "tab_closed", "workspace_id": "w32"}
         });
-        assert_eq!(lifecycle_membership(&tab_closed), None);
         assert_eq!(
             lifecycle_closure(&tab_closed),
             Some(TopologyClosure::Tab {
@@ -2978,7 +2893,6 @@ mod tests {
                 }
             }
         });
-        assert_eq!(lifecycle_membership(&workspace_closed), None);
         assert_eq!(
             lifecycle_closure(&workspace_closed),
             Some(TopologyClosure::Workspace {
@@ -4250,6 +4164,195 @@ mod tests {
             remaining_tabs(DETECTION_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
+    }
+
+    #[cfg(unix)]
+    async fn native_shared_tab_working(
+        workspace: &Workspace,
+        cwd: &str,
+    ) -> Result<Vec<(&'static str, bool)>, String> {
+        let env = passthrough_env_args();
+        let mut args = vec![
+            "pane",
+            "split",
+            &workspace.pane_id,
+            "--direction",
+            "right",
+            "--cwd",
+            cwd,
+            "--no-focus",
+        ];
+        for value in &env {
+            args.extend(["--env", value]);
+        }
+        let split = herdr_json(&args)?;
+        let second = split["result"]["pane"]["pane_id"]
+            .as_str()
+            .ok_or("pane split omitted pane_id")?;
+        let settings = Path::new(cwd).join("testrun-settings.json");
+        fs::write(
+            &settings,
+            r#"{"permissions":{"allow":["Bash(python3:*)"]}}"#,
+        )
+        .map_err(|error| error.to_string())?;
+        let nonce = agent_name_nonce()?;
+        start_claude_haiku_agent_with_settings(
+            &format!("snapshot-first-{nonce}"),
+            &workspace.pane_id,
+            &settings,
+        )?;
+        start_claude_haiku_agent_with_settings(
+            &format!("snapshot-second-{nonce}"),
+            second,
+            &settings,
+        )?;
+        wait_for_status(second, &[STATUS_IDLE, STATUS_DONE], Duration::from_secs(20)).await?;
+        submit_owner_prompt(
+            &workspace.pane_id,
+            "Use Bash now to run exactly `python3 -c 'import time; time.sleep(60)'` in the foreground. Do not run anything else.",
+        )?;
+        wait_for_status(
+            &workspace.pane_id,
+            &[STATUS_WORKING],
+            Duration::from_secs(20),
+        )
+        .await?;
+        let agents = list_agents()?
+            .into_iter()
+            .filter(|agent| agent.tab_id == workspace.tab_id)
+            .collect::<Vec<_>>();
+        println!(
+            "native shared-tab statuses: {:?}",
+            agents
+                .iter()
+                .map(|agent| (&agent.pane_id, &agent.agent_status))
+                .collect::<Vec<_>>()
+        );
+        let mut reversed = agents.clone();
+        reversed.reverse();
+        Ok(vec![
+            (
+                "real shared tab has working and settled panes",
+                agents.len() == 2
+                    && agents
+                        .iter()
+                        .any(|agent| agent.agent_status == STATUS_WORKING)
+                    && agents.iter().any(|agent| {
+                        matches!(agent.agent_status.as_str(), STATUS_IDLE | STATUS_DONE)
+                    }),
+            ),
+            (
+                "shared-tab status stays working",
+                super::tab_is_working(&agents, &workspace.tab_id),
+            ),
+            (
+                "shared-tab status ignores pane order",
+                super::tab_is_working(&reversed, &workspace.tab_id),
+            ),
+        ])
+    }
+
+    #[cfg(unix)]
+    fn refresh_owned_topology(
+        previous: &mut HashSet<String>,
+        workspace: &str,
+    ) -> Result<Vec<TopologyClosure>, String> {
+        let workspaces = workspace_list_result()?
+            .into_iter()
+            .map(|item| item.workspace_id)
+            .collect::<HashSet<_>>();
+        let tabs = tab_list_result()?
+            .into_iter()
+            .map(|tab| tab.tab_id)
+            .collect::<HashSet<_>>();
+        let current = workspaces
+            .iter()
+            .filter(|id| id.as_str() == workspace)
+            .chain(
+                tabs.iter()
+                    .filter(|id| id.split_once(':').is_some_and(|(id, _)| id == workspace)),
+            )
+            .cloned()
+            .collect();
+        Ok(super::update_mirrored_topology(
+            previous,
+            current,
+            &workspaces,
+            &tabs,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn native_topology_departures(
+        workspace: &Workspace,
+        cwd: &str,
+    ) -> Result<Vec<(&'static str, bool)>, String> {
+        let sibling = create_tab("testrun-departed", &workspace.id, cwd)?;
+        let mut previous = HashSet::new();
+        let initial = refresh_owned_topology(&mut previous, &workspace.id)?;
+        let cached = previous.contains(&workspace.id)
+            && previous.contains(&workspace.tab_id)
+            && previous.contains(&sibling.tab_id);
+        herdr_json(&["tab", "close", &sibling.tab_id])?;
+        let tabs = refresh_owned_topology(&mut previous, &workspace.id)?;
+        let tab_pruned =
+            !previous.contains(&sibling.tab_id) && previous.contains(&workspace.tab_id);
+        herdr_json(&["workspace", "close", &workspace.id])?;
+        let workspaces = refresh_owned_topology(&mut previous, &workspace.id)?;
+        let late = refresh_owned_topology(&mut previous, &workspace.id)?;
+        Ok(vec![
+            ("initial live topology cached", cached && initial.is_empty()),
+            (
+                "closed tab pruned and closure retained",
+                tab_pruned
+                    && tabs
+                        == vec![TopologyClosure::Tab {
+                            workspace_id: workspace.id.clone(),
+                            tab_id: sibling.tab_id,
+                        }],
+            ),
+            (
+                "closed workspace pruned and one closure retained",
+                previous.is_empty()
+                    && workspaces
+                        == vec![TopologyClosure::Workspace {
+                            workspace_id: workspace.id.clone(),
+                        }],
+            ),
+            ("late snapshot does not repeat closures", late.is_empty()),
+        ])
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn native_snapshot_aggregates_tab_working_and_prunes_closed_topology()
+    -> Result<(), String> {
+        let label = format!("testrun-snapshot-state-{}", agent_name_nonce()?);
+        let cwd = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("HOME is required")?
+            .join(".cache/herdr-connect-testrun")
+            .join(&label);
+        fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
+        let cwd_text = cwd.to_str().ok_or("test cwd must be UTF-8")?;
+        let workspace = create_workspace(&label, cwd_text)?;
+        let outcome = async {
+            let mut checks = native_shared_tab_working(&workspace, cwd_text).await?;
+            checks.extend(native_topology_departures(&workspace, cwd_text)?);
+            Ok::<_, String>(checks)
+        }
+        .await;
+        close_workspace(&workspace.id);
+        let leftovers = remaining_workspaces(&label)?;
+        fs::remove_dir_all(&cwd).map_err(|error| error.to_string())?;
+        println!("named zero-leftover check: {leftovers} owned Herdr workspaces");
+        assert_eq!(leftovers, 0, "named zero-leftover check");
+        for (case, observed) in outcome? {
+            println!("real native snapshot: {case}: {observed}");
+            assert!(observed, "{case}");
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -8717,7 +8820,7 @@ mod tests {
         seen.extend(notices.try_iter());
         let dispatched = seen
             .iter()
-            .filter(|notice| notice.starts_with("discord gateway deletion:"))
+            .filter(|notice| notice.starts_with("chat gateway deletion:"))
             .cloned()
             .collect();
         let errors = seen
@@ -8762,7 +8865,7 @@ mod tests {
             .delete_channel(thread.id)
             .await
             .map_err(|error| error.to_string());
-        let seen = deletion_notices(notices, "discord gateway deletion: THREAD_DELETE").await;
+        let seen = deletion_notices(notices, "chat gateway deletion: THREAD_DELETE").await;
         gateway.abort();
         deleted?;
         expect_no_deletion_errors(&seen?.1)?;
@@ -8908,7 +9011,7 @@ mod tests {
             .delete_channel(thread.id)
             .await
             .map_err(|error| error.to_string());
-        let seen = deletion_notices(notices, "discord gateway deletion: THREAD_DELETE").await;
+        let seen = deletion_notices(notices, "chat gateway deletion: THREAD_DELETE").await;
         gateway.abort();
         deleted?;
         expect_no_deletion_errors(&seen?.1)?;
@@ -9012,7 +9115,7 @@ mod tests {
             .delete_channel(channel.id)
             .await
             .map_err(|error| error.to_string());
-        let seen = deletion_notices(notices, "discord gateway deletion: CHANNEL_DELETE").await;
+        let seen = deletion_notices(notices, "chat gateway deletion: CHANNEL_DELETE").await;
         gateway.abort();
         deleted?;
         expect_no_deletion_errors(&seen?.1)?;
@@ -9385,9 +9488,9 @@ mod tests {
             .await
         };
         let dispatch = if delete_thread {
-            "discord gateway deletion: THREAD_DELETE"
+            "chat gateway deletion: THREAD_DELETE"
         } else {
-            "discord gateway deletion: CHANNEL_DELETE"
+            "chat gateway deletion: CHANNEL_DELETE"
         };
         let seen = deletion_notices(notices, dispatch).await;
         gateway.abort();
@@ -9422,9 +9525,9 @@ mod tests {
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         for ((name, delete_thread), (_, outcome)) in cases.into_iter().zip(outcomes) {
             let dispatch = if delete_thread {
-                "discord gateway deletion: THREAD_DELETE"
+                "chat gateway deletion: THREAD_DELETE"
             } else {
-                "discord gateway deletion: CHANNEL_DELETE"
+                "chat gateway deletion: CHANNEL_DELETE"
             };
             assert_eq!(
                 outcome.and_then(|(dispatched, errors)| {
