@@ -3670,17 +3670,17 @@ mod tests {
 
     #[cfg(unix)]
     fn claude_testrun_dir(home: &Path) -> PathBuf {
-        home.join(".cache/herdr-connect-testrun/claude")
+        home.join(".cache/herdr-connect-testrun/testrun-claude")
     }
 
     #[cfg(unix)]
     fn cursor_testrun_dir(home: &Path) -> PathBuf {
-        home.join(".cache/herdr-connect-testrun/cursor")
+        home.join(".cache/herdr-connect-testrun/testrun-cursor")
     }
 
     #[cfg(unix)]
     fn codex_testrun_dir(home: &Path) -> PathBuf {
-        home.join(".cache/herdr-connect-testrun/codex")
+        home.join(".cache/herdr-connect-testrun/testrun-codex")
     }
 
     #[cfg(unix)]
