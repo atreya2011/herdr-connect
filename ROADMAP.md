@@ -6,7 +6,7 @@ This file preserves the product information needed after the historical TypeScri
 
 Before new implementation work:
 
-1. Keep the Discord service running in service scope with `testrun-` exclusion enabled. Test bridges for both adapters default to test-only scope. Service-filter verification may explicitly select service scope and inspect events without driving production handlers or enabling the production registry; tests mutate and clean up only their own `testrun-` resources. Ensure that no other Socket Mode connection uses the Slack test app before a Slack test connects. The service stays Discord-only.
+1. Keep the Discord service running in service scope with `testrun-` exclusion enabled. Test bridges for both adapters default to test-only scope. Service-filter verification may explicitly select service scope and inspect events without driving production handlers or enabling the production registry; tests mutate and clean up only their own `testrun-` resources. A Slack service-sweep probe requires no active non-testrun bridge channels in the test workspace; orphan an owned `testrun-` channel, verify its name and unarchived state are preserved, then rename and archive it in test-only scope. Ensure that no other Socket Mode connection uses the Slack test app before a Slack test connects. The service stays Discord-only.
 2. Run formatting and strict lint gates.
 3. Run the full real-service suite serially with `.env` exported without printing it.
 4. Confirm that no `testrun-` Discord channels or threads and no unarchived `testrun-` Slack channels remain. Slack tests clean up by archiving; archived channels do not count as leftovers.

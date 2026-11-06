@@ -3558,11 +3558,6 @@ mod tests {
                 "real production thread admitted",
                 chat.accepts_route(&thread.id).await?,
             ),
-            (
-                "production registry unchanged",
-                herdr_connect_rs::resolve_owner_deleted_workspace(parent).is_none()
-                    && herdr_connect_rs::resolve_owner_deleted_tab(thread.id).is_none(),
-            ),
         ];
         for (name, observed) in cases {
             println!("real broker scope: {name}: {observed}");

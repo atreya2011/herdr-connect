@@ -167,9 +167,11 @@ async fn exercise_topology(
             .name
             .as_deref()
             .is_some_and(|name| name.starts_with("testrun-"))
-            && !after
-                .iter()
-                .any(|entry| entry.id == channel.id && entry.flags.is_archived != Some(true))
+            && !after.iter().any(|entry| {
+                entry.id == channel.id
+                    && entry.name == channel.name
+                    && entry.flags.is_archived != Some(true)
+            })
         {
             return Err("non-test channel changed".into());
         }
@@ -559,11 +561,24 @@ fn test_question() -> Question {
     }
 }
 
-async fn sweep_preserving_channels(
+fn check_sweep_channels(
     slack: &Slack,
-    routes: Vec<Result<TopologyRoute, String>>,
+    before: &[SlackChannelInfo],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let before = slack.channels().await?;
+    if slack.scope() == ChatScope::Service
+        && before.iter().any(|channel| {
+            !channel
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("testrun-"))
+                && channel
+                    .topic
+                    .as_ref()
+                    .is_some_and(|topic| topic.value.starts_with("herdr workspace ["))
+        })
+    {
+        return Err("service sweep refused while a non-test bridge channel exists".into());
+    }
     let live = (
         workspace_list_result()?
             .into_iter()
@@ -574,7 +589,7 @@ async fn sweep_preserving_channels(
             .map(|entry| entry.tab_id)
             .collect::<HashSet<_>>(),
     );
-    for channel in &before {
+    for channel in before {
         if channel
             .name
             .as_deref()
@@ -617,6 +632,15 @@ async fn sweep_preserving_channels(
             return Err("sweep would rename a non-test channel; refused before sweep".into());
         }
     }
+    Ok(())
+}
+
+async fn sweep_preserving_channels(
+    slack: &Slack,
+    routes: Vec<Result<TopologyRoute, String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before = slack.channels().await?;
+    check_sweep_channels(slack, &before)?;
     slack
         .startup_sweep(routes, || {
             Ok((
@@ -637,13 +661,54 @@ async fn sweep_preserving_channels(
             .name
             .as_deref()
             .is_some_and(|name| name.starts_with("testrun-"))
-            && !after
-                .iter()
-                .any(|entry| entry.id == channel.id && entry.flags.is_archived != Some(true))
+            && !after.iter().any(|entry| {
+                entry.id == channel.id
+                    && entry.name == channel.name
+                    && entry.flags.is_archived != Some(true)
+            })
         {
             return Err("non-test channel changed during startup sweep".into());
         }
     }
+    Ok(())
+}
+
+async fn preserve_service_orphan(
+    service: &Slack,
+    route: &TopologyRoute,
+    channel: &SlackChannelId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = SlackClient::new(SlackClientHyperConnector::new()?);
+    let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
+    let session = client.open_session(&token);
+    let request = SlackApiConversationsInfoRequest::new(channel.clone());
+    let name = session
+        .conversations_info(&request)
+        .await?
+        .channel
+        .name
+        .ok_or("owned Slack channel has no name")?;
+    herdr(&["workspace", "close", &route.workspace_id])?;
+    if workspace_list_result()?
+        .iter()
+        .any(|workspace| workspace.workspace_id == route.workspace_id)
+        || tab_list_result()?
+            .iter()
+            .any(|tab| tab.tab_id == route.tab_id)
+    {
+        return Err("owned workspace/tab did not become an orphan".into());
+    }
+    sweep_preserving_channels(service, Vec::new()).await?;
+    let after = session.conversations_info(&request).await?.channel;
+    let same_name = after.name.as_deref() == Some(name.as_str());
+    if after.flags.is_archived != Some(false) || !same_name {
+        return Err(format!(
+            "service sweep changed owned orphan: archived={:?} same_name={same_name}",
+            after.flags.is_archived
+        )
+        .into());
+    }
+    println!("service sweep preserved orphan: unarchived=true same_name=true");
     Ok(())
 }
 
@@ -653,6 +718,13 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
     let slack = Slack::from_env().await?;
     let route = create_route()?;
     let result = async {
+        let filtered = Slack::from_env()
+            .await?
+            .with_scope(ChatScope::Service)
+            .with_ignore_test_runs(true);
+        if filtered.sync_route(&route).await.is_ok() {
+            return Err("service excludes test route".into());
+        }
         sweep_preserving_channels(&slack, vec![Ok(route.clone())]).await?;
         let found = slack
             .cached_route(&route)
@@ -685,21 +757,7 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
             .await?
             .iter()
             .any(|channel| channel.id == old.channel);
-        let filtered = Slack::from_env()
-            .await?
-            .with_scope(ChatScope::Service)
-            .with_ignore_test_runs(true);
-        let excluded = filtered.sync_route(&route).await.is_err();
-        if !excluded {
-            return Err("service excludes test route".into());
-        }
-        sweep_preserving_channels(&filtered, Vec::new()).await?;
-        let preserved = slack
-            .channels()
-            .await?
-            .iter()
-            .any(|channel| channel.id == found.channel);
-        herdr(&["workspace", "close", &route.workspace_id])?;
+        preserve_service_orphan(&filtered, &route, &found.channel).await?;
         sweep_preserving_channels(&slack, Vec::new()).await?;
         let client = SlackClient::new(SlackClientHyperConnector::new()?);
         let token = SlackApiToken::new(token.into());
@@ -724,8 +782,6 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
             .channel;
         Ok::<_, Box<dyn std::error::Error>>(vec![
             ("startup archives closed tab channel", tab_removed),
-            ("service excludes test route", excluded),
-            ("service sweep preserves test channel", preserved),
             (
                 "startup archives closed workspace",
                 archived.flags.is_archived == Some(true),
