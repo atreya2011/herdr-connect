@@ -22,13 +22,12 @@ use herdr_connect_rs::{
     TopologyCache, TopologyClosure, TopologyRoute, Transition, TransitionMessage,
     agent_read_detection, create_transition_messages, dialog_shows_question, drive_gateway,
     fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
-    format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, list_mirrored, live_message_nonce, load_discord_config, name_unlabeled_tabs,
-    read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
-    read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
-    route_is_test_run, route_topology, split_live_message, status_subscriptions,
-    subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
-    workspace_list_result,
+    format_detection_question, hook_timeout, is_postable_transition, list_agents, list_mirrored,
+    live_message_nonce, load_discord_config, name_unlabeled_tabs, read_claude_incremental,
+    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
+    read_cursor_incremental, read_cursor_prompts_incremental, route_is_test_run, route_topology,
+    split_live_message, status_subscriptions, subscribe_herdr_events, tab_list_result,
+    take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -1867,6 +1866,13 @@ async fn apply_lifecycle_event<C: Chat>(
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime<C>,
 ) -> bool {
+    if matches!(
+        event.get("event").and_then(serde_json::Value::as_str),
+        Some("workspace_renamed" | "tab_renamed")
+    ) && let Err(error) = discord.0.topology_changed().await
+    {
+        bridge_eprintln!("chat topology rename error: {error}");
+    }
     if !runtime.state.ignore_test_runs
         && let Some(change) = lifecycle_membership(event)
         && apply_membership(&mut runtime.pane_ids, change)
@@ -1964,7 +1970,7 @@ async fn handle_lifecycle_subscribe_error<C: Chat>(
 ) -> bool {
     bridge_eprintln!("herdr lifecycle subscribe error: {error}");
     let Some(next_lifecycle) = unwrap_or_shutdown(
-        subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), stop).await,
+        subscribe_herdr_events_with_backoff(&discord.0.lifecycle_subscriptions(), stop).await,
         broker,
     ) else {
         return false;
@@ -2204,15 +2210,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    let chat = Arc::new(
-        Slack::new(
-            std::env::var("SLACK_BOT_TOKEN")?,
-            "U0CEYEYSKT5".into(),
-            "T0CF6JNT0KB",
-        )
-        .await?
-        .with_ignore_test_runs(true),
-    );
+    let chat = Arc::new(Slack::from_env().await?.with_ignore_test_runs(true));
     chat.connect_socket(std::env::var("SLACK_APP_TOKEN")?)
         .await?;
     let identity = OwnerIdentity {
@@ -2250,7 +2248,8 @@ async fn run_connected_bridge<C: Chat>(
     };
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let Some(lifecycle) = unwrap_or_shutdown(
-        subscribe_herdr_events_with_backoff(&lifecycle_subscriptions(), &mut stop).await,
+        subscribe_herdr_events_with_backoff(&connection.0.lifecycle_subscriptions(), &mut stop)
+            .await,
         &mut broker,
     ) else {
         return Ok(());

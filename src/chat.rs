@@ -81,6 +81,12 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Deletion: Display + Send + 'static;
 
     fn owner_id(&self) -> &str;
+    fn lifecycle_subscriptions(&self) -> Vec<serde_json::Value> {
+        crate::lifecycle_subscriptions()
+    }
+    fn topology_changed(&self) -> impl Future<Output = Result<(), ChatError>> + Send {
+        async { Ok(()) }
+    }
     fn sync_route(
         &self,
         route: &TopologyRoute,

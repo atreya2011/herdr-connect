@@ -2,9 +2,7 @@ use std::collections::HashSet;
 
 use slack_morphism::prelude::*;
 
-use super::{
-    Slack, SlackArchive, SlackRoute, SlackSocketEvent, delivery::escape, error, workspace_id,
-};
+use super::{Slack, SlackArchive, SlackRoute, SlackSocketEvent, delivery::escape, error, identity};
 use crate::{
     Ack, Chat, ChatError, Closed, Component, Inbound, OwnerIdentity, OwnerMessage,
     PermissionVendor, Question, TopologyClosure, TopologyRoute, TransitionMessage,
@@ -22,14 +20,11 @@ impl Slack {
         {
             return Ok(None);
         }
-        let Some(message) = action
+        let Some(_message) = action
             .message
             .as_ref()
             .filter(|message| message.sender.user.as_ref() == Some(&self.bot))
         else {
-            return Ok(None);
-        };
-        let Some(thread) = message.origin.thread_ts.clone() else {
             return Ok(None);
         };
         let Some(channel) = action.channel.as_ref() else {
@@ -37,14 +32,14 @@ impl Slack {
         };
         let route = SlackRoute {
             channel: channel.id.clone(),
-            thread: Some(thread),
+            thread: None,
         };
         let mut topology = self.topology.lock().await;
-        if !topology.threads.values().any(|entry| entry == &route) {
+        if !topology.tabs.values().any(|entry| entry == &route) {
             self.load(&mut topology).await?;
         }
         let mapped = topology
-            .threads
+            .tabs
             .iter()
             .find(|(_, entry)| *entry == &route)
             .and_then(|(tab, _)| {
@@ -53,7 +48,7 @@ impl Slack {
                     .iter()
                     .find(|channel| channel.id == route.channel)
                     .and_then(|channel| {
-                        workspace_id(channel).map(|workspace| (workspace.to_owned(), tab.clone()))
+                        identity(channel).map(|(workspace, _)| (workspace.to_owned(), tab.clone()))
                     })
             });
         drop(topology);
@@ -107,6 +102,17 @@ impl Chat for Slack {
     fn owner_id(&self) -> &str {
         &self.owner.0
     }
+    fn lifecycle_subscriptions(&self) -> Vec<serde_json::Value> {
+        let mut subscriptions = crate::lifecycle_subscriptions();
+        subscriptions.extend([
+            serde_json::json!({"type":"workspace.renamed"}),
+            serde_json::json!({"type":"tab.renamed"}),
+        ]);
+        subscriptions
+    }
+    async fn topology_changed(&self) -> Result<(), ChatError> {
+        self.refresh_names().await
+    }
 
     async fn sync_route(&self, route: &TopologyRoute) -> Result<SlackRoute, ChatError> {
         self.sync(route, false).await
@@ -118,23 +124,11 @@ impl Chat for Slack {
         &self,
         route: &TopologyRoute,
     ) -> Result<(SlackRoute, SlackRoute), ChatError> {
-        let thread = self.sync(route, false).await?;
-        Ok((
-            SlackRoute {
-                channel: thread.channel.clone(),
-                thread: None,
-            },
-            thread,
-        ))
+        let channel = self.sync(route, false).await?;
+        Ok((channel.clone(), channel))
     }
     async fn cached_route(&self, route: &TopologyRoute) -> Result<Option<SlackRoute>, ChatError> {
-        Ok(self
-            .topology
-            .lock()
-            .await
-            .threads
-            .get(&route.tab_id)
-            .cloned())
+        Ok(self.topology.lock().await.tabs.get(&route.tab_id).cloned())
     }
     async fn register_archived(&self) -> Result<(), ChatError> {
         Ok(())
@@ -204,7 +198,16 @@ impl Chat for Slack {
         message: &SlackTs,
         text: &str,
     ) -> Result<(), ChatError> {
-        self.update(route, message, text).await
+        let question = self.question_text.lock().await.remove(message);
+        if text == "resolved: pane left blocked" {
+            let text = question.map_or_else(
+                || "resolved".to_owned(),
+                |question| format!("{question}\n\nResolved"),
+            );
+            self.update(route, message, &text).await
+        } else {
+            self.update(route, message, text).await
+        }
     }
     async fn post_question_card(
         &self,
@@ -262,19 +265,11 @@ impl Chat for Slack {
             .ok_or_else(|| error("Slack interaction has no user"))?;
         self.client
             .open_session(&self.token)
-            .chat_post_ephemeral(
-                &SlackApiChatPostEphemeralRequest::new(
-                    channel.id.clone(),
-                    user.id.clone(),
-                    SlackMessageContent::new().with_text(escape(text)),
-                )
-                .opt_thread_ts(
-                    interaction
-                        .message
-                        .as_ref()
-                        .and_then(|message| message.origin.thread_ts.clone()),
-                ),
-            )
+            .chat_post_ephemeral(&SlackApiChatPostEphemeralRequest::new(
+                channel.id.clone(),
+                user.id.clone(),
+                SlackMessageContent::new().with_text(escape(text)),
+            ))
             .await
             .map_err(error)?;
         Ok(())
@@ -294,7 +289,20 @@ impl Chat for Slack {
         _message: &SlackTs,
         text: &str,
     ) -> Result<(), ChatError> {
-        self.send(route, text).await.map(drop)
+        if text.starts_with("accepted:") {
+            self.client
+                .open_session(&self.token)
+                .chat_post_ephemeral(&SlackApiChatPostEphemeralRequest::new(
+                    route.channel.clone(),
+                    self.owner.clone(),
+                    SlackMessageContent::new().with_text(escape(text)),
+                ))
+                .await
+                .map_err(error)?;
+            Ok(())
+        } else {
+            self.send(route, text).await.map(drop)
+        }
     }
     async fn owner_message(
         &self,

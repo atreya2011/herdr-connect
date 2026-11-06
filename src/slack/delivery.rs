@@ -22,7 +22,6 @@ impl Slack {
         content: SlackMessageContent,
     ) -> Result<SlackTs, ChatError> {
         let request = SlackApiChatPostMessageRequest::new(route.channel.clone(), content)
-            .opt_thread_ts(route.thread.clone())
             .with_parse("none".into())
             .with_unfurl_links(false)
             .with_unfurl_media(false);
@@ -93,7 +92,7 @@ impl Slack {
         {
             let mut topology = self.topology.lock().await;
             topology.loaded = false;
-            topology.threads.clear();
+            topology.tabs.clear();
         }
     }
 
@@ -110,11 +109,47 @@ impl Slack {
         Ok(())
     }
 
+    pub(super) async fn use_status_message(
+        &self,
+        route: &SlackRoute,
+        message: &SlackTs,
+    ) -> Result<(), ChatError> {
+        let previous = self
+            .status_messages
+            .lock()
+            .await
+            .insert(route.channel.clone(), message.clone());
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous != message)
+        {
+            let task = self.working.lock().await.remove(route);
+            if let Some(Some(task)) = task {
+                task.abort();
+            }
+            if let Some(previous) = previous {
+                self.client
+                    .open_session(&self.token)
+                    .assistant_threads_set_status(&SlackApiAssistantThreadsSetStatusRequest::new(
+                        route.channel.clone(),
+                        String::new(),
+                        previous,
+                    ))
+                    .await
+                    .map_err(error)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn set_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
-        let thread = route
-            .thread
-            .clone()
-            .ok_or_else(|| error("working status needs a tab thread"))?;
+        let thread = self
+            .status_messages
+            .lock()
+            .await
+            .get(&route.channel)
+            .cloned()
+            .ok_or_else(|| error("working status needs an owner message"))?;
         self.client
             .open_session(&self.token)
             .assistant_threads_set_status(&SlackApiAssistantThreadsSetStatusRequest::new(
@@ -128,6 +163,14 @@ impl Slack {
     }
 
     pub async fn track_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
+        if !self
+            .status_messages
+            .lock()
+            .await
+            .contains_key(&route.channel)
+        {
+            return Ok(());
+        }
         let mut tasks = self.working.lock().await;
         if tasks
             .get(route)
@@ -146,10 +189,13 @@ impl Slack {
                 route.clone(),
                 self.events_tx.clone(),
             );
-            let thread = route
-                .thread
-                .clone()
-                .ok_or_else(|| error("working status needs a tab thread"))?;
+            let thread = self
+                .status_messages
+                .lock()
+                .await
+                .get(&route.channel)
+                .cloned()
+                .ok_or_else(|| error("working status needs an owner message"))?;
             let key = route.clone();
             tasks.insert(
                 key,
@@ -184,6 +230,9 @@ impl Slack {
 impl Drop for Slack {
     fn drop(&mut self) {
         for task in self.working.get_mut().values().flatten() {
+            task.abort();
+        }
+        for (_, task) in self.renames.get_mut().values() {
             task.abort();
         }
     }

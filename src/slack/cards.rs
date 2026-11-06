@@ -64,8 +64,14 @@ impl Slack {
         question: &Question,
         token: &str,
     ) -> Result<SlackTs, ChatError> {
-        self.send_content(route, question_content(question, token, &self.owner)?)
+        let message = self
+            .send_content(route, question_content(question, token, &self.owner)?)
+            .await?;
+        self.question_text
+            .lock()
             .await
+            .insert(message.clone(), question.question.clone());
+        Ok(message)
     }
 
     pub async fn update_question(
@@ -80,6 +86,11 @@ impl Slack {
             message,
             question_content(question, token, &self.owner)?,
         )
-        .await
+        .await?;
+        self.question_text
+            .lock()
+            .await
+            .insert(message.clone(), question.question.clone());
+        Ok(())
     }
 }

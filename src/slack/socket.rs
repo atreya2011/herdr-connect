@@ -5,7 +5,7 @@ use std::time::Duration;
 use slack_morphism::prelude::*;
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 
-use super::{Slack, SlackRoute, error, tab_id, workspace_id};
+use super::{Slack, SlackRoute, error, identity};
 use crate::{ChatError, Closed};
 
 pub enum SlackSocketEvent {
@@ -181,9 +181,6 @@ impl Slack {
         let Some(channel) = posted.origin.channel else {
             return Ok(None);
         };
-        let Some(thread) = posted.origin.thread_ts.filter(|ts| ts != &posted.origin.ts) else {
-            return Ok(None);
-        };
         let info = self
             .client
             .open_session(&self.token)
@@ -199,40 +196,26 @@ impl Slack {
         {
             return Ok(None);
         }
-        let Some(workspace) = workspace_id(&info) else {
+        let Some((workspace, tab)) = identity(&info) else {
             return Ok(None);
         };
-        let messages = self.history(&channel).await?;
-        let Some(parent) = messages.iter().find(|message| message.origin.ts == thread) else {
-            return Ok(None);
-        };
-        if self.ignore_test_runs
-            && parent
-                .content
-                .text
-                .as_deref()
-                .is_some_and(|text| text.starts_with("testrun-"))
-        {
+        if self.excluded(workspace, tab).await? {
             return Ok(None);
         }
-        let Some(tab) = tab_id(parent, workspace, &self.bot) else {
-            return Ok(None);
+        let route = SlackRoute {
+            channel,
+            thread: None,
         };
-        if self.excluded(workspace, &tab).await? {
-            return Ok(None);
-        }
+        self.use_status_message(&route, &posted.origin.ts).await?;
         let content = posted
             .content
             .and_then(|content| content.text)
             .unwrap_or_default();
         Ok(Some((
-            SlackRoute {
-                channel,
-                thread: Some(thread),
-            },
+            route,
             posted.origin.ts,
             content,
-            tab,
+            tab.to_owned(),
             workspace.to_owned(),
         )))
     }
@@ -273,21 +256,19 @@ impl Slack {
         {
             return Ok(());
         }
-        let Some(workspace) = workspace_id(&channel) else {
+        let Some((workspace, tab)) = identity(&channel) else {
             return Ok(());
         };
-        if self.excluded(workspace, "").await? {
+        if self.excluded(workspace, tab).await? {
             return Ok(());
         }
-        let workspace = workspace.to_owned();
-        tokio::task::spawn_blocking(move || close(Closed::Workspace(workspace)))
+        let tab = tab.to_owned();
+        tokio::task::spawn_blocking(move || close(Closed::Tab(tab)))
             .await
             .map_err(error)?
             .map_err(error)?;
         topology.channels.retain(|entry| entry.id != channel.id);
-        topology
-            .threads
-            .retain(|_, route| route.channel != channel.id);
+        topology.tabs.retain(|_, route| route.channel != channel.id);
         drop(topology);
         Ok(())
     }
