@@ -164,6 +164,22 @@ mod tests {
         plain_channel: GuildDeletion,
     }
 
+    impl RecordedDeletionFixture {
+        fn register_deletion(&self, deletion: &GuildDeletion, registered: bool) {
+            forget_owned(self.threads[0].id);
+            forget_owned(self.threads[1].id);
+            if let GuildDeletion::Channel(channel) = deletion {
+                forget_owned(channel.id);
+                if registered {
+                    remember_workspace_channels(std::slice::from_ref(channel));
+                }
+            }
+            if registered {
+                remember_tab_threads(&self.threads);
+            }
+        }
+    }
+
     fn recorded_deletion_fixture() -> RecordedDeletionFixture {
         let mut recorded: std::collections::HashMap<String, AuditLog> = serde_json::from_str(
             include_str!("../tests/fixtures/discord_audit_log_deletions.json"),
@@ -252,6 +268,7 @@ mod tests {
         let fixture = recorded_deletion_fixture();
         let thread_entries = &fixture.thread_entries;
         let channel_entries = &fixture.channel_entries;
+        let on_channel = &fixture.on_channel;
         let mut without_user = channel_entries[0].clone();
         without_user.user_id = None;
         let owner = OWNER.to_string();
@@ -265,14 +282,14 @@ mod tests {
             ),
             (
                 "the owner deletes a workspace channel",
-                &fixture.on_channel,
+                on_channel,
                 vec![channel_entries[0].clone()],
                 Some(Close::Workspace("testrun-b".to_owned())),
                 true,
             ),
             (
                 "the owner entry follows a bot entry",
-                &fixture.on_channel,
+                on_channel,
                 vec![channel_entries[1].clone(), channel_entries[0].clone()],
                 Some(Close::Workspace("testrun-b".to_owned())),
                 true,
@@ -293,7 +310,7 @@ mod tests {
             ),
             (
                 "an entry without a user",
-                &fixture.on_channel,
+                on_channel,
                 vec![without_user],
                 None,
                 true,
@@ -312,13 +329,7 @@ mod tests {
                 None,
                 true,
             ),
-            (
-                "no audit log entry",
-                &fixture.on_channel,
-                Vec::new(),
-                None,
-                true,
-            ),
+            ("no audit log entry", on_channel, Vec::new(), None, true),
             (
                 "the target has no audit log entry",
                 &fixture.no_entry_channel,
@@ -334,6 +345,13 @@ mod tests {
                 false,
             ),
             (
+                "the owner deletes an unregistered channel with a workspace topic",
+                on_channel,
+                vec![channel_entries[0].clone()],
+                None,
+                false,
+            ),
+            (
                 "the owner deletes a channel with no workspace topic",
                 &fixture.plain_channel,
                 vec![channel_entries[0].clone()],
@@ -342,11 +360,7 @@ mod tests {
             ),
         ];
         for (name, deletion, entries, expected, registered) in cases {
-            forget_owned(fixture.threads[0].id);
-            forget_owned(fixture.threads[1].id);
-            if registered {
-                remember_tab_threads(&fixture.threads);
-            }
+            fixture.register_deletion(deletion, registered);
             assert_eq!(decide_close(deletion, &entries, &owner), expected, "{name}");
         }
     }
