@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, Discord, Inbound, archived_threads, list_agents, list_mirrored, owned_thread_is_test_run,
-    route_is_test_run, tab_list_result, topology_absent_from_herdr, workspace_list_result,
+    Chat, ChatScope, Discord, Inbound, archived_threads, list_agents, list_mirrored,
+    owned_thread_is_test_run, route_is_test_run, tab_list_result, topology_absent_from_herdr,
+    workspace_list_result,
 };
 use serde_json::Value;
 use serial_test::serial;
@@ -257,6 +258,11 @@ impl Fixture {
     }
 
     fn chat(&self, filtered: bool) -> Arc<Discord> {
+        let scope = if filtered {
+            ChatScope::Service
+        } else {
+            ChatScope::TestRuns
+        };
         Arc::new(
             Discord::new(
                 self.client.clone(),
@@ -265,6 +271,7 @@ impl Fixture {
                 self.owner.clone(),
                 Arc::new(tokio::sync::Mutex::new(None)),
             )
+            .with_scope(scope)
             .with_ignore_test_runs(filtered),
         )
     }
@@ -519,12 +526,19 @@ impl Fixture {
         }
         fs::remove_dir_all(&self.directory)?;
         preserved(&self.client, &self.before).await?;
-        let (channels, threads) = topology(&self.client, self.guild).await?;
-        let count = channels
-            .iter()
-            .chain(&threads)
-            .filter(|channel| test_name(channel))
-            .count();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let count = loop {
+            let (channels, threads) = topology(&self.client, self.guild).await?;
+            let count = channels
+                .iter()
+                .chain(&threads)
+                .filter(|channel| test_name(channel))
+                .count();
+            if count == 0 || tokio::time::Instant::now() >= deadline {
+                break count;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
         println!("named zero-leftover check: {count} testrun Discord channels and threads");
         assert_eq!(count, 0);
         Ok(())

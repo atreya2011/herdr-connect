@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, Inbound, PermissionVendor, Question, QuestionOption, Slack, TopologyClosure,
+    Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Slack, TopologyClosure,
     TopologyRoute, slack_channel_name, tab_list_result, workspace_list_result,
 };
 use serde_json::Value;
@@ -685,8 +685,14 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
             .await?
             .iter()
             .any(|channel| channel.id == old.channel);
-        let filtered = Slack::from_env().await?.with_ignore_test_runs(true);
+        let filtered = Slack::from_env()
+            .await?
+            .with_scope(ChatScope::Service)
+            .with_ignore_test_runs(true);
         let excluded = filtered.sync_route(&route).await.is_err();
+        if !excluded {
+            return Err("service excludes test route".into());
+        }
         sweep_preserving_channels(&filtered, Vec::new()).await?;
         let preserved = slack
             .channels()

@@ -1664,6 +1664,18 @@ fn parse_activity_args(
     ))
 }
 
+fn broker_responder(
+    client: Arc<Client>,
+    token: String,
+    guild: Id<GuildMarker>,
+    owner_id: String,
+) -> Arc<PermissionResponder<Discord>> {
+    let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+    let chat =
+        Discord::new(client, token, guild, owner_id, topology_cache).with_scope(ChatScope::Service);
+    Arc::new(PermissionResponder::new(Arc::new(chat)))
+}
+
 async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path =
         socket_path(args).ok_or("broker requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>")?;
@@ -1677,14 +1689,8 @@ async fn run_broker(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     ])?;
     let guild = Id::<GuildMarker>::new(config.guild_id.parse()?);
     let client = Arc::new(Client::builder().token(config.token.clone()).build());
-    let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
-    let responder = Arc::new(PermissionResponder::new(Arc::new(Discord::new(
-        Arc::clone(&client),
-        config.token,
-        guild,
-        config.owner_id,
-        topology_cache,
-    ))));
+    herdr_connect_rs::enable_production_topology();
+    let responder = broker_responder(client, config.token, guild, config.owner_id);
     let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
     drop(activity_rx);
     run_permission_broker(&socket_path, responder, activity_tx)
@@ -3474,6 +3480,95 @@ mod tests {
             owner_id: std::env::var("DISCORD_OWNER_ID").ok()?,
         };
         Some(guild)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn broker_service_scope_admits_real_production_metadata() -> Result<(), String> {
+        let guild = blocked_capture_guild().ok_or("real Discord environment is required")?;
+        let responder = super::broker_responder(
+            guild.client.clone(),
+            std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
+            guild.id,
+            guild.owner_id.clone(),
+        );
+        let channels = guild
+            .client
+            .guild_channels(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let threads = guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .threads;
+        let workspaces = workspace_list_result()?;
+        let tabs = tab_list_result()?;
+        let selected = tabs
+            .iter()
+            .filter(|tab| {
+                !tab.label.starts_with("testrun-")
+                    && workspaces.iter().any(|workspace| {
+                        workspace.workspace_id == tab.workspace_id
+                            && !workspace.label.starts_with("testrun-")
+                    })
+            })
+            .find_map(|tab| {
+                let topic = format!("herdr workspace [{}]", tab.workspace_id);
+                let parent = channels.iter().find(|channel| {
+                    !is_test_channel(channel) && channel.topic.as_deref() == Some(topic.as_str())
+                })?;
+                let suffix = format!(" [{}]", tab.tab_id);
+                let thread = threads.iter().find(|thread| {
+                    thread.parent_id == Some(parent.id)
+                        && !is_test_channel(thread)
+                        && thread
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.ends_with(&suffix))
+                })?;
+                Some((tab, parent, thread))
+            })
+            .ok_or("requires an existing production Herdr tab and Discord channel/thread")?;
+        let (tab, parent, thread) = selected;
+        let chat = responder.chat();
+        let cases = [
+            (
+                "same CLI constructor selects Service",
+                chat.scope() == super::ChatScope::Service,
+            ),
+            (
+                "real production Herdr tab admitted",
+                chat.accepts_herdr_route(&tab.workspace_id, &tab.tab_id)
+                    .await?,
+            ),
+            (
+                "real production channel admitted",
+                chat.accepts_route(&parent.id).await?,
+            ),
+            (
+                "real production thread admitted",
+                chat.accepts_route(&thread.id).await?,
+            ),
+            (
+                "production registry unchanged",
+                herdr_connect_rs::resolve_owner_deleted_workspace(parent).is_none()
+                    && herdr_connect_rs::resolve_owner_deleted_tab(thread.id).is_none(),
+            ),
+        ];
+        for (name, observed) in cases {
+            println!("real broker scope: {name}: {observed}");
+            assert!(observed, "{name}");
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

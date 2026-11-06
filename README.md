@@ -64,7 +64,7 @@ For Discord, identity is the topic and the `[tab_id]` suffix. Existing Discord n
 
   Answers type the native dialog keys through Herdr: an option number for single select; option numbers, `right`, and a final `enter` for multiple choice; the free-text option number, text, and `enter` for free text. A multi-question call updates one card as each answer advances the dialog, with an extra `enter` to submit the final single-select or free-text answer on its review screen. Before typing, the bridge rechecks the dialog. A terminal answer retires the card or advances it to the next question; failed input asks the owner to answer in the terminal. When the pane leaves blocked, Discord shows `resolved: pane left blocked`; Slack retains the question with a Resolved label. Partially toggled terminal choices remain in place when a chat answer is typed.
 
-Production Discord and Slack runs exclude `testrun-` Herdr workspaces, tabs, chat channels, and Discord threads or threads under test channels. Their messages, buttons, and close events are ignored, and cleanup preserves their topology. Both adapters default to test-only scope: inbound messages, buttons, deletions, and archives require both a test chat resource and a `testrun-` Herdr workspace or tab. Production events receive no response; Discord test deletion registries contain only test topology. Tests create and clean up only their own resources. Run tests serially with the Discord service up; allow only one Socket Mode connection to the Slack test app. The service stays Discord-only.
+The no-argument Discord bridge and the `slack` bridge exclude `testrun-` Herdr workspaces, tabs, chat channels, and Discord threads or threads under test channels. Their messages, buttons, and close events are ignored, and cleanup preserves their topology. Both adapters default to test-only scope: inbound messages, buttons, deletions, and archives require both a test chat resource and a `testrun-` Herdr workspace or tab. Production events receive no response; Discord test deletion registries contain only test topology. Tests create and clean up only their own resources. Run tests serially with the Discord service up; allow only one Socket Mode connection to the Slack test app. The service stays Discord-only.
 
 ## Configuration
 
@@ -77,7 +77,7 @@ Production Discord and Slack runs exclude `testrun-` Herdr workspaces, tabs, cha
 - `SLACK_APP_TOKEN`
 - `SLACK_OWNER_ID`
 
-Set `HERDR_SOCKET_PATH` if the Herdr socket is not the default. Slack discovers its team through `auth.test`. Its bot needs `users:read` and `chat:write.customize` to mirror prompts with the owner profile. Never print or commit `.env`. Keep one production bridge per chat destination. Both adapters default to test-only scope; the no-argument and `slack` entry points select service scope.
+Set `HERDR_SOCKET_PATH` if the Herdr socket is not the default. Slack discovers its team through `auth.test`. Its bot needs `users:read` and `chat:write.customize` to mirror prompts with the owner profile. Never print or commit `.env`. Keep one production bridge per chat destination. Both adapters default to test-only scope; the no-argument, `slack`, and `broker` entry points select service scope. Standalone `broker` keeps test-run exclusion disabled.
 
 The no-argument command selects Discord. Use `cargo run -- slack` for Slack; keep that connection closed while tests use the same Slack app.
 
