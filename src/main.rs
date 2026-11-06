@@ -221,35 +221,40 @@ async fn handle_blocked_card<C: Chat>(context: BlockedCardContext<'_, C>) {
 const PENDING_QUESTION_WAIT: Duration = Duration::from_secs(3);
 const PENDING_QUESTION_POLL: Duration = Duration::from_millis(500);
 
-const QUESTION_DIALOG_MARKER: &str = "Type something.";
-
 async fn shown_question(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
     detection: Option<&str>,
 ) -> Option<(Vec<Question>, usize)> {
-    let detection = detection?;
-    format_detection_question(detection)?;
-    let wait = detection.contains(QUESTION_DIALOG_MARKER);
+    let mut detection = detection?.to_owned();
     let deadline = tokio::time::Instant::now() + PENDING_QUESTION_WAIT;
-    let mut last_error: Option<String>;
+    let mut last_error = None;
     loop {
-        match pending_questions(snapshot, session) {
-            Ok(questions) => {
-                last_error = None;
-                if let Some(index) = questions
-                    .iter()
-                    .position(|question| dialog_shows_question(detection, question))
-                {
-                    return Some((questions, index));
+        if format_detection_question(&detection).is_some() {
+            match pending_questions(snapshot, session) {
+                Ok(questions) => {
+                    last_error = None;
+                    if let Some(index) = questions
+                        .iter()
+                        .position(|question| dialog_shows_question(&detection, question))
+                    {
+                        return Some((questions, index));
+                    }
                 }
+                Err(error) => last_error = Some(error),
             }
-            Err(error) => last_error = Some(error),
         }
-        if !wait || tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(PENDING_QUESTION_POLL).await;
+        match agent_read_detection(&snapshot.pane_id) {
+            Ok(current) => detection = current,
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
     }
     if let Some(error) = last_error {
         bridge_eprintln!("agent blocked-context capture error: {error}");
