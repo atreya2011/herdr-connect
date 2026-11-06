@@ -3692,6 +3692,23 @@ mod tests {
 
     #[cfg(unix)]
     fn create_workspace(label: &str, cwd: &str) -> Result<Workspace, String> {
+        let workspace = create_workspace_with_numeric_tab(label, cwd)?;
+        let output = Command::new("herdr")
+            .args(["tab", "rename", &workspace.tab_id, label])
+            .output()
+            .map_err(|error| format!("herdr tab rename spawn failed: {error}"))?;
+        if !output.status.success() {
+            close_workspace(&workspace.id);
+            return Err(format!(
+                "herdr tab rename failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(workspace)
+    }
+
+    #[cfg(unix)]
+    fn create_workspace_with_numeric_tab(label: &str, cwd: &str) -> Result<Workspace, String> {
         let mut args = vec![
             "workspace",
             "create",
@@ -3719,16 +3736,6 @@ mod tests {
             .as_str()
             .ok_or("herdr workspace create result missing pane_id")?
             .to_owned();
-        let output = Command::new("herdr")
-            .args(["tab", "rename", &tab_id, label])
-            .output()
-            .map_err(|error| format!("herdr tab rename spawn failed: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "herdr tab rename failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
         Ok(Workspace {
             id: workspace_id,
             tab_id,
@@ -7155,28 +7162,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn create_unlabeled_tab(workspace_id: &str, cwd: &str) -> Result<Tab, String> {
-        let created = herdr_json(&[
-            "tab",
-            "create",
-            "--workspace",
-            workspace_id,
-            "--cwd",
-            cwd,
-            "--no-focus",
-        ])?;
-        let tab_id = created["result"]["tab"]["tab_id"]
-            .as_str()
-            .ok_or("herdr tab create result missing tab_id")?
-            .to_owned();
-        let pane_id = created["result"]["root_pane"]["pane_id"]
-            .as_str()
-            .ok_or("herdr tab create result missing pane_id")?
-            .to_owned();
-        Ok(Tab { tab_id, pane_id })
-    }
-
-    #[cfg(unix)]
     async fn unlabeled_tab_gets_a_generated_name_exercise(
         guild: &BlockedCaptureGuild,
         tab: &Tab,
@@ -7256,8 +7241,6 @@ mod tests {
             "named zero-leftover check"
         );
 
-        let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
-            .expect("HERDR_WORKSPACE_ID is set by the real Herdr pane environment");
         let cwd_dir = std::env::temp_dir().join(format!(
             "testrun-unlabeled-{}-{}",
             std::process::id(),
@@ -7269,48 +7252,40 @@ mod tests {
         fs::create_dir_all(&cwd_dir).expect("create unlabeled-tab test cwd");
         let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
 
-        let created = create_unlabeled_tab(&workspace_id, cwd);
-        let (tab_id, result) = match created {
-            Ok(tab) => {
-                let outcome = unlabeled_tab_gets_a_generated_name_exercise(&guild, &tab).await;
-                (Some(tab.tab_id), outcome)
-            }
-            Err(error) => (None, Err(error)),
+        let workspace = create_workspace_with_numeric_tab("testrun-unlabeled", cwd)
+            .expect("testrun workspace is created");
+        let tab = Tab {
+            tab_id: workspace.tab_id,
+            pane_id: workspace.pane_id,
         };
-        let topic = format!("herdr workspace [{workspace_id}]");
-        let thread_cleanup = match &tab_id {
-            Some(tab_id) => delete_tab_threads(&guild, &topic, tab_id).await,
-            None => Ok(()),
-        };
-        if let Some(tab_id) = &tab_id {
-            close_tab(tab_id);
-        }
+        let result = unlabeled_tab_gets_a_generated_name_exercise(&guild, &tab).await;
+        let topic = format!("herdr workspace [{}]", workspace.id);
+        let thread_cleanup = delete_tab_threads(&guild, &topic, &tab.tab_id).await;
+        close_workspace(&workspace.id);
         let _ = fs::remove_dir_all(&cwd_dir);
 
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
         assert!(thread_cleanup.is_ok(), "{thread_cleanup:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
-        if let Some(tab_id) = &tab_id {
-            if let Some(channel) = guild_channels_for_guild(&guild)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
-            {
-                assert!(
-                    !thread_with_suffix_survives(&guild, channel.id, &format!(" [{tab_id}]"))
-                        .await
-                        .unwrap(),
-                    "named zero-leftover check"
-                );
-            }
-            let tabs = tab_list_result().expect("tab.list succeeds for the zero-leftover check");
+        if let Some(channel) = guild_channels_for_guild(&guild)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
+        {
             assert!(
-                !tabs.iter().any(|listed| &listed.tab_id == tab_id),
+                !thread_with_suffix_survives(&guild, channel.id, &format!(" [{}]", tab.tab_id))
+                    .await
+                    .unwrap(),
                 "named zero-leftover check"
             );
         }
+        let tabs = tab_list_result().expect("tab.list succeeds for the zero-leftover check");
+        assert!(
+            !tabs.iter().any(|listed| listed.tab_id == tab.tab_id),
+            "named zero-leftover check"
+        );
     }
 
     #[cfg(unix)]
