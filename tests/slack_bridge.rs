@@ -3,7 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Slack, TopologyClosure, TopologyRoute, tab_list_result, workspace_list_result,
+    Slack, SlackArchive, SlackSocketEvent, TopologyClosure, TopologyRoute, tab_list_result,
+    workspace_list_result,
 };
 use serde_json::Value;
 use slack_morphism::prelude::*;
@@ -287,6 +288,79 @@ async fn slack_delivery_real_thread() -> Result<(), Box<dyn std::error::Error>> 
         Ok::<_, Box<dyn std::error::Error>>(checks)
     }
     .await;
+    let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    assert_eq!(
+        leftovers, 0,
+        "zero-leftover check: unarchived testrun- Slack channels"
+    );
+    for (name, passed) in result? {
+        assert!(passed, "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
+    let slack = Slack::new(
+        std::env::var("SLACK_BOT_TOKEN")?,
+        "U0CEYEYSKT5".into(),
+        "T0CF6JNT0KB",
+    )
+    .await?;
+    let route = create_route()?;
+    let result = async {
+        slack
+            .connect_socket(std::env::var("SLACK_APP_TOKEN")?)
+            .await?;
+        let found = slack.sync(&route, false).await?;
+        let sent = slack.send(&found, "testrun socket delivery").await?;
+        let received = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(SlackSocketEvent::Push(event)) = slack.next_socket_event().await
+                    && let SlackEventCallbackBody::Message(message) = event.event
+                    && message.origin.ts == sent
+                {
+                    break message;
+                }
+            }
+        })
+        .await?;
+        let ignored = slack.resolve_owner_message(received).await?.is_none();
+        slack
+            .close(&TopologyClosure::Workspace {
+                workspace_id: route.workspace_id.clone(),
+            })
+            .await?;
+        let archive = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(SlackSocketEvent::Push(event)) = slack.next_socket_event().await
+                    && let SlackEventCallbackBody::ChannelArchive(archive) = event.event
+                    && archive.channel == found.channel
+                {
+                    break archive;
+                }
+            }
+        })
+        .await?;
+        let non_owner_archive = archive.user != SlackUserId::from("U0CEYEYSKT5");
+        slack
+            .close_archived(SlackArchive(archive), |_| {
+                Err("bot archive must never close Herdr".into())
+            })
+            .await?;
+        Ok::<_, Box<dyn std::error::Error>>(vec![
+            ("bot message ignored as owner prompt", ignored),
+            ("archive has actual non-owner actor", non_owner_archive),
+            (
+                "non-owner archive leaves Herdr alive",
+                workspace_list_result()?
+                    .iter()
+                    .any(|entry| entry.workspace_id == route.workspace_id),
+            ),
+        ])
+    }
+    .await;
+    slack.shutdown_socket().await;
     let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
     assert_eq!(
         leftovers, 0,

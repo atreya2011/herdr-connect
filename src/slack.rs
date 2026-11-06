@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 use crate::{ChatError, TopologyClosure, TopologyRoute, workspace_list_result};
 
 mod delivery;
+mod socket;
+pub use socket::{SlackArchive, SlackSocketEvent};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SlackRoute {
@@ -27,8 +29,12 @@ pub struct Slack {
     token: SlackApiToken,
     owner: SlackUserId,
     bot: SlackUserId,
+    team: String,
     topology: Mutex<Topology>,
     ignore_test_runs: bool,
+    listener: Mutex<Option<SlackClientSocketModeListener<SlackClientHyperHttpsConnector>>>,
+    events_tx: tokio::sync::mpsc::UnboundedSender<SlackSocketEvent>,
+    events: Mutex<tokio::sync::mpsc::UnboundedReceiver<SlackSocketEvent>>,
 }
 
 fn error(error: impl Display) -> ChatError {
@@ -96,13 +102,18 @@ impl Slack {
         if auth.team_id.to_string() != team {
             return Err(error("Slack token belongs to another team"));
         }
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             client,
             token,
             owner: owner.into(),
             bot: auth.user_id,
+            team: team.to_owned(),
             topology: Mutex::new(Topology::default()),
             ignore_test_runs: false,
+            listener: Mutex::new(None),
+            events_tx,
+            events: Mutex::new(events),
         })
     }
 

@@ -76,7 +76,7 @@ pub use readers::{
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
     read_cursor_incremental, read_cursor_prompts_incremental,
 };
-pub use slack::{Slack, SlackRoute};
+pub use slack::{Slack, SlackArchive, SlackRoute, SlackSocketEvent};
 pub use topology::{
     TopologyCache, TopologyRoute, archived_threads, cached_route, channel_is_test_run,
     delete_tab_thread, delete_thread_created_message, delete_topology_absent_from_herdr,

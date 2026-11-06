@@ -6,6 +6,8 @@ The Slack adapter uses `slack-morphism` with `SLACK_BOT_TOKEN`. It creates a pub
 
 Slack replies and activity messages go into the tab thread. Terminal prompts are labeled bot messages identifying the owner; they do not impersonate the owner. Working status uses `assistant.threads.setStatus`, with an empty status clearing it. A successful API call does not establish that the Slack app displays the indicator; that still needs owner verification.
 
+Socket Mode uses `SLACK_APP_TOKEN` and one connection. Messages qualify only when authored by the owner in a bot tab thread under a workspace topic. Only a `channel_archive` event naming the owner can close the corresponding Herdr workspace. Bot archives, other users, channel deletion events, and deleted parent messages do not prove owner intent and close nothing.
+
 ## Architecture
 
 Discord and Herdr do not share a socket. This process sits between them.
