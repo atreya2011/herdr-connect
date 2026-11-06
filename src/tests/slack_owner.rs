@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    AgentSnapshot, Chat, ChatError, Closed, Inbound, OwnerIdentity, PermissionResponder, Slack,
-    SlackRoute, handle_component, handle_owner_message, workspace_close, workspace_list_result,
+    AgentSnapshot, Chat, ChatError, Closed, Inbound, PermissionResponder, Slack, SlackRoute,
+    handle_component, handle_owner_message, workspace_close, workspace_list_result,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -17,8 +17,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::{
-    Workspace, activity_binary_path, herdr_json, matching_tab, passthrough_env_args,
-    snapshot_for_pane, transcript_question_answer,
+    Follower, Workspace, activity_binary_path, herdr_json, matching_tab, passthrough_env_args,
+    read_new_terminal_prompts, resolve_session_path, snapshot_for_pane, transcript_question_answer,
 };
 use crate::{
     BridgeState, ChatConnection, handle_activity_event, handle_live_event, process_snapshot,
@@ -51,6 +51,14 @@ enum Goal {
         tap: &'static str,
     },
     Archived,
+    ReviewPrompt,
+    ReviewAnswer(String),
+    ReviewConfirmation(&'static str),
+}
+
+enum Exercise {
+    Acceptance,
+    Review,
 }
 
 struct Driver {
@@ -68,6 +76,7 @@ struct Driver {
     clock: tokio::time::Interval,
     messages: Vec<SlackHistoryMessage>,
     owner_texts: Vec<String>,
+    decoded_texts: Vec<(String, String)>,
     taps: Vec<String>,
     working_confirmed: bool,
     working_observed: bool,
@@ -230,10 +239,7 @@ impl Owned {
             connection: (
                 self.chat.clone(),
                 responder,
-                OwnerIdentity {
-                    display_name: self.chat.owner_id().to_owned(),
-                    avatar_url: None,
-                },
+                self.chat.owner_identity().clone(),
             ),
             pane: workspace.pane_id.clone(),
             workspace: workspace.id.clone(),
@@ -251,6 +257,7 @@ impl Owned {
             clock: tokio::time::interval(Duration::from_secs(2)),
             messages: Vec::new(),
             owner_texts: Vec::new(),
+            decoded_texts: Vec::new(),
             taps: Vec::new(),
             working_confirmed: false,
             working_observed: false,
@@ -446,43 +453,61 @@ impl Driver {
         Ok(())
     }
 
+    async fn owner_posted(&mut self, posted: &SlackMessageEvent) -> Result<bool, String> {
+        if posted
+            .sender
+            .user
+            .as_ref()
+            .is_none_or(|user| user.0 != self.connection.0.owner_id())
+            || posted.sender.bot_id.is_some()
+            || posted.subtype.is_some()
+        {
+            return Ok(false);
+        }
+        let text = posted
+            .content
+            .as_ref()
+            .and_then(|content| content.text.clone())
+            .ok_or("owner message has no text")?;
+        self.owner_texts.push(text.clone());
+        if let Some(message) = self
+            .connection
+            .0
+            .owner_message(posted.clone())
+            .await
+            .map_err(String::from)?
+        {
+            self.decoded_texts.push((text.clone(), message.content));
+        }
+        if let Goal::ReviewConfirmation(expected) = self.goal
+            && text.trim() == expected
+        {
+            return Ok(true);
+        }
+        if matches!(self.goal, Goal::Working) {
+            match text.trim() {
+                "STATUS VISIBLE" => {
+                    self.working_confirmed = self.snapshot.agent_status == "working";
+                    return Ok(true);
+                }
+                "STATUS NOT VISIBLE" => {
+                    return Err(
+                        "owner reports working status is not visible in the channel view".into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     async fn inbound(&mut self, event: Inbound<Slack>) -> Result<(), String> {
         match event {
             Inbound::Posted(posted)
                 if posted.origin.channel.as_ref() == Some(&self.route.channel) =>
             {
-                if posted
-                    .sender
-                    .user
-                    .as_ref()
-                    .is_some_and(|user| user.0 == self.connection.0.owner_id())
-                    && posted.sender.bot_id.is_none()
-                    && posted.subtype.is_none()
-                {
-                    let text = posted
-                        .content
-                        .as_ref()
-                        .and_then(|content| content.text.clone())
-                        .ok_or("owner message has no text")?;
-                    self.owner_texts.push(text.clone());
-                    if matches!(self.goal, Goal::Working) {
-                        match text.trim() {
-                            "STATUS VISIBLE" => {
-                                self.connection
-                                    .0
-                                    .owner_message(posted)
-                                    .await
-                                    .map_err(String::from)?;
-                                self.working_confirmed = self.snapshot.agent_status == "working";
-                                return Ok(());
-                            }
-                            "STATUS NOT VISIBLE" => return Err(
-                                "owner reports working status is not visible in the channel view"
-                                    .into(),
-                            ),
-                            _ => {}
-                        }
-                    }
+                if self.owner_posted(&posted).await? {
+                    return Ok(());
                 }
                 let responder = self.connection.1.clone();
                 self.tasks
@@ -628,12 +653,114 @@ impl Driver {
                 };
                 Ok(answered && input && self.settled()?)
             }
+            Goal::ReviewPrompt => self.review_prompt_observed(),
+            Goal::ReviewAnswer(question) => self.review_answer_observed(question),
+            Goal::ReviewConfirmation(expected) => {
+                Ok(self.owner_texts.iter().any(|text| text.trim() == *expected))
+            }
             Goal::Archived => Ok(self.archived_by_owner
                 && tab_list_result()?.iter().all(|tab| tab.tab_id != self.tab)
                 && workspace_list_result()?
                     .iter()
                     .any(|workspace| workspace.workspace_id == self.workspace)),
         }
+    }
+
+    fn decoded_review_text(&self, prefix: &str, rich: bool) -> Result<Option<&str>, String> {
+        let Some((raw, decoded)) = self
+            .decoded_texts
+            .iter()
+            .find(|(_, decoded)| decoded.starts_with(prefix))
+        else {
+            return Ok(None);
+        };
+        let mut checks = vec![
+            ("encoded ampersand", raw.contains("&amp;")),
+            ("encoded less-than", raw.contains("&lt;")),
+            ("encoded greater-than", raw.contains("&gt;")),
+            ("decoded entities", decoded.contains("A & B < C > D")),
+            (
+                "no raw entities or link markup",
+                !["&amp;", "&lt;", "&gt;", "<https://", "<@", "<#"]
+                    .iter()
+                    .any(|value| decoded.contains(value)),
+            ),
+        ];
+        if rich {
+            checks.extend([
+                (
+                    "plain URL delivered",
+                    raw.contains("<https://example.com") && decoded.contains("https://example.com"),
+                ),
+                (
+                    "labeled URL decoded",
+                    raw.contains("|Example>") && decoded.contains("Example (https://example.org"),
+                ),
+                (
+                    "owner mention decoded",
+                    raw.contains(&format!("<@{}>", self.connection.0.owner_id()))
+                        && decoded.contains(&format!("@{}", self.connection.0.owner_id())),
+                ),
+                (
+                    "channel mention decoded",
+                    raw.contains(&format!("<#{}", self.route.channel)) && decoded.contains('#'),
+                ),
+            ]);
+        }
+        for (case, observed) in checks {
+            if !observed {
+                return Err(format!(
+                    "real Slack decoding observation failed: {case}; raw={raw:?}; decoded={decoded:?}"
+                ));
+            }
+        }
+        Ok(Some(decoded))
+    }
+
+    fn review_prompt_observed(&self) -> Result<bool, String> {
+        if !self.bot_said("DECODE PROMPT OK") || !self.settled()? {
+            return Ok(false);
+        }
+        let decoded = self
+            .decoded_review_text("Reply with exactly DECODE PROMPT OK", true)?
+            .ok_or("agent replied without the genuine owner encoding message")?;
+        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
+        let session = self
+            .snapshot
+            .session
+            .as_ref()
+            .ok_or("agent has no reported session")?;
+        let path = resolve_session_path(Path::new(&home), &self.snapshot, session)
+            .map_err(|error| error.to_string())?;
+        let (prompts, _) = read_new_terminal_prompts(&path, Follower::Claude(0))?;
+        if !prompts.iter().any(|prompt| prompt == decoded) {
+            return Err(
+                "native Claude transcript does not contain the decoded owner prompt".into(),
+            );
+        }
+        println!(
+            "OWNER OBSERVED: native prompt contains decoded entities, plain and labeled URLs, owner and channel mentions"
+        );
+        Ok(true)
+    }
+
+    fn review_answer_observed(&self, question: &str) -> Result<bool, String> {
+        if !self.bot_said("DECODE ANSWER OK") || !self.settled()? {
+            return Ok(false);
+        }
+        let decoded = self
+            .decoded_review_text("FREE ANSWER A & B", false)?
+            .ok_or("question completed without the genuine encoded owner answer")?;
+        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
+        if transcript_question_answer(Path::new(&home), &self.snapshot, question)?.as_deref()
+            != Some(decoded)
+        {
+            return Err(
+                "native Claude question answer differs from the decoded owner answer".into(),
+            );
+        }
+        println!("OWNER OBSERVED: native free-text answer contains decoded entities");
+        Ok(true)
     }
 
     async fn wait(&mut self, goal: Goal) -> Result<(), String> {
@@ -703,7 +830,7 @@ impl Driver {
         Ok(())
     }
 
-    async fn exercise(&mut self) -> Result<(), String> {
+    async fn ready(&mut self) -> Result<String, String> {
         let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         while !self.settled()? {
             tokio::time::timeout_at(ready_deadline, Box::pin(self.pump()))
@@ -711,10 +838,14 @@ impl Driver {
                 .map_err(|_| "real agent bootstrap did not settle".to_owned())??;
         }
         self.refresh().await?;
-        let channel_url = format!(
+        Ok(format!(
             "https://app.slack.com/client/{}/{}",
             self.team, self.route.channel
-        );
+        ))
+    }
+
+    async fn exercise(&mut self) -> Result<(), String> {
+        let channel_url = self.ready().await?;
         action(&format!(
             "message: open {channel_url} and reply exactly: Reply with exactly SLACK OWNER OK and use no tools."
         ))?;
@@ -753,12 +884,89 @@ impl Driver {
         ))?;
         self.wait(Goal::Archived).await
     }
+
+    async fn ask_review_question(&mut self, multi: bool) -> Result<String, String> {
+        let question = format!(
+            "Slack decoding {} {}?",
+            if multi { "toppings" } else { "free text" },
+            self.tab
+        );
+        let options = if multi {
+            json!([{"label":"Cheese","description":"Add cheese"},{"label":"Olives","description":"Add olives"},{"label":"Mushrooms","description":"Add mushrooms"}])
+        } else {
+            json!([{"label":"Red","description":"The color red"},{"label":"Blue","description":"The color blue"}])
+        };
+        self.prompt(&format!("Use AskUserQuestion now with exactly one question: {}. After its answer, reply only {}. Use no other tools.", json!({"header":"Slack review","question":question,"multiSelect":multi,"options":options}), if multi { "CHOICES RECEIVED" } else { "DECODE ANSWER OK" }))?;
+        let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+        while self
+            .connection
+            .1
+            .pending_question_token(&self.route)
+            .is_none()
+        {
+            tokio::time::timeout_at(deadline, Box::pin(self.pump()))
+                .await
+                .map_err(|_| {
+                    "real review question did not appear within 20 minutes".to_owned()
+                })??;
+        }
+        Ok(question)
+    }
+
+    fn review_question_open(&self, token: &str, case: &str) -> Result<(), String> {
+        let pending = self.connection.1.pending_question_token(&self.route);
+        let status = snapshot_for_pane(&self.pane)?.agent_status;
+        if pending.as_deref() != Some(token) || status != "blocked" {
+            return Err(format!(
+                "{case}: native question left blocked or its pending card changed; status={status} pending={pending:?}"
+            ));
+        }
+        println!("OWNER OBSERVED: {case}: same pending question and native agent remains blocked");
+        Ok(())
+    }
+
+    async fn review(&mut self) -> Result<(), String> {
+        let channel_url = self.ready().await?;
+        action(&format!(
+            "encoding prompt: open {channel_url}. Type: Reply with exactly DECODE PROMPT OK and use no tools. Encoding probe: A & B < C > D https://example.com ; then add a rich link labeled Example to https://example.org using the Slack link editor, mention yourself using @, and mention this channel using #. Send as one message."
+        ))?;
+        self.wait(Goal::ReviewPrompt).await?;
+        let question = self.ask_review_question(false).await?;
+        action(&format!(
+            "free-text answer: in {channel_url}, reply exactly FREE ANSWER A & B < C > D to the real Slack review question card."
+        ))?;
+        self.wait(Goal::ReviewAnswer(question)).await?;
+        let question = self.ask_review_question(true).await?;
+        let token = self
+            .connection
+            .1
+            .pending_question_token(&self.route)
+            .ok_or("review question has no pending token")?;
+        action(&format!(
+            "empty selection: in {channel_url}, click Submit choices without selecting anything. After seeing the ephemeral refused: choose at least one option, post EMPTY REFUSAL VISIBLE. Leave the question unanswered."
+        ))?;
+        self.wait(Goal::ReviewConfirmation("EMPTY REFUSAL VISIBLE"))
+            .await?;
+        self.review_question_open(&token, "empty submission refused")?;
+        action(&format!(
+            "selection only: in {channel_url}, select Cheese and Olives, do not click Submit choices, then post SELECTION ONLY."
+        ))?;
+        self.wait(Goal::ReviewConfirmation("SELECTION ONLY"))
+            .await?;
+        self.review_question_open(&token, "selector change ignored")?;
+        action(&format!(
+            "submit selected choices: in {channel_url}, click Submit choices once. The test will verify the native answer is Cheese, Olives, then clean up only its own resources."
+        ))?;
+        self.wait(Goal::Question {
+            text: question,
+            expected: vec!["Cheese".into(), "Olives".into()],
+            tap: "herdrask-multi:",
+        })
+        .await
+    }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-#[ignore = "requires the real Slack owner to perform each printed action"]
-async fn owner_acceptance_runs_in_order() -> Result<(), String> {
+async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
     let label = format!(
         "testrun-slack-owner-{}-{}",
         std::process::id(),
@@ -793,7 +1001,12 @@ async fn owner_acceptance_runs_in_order() -> Result<(), String> {
         let mut driver = owned.start().await?;
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
         tokio::select! {
-            result = driver.exercise() => result,
+            result = async {
+                match exercise {
+                    Exercise::Acceptance => driver.exercise().await,
+                    Exercise::Review => driver.review().await,
+                }
+            } => result,
             _ = tokio::signal::ctrl_c() => Err("owner acceptance interrupted; cleaning up owned fixtures".into()),
             _ = terminate.recv() => Err("owner acceptance terminated; cleaning up owned fixtures".into()),
         }
@@ -802,4 +1015,18 @@ async fn owner_acceptance_runs_in_order() -> Result<(), String> {
     let cleanup = owned.cleanup().await;
     cleanup?;
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires the real Slack owner to perform each printed action"]
+async fn owner_acceptance_runs_in_order() -> Result<(), String> {
+    run_owner_exercise(Exercise::Acceptance).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires the real Slack owner to post encoded messages and use question cards"]
+async fn owner_review_decodes_messages_and_refuses_empty_choices() -> Result<(), String> {
+    run_owner_exercise(Exercise::Review).await
 }
