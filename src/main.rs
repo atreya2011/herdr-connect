@@ -227,22 +227,23 @@ async fn shown_question(
     detection: Option<&str>,
 ) -> Option<(Vec<Question>, usize)> {
     let mut detection = detection?.to_owned();
+    let question_dialog = |text: &str| {
+        format_detection_question(text).is_some_and(|dialog| dialog.contains("Type something"))
+    };
     let deadline = tokio::time::Instant::now() + PENDING_QUESTION_WAIT;
     let mut last_error = None;
-    loop {
-        if format_detection_question(&detection).is_some() {
-            match pending_questions(snapshot, session) {
-                Ok(questions) => {
-                    last_error = None;
-                    if let Some(index) = questions
-                        .iter()
-                        .position(|question| dialog_shows_question(&detection, question))
-                    {
-                        return Some((questions, index));
-                    }
+    while question_dialog(&detection) {
+        match pending_questions(snapshot, session) {
+            Ok(questions) => {
+                last_error = None;
+                if let Some(index) = questions
+                    .iter()
+                    .position(|question| dialog_shows_question(&detection, question))
+                {
+                    return Some((questions, index));
                 }
-                Err(error) => last_error = Some(error),
             }
+            Err(error) => last_error = Some(error),
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -5969,6 +5970,136 @@ mod tests {
         three options: label \"Cheese\" with description \"Add cheese\", label \"Olives\" with \
         description \"Add olives\", and label \"Mushrooms\" with description \"Add mushrooms\". \
         multiSelect must be true. Do not do anything else and do not say anything else.";
+
+    #[cfg(unix)]
+    async fn blocked_dialog_discovery_exercise(
+        guild: &BlockedCaptureGuild,
+        tab: &Tab,
+        directory: &Path,
+        question: bool,
+    ) -> Result<(Duration, bool, bool, bool), String> {
+        let settings = directory.join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::to_vec(&json!({"permissions": {"ask": ["Bash(touch *)"]}}))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let name = format!("dialog-claude-{}", agent_name_nonce()?);
+        herdr_json(&[
+            "pane",
+            "wait-output",
+            &tab.pane_id,
+            "--match",
+            "╰─",
+            "--timeout",
+            "15000",
+        ])?;
+        herdr_json(&[
+            "agent",
+            "start",
+            &name,
+            "--kind",
+            "claude",
+            "--pane",
+            &tab.pane_id,
+            "--timeout",
+            "60000",
+            "--",
+            "--model",
+            "haiku",
+            "--permission-mode",
+            "manual",
+            "--settings",
+            settings.to_str().ok_or("settings path is not UTF-8")?,
+        ])?;
+        let connection = discord_tuple(guild);
+        let idle = snapshot_for_pane(&tab.pane_id)?;
+        let tabs = [matching_tab(&tab.tab_id)?];
+        let route = route_topology(std::slice::from_ref(&idle), &tabs, &idle.terminal_id)?;
+        let thread = connection.0.sync_route(&route).await?;
+        let mut state = BridgeState::<Discord>::default();
+        own(&idle, &tabs, &connection, &mut state).await;
+        let prompt = if question {
+            MULTI_QUESTION_FORCE_PROMPT
+        } else {
+            "Run exactly `touch testrun-permission-marker` using Bash now. Do nothing else."
+        };
+        submit_owner_prompt(&tab.pane_id, prompt)?;
+        let blocked = poll_snapshot(&tab.pane_id, Duration::from_secs(90), |snapshot| {
+            snapshot.agent_status == "blocked"
+        })?;
+        let session = blocked
+            .session
+            .as_ref()
+            .ok_or("blocked pane has no session")?;
+        let detection = agent_read_detection(&tab.pane_id)?;
+        println!("real blocked dialog question={question}:\n{detection}");
+        let start = Instant::now();
+        let discovered = super::shown_question(&blocked, session, Some(&detection)).await;
+        let elapsed = start.elapsed();
+        state
+            .previous
+            .insert(blocked.terminal_id.clone(), STATUS_WORKING.to_owned());
+        own(&blocked, &tabs, &connection, &mut state).await;
+        let interactive = connection.1.pending_question_token(&thread).is_some();
+        let card = thread_messages(guild, thread)
+            .await?
+            .iter()
+            .any(|(_, has_embed, _)| *has_embed);
+        println!(
+            "real blocked delivery question={question} discovery={elapsed:?} matched={} interactive={interactive} card={card}",
+            discovered.is_some()
+        );
+        Ok((elapsed, discovered.is_some(), interactive, card))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn blocked_dialog_discovery_waits_only_for_questions() {
+        let guild = blocked_capture_guild().expect("real Discord test environment is configured");
+        for question in [false, true] {
+            let (tab, directory) = question_tab_fixture().expect("create real dialog test tab");
+            let outcome =
+                blocked_dialog_discovery_exercise(&guild, &tab, &directory, question).await;
+            let home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .expect("HOME is set");
+            cleanup_real_claude_session_dir(&home, &tab.pane_id);
+            close_tab(&tab.tab_id);
+            clear_directory_contents(&directory).expect("clean dialog test directory");
+            let remaining = blocked_capture_cleanup(&guild)
+                .await
+                .expect("clean Discord topology");
+            println!(
+                "dialog discovery outcome question={question}: {outcome:?}; leftovers={remaining}"
+            );
+            let (elapsed, matched, interactive, card) =
+                outcome.expect("real blocked dialog exercise succeeds");
+            assert_eq!(
+                matched, question,
+                "only question dialogs match the vendor log"
+            );
+            assert_eq!(
+                interactive, question,
+                "only questions get an interactive card"
+            );
+            assert!(card, "the blocked dialog posts a real Discord card");
+            if !question {
+                assert!(
+                    elapsed < super::PENDING_QUESTION_POLL,
+                    "permission discovery must not wait for the question log: {elapsed:?}"
+                );
+            }
+            assert_eq!(remaining, 0, "named zero-leftover check");
+            assert_eq!(
+                remaining_tabs(&format!("{QUESTION_LABEL}-claude")).expect("list real test tabs"),
+                0,
+                "named zero-leftover check"
+            );
+        }
+    }
 
     #[cfg(unix)]
     fn question_tab_fixture() -> Result<(Tab, PathBuf), String> {
