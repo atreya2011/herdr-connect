@@ -136,115 +136,217 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use twilight_model::guild::audit_log::{AuditLogEntry, AuditLogEventType};
+    use twilight_model::channel::Channel;
+    use twilight_model::guild::audit_log::{AuditLog, AuditLogEntry};
     use twilight_model::id::Id;
 
     use super::{Close, GuildDeletion, decide_close, handle_guild_deletion};
     use crate::TopologyCache;
     use crate::gateway::close_in_herdr;
     use crate::topology::{
-        owner_deletion_tests::channel, remember_tab_threads, remember_workspace_channels,
+        forget_owned, owner_deletion_tests::channel, remember_tab_threads,
+        remember_workspace_channels,
     };
 
-    const OWNER: u64 = 4_242;
-    const BOT: u64 = 4_343;
+    const OWNER: u64 = 100_000_000_000_000_001;
 
-    fn entry(action_type: AuditLogEventType, target: u64, user: Option<u64>) -> AuditLogEntry {
-        AuditLogEntry {
-            action_type,
-            changes: Vec::new(),
-            guild_id: Some(Id::new(1)),
-            id: Id::new(target + 1),
-            options: None,
-            reason: None,
-            target_id: Some(Id::new(target)),
-            user_id: user.map(Id::new),
+    struct RecordedDeletionFixture {
+        thread_entries: Vec<AuditLogEntry>,
+        channel_entries: Vec<AuditLogEntry>,
+        workspace: Channel,
+        threads: [Channel; 2],
+        on_thread: GuildDeletion,
+        on_other_thread: GuildDeletion,
+        on_channel: GuildDeletion,
+        on_other_channel: GuildDeletion,
+        no_entry_channel: GuildDeletion,
+        wrong_action: GuildDeletion,
+        plain_channel: GuildDeletion,
+    }
+
+    fn recorded_deletion_fixture() -> RecordedDeletionFixture {
+        let mut recorded: std::collections::HashMap<String, AuditLog> = serde_json::from_str(
+            include_str!("../tests/fixtures/discord_audit_log_deletions.json"),
+        )
+        .expect("recorded Discord audit responses deserialize");
+        let thread_entries = recorded
+            .remove("thread_delete")
+            .expect("thread-delete response")
+            .entries;
+        let channel_entries = recorded
+            .remove("channel_delete")
+            .expect("channel-delete response")
+            .entries;
+        let thread_target = thread_entries[0]
+            .target_id
+            .expect("owner thread target")
+            .get();
+        let other_thread_target = thread_entries[1]
+            .target_id
+            .expect("other-user thread target")
+            .get();
+        let channel_target = channel_entries[0]
+            .target_id
+            .expect("owner channel target")
+            .get();
+        let other_channel_target = channel_entries[1]
+            .target_id
+            .expect("other-user channel target")
+            .get();
+        let workspace = channel(9_010, "work", Some("herdr workspace [testrun-a]"), None);
+        let thread = channel(thread_target, "build [testrun-a:t1]", None, Some(9_010));
+        let other_thread = channel(
+            other_thread_target,
+            "build [testrun-a:t2]",
+            None,
+            Some(9_010),
+        );
+        remember_workspace_channels(std::slice::from_ref(&workspace));
+        let on_thread = GuildDeletion::Thread { id: thread.id };
+        let on_other_thread = GuildDeletion::Thread {
+            id: other_thread.id,
+        };
+        let on_channel = GuildDeletion::Channel(Box::new(channel(
+            channel_target,
+            "work",
+            Some("herdr workspace [testrun-b]"),
+            None,
+        )));
+        let on_other_channel = GuildDeletion::Channel(Box::new(channel(
+            other_channel_target,
+            "work",
+            Some("herdr workspace [testrun-c]"),
+            None,
+        )));
+        let no_entry_channel = GuildDeletion::Channel(Box::new(channel(
+            9_099,
+            "work",
+            Some("herdr workspace [testrun-d]"),
+            None,
+        )));
+        let wrong_action = GuildDeletion::Channel(Box::new(channel(
+            thread_target,
+            "work",
+            Some("herdr workspace [testrun-a]"),
+            None,
+        )));
+        let plain_channel =
+            GuildDeletion::Channel(Box::new(channel(channel_target, "lounge", None, None)));
+        RecordedDeletionFixture {
+            thread_entries,
+            channel_entries,
+            workspace,
+            threads: [thread, other_thread],
+            on_thread,
+            on_other_thread,
+            on_channel,
+            on_other_channel,
+            no_entry_channel,
+            wrong_action,
+            plain_channel,
         }
     }
 
     #[test]
     fn deletion_decisions_close_only_what_the_audit_log_shows_the_owner_deleted() {
-        let workspace = channel(9_010, "work", Some("herdr workspace [testrun-a]"), None);
-        let thread = channel(9_030, "build [testrun-a:t1]", None, Some(9_010));
-        let workspace_channel = channel(9_041, "work", Some("herdr workspace [testrun-b]"), None);
-        remember_workspace_channels(std::slice::from_ref(&workspace));
-        remember_tab_threads(std::slice::from_ref(&thread));
-        let on_thread = GuildDeletion::Thread { id: thread.id };
-        let on_channel = GuildDeletion::Channel(Box::new(workspace_channel));
-        let unregistered_thread = GuildDeletion::Thread {
-            id: channel(9_031, "notes", None, Some(9_010)).id,
-        };
-        let plain_channel = GuildDeletion::Channel(Box::new(channel(9_040, "lounge", None, None)));
-        let thread_delete = AuditLogEventType::ThreadDelete;
-        let channel_delete = AuditLogEventType::ChannelDelete;
+        let fixture = recorded_deletion_fixture();
+        let thread_entries = &fixture.thread_entries;
+        let channel_entries = &fixture.channel_entries;
+        let mut without_user = channel_entries[0].clone();
+        without_user.user_id = None;
         let owner = OWNER.to_string();
         let cases = [
             (
                 "the owner deletes a tab thread",
-                &on_thread,
-                vec![entry(thread_delete, 9_030, Some(OWNER))],
-                Some(Close::Tab("testrun-a:t1".to_owned(), workspace.id)),
+                &fixture.on_thread,
+                vec![thread_entries[0].clone()],
+                Some(Close::Tab("testrun-a:t1".to_owned(), fixture.workspace.id)),
+                true,
             ),
             (
                 "the owner deletes a workspace channel",
-                &on_channel,
-                vec![entry(channel_delete, 9_041, Some(OWNER))],
+                &fixture.on_channel,
+                vec![channel_entries[0].clone()],
                 Some(Close::Workspace("testrun-b".to_owned())),
+                true,
             ),
             (
                 "the owner entry follows a bot entry",
-                &on_channel,
-                vec![
-                    entry(channel_delete, 9_042, Some(BOT)),
-                    entry(channel_delete, 9_041, Some(OWNER)),
-                ],
+                &fixture.on_channel,
+                vec![channel_entries[1].clone(), channel_entries[0].clone()],
                 Some(Close::Workspace("testrun-b".to_owned())),
+                true,
             ),
             (
                 "the bot token deletes a tab thread",
-                &on_thread,
-                vec![entry(thread_delete, 9_030, Some(BOT))],
+                &fixture.on_other_thread,
+                vec![thread_entries[1].clone()],
                 None,
+                true,
             ),
             (
                 "the bot token deletes a workspace channel",
-                &on_channel,
-                vec![entry(channel_delete, 9_041, Some(BOT))],
+                &fixture.on_other_channel,
+                vec![channel_entries[1].clone()],
                 None,
+                true,
             ),
             (
                 "an entry without a user",
-                &on_channel,
-                vec![entry(channel_delete, 9_041, None)],
+                &fixture.on_channel,
+                vec![without_user],
                 None,
+                true,
             ),
             (
                 "the owner deleted another channel",
-                &on_channel,
-                vec![entry(channel_delete, 9_042, Some(OWNER))],
+                &fixture.on_other_channel,
+                vec![channel_entries[0].clone()],
                 None,
+                true,
             ),
             (
                 "the owner entry has another action type",
-                &on_thread,
-                vec![entry(channel_delete, 9_030, Some(OWNER))],
+                &fixture.wrong_action,
+                vec![thread_entries[0].clone()],
                 None,
+                true,
             ),
-            ("no audit log entry", &on_channel, Vec::new(), None),
+            (
+                "no audit log entry",
+                &fixture.on_channel,
+                Vec::new(),
+                None,
+                true,
+            ),
+            (
+                "the target has no audit log entry",
+                &fixture.no_entry_channel,
+                channel_entries.clone(),
+                None,
+                true,
+            ),
             (
                 "the owner deletes a thread the registry never held",
-                &unregistered_thread,
-                vec![entry(thread_delete, 9_031, Some(OWNER))],
+                &fixture.on_thread,
+                vec![thread_entries[0].clone()],
                 None,
+                false,
             ),
             (
                 "the owner deletes a channel with no workspace topic",
-                &plain_channel,
-                vec![entry(channel_delete, 9_040, Some(OWNER))],
+                &fixture.plain_channel,
+                vec![channel_entries[0].clone()],
                 None,
+                true,
             ),
         ];
-        for (name, deletion, entries, expected) in cases {
+        for (name, deletion, entries, expected, registered) in cases {
+            forget_owned(fixture.threads[0].id);
+            forget_owned(fixture.threads[1].id);
+            if registered {
+                remember_tab_threads(&fixture.threads);
+            }
             assert_eq!(decide_close(deletion, &entries, &owner), expected, "{name}");
         }
     }
