@@ -1329,6 +1329,9 @@ async fn discord_connection(
         topology_cache,
     ));
     let responder = Arc::new(PermissionResponder::new(Arc::clone(&chat)));
+    if let Err(error) = herdr_connect_rs::fetch_topology_lists(&client, guild).await {
+        bridge_eprintln!("discord startup topology registration error: {error}");
+    }
     let gateway = tokio::spawn(drive_gateway(Arc::clone(&responder), notices_tx));
     Ok(((chat, responder, identity), gateway))
 }
