@@ -23,11 +23,12 @@ use herdr_connect_rs::{
     agent_read_detection, create_transition_messages, dialog_shows_question, drive_gateway,
     fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
     format_detection_question, hook_timeout, is_postable_transition, lifecycle_subscriptions,
-    list_agents, live_message_nonce, load_discord_config, name_unlabeled_tabs,
+    list_agents, list_mirrored, live_message_nonce, load_discord_config, name_unlabeled_tabs,
     read_claude_incremental, read_claude_prompts_incremental, read_codex_incremental,
     read_codex_prompts_incremental, read_cursor_incremental, read_cursor_prompts_incremental,
-    route_topology, split_live_message, status_subscriptions, subscribe_herdr_events,
-    tab_list_result, take_owner_prompt_suppression, transition_card_nonce, workspace_list_result,
+    route_is_test_run, route_topology, split_live_message, status_subscriptions,
+    subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
+    workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -82,6 +83,8 @@ struct BridgeState<C: Chat> {
     terminal_prompt_positions: HashMap<String, (PathBuf, Follower, Follower)>,
     awaiting_first_log: HashMap<String, String>,
     seen_without_session: HashMap<String, SystemTime>,
+    ignore_test_runs: bool,
+    mirrored_topology: HashSet<String>,
 }
 
 impl<C: Chat> Default for BridgeState<C> {
@@ -99,6 +102,8 @@ impl<C: Chat> Default for BridgeState<C> {
             terminal_prompt_positions: HashMap::new(),
             awaiting_first_log: HashMap::new(),
             seen_without_session: HashMap::new(),
+            ignore_test_runs: false,
+            mirrored_topology: HashSet::new(),
         }
     }
 }
@@ -1058,6 +1063,16 @@ async fn handle_live_event<C: Chat>(
         return;
     };
     let (path, start_position, route) = (watch.path.clone(), watch.follower, watch.route.clone());
+    if state.ignore_test_runs {
+        match route_is_test_run(&route.workspace_id, &route.tab_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                bridge_eprintln!("live capture filter error for {terminal}: {error}");
+                return;
+            }
+        }
+    }
     mirror_terminal_prompts(connection, terminal, &route, state).await;
     let (texts, read_position) = match read_new_live_texts(&path, start_position) {
         Ok(result) => result,
@@ -1131,6 +1146,19 @@ async fn handle_activity_event<C: Chat>(
     frame: ActivityFrame,
     state: &mut BridgeState<C>,
 ) {
+    if !state.activity_eligible_panes.contains(&frame.pane_id) {
+        return;
+    }
+    if state.ignore_test_runs {
+        match route_is_test_run(&frame.workspace_id, &frame.tab_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                bridge_eprintln!("activity filter error for pane {}: {error}", frame.pane_id);
+                return;
+            }
+        }
+    }
     let (_, responder, _) = discord;
     let route = TopologyRoute {
         workspace_id: frame.workspace_id,
@@ -1147,9 +1175,6 @@ async fn handle_activity_event<C: Chat>(
             return;
         }
     };
-    if !state.activity_eligible_panes.contains(&frame.pane_id) {
-        return;
-    }
     if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
         let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
         match responder
@@ -1292,6 +1317,7 @@ fn prune_departed_state<C: Chat>(
 
 async fn discord_connection(
     topology_cache: TopologyCache,
+    ignore_test_runs: bool,
 ) -> Result<(ChatConnection<Discord>, GatewayTask), Box<dyn std::error::Error>> {
     let mut environment: Vec<(&str, String)> = Vec::new();
     for name in [
@@ -1321,14 +1347,19 @@ async fn discord_connection(
             bridge_eprintln!("{notice}");
         }
     });
-    let chat = Arc::new(Discord::new(
-        Arc::clone(&client),
-        config.token,
-        guild,
-        config.owner_id,
-        topology_cache,
-    ));
-    let responder = Arc::new(PermissionResponder::new(Arc::clone(&chat)));
+    let chat = Arc::new(
+        Discord::new(
+            Arc::clone(&client),
+            config.token,
+            guild,
+            config.owner_id,
+            topology_cache,
+        )
+        .with_ignore_test_runs(ignore_test_runs),
+    );
+    let responder = Arc::new(
+        PermissionResponder::new(Arc::clone(&chat)).with_ignore_test_runs(ignore_test_runs),
+    );
     if let Err(error) = herdr_connect_rs::fetch_topology_lists(&client, guild).await {
         bridge_eprintln!("discord startup topology registration error: {error}");
     }
@@ -1822,11 +1853,17 @@ async fn apply_lifecycle_event<C: Chat>(
     broker: &mut Option<BrokerTask>,
     runtime: &mut BridgeRuntime<C>,
 ) -> bool {
-    if let Some(change) = lifecycle_membership(event)
+    if !runtime.state.ignore_test_runs
+        && let Some(change) = lifecycle_membership(event)
         && apply_membership(&mut runtime.pane_ids, change)
     {
         let Some(next_status) = unwrap_or_shutdown(
-            subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
+            subscribe_status_with_backoff(
+                &mut runtime.pane_ids,
+                stop,
+                runtime.state.ignore_test_runs,
+            )
+            .await,
             broker,
         ) else {
             return false;
@@ -1834,10 +1871,19 @@ async fn apply_lifecycle_event<C: Chat>(
         runtime.status = next_status;
     }
 
-    if let Some(closure) = lifecycle_closure(event)
-        && let Err(error) = discord.1.chat().close_topology(&closure).await
-    {
-        bridge_eprintln!("herdr topology closure error: {error}");
+    if let Some(closure) = lifecycle_closure(event) {
+        let id = match &closure {
+            TopologyClosure::Tab { tab_id, .. } => tab_id,
+            TopologyClosure::Workspace { workspace_id } => workspace_id,
+        };
+        if !runtime.state.ignore_test_runs || runtime.state.mirrored_topology.contains(id) {
+            match discord.1.chat().close_topology(&closure).await {
+                Ok(()) => {
+                    runtime.state.mirrored_topology.remove(id);
+                }
+                Err(error) => bridge_eprintln!("herdr topology closure error: {error}"),
+            }
+        }
     }
 
     doorbell_unless_shutdown(
@@ -1862,11 +1908,20 @@ fn spawn_archived_thread_registration<C: Chat>(discord: &ChatConnection<C>) {
     });
 }
 
+fn list_topology(ignore_test_runs: bool) -> Result<(Vec<AgentSnapshot>, Vec<HerdrTab>), String> {
+    if ignore_test_runs {
+        list_mirrored()
+    } else {
+        list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs)))
+    }
+}
+
 fn spawn_startup_topology_sweep<C: Chat>(
     discord: &ChatConnection<C>,
     rename_errors_reported: &mut HashSet<String>,
+    ignore_test_runs: bool,
 ) {
-    match list_agents().and_then(|agents| tab_list_result().map(|tabs| (agents, tabs))) {
+    match list_topology(ignore_test_runs) {
         Ok((agents, mut tabs)) => {
             for error in name_unlabeled_tabs(&agents, &mut tabs, rename_errors_reported) {
                 bridge_eprintln!("herdr startup topology error: {error}");
@@ -1947,7 +2002,12 @@ async fn handle_status_select_result<C: Chat>(
         Err(error) => {
             bridge_eprintln!("herdr status subscribe error: {error}");
             let Some(next_status) = unwrap_or_shutdown(
-                subscribe_status_with_backoff(&mut runtime.pane_ids, stop).await,
+                subscribe_status_with_backoff(
+                    &mut runtime.pane_ids,
+                    stop,
+                    runtime.state.ignore_test_runs,
+                )
+                .await,
                 broker,
             ) else {
                 return false;
@@ -1991,11 +2051,12 @@ async fn subscribe_herdr_events_with_backoff(
 async fn subscribe_status_with_backoff(
     pane_ids: &mut Vec<String>,
     stop: &mut tokio::signal::unix::Signal,
+    ignore_test_runs: bool,
 ) -> Result<Option<HerdrSubscription>, BridgeInterrupt> {
     let mut delay = SUBSCRIBE_RETRY_INITIAL;
     loop {
         let outcome: Result<Option<HerdrSubscription>, String> = async {
-            let agents = list_agents()?;
+            let (agents, _) = list_topology(ignore_test_runs)?;
             reconcile_pane_ids(pane_ids, pane_ids_from_agents(&agents));
             if pane_ids.is_empty() {
                 return Ok(None);
@@ -2024,8 +2085,53 @@ async fn apply_herdr_snapshot<C: Chat>(
     discord: &ChatConnection<C>,
     state: &mut BridgeState<C>,
 ) -> Result<Vec<String>, String> {
-    let agents = list_agents()?;
+    let mut agents = list_agents()?;
     let mut tabs = tab_list_result()?;
+    let mut excluded_terminals = HashSet::new();
+    if state.ignore_test_runs {
+        let workspaces = workspace_list_result()?;
+        let all_terminals: HashSet<String> = agents
+            .iter()
+            .map(|agent| agent.terminal_id.clone())
+            .collect();
+        let test_workspaces: HashSet<&str> = workspaces
+            .iter()
+            .filter(|workspace| {
+                workspace
+                    .label
+                    .starts_with(herdr_connect_rs::TEST_RUN_PREFIX)
+            })
+            .map(|workspace| workspace.workspace_id.as_str())
+            .collect();
+        state.mirrored_topology.retain(|id| {
+            !test_workspaces.contains(id.as_str())
+                && !tabs.iter().any(|tab| {
+                    &tab.tab_id == id
+                        && (test_workspaces.contains(tab.workspace_id.as_str())
+                            || tab.label.starts_with(herdr_connect_rs::TEST_RUN_PREFIX))
+                })
+        });
+        herdr_connect_rs::retain_mirrored(&mut agents, &mut tabs, &workspaces);
+        let included_terminals: HashSet<String> = agents
+            .iter()
+            .map(|agent| agent.terminal_id.clone())
+            .collect();
+        excluded_terminals = all_terminals
+            .difference(&included_terminals)
+            .cloned()
+            .collect();
+        state.mirrored_topology.extend(
+            workspaces
+                .into_iter()
+                .filter(|workspace| {
+                    !workspace
+                        .label
+                        .starts_with(herdr_connect_rs::TEST_RUN_PREFIX)
+                })
+                .map(|workspace| workspace.workspace_id)
+                .chain(tabs.iter().map(|tab| tab.tab_id.clone())),
+        );
+    }
     for error in name_unlabeled_tabs(&agents, &mut tabs, &mut state.rename_errors_reported) {
         bridge_eprintln!("{error}");
     }
@@ -2038,6 +2144,9 @@ async fn apply_herdr_snapshot<C: Chat>(
     let departed_cards =
         prune_departed_state(state, &current_terminals, &current_panes, &current_tabs);
     for (terminal, card) in departed_cards {
+        if excluded_terminals.contains(&terminal) {
+            continue;
+        }
         expire_departed_card(discord, &terminal, card).await;
     }
     for snapshot in &agents {
@@ -2056,7 +2165,8 @@ async fn doorbell_snapshot<C: Chat>(
     match apply_herdr_snapshot(discord, state).await {
         Ok(from_snapshot) => {
             if reconcile_pane_ids(pane_ids, from_snapshot) {
-                *status = subscribe_status_with_backoff(pane_ids, stop).await?;
+                *status =
+                    subscribe_status_with_backoff(pane_ids, stop, state.ignore_test_runs).await?;
             }
         }
         Err(error) => bridge_eprintln!("herdr snapshot error: {error}"),
@@ -2076,11 +2186,12 @@ async fn next_status_event(
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-    let (connection, mut gateway) = discord_connection(Arc::clone(&topology_cache)).await?;
+    let (connection, mut gateway) = discord_connection(Arc::clone(&topology_cache), true).await?;
     let mut broker = start_broker(&connection, activity_tx);
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
         live_tx: Some(live_tx),
+        ignore_test_runs: true,
         ..BridgeState::default()
     };
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -2092,7 +2203,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut pane_ids = Vec::new();
     let Some(status) = unwrap_or_shutdown(
-        subscribe_status_with_backoff(&mut pane_ids, &mut stop).await,
+        subscribe_status_with_backoff(&mut pane_ids, &mut stop, true).await,
         &mut broker,
     ) else {
         return Ok(());
@@ -2118,7 +2229,11 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     spawn_archived_thread_registration(&connection);
-    spawn_startup_topology_sweep(&connection, &mut runtime.state.rename_errors_reported);
+    spawn_startup_topology_sweep(
+        &connection,
+        &mut runtime.state.rename_errors_reported,
+        runtime.state.ignore_test_runs,
+    );
     bridge_event_loop(
         &connection,
         &mut gateway,
@@ -2649,7 +2764,8 @@ mod tests {
                 std::ffi::OsString::from_vec(b"secret-token\xff".to_vec()),
             );
         }
-        let result = super::discord_connection(Arc::new(tokio::sync::Mutex::new(None))).await;
+        let result =
+            super::discord_connection(Arc::new(tokio::sync::Mutex::new(None)), false).await;
         unsafe {
             match original {
                 Some(value) => std::env::set_var("DISCORD_TOKEN", value),
@@ -4107,7 +4223,7 @@ mod tests {
 
             let outcome = tokio::time::timeout(
                 Duration::from_secs(20),
-                subscribe_status_with_backoff(&mut pane_ids, &mut stop),
+                subscribe_status_with_backoff(&mut pane_ids, &mut stop, false),
             )
             .await;
 
@@ -8809,13 +8925,16 @@ mod tests {
                 &mut HashMap::new(),
                 &workspace_id,
                 &tab_id,
+                false,
             )
             .await
         } else {
             herdr_connect_rs::delete_workspace_channel(
                 guild.client.as_ref(),
                 &mut channels,
+                &threads,
                 &workspace_id,
+                false,
             )
             .await
         };

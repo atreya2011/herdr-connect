@@ -36,6 +36,8 @@ flowchart LR
 
 Identity is the topic and the `[tab_id]` suffix. Existing names are not renamed.
 
+The no-argument service run ignores Herdr workspaces and tabs whose labels start with `testrun-`, and Discord channels and threads with that prefix, including threads under a matching channel. Messages, buttons, and deletion events in them are ignored, and topology cleanup preserves them. Test bridge instances keep filtering disabled.
+
 ## Configuration
 
 `.env` (mode `600`, gitignored):

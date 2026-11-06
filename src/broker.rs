@@ -20,7 +20,7 @@ use crate::registry::{
     ApprovalRequest, InteractionRegistry, PendingQuestion, QuestionRegistry, ResolveError,
     generate_token,
 };
-use crate::{bridge_eprintln, list_agents, route_topology, tab_list_result};
+use crate::{bridge_eprintln, list_agents, route_is_test_run, route_topology, tab_list_result};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(45);
@@ -41,6 +41,7 @@ pub struct PermissionResponder<C: Chat> {
     chat: Arc<C>,
     registry: Arc<InteractionRegistry<C::Route>>,
     question_registry: QuestionRegistry<C::Route, C::Message>,
+    ignore_test_runs: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -109,7 +110,14 @@ impl<C: Chat> PermissionResponder<C> {
             chat,
             registry: Arc::new(InteractionRegistry::default()),
             question_registry: QuestionRegistry::default(),
+            ignore_test_runs: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_ignore_test_runs(mut self, ignore_test_runs: bool) -> Self {
+        self.ignore_test_runs = ignore_test_runs;
+        self
     }
 
     #[must_use]
@@ -326,6 +334,7 @@ impl<C: Chat> PermissionResponder<C> {
         liveness: &HookLiveness,
     ) -> Option<crate::TopologyRoute> {
         let session_id = session_id.to_owned();
+        let ignore_test_runs = self.ignore_test_runs;
         let route_task = tokio::task::spawn_blocking(move || {
             let agents = list_agents()?;
             let tabs = tab_list_result()?;
@@ -345,11 +354,14 @@ impl<C: Chat> PermissionResponder<C> {
                     return Err("permission request has ambiguous pane mapping".to_owned());
                 }
             };
-            route_topology(&agents, &tabs, &agent.terminal_id)
+            if ignore_test_runs && route_is_test_run(&agent.workspace_id, &agent.tab_id)? {
+                return Ok(None);
+            }
+            route_topology(&agents, &tabs, &agent.terminal_id).map(Some)
         });
         let route = tokio::select! {
             result = route_task => result.ok().and_then(|result| match result {
-                Ok(route) => Some(route),
+                Ok(route) => route,
                 Err(error) => {
                     bridge_eprintln!("{error}");
                     None

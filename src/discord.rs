@@ -23,15 +23,17 @@ use crate::chat::{
 };
 use crate::deletion::{GuildDeletion, handle_guild_deletion};
 use crate::delivery::expire_permission_card;
+
 use crate::{
     OwnerIdentity, PermissionVendor, Question, TopologyCache, TopologyRoute, TransitionMessage,
     UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, bridge_eprintln, cached_route,
     delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
     deliver_activity_message, deliver_live_message, deliver_permission_card, deliver_question_card,
     deliver_transition_card, execute_terminal_prompt_webhook, expire_informational_card,
-    fetch_owner_identity, fetch_topology_lists, reconcile_topology_cache,
-    register_archived_tab_threads, resolve_terminal_prompt_webhook, should_handle_owner_message,
-    sync_topology, update_activity_message, update_question_card, workspace_channel_id,
+    fetch_owner_identity, fetch_topology_lists, is_test_run_name, owned_thread_is_test_run,
+    reconcile_topology_cache, register_archived_tab_threads, resolve_terminal_prompt_webhook,
+    should_handle_owner_message, sync_topology, update_activity_message, update_question_card,
+    workspace_channel_id,
 };
 
 pub const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
@@ -45,6 +47,7 @@ pub struct Discord {
     topology_cache: TopologyCache,
     webhooks: Mutex<WebhookCache>,
     shard: tokio::sync::Mutex<Shard>,
+    ignore_test_runs: bool,
 }
 
 pub async fn fetch_startup_owner_identity(
@@ -122,7 +125,113 @@ impl Discord {
             topology_cache,
             webhooks: Mutex::new(HashMap::new()),
             shard: tokio::sync::Mutex::new(shard),
+            ignore_test_runs: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_ignore_test_runs(mut self, ignore_test_runs: bool) -> Self {
+        self.ignore_test_runs = ignore_test_runs;
+        self
+    }
+
+    async fn component_in_test_run(
+        &self,
+        interaction: &DiscordInteraction,
+    ) -> Result<bool, ChatError> {
+        if !self.ignore_test_runs {
+            return Ok(false);
+        }
+        let channel_id = interaction
+            .channel
+            .as_ref()
+            .map(|channel| channel.id)
+            .ok_or_else(|| chat_error("component interaction has no channel"))?;
+        let channel = self
+            .client
+            .channel(channel_id)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        if is_test_run_name(channel.name.as_deref()) {
+            return Ok(true);
+        }
+        let Some(parent_id) = channel.parent_id else {
+            return Ok(false);
+        };
+        let parent = self
+            .client
+            .channel(parent_id)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        if is_test_run_name(parent.name.as_deref()) {
+            return Ok(true);
+        }
+        self.herdr_surface_in_test_run(channel.name.as_deref(), parent.topic.as_deref())
+            .await
+    }
+
+    async fn herdr_surface_in_test_run(
+        &self,
+        name: Option<&str>,
+        topic: Option<&str>,
+    ) -> Result<bool, ChatError> {
+        if !self.ignore_test_runs {
+            return Ok(false);
+        }
+        let Some((tab_id, workspace_id)) = name
+            .zip(topic)
+            .and_then(|(name, topic)| prompt_surface_markers(name, topic))
+        else {
+            return Ok(false);
+        };
+        let (tab_id, workspace_id) = (tab_id.to_owned(), workspace_id.to_owned());
+        tokio::task::spawn_blocking(move || crate::route_is_test_run(&workspace_id, &tab_id))
+            .await
+            .map_err(chat_error)?
+            .map_err(chat_error)
+    }
+
+    async fn deletion_in_test_run(&self, deletion: &GuildDeletion) -> Result<bool, ChatError> {
+        if !self.ignore_test_runs {
+            return Ok(false);
+        }
+        let named_test_run = match deletion {
+            GuildDeletion::Channel(channel) => is_test_run_name(channel.name.as_deref()),
+            GuildDeletion::Thread { id } => owned_thread_is_test_run(*id),
+        };
+        if named_test_run {
+            return Ok(true);
+        }
+        let deletion = deletion.clone();
+        tokio::task::spawn_blocking(move || match deletion {
+            GuildDeletion::Channel(channel) => {
+                let Some(workspace_id) = crate::resolve_owner_deleted_workspace(&channel) else {
+                    return Ok(false);
+                };
+                crate::route_is_test_run(&workspace_id, "")
+            }
+            GuildDeletion::Thread { id } => {
+                let Some((tab_id, _)) = crate::resolve_owner_deleted_tab(id) else {
+                    return Ok(false);
+                };
+                let Some(tab) = crate::tab_list_result()?
+                    .into_iter()
+                    .find(|tab| tab.tab_id == tab_id)
+                else {
+                    return Ok(false);
+                };
+                crate::route_is_test_run(&tab.workspace_id, &tab_id)
+            }
+        })
+        .await
+        .map_err(chat_error)?
+        .map_err(chat_error)
     }
 
     #[must_use]
@@ -329,6 +438,7 @@ impl Chat for Discord {
             active_threads,
             &live_workspace_ids,
             &live_tab_ids,
+            self.ignore_test_runs,
         )
         .await;
         drop(guard);
@@ -357,11 +467,19 @@ impl Chat for Discord {
                     &mut archived_cache,
                     workspace_id,
                     tab_id,
+                    self.ignore_test_runs,
                 )
                 .await
             }
             TopologyClosure::Workspace { workspace_id } => {
-                delete_workspace_channel(&self.client, channels, workspace_id).await
+                delete_workspace_channel(
+                    &self.client,
+                    channels,
+                    active_threads,
+                    workspace_id,
+                    self.ignore_test_runs,
+                )
+                .await
             }
         };
         if let Err(error) = result {
@@ -622,9 +740,20 @@ impl Chat for Discord {
         let Some(thread_name) = thread.name.as_deref() else {
             return Ok(None);
         };
+        if self.ignore_test_runs
+            && (is_test_run_name(Some(thread_name)) || is_test_run_name(parent.name.as_deref()))
+        {
+            return Ok(None);
+        }
         let Some(topic) = parent.topic.as_deref() else {
             return Ok(None);
         };
+        if self
+            .herdr_surface_in_test_run(Some(thread_name), Some(topic))
+            .await?
+        {
+            return Ok(None);
+        }
         let Some((tab_id, workspace_id)) = prompt_surface_markers(thread_name, topic) else {
             return Ok(None);
         };
@@ -647,25 +776,43 @@ impl Chat for Discord {
                     EventTypeFlags::MESSAGE_CREATE
                         | EventTypeFlags::INTERACTION_CREATE
                         | EventTypeFlags::THREAD_DELETE
-                        | EventTypeFlags::CHANNEL_DELETE,
+                        | EventTypeFlags::CHANNEL_DELETE
+                        | EventTypeFlags::CHANNEL_UPDATE
+                        | EventTypeFlags::THREAD_UPDATE,
                 )
                 .await?;
             match event {
                 Ok(Event::MessageCreate(message)) => return Some(Ok(Inbound::Posted(message.0))),
                 Ok(Event::InteractionCreate(interaction)) => {
                     if let Some(component) = self.component(interaction.0) {
-                        return Some(Ok(Inbound::Component(component)));
+                        match self.component_in_test_run(&component.interaction).await {
+                            Ok(true) => {}
+                            Ok(false) => return Some(Ok(Inbound::Component(component))),
+                            Err(error) => return Some(Err(error)),
+                        }
                     }
                 }
                 Ok(Event::ThreadDelete(thread)) if thread.guild_id == self.guild => {
-                    return Some(Ok(Inbound::Deleted(GuildDeletion::Thread {
-                        id: thread.id,
-                    })));
+                    let deletion = GuildDeletion::Thread { id: thread.id };
+                    match self.deletion_in_test_run(&deletion).await {
+                        Ok(true) => {}
+                        Ok(false) => return Some(Ok(Inbound::Deleted(deletion))),
+                        Err(error) => return Some(Err(error)),
+                    }
                 }
                 Ok(Event::ChannelDelete(channel)) if channel.guild_id == Some(self.guild) => {
-                    return Some(Ok(Inbound::Deleted(GuildDeletion::Channel(Box::new(
-                        channel.0,
-                    )))));
+                    let deletion = GuildDeletion::Channel(Box::new(channel.0));
+                    match self.deletion_in_test_run(&deletion).await {
+                        Ok(true) => {}
+                        Ok(false) => return Some(Ok(Inbound::Deleted(deletion))),
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                Ok(Event::ChannelUpdate(channel)) if channel.guild_id == Some(self.guild) => {
+                    crate::remember_workspace_channels(std::slice::from_ref(&channel.0));
+                }
+                Ok(Event::ThreadUpdate(thread)) if thread.guild_id == Some(self.guild) => {
+                    crate::remember_tab_threads(std::slice::from_ref(&thread.0));
                 }
                 Ok(_) => {}
                 Err(error) => return Some(Err(chat_error(error))),

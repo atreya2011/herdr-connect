@@ -6,7 +6,7 @@ use twilight_model::channel::Channel;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker, UserMarker};
 
-use crate::{AgentSnapshot, HerdrTab, format_thread_name};
+use crate::{AgentSnapshot, HerdrTab, TEST_RUN_PREFIX, format_thread_name};
 
 pub type TopologyCache = Arc<Mutex<Option<(Vec<Channel>, Vec<Channel>)>>>;
 
@@ -457,9 +457,11 @@ fn thread_tab_suffix(name: &str) -> Option<&str> {
 struct OwnedTopology {
     workspaces: HashMap<Id<ChannelMarker>, String>,
     threads: HashMap<Id<ChannelMarker>, OwnedThread>,
+    test_run_channels: HashSet<Id<ChannelMarker>>,
 }
 
 struct OwnedThread {
+    name: String,
     tab_id: String,
     parent: Id<ChannelMarker>,
 }
@@ -476,6 +478,11 @@ fn owned_topology() -> std::sync::MutexGuard<'static, OwnedTopology> {
 pub fn remember_workspace_channels(channels: &[Channel]) {
     let mut owned = owned_topology();
     for channel in channels {
+        if is_test_run_name(channel.name.as_deref()) {
+            owned.test_run_channels.insert(channel.id);
+        } else {
+            owned.test_run_channels.remove(&channel.id);
+        }
         if let Some(workspace_id) = workspace_topic_id(channel) {
             owned
                 .workspaces
@@ -488,20 +495,34 @@ pub fn remember_workspace_channels(channels: &[Channel]) {
 pub fn remember_tab_threads(threads: &[Channel]) {
     let mut owned = owned_topology();
     for thread in threads {
+        if let Some(existing) = owned.threads.get_mut(&thread.id)
+            && let Some(name) = &thread.name
+        {
+            existing.name.clone_from(name);
+        }
         let Some(parent) = thread.parent_id else {
             continue;
         };
         let Some(workspace_id) = owned.workspaces.get(&parent) else {
             continue;
         };
-        let Some(tab_id) = thread.name.as_deref().and_then(thread_tab_suffix) else {
+        let Some(name) = thread.name.as_ref() else {
+            continue;
+        };
+        let Some(tab_id) = thread_tab_suffix(name) else {
             continue;
         };
         if tab_id.starts_with(&format!("{workspace_id}:t")) {
             let tab_id = tab_id.to_owned();
-            owned
-                .threads
-                .insert(thread.id, OwnedThread { tab_id, parent });
+            let name = name.clone();
+            owned.threads.insert(
+                thread.id,
+                OwnedThread {
+                    name,
+                    tab_id,
+                    parent,
+                },
+            );
         }
     }
 }
@@ -509,6 +530,7 @@ pub fn remember_tab_threads(threads: &[Channel]) {
 pub fn forget_owned(id: Id<ChannelMarker>) {
     let mut owned = owned_topology();
     owned.threads.remove(&id);
+    owned.test_run_channels.remove(&id);
     if owned.workspaces.remove(&id).is_some() {
         owned.threads.retain(|_, thread| thread.parent != id);
     }
@@ -525,6 +547,19 @@ pub fn resolve_owner_deleted_tab(
 }
 
 #[must_use]
+pub fn owned_thread_is_test_run(thread_id: Id<ChannelMarker>) -> bool {
+    let owned = owned_topology();
+    owned.threads.get(&thread_id).is_some_and(|thread| {
+        is_test_run_name(Some(&thread.name)) || owned.test_run_channels.contains(&thread.parent)
+    })
+}
+
+#[must_use]
+pub fn is_test_run_name(name: Option<&str>) -> bool {
+    name.is_some_and(|name| name.starts_with(TEST_RUN_PREFIX))
+}
+
+#[must_use]
 pub fn resolve_owner_deleted_workspace(deleted: &Channel) -> Option<String> {
     owned_topology().workspaces.get(&deleted.id).cloned()
 }
@@ -536,10 +571,14 @@ pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
     archived_cache: &mut HashMap<Id<ChannelMarker>, Vec<Channel>, S>,
     workspace_id: &str,
     tab_id: &str,
+    ignore_test_runs: bool,
 ) -> Result<(), String> {
     let Some(workspace_channel) = workspace_channel_id(channels, workspace_id) else {
         return Ok(());
     };
+    if ignore_test_runs && channel_is_test_run(channels, workspace_channel) {
+        return Ok(());
+    }
     let thread_suffix = format!(" [{tab_id}]");
     let mut resolved =
         single_matching_thread(active_threads, workspace_channel, &thread_suffix, tab_id)?;
@@ -559,19 +598,48 @@ pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
     let Some(thread) = resolved else {
         return Ok(());
     };
+    if ignore_test_runs && is_test_run_name(thread.name.as_deref()) {
+        return Ok(());
+    }
     delete_channel_if_present(client, thread.id).await?;
     active_threads.retain(|entry| entry.id != thread.id);
     delete_thread_created_message(client, workspace_channel, thread.id).await
 }
 
+#[must_use]
+pub fn channel_is_test_run(channels: &[Channel], id: Id<ChannelMarker>) -> bool {
+    channels
+        .iter()
+        .find(|channel| channel.id == id)
+        .is_some_and(|channel| is_test_run_name(channel.name.as_deref()))
+}
+
 pub async fn delete_workspace_channel(
     client: &twilight_http::Client,
     channels: &mut Vec<Channel>,
+    active_threads: &[Channel],
     workspace_id: &str,
+    ignore_test_runs: bool,
 ) -> Result<(), String> {
     let Some(channel_id) = workspace_channel_id(channels, workspace_id) else {
         return Ok(());
     };
+    if ignore_test_runs {
+        if channel_is_test_run(channels, channel_id)
+            || active_threads.iter().any(|thread| {
+                thread.parent_id == Some(channel_id) && is_test_run_name(thread.name.as_deref())
+            })
+        {
+            return Ok(());
+        }
+        if archived_threads(client, channel_id)
+            .await?
+            .iter()
+            .any(|thread| is_test_run_name(thread.name.as_deref()))
+        {
+            return Ok(());
+        }
+    }
     delete_channel_if_present(client, channel_id).await?;
     channels.retain(|channel| channel.id != channel_id);
     Ok(())
@@ -620,6 +688,7 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
     active_threads: &mut Vec<Channel>,
     live_workspace_ids: &HashSet<&str, S>,
     live_tab_ids: &HashSet<&str, S>,
+    ignore_test_runs: bool,
 ) -> Result<(), String> {
     let absent = topology_absent_from_herdr(
         client,
@@ -635,8 +704,23 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
         .map(|channel| channel.id)
         .collect();
     for channel in absent {
+        if ignore_test_runs
+            && (is_test_run_name(channel.name.as_deref())
+                || channel
+                    .parent_id
+                    .is_some_and(|parent| channel_is_test_run(channels, parent)))
+        {
+            continue;
+        }
         if let Some(workspace_id) = workspace_topic_id(&channel) {
-            delete_workspace_channel(client, channels, workspace_id).await?;
+            delete_workspace_channel(
+                client,
+                channels,
+                active_threads,
+                workspace_id,
+                ignore_test_runs,
+            )
+            .await?;
         } else if let Some(parent) = channel.parent_id {
             if !orphaned_channels.contains(&parent) {
                 delete_channel_if_present(client, channel.id).await?;

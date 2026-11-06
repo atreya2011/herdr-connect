@@ -52,10 +52,11 @@ pub use discord::{
 pub use gateway::drive_gateway;
 pub use herdr::{
     AgentSession, AgentSnapshot, EVENT_KEY, HerdrSubscription, HerdrTab, HerdrWorkspace,
-    STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, agent_read_detection,
-    generated_tab_name, is_numeric_label, lifecycle_subscriptions, list_agents,
-    name_unlabeled_tabs, request_rpc_result, status_subscriptions, subscribe_herdr_events,
-    tab_close, tab_list_result, workspace_close, workspace_list_result,
+    STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TEST_RUN_PREFIX,
+    agent_read_detection, generated_tab_name, is_numeric_label, lifecycle_subscriptions,
+    list_agents, list_mirrored, name_unlabeled_tabs, request_rpc_result, retain_mirrored,
+    route_is_test_run, status_subscriptions, subscribe_herdr_events, tab_close, tab_list_result,
+    workspace_close, workspace_list_result,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
@@ -75,9 +76,10 @@ pub use readers::{
     read_cursor_incremental, read_cursor_prompts_incremental,
 };
 pub use topology::{
-    TopologyCache, TopologyRoute, archived_threads, cached_route, delete_tab_thread,
-    delete_thread_created_message, delete_topology_absent_from_herdr, delete_workspace_channel,
-    fetch_topology_lists, forget_owned, reconcile_topology_cache, register_archived_tab_threads,
+    TopologyCache, TopologyRoute, archived_threads, cached_route, channel_is_test_run,
+    delete_tab_thread, delete_thread_created_message, delete_topology_absent_from_herdr,
+    delete_workspace_channel, fetch_topology_lists, forget_owned, is_test_run_name,
+    owned_thread_is_test_run, reconcile_topology_cache, register_archived_tab_threads,
     remember_tab_threads, remember_workspace_channels, resolve_owner_deleted_tab,
     resolve_owner_deleted_workspace, route_topology, sync_topology, topology_absent_from_herdr,
     workspace_channel_id, workspace_channel_name,

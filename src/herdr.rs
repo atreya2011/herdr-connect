@@ -20,6 +20,8 @@ pub const STATUS_DONE: &str = "done";
 
 pub const EVENT_KEY: &str = "event";
 
+pub const TEST_RUN_PREFIX: &str = "testrun-";
+
 const SUBSCRIPTION_TYPE_KEY: &str = "type";
 
 const RPC_ID_KEY: &str = "id";
@@ -333,6 +335,47 @@ pub fn workspace_list_result() -> Result<Vec<HerdrWorkspace>, String> {
         .iter()
         .map(|workspace| HerdrWorkspace::deserialize(workspace).map_err(|error| error.to_string()))
         .collect()
+}
+
+pub fn route_is_test_run(workspace_id: &str, tab_id: &str) -> Result<bool, String> {
+    if workspace_list_result()?.iter().any(|workspace| {
+        workspace.workspace_id == workspace_id && workspace.label.starts_with(TEST_RUN_PREFIX)
+    }) {
+        return Ok(true);
+    }
+    Ok(tab_list_result()?
+        .iter()
+        .any(|tab| tab.tab_id == tab_id && tab.label.starts_with(TEST_RUN_PREFIX)))
+}
+
+pub fn retain_mirrored(
+    agents: &mut Vec<AgentSnapshot>,
+    tabs: &mut Vec<HerdrTab>,
+    workspaces: &[HerdrWorkspace],
+) {
+    let open: HashSet<&str> = workspaces
+        .iter()
+        .filter(|workspace| !workspace.label.starts_with(TEST_RUN_PREFIX))
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect();
+    let test_run_tabs: HashSet<String> = tabs
+        .iter()
+        .filter(|tab| tab.label.starts_with(TEST_RUN_PREFIX))
+        .map(|tab| tab.tab_id.clone())
+        .collect();
+    agents.retain(|agent| {
+        open.contains(agent.workspace_id.as_str()) && !test_run_tabs.contains(&agent.tab_id)
+    });
+    tabs.retain(|tab| {
+        open.contains(tab.workspace_id.as_str()) && !test_run_tabs.contains(&tab.tab_id)
+    });
+}
+
+pub fn list_mirrored() -> Result<(Vec<AgentSnapshot>, Vec<HerdrTab>), String> {
+    let mut agents = list_agents()?;
+    let mut tabs = tab_list_result()?;
+    retain_mirrored(&mut agents, &mut tabs, &workspace_list_result()?);
+    Ok((agents, tabs))
 }
 
 #[must_use]
