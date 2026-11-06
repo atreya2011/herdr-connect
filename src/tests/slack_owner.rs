@@ -257,7 +257,7 @@ impl Owned {
             archived_by_owner: false,
             goal: Goal::Message,
             directory: self.directory.clone(),
-            team: std::env::var("SLACK_TEAM_ID").map_err(|error| error.to_string())?,
+            team: self.chat.team_id().to_owned(),
         })
     }
 

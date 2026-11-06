@@ -118,7 +118,7 @@ fn named_tab(workspace: &str, tab: &str) -> Result<(String, bool), ChatError> {
     ))
 }
 impl Slack {
-    pub async fn new(token: String, owner: String, team: &str) -> Result<Self, ChatError> {
+    pub async fn new(token: String, owner: String) -> Result<Self, ChatError> {
         let connector = SlackClientHyperConnector::new()
             .map_err(error)?
             .with_rate_control(SlackApiRateControlConfig::new().with_max_retries(5));
@@ -129,16 +129,13 @@ impl Slack {
             .auth_test()
             .await
             .map_err(error)?;
-        if auth.team_id.to_string() != team {
-            return Err(error("Slack token belongs to another team"));
-        }
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             client,
             token,
             owner: owner.into(),
             bot: auth.user_id,
-            team: team.to_owned(),
+            team: auth.team_id.to_string(),
             topology: Arc::new(Mutex::new(Topology::default())),
             ignore_test_runs: false,
             listener: Mutex::new(None),
@@ -154,9 +151,12 @@ impl Slack {
         Self::new(
             std::env::var("SLACK_BOT_TOKEN").map_err(error)?,
             std::env::var("SLACK_OWNER_ID").map_err(error)?,
-            &std::env::var("SLACK_TEAM_ID").map_err(error)?,
         )
         .await
+    }
+    #[must_use]
+    pub fn team_id(&self) -> &str {
+        &self.team
     }
     #[must_use]
     pub const fn with_ignore_test_runs(mut self, ignore: bool) -> Self {
