@@ -2302,6 +2302,9 @@ async fn run_connected_bridge<C: Chat>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod slack_owner;
+
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::Write;

@@ -10,6 +10,13 @@ Socket Mode uses `SLACK_APP_TOKEN` and one connection. Messages qualify only whe
 
 The `slack` subcommand runs the shared bridge loop against team `T0CF6JNT0KB`, owner `U0CEYEYSKT5`, with the same `testrun-` exclusion as the no-argument Discord run. The service continues to use Discord only. Permission cards have Allow and Deny buttons; single-choice questions have option buttons, and multiple-choice questions have a menu followed by Submit choices. Button taps arrive over Socket Mode and use the existing permission and question responders. Tests instantiate Slack directly with filtering disabled; run Slack tests serially and never keep another connection to the test app open.
 
+The ignored owner acceptance driver prints one `OWNER ACTION:` at a time and waits up to 20 minutes for each observed result: message, working status, Deny, Allow, single choice, multiple choice, free text, parent deletion, then channel archive. Permission cards retain their normal 45-second expiry. The driver creates a real Claude agent in its own `testrun-` workspace, uses an isolated hook broker and one Socket Mode connection, and cleans up only its own resources. Production snapshots are taken separately before and after the run. It is intentionally not part of unattended test runs.
+
+```bash
+set -a; . ./.env >/dev/null 2>&1; set +a
+cargo test tests::slack_owner::owner_acceptance_runs_in_order -- --ignored --exact --nocapture --test-threads=1
+```
+
 ## Architecture
 
 Discord and Herdr do not share a socket. This process sits between them.
