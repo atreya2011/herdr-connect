@@ -477,7 +477,10 @@ pub fn remember_workspace_channels(channels: &[Channel]) {
     let mut owned = owned_topology();
     for channel in channels {
         if let Some(workspace_id) = workspace_topic_id(channel) {
-            owned.workspaces.insert(channel.id, workspace_id.to_owned());
+            owned
+                .workspaces
+                .entry(channel.id)
+                .or_insert_with(|| workspace_id.to_owned());
         }
     }
 }
@@ -746,6 +749,23 @@ pub mod owner_deletion_tests {
         );
         forget_owned(id(8_110));
         assert_eq!(resolve_owner_deleted_tab(id(8_121)), None);
+    }
+
+    #[test]
+    fn a_refetch_keeps_the_first_workspace_registered_for_a_channel() {
+        let cases = [
+            ("initial fetch", "herdr workspace [w5]"),
+            ("refetch after a topic edit", "herdr workspace [w9]"),
+        ];
+        for (name, topic) in cases {
+            let fetched = channel(8_410, "work", Some(topic), None);
+            remember_workspace_channels(std::slice::from_ref(&fetched));
+            assert_eq!(
+                resolve_owner_deleted_workspace(&fetched).as_deref(),
+                Some("w5"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
