@@ -135,18 +135,13 @@ impl Discord {
         self
     }
 
-    async fn component_in_test_run(
+    pub async fn channel_in_test_run(
         &self,
-        interaction: &DiscordInteraction,
+        channel_id: Id<ChannelMarker>,
     ) -> Result<bool, ChatError> {
         if !self.ignore_test_runs {
             return Ok(false);
         }
-        let channel_id = interaction
-            .channel
-            .as_ref()
-            .map(|channel| channel.id)
-            .ok_or_else(|| chat_error("component interaction has no channel"))?;
         let channel = self
             .client
             .channel(channel_id)
@@ -778,14 +773,16 @@ impl Chat for Discord {
                         | EventTypeFlags::THREAD_DELETE
                         | EventTypeFlags::CHANNEL_DELETE
                         | EventTypeFlags::CHANNEL_UPDATE
-                        | EventTypeFlags::THREAD_UPDATE,
+                        | EventTypeFlags::THREAD_UPDATE
+                        | EventTypeFlags::CHANNEL_CREATE
+                        | EventTypeFlags::THREAD_CREATE,
                 )
                 .await?;
             match event {
                 Ok(Event::MessageCreate(message)) => return Some(Ok(Inbound::Posted(message.0))),
                 Ok(Event::InteractionCreate(interaction)) => {
                     if let Some(component) = self.component(interaction.0) {
-                        match self.component_in_test_run(&component.interaction).await {
+                        match self.channel_in_test_run(component.route).await {
                             Ok(true) => {}
                             Ok(false) => return Some(Ok(Inbound::Component(component))),
                             Err(error) => return Some(Err(error)),
@@ -808,8 +805,14 @@ impl Chat for Discord {
                         Err(error) => return Some(Err(error)),
                     }
                 }
+                Ok(Event::ChannelCreate(channel)) if channel.guild_id == Some(self.guild) => {
+                    crate::remember_workspace_channels(std::slice::from_ref(&channel.0));
+                }
                 Ok(Event::ChannelUpdate(channel)) if channel.guild_id == Some(self.guild) => {
                     crate::remember_workspace_channels(std::slice::from_ref(&channel.0));
+                }
+                Ok(Event::ThreadCreate(thread)) if thread.guild_id == Some(self.guild) => {
+                    crate::remember_tab_threads(std::slice::from_ref(&thread.0));
                 }
                 Ok(Event::ThreadUpdate(thread)) if thread.guild_id == Some(self.guild) => {
                     crate::remember_tab_threads(std::slice::from_ref(&thread.0));
