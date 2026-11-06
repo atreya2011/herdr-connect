@@ -109,17 +109,7 @@ async fn exercise_topology(
     for (name, fresh) in [("cached route", false), ("restart recovery", true)] {
         checks.push((name, slack.sync(route, fresh).await? == found));
     }
-    let live = (
-        workspace_list_result()?
-            .into_iter()
-            .map(|entry| entry.workspace_id)
-            .collect::<HashSet<_>>(),
-        tab_list_result()?
-            .into_iter()
-            .map(|entry| entry.tab_id)
-            .collect::<HashSet<_>>(),
-    );
-    slack.sweep(vec![Ok(route.clone())], live).await?;
+    sweep_preserving_channels(slack, vec![Ok(route.clone())]).await?;
     let after = slack.channels().await?;
     for channel in before {
         if !channel
@@ -184,7 +174,12 @@ async fn cleanup(
                 .await?;
         }
     }
-    herdr(&["workspace", "close", workspace])?;
+    if workspace_list_result()?
+        .iter()
+        .any(|entry| entry.workspace_id == workspace)
+    {
+        herdr(&["workspace", "close", workspace])?;
+    }
     let leftovers = slack
         .channels()
         .await?
@@ -497,4 +492,164 @@ fn test_question() -> Question {
         ],
         multi_select: false,
     }
+}
+
+async fn sweep_preserving_channels(
+    slack: &Slack,
+    routes: Vec<Result<TopologyRoute, String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before = slack.channels().await?;
+    let live = (
+        workspace_list_result()?
+            .into_iter()
+            .map(|entry| entry.workspace_id)
+            .collect::<HashSet<_>>(),
+        tab_list_result()?
+            .into_iter()
+            .map(|entry| entry.tab_id)
+            .collect::<HashSet<_>>(),
+    );
+    for channel in &before {
+        if channel
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("testrun-"))
+        {
+            continue;
+        }
+        let workspace = channel
+            .topic
+            .as_ref()
+            .and_then(|topic| topic.value.strip_prefix("herdr workspace ["))
+            .and_then(|id| id.strip_suffix(']'));
+        let Some(workspace) = workspace else {
+            continue;
+        };
+        if !live.0.contains(workspace) {
+            return Err("sweep would archive a non-test channel; refused before sweep".into());
+        }
+        for message in slack.history(&channel.id).await? {
+            if let Some(tab) = message
+                .content
+                .text
+                .as_deref()
+                .and_then(|text| text.rsplit_once(" ["))
+                .and_then(|(_, suffix)| suffix.strip_suffix(']'))
+                && tab.starts_with(&format!("{workspace}:t"))
+                && !live.1.contains(tab)
+            {
+                return Err("sweep would delete a non-test parent; refused before sweep".into());
+            }
+        }
+    }
+    slack.startup_sweep(routes, || Ok(live)).await;
+    let after = slack.channels().await?;
+    for channel in before {
+        if !channel
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("testrun-"))
+            && !after
+                .iter()
+                .any(|entry| entry.id == channel.id && entry.flags.is_archived != Some(true))
+        {
+            return Err("non-test channel changed during startup sweep".into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("SLACK_BOT_TOKEN")?;
+    let slack = Slack::new(token.clone(), "U0CEYEYSKT5".into(), "T0CF6JNT0KB").await?;
+    let route = create_route()?;
+    let result = async {
+        sweep_preserving_channels(&slack, vec![Ok(route.clone())]).await?;
+        let found = slack
+            .cached_route(&route)
+            .await?
+            .ok_or("startup did not create route")?;
+        let created = herdr(&[
+            "tab",
+            "create",
+            "--workspace",
+            &route.workspace_id,
+            "--label",
+            "testrun-obsolete",
+            "--cwd",
+            "/tmp",
+            "--no-focus",
+        ])?;
+        let tab = created["result"]["tab"]["tab_id"]
+            .as_str()
+            .ok_or("new tab has no id")?;
+        let obsolete = TopologyRoute {
+            tab_id: tab.into(),
+            thread_name: format!("testrun-obsolete [{tab}]"),
+            ..route.clone()
+        };
+        let old = slack.sync_route(&obsolete).await?;
+        herdr(&["tab", "close", tab])?;
+        sweep_preserving_channels(&slack, Vec::new()).await?;
+        let tab_removed = slack
+            .history(&found.channel)
+            .await?
+            .iter()
+            .all(|message| Some(&message.origin.ts) != old.thread.as_ref());
+        let filtered = Slack::new(token.clone(), "U0CEYEYSKT5".into(), "T0CF6JNT0KB")
+            .await?
+            .with_ignore_test_runs(true);
+        let excluded = filtered.sync_route(&route).await.is_err();
+        sweep_preserving_channels(&filtered, Vec::new()).await?;
+        let preserved = slack
+            .history(&found.channel)
+            .await?
+            .iter()
+            .any(|message| Some(&message.origin.ts) == found.thread.as_ref());
+        herdr(&["workspace", "close", &route.workspace_id])?;
+        sweep_preserving_channels(&slack, Vec::new()).await?;
+        let client = SlackClient::new(SlackClientHyperConnector::new()?);
+        let token = SlackApiToken::new(token.into());
+        let archived = client
+            .open_session(&token)
+            .conversations_info(&SlackApiConversationsInfoRequest::new(found.channel))
+            .await?
+            .channel;
+
+        let reused = client
+            .open_session(&token)
+            .conversations_create(&SlackApiConversationsCreateRequest::new(
+                route.channel_name.clone(),
+            ))
+            .await?
+            .channel;
+        Ok::<_, Box<dyn std::error::Error>>(vec![
+            ("startup removes closed tab parent", tab_removed),
+            ("service excludes test route", excluded),
+            ("service sweep preserves test parent", preserved),
+            (
+                "startup archives closed workspace",
+                archived.flags.is_archived == Some(true),
+            ),
+            (
+                "startup renames before archive",
+                archived.name.as_deref() != Some(&route.channel_name),
+            ),
+            (
+                "released channel name reused",
+                reused.name.as_deref() == Some(&route.channel_name),
+            ),
+        ])
+    }
+    .await;
+    let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    assert_eq!(
+        leftovers, 0,
+        "zero-leftover check: unarchived testrun- Slack channels"
+    );
+    for (name, passed) in result? {
+        assert!(passed, "{name}");
+    }
+    Ok(())
 }
