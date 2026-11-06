@@ -101,7 +101,7 @@ impl Slack {
         self.send_content(
             route,
             SlackMessageContent::new().with_text(format!(
-                "Terminal prompt from <@{}>:\n{}",
+                "Terminal prompt from {}:\n{}",
                 self.owner,
                 escape(text)
             )),

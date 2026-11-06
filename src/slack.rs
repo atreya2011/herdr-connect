@@ -287,10 +287,13 @@ impl Slack {
         let response = self
             .client
             .open_session(&self.token)
-            .chat_post_message(&SlackApiChatPostMessageRequest::new(
-                channel.clone(),
-                SlackMessageContent::new().with_text(route.thread_name.clone()),
-            ))
+            .chat_post_message(
+                &SlackApiChatPostMessageRequest::new(
+                    channel.clone(),
+                    SlackMessageContent::new().with_text(delivery::escape(&route.thread_name)),
+                )
+                .with_parse("none".into()),
+            )
             .await
             .map_err(error)?;
         let found = SlackRoute {

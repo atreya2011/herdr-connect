@@ -2232,7 +2232,7 @@ async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|error| error.to_string());
     abort.abort();
-    chat.shutdown_socket().await;
+    chat.shutdown_socket().await?;
     result.map_err(Into::into)
 }
 

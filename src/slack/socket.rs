@@ -124,7 +124,7 @@ impl Slack {
         }
     }
 
-    pub async fn shutdown_socket(&self) {
+    pub async fn shutdown_socket(&self) -> Result<(), ChatError> {
         let routes: Vec<_> = self
             .working
             .lock()
@@ -137,15 +137,17 @@ impl Slack {
                 })
             })
             .collect();
+        let mut result = Ok(());
         for route in routes {
             if let Err(failure) = self.set_working(&route, false).await {
-                crate::bridge_eprintln!("Slack status cleanup error: {failure}");
+                result = Err(failure);
             }
         }
         let listener = self.listener.lock().await.take();
         if let Some(listener) = listener {
             listener.shutdown().await;
         }
+        result
     }
 
     pub async fn next_socket_event(&self) -> Option<SlackSocketEvent> {

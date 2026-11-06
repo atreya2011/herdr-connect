@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, PermissionVendor, Question, QuestionOption, Slack, SlackArchive, SlackSocketEvent,
+    Chat, Inbound, OwnerIdentity, PermissionVendor, Question, QuestionOption, Slack,
     TopologyClosure, TopologyRoute, tab_list_result, workspace_list_result,
 };
 use serde_json::Value;
@@ -234,17 +234,27 @@ async fn slack_delivery_real_thread() -> Result<(), Box<dyn std::error::Error>> 
     let slack = Slack::new(token.clone(), "U0CEYEYSKT5".into(), "T0CF6JNT0KB").await?;
     let route = create_route()?;
     let result = async {
-        let found = slack.sync(&route, false).await?;
-        let reply = slack.send(&found, "testrun agent reply <literal>").await?;
+        let (parent, found) = slack.sync_route_with_parent(&route).await?;
         slack
-            .mirror_prompt(&found, "testrun terminal prompt")
+            .post_live(&found, "testrun agent reply <literal>", "testrun-reply")
             .await?;
-        let activity = slack.send(&found, "testrun activity").await?;
         slack
-            .update(&found, &activity, "testrun activity updated")
+            .post_as_owner(
+                &parent,
+                &found,
+                &OwnerIdentity {
+                    display_name: "U0CEYEYSKT5".into(),
+                    avatar_url: None,
+                },
+                "testrun terminal prompt",
+            )
             .await?;
-        slack.set_working(&found, true).await?;
-        slack.set_working(&found, false).await?;
+        let activity = slack.post_activity(&found, "testrun activity").await?;
+        slack
+            .edit_activity(&found, &activity, "testrun activity updated")
+            .await?;
+        slack.agent_status(&route, true).await?;
+        slack.agent_status(&route, false).await?;
         let client = SlackClient::new(SlackClientHyperConnector::new()?);
         let token = SlackApiToken::new(token.into());
         let replies = client
@@ -258,8 +268,7 @@ async fn slack_delivery_real_thread() -> Result<(), Box<dyn std::error::Error>> 
             (
                 "agent reply in thread",
                 replies.messages.iter().any(|message| {
-                    message.origin.ts == reply
-                        && message.origin.thread_ts == found.thread
+                    message.origin.thread_ts == found.thread
                         && message.content.text.as_deref()
                             == Some("testrun agent reply &lt;literal&gt;")
                 }),
@@ -269,7 +278,7 @@ async fn slack_delivery_real_thread() -> Result<(), Box<dyn std::error::Error>> 
                 replies.messages.iter().any(|message| {
                     message.sender.bot_id.is_some()
                         && message.content.text.as_deref()
-                            == Some("Terminal prompt from <@U0CEYEYSKT5>:\ntestrun terminal prompt")
+                            == Some("Terminal prompt from U0CEYEYSKT5:\ntestrun terminal prompt")
                 }),
             ),
             (
@@ -311,8 +320,7 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
         let sent = slack.send(&found, "testrun socket delivery").await?;
         let received = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                if let Some(SlackSocketEvent::Push(event)) = slack.next_socket_event().await
-                    && let SlackEventCallbackBody::Message(message) = event.event
+                if let Some(Ok(Inbound::Posted(message))) = slack.next_event().await
                     && message.origin.ts == sent
                 {
                     break message;
@@ -320,28 +328,32 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .await?;
-        let ignored = slack.resolve_owner_message(received).await?.is_none();
-        slack
-            .close(&TopologyClosure::Workspace {
-                workspace_id: route.workspace_id.clone(),
-            })
+        let ignored = slack.owner_message(received).await?.is_none();
+        slack.agent_status(&route, true).await?;
+        let client = SlackClient::new(SlackClientHyperConnector::new()?);
+        let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
+        client
+            .open_session(&token)
+            .conversations_archive(&SlackApiConversationsArchiveRequest::new(
+                found.channel.clone(),
+            ))
             .await?;
         let archive = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                if let Some(SlackSocketEvent::Push(event)) = slack.next_socket_event().await
-                    && let SlackEventCallbackBody::ChannelArchive(archive) = event.event
-                    && archive.channel == found.channel
+                if let Some(Ok(Inbound::Deleted(archive))) = slack.next_event().await
+                    && archive.0.channel == found.channel
                 {
                     break archive;
                 }
             }
         })
         .await?;
-        let non_owner_archive = archive.user != SlackUserId::from("U0CEYEYSKT5");
+        let non_owner_archive = archive.0.user != SlackUserId::from("U0CEYEYSKT5");
         slack
-            .close_archived(SlackArchive(archive), |_| {
-                Err("bot archive must never close Herdr".into())
-            })
+            .handle_deletion(
+                archive,
+                |_| Err("bot archive must never close Herdr".into()),
+            )
             .await?;
         Ok::<_, Box<dyn std::error::Error>>(vec![
             ("bot message ignored as owner prompt", ignored),
@@ -355,8 +367,9 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
         ])
     }
     .await;
-    slack.shutdown_socket().await;
+    let shutdown = slack.shutdown_socket().await;
     let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    shutdown?;
     assert_eq!(
         leftovers, 0,
         "zero-leftover check: unarchived testrun- Slack channels"
@@ -453,8 +466,9 @@ async fn slack_cards_real_thread() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, Box<dyn std::error::Error>>(checks)
     }
     .await;
-    slack.shutdown_socket().await;
+    let shutdown = slack.shutdown_socket().await;
     let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    shutdown?;
     assert_eq!(
         leftovers, 0,
         "zero-leftover check: unarchived testrun- Slack channels"
