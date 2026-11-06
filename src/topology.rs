@@ -819,8 +819,8 @@ pub mod owner_deletion_tests {
     #[test]
     fn owner_deleted_thread_resolves_from_the_registry_not_the_cache() {
         remember_workspace_channels(&[
-            channel(8_010, "work", Some("herdr workspace [w1]"), None),
-            channel(8_011, "chat", Some("just talking"), None),
+            channel(8_010, "testrun-work", Some("herdr workspace [w1]"), None),
+            channel(8_011, "testrun-chat", Some("just talking"), None),
         ]);
         remember_tab_threads(&[
             channel(8_020, "build [w1:t2]", None, Some(8_010)),
@@ -848,7 +848,7 @@ pub mod owner_deletion_tests {
 
     #[test]
     fn a_thread_dropped_by_reconcile_still_resolves() {
-        let workspace = channel(8_210, "work", Some("herdr workspace [w3]"), None);
+        let workspace = channel(8_210, "testrun-work", Some("herdr workspace [w3]"), None);
         let thread = channel(8_220, "a [w3:t1]", None, Some(8_210));
         let newer = channel(8_230, "b [w3:t2]", None, Some(8_210));
         remember_workspace_channels(std::slice::from_ref(&workspace));
@@ -873,7 +873,12 @@ pub mod owner_deletion_tests {
 
     #[test]
     fn a_forgotten_thread_no_longer_resolves_and_a_forgotten_channel_takes_its_threads() {
-        remember_workspace_channels(&[channel(8_110, "work", Some("herdr workspace [w2]"), None)]);
+        remember_workspace_channels(&[channel(
+            8_110,
+            "testrun-work",
+            Some("herdr workspace [w2]"),
+            None,
+        )]);
         remember_tab_threads(&[
             channel(8_120, "a [w2:t1]", None, Some(8_110)),
             channel(8_121, "b [w2:t2]", None, Some(8_110)),
@@ -895,7 +900,7 @@ pub mod owner_deletion_tests {
             ("refetch after a topic edit", "herdr workspace [w9]"),
         ];
         for (name, topic) in cases {
-            let fetched = channel(8_410, "work", Some(topic), None);
+            let fetched = channel(8_410, "testrun-work", Some(topic), None);
             remember_workspace_channels(std::slice::from_ref(&fetched));
             assert_eq!(
                 resolve_owner_deleted_workspace(&fetched).as_deref(),
@@ -907,7 +912,12 @@ pub mod owner_deletion_tests {
 
     #[test]
     fn owner_deleted_channel_resolves_from_the_registry_not_the_topic() {
-        remember_workspace_channels(&[channel(8_310, "work", Some("herdr workspace [w4]"), None)]);
+        remember_workspace_channels(&[channel(
+            8_310,
+            "testrun-work",
+            Some("herdr workspace [w4]"),
+            None,
+        )]);
         let cases = [
             (
                 "registered workspace channel",
@@ -937,7 +947,7 @@ pub mod owner_deletion_tests {
             ("channel without a topic", 8_313, None, None),
         ];
         for (name, channel_id, topic, expected) in cases {
-            let deleted = channel(channel_id, "work", topic, None);
+            let deleted = channel(channel_id, "testrun-work", topic, None);
             assert_eq!(
                 resolve_owner_deleted_workspace(&deleted).as_deref(),
                 expected,

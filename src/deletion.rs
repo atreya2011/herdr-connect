@@ -209,7 +209,12 @@ mod tests {
             .target_id
             .expect("other-user channel target")
             .get();
-        let workspace = channel(9_010, "work", Some("herdr workspace [testrun-a]"), None);
+        let workspace = channel(
+            9_010,
+            "testrun-work",
+            Some("herdr workspace [testrun-a]"),
+            None,
+        );
         let thread = channel(thread_target, "build [testrun-a:t1]", None, Some(9_010));
         let other_thread = channel(
             other_thread_target,
@@ -224,25 +229,25 @@ mod tests {
         };
         let on_channel = GuildDeletion::Channel(Box::new(channel(
             channel_target,
-            "work",
+            "testrun-work",
             Some("herdr workspace [testrun-b]"),
             None,
         )));
         let on_other_channel = GuildDeletion::Channel(Box::new(channel(
             other_channel_target,
-            "work",
+            "testrun-work",
             Some("herdr workspace [testrun-c]"),
             None,
         )));
         let no_entry_channel = GuildDeletion::Channel(Box::new(channel(
             9_099,
-            "work",
+            "testrun-work",
             Some("herdr workspace [testrun-d]"),
             None,
         )));
         let wrong_action = GuildDeletion::Channel(Box::new(channel(
             thread_target,
-            "work",
+            "testrun-work",
             Some("herdr workspace [testrun-a]"),
             None,
         )));
