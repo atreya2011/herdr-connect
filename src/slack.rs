@@ -8,6 +8,8 @@ mod cards;
 mod chat;
 mod delivery;
 mod socket;
+#[cfg(test)]
+mod tests;
 pub use socket::{SlackArchive, SlackSocketEvent};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SlackRoute {

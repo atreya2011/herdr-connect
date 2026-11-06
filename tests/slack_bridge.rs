@@ -3,8 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, Inbound, OwnerIdentity, PermissionVendor, Question, QuestionOption, Slack,
-    TopologyClosure, TopologyRoute, slack_channel_name, tab_list_result, workspace_list_result,
+    Chat, Inbound, PermissionVendor, Question, QuestionOption, Slack, TopologyClosure,
+    TopologyRoute, slack_channel_name, tab_list_result, workspace_list_result,
 };
 use serde_json::Value;
 use slack_morphism::prelude::*;
@@ -18,6 +18,46 @@ fn herdr(args: &[&str]) -> Result<Value, String> {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
     serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn slack_observe_unicode_channel_name() -> Result<(), Box<dyn std::error::Error>> {
+    let client = SlackClient::new(SlackClientHyperConnector::new()?);
+    let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
+    let session = client.open_session(&token);
+    let name = format!(
+        "testrun-日本語-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+    );
+    let created = session
+        .conversations_create(
+            &SlackApiConversationsCreateRequest::new(name.clone()).with_is_private(false),
+        )
+        .await?;
+    let actual_name = created.channel.name;
+    session
+        .conversations_archive(&SlackApiConversationsArchiveRequest::new(
+            created.channel.id.clone(),
+        ))
+        .await?;
+    let archived = session
+        .conversations_info(&SlackApiConversationsInfoRequest::new(created.channel.id))
+        .await?
+        .channel
+        .flags
+        .is_archived
+        == Some(true);
+    println!("named zero-leftover check: owned Unicode probe archived={archived}");
+    for (case, observed) in [
+        (
+            "Unicode channel name preserved",
+            actual_name.as_deref() == Some(name.as_str()),
+        ),
+        ("owned Unicode channel archived", archived),
+    ] {
+        assert!(observed, "{case}");
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -258,10 +298,7 @@ async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>>
             .post_as_owner(
                 &parent,
                 &found,
-                &OwnerIdentity {
-                    display_name: slack.owner_id().into(),
-                    avatar_url: None,
-                },
+                slack.owner_identity(),
                 "testrun terminal prompt",
             )
             .await?;
@@ -289,17 +326,12 @@ async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>>
                 }),
             ),
             (
-                "terminal prompt from bot",
+                "terminal prompt uses owner display name",
                 replies.messages.iter().any(|message| {
                     message.sender.bot_id.is_some()
-                        && message.content.text.as_deref()
-                            == Some(
-                                format!(
-                                    "Terminal prompt from {}:\ntestrun terminal prompt",
-                                    slack.owner_id()
-                                )
-                                .as_str(),
-                            )
+                        && message.sender.username.as_deref()
+                            == Some(slack.owner_identity().display_name.as_str())
+                        && message.content.text.as_deref() == Some("testrun terminal prompt")
                 }),
             ),
             (
@@ -447,16 +479,27 @@ async fn slack_cards_real_channel() -> Result<(), Box<dyn std::error::Error>> {
                 permission_blocks[2]["elements"][1]["action_id"] == "herdr:deny:testrun-permission",
             ),
             (
+                "question header and option descriptions included",
+                single_blocks[0]["text"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&question.header))
+                    && question.options.iter().all(|option| {
+                        single_blocks[2]["text"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&option.description))
+                    }),
+            ),
+            (
                 "single-choice button",
-                single_blocks[2]["elements"][1]["action_id"] == "herdrask:testrun-question:1",
+                single_blocks[3]["elements"][1]["action_id"] == "herdrask:testrun-question:1",
             ),
             (
                 "multiple-choice menu",
-                multi_blocks[2]["accessory"]["type"] == "multi_static_select",
+                multi_blocks[3]["accessory"]["type"] == "multi_static_select",
             ),
             (
                 "multiple-choice submit button",
-                multi_blocks[3]["elements"][0]["action_id"] == "herdrask-multi:testrun-question",
+                multi_blocks[4]["elements"][0]["action_id"] == "herdrask-multi:testrun-question",
             ),
             (
                 "retired permission has no actions",
@@ -574,7 +617,20 @@ async fn sweep_preserving_channels(
             return Err("sweep would rename a non-test channel; refused before sweep".into());
         }
     }
-    slack.startup_sweep(routes, || Ok(live)).await;
+    slack
+        .startup_sweep(routes, || {
+            Ok((
+                workspace_list_result()?
+                    .into_iter()
+                    .map(|workspace| workspace.workspace_id)
+                    .collect(),
+                tab_list_result()?
+                    .into_iter()
+                    .map(|tab| tab.tab_id)
+                    .collect(),
+            ))
+        })
+        .await;
     let after = slack.channels().await?;
     for channel in before {
         if !channel
