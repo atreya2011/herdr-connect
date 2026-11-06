@@ -238,6 +238,14 @@ pub async fn sync_topology(
             "Discord topology has duplicate channels for workspace {workspace_id}"
         ));
     }
+    if !production_topology_enabled()
+        && !matching_channels.first().map_or_else(
+            || is_test_run_name(Some(channel_name)),
+            |channel| is_test_run_name(channel.name.as_deref()),
+        )
+    {
+        return Err("test bridge refused a non-testrun workspace channel".to_owned());
+    }
     let matching_channel_id = matching_channels.first().map(|channel| channel.id);
     let workspace_channel = if let Some(id) = matching_channel_id {
         id
@@ -455,6 +463,7 @@ fn thread_tab_suffix(name: &str) -> Option<&str> {
 
 #[derive(Default)]
 struct OwnedTopology {
+    production: bool,
     workspaces: HashMap<Id<ChannelMarker>, String>,
     threads: HashMap<Id<ChannelMarker>, OwnedThread>,
     test_run_channels: HashSet<Id<ChannelMarker>>,
@@ -475,9 +484,25 @@ fn owned_topology() -> std::sync::MutexGuard<'static, OwnedTopology> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+pub fn enable_production_topology() {
+    owned_topology().production = true;
+}
+
+fn production_topology_enabled() -> bool {
+    owned_topology().production
+}
+
 pub fn remember_workspace_channels(channels: &[Channel]) {
     let mut owned = owned_topology();
     for channel in channels {
+        if !owned.production && !is_test_run_name(channel.name.as_deref()) {
+            owned.workspaces.remove(&channel.id);
+            owned.test_run_channels.remove(&channel.id);
+            owned
+                .threads
+                .retain(|_, thread| thread.parent != channel.id);
+            continue;
+        }
         if is_test_run_name(channel.name.as_deref()) {
             owned.test_run_channels.insert(channel.id);
         } else {
@@ -495,6 +520,14 @@ pub fn remember_workspace_channels(channels: &[Channel]) {
 pub fn remember_tab_threads(threads: &[Channel]) {
     let mut owned = owned_topology();
     for thread in threads {
+        if !owned.production
+            && thread
+                .parent_id
+                .is_none_or(|parent| !owned.workspaces.contains_key(&parent))
+        {
+            owned.threads.remove(&thread.id);
+            continue;
+        }
         if let Some(existing) = owned.threads.get_mut(&thread.id)
             && let Some(name) = &thread.name
         {
@@ -544,6 +577,11 @@ pub fn resolve_owner_deleted_tab(
         .threads
         .get(&thread_id)
         .map(|thread| (thread.tab_id.clone(), thread.parent))
+}
+
+#[must_use]
+pub fn owned_channel_is_test_run(channel_id: Id<ChannelMarker>) -> bool {
+    owned_topology().test_run_channels.contains(&channel_id)
 }
 
 #[must_use]
@@ -598,7 +636,11 @@ pub async fn delete_tab_thread<S: std::hash::BuildHasher + Sync>(
     let Some(thread) = resolved else {
         return Ok(());
     };
-    if ignore_test_runs && is_test_run_name(thread.name.as_deref()) {
+    if (ignore_test_runs && is_test_run_name(thread.name.as_deref()))
+        || (!production_topology_enabled()
+            && !channel_is_test_run(channels, workspace_channel)
+            && !is_test_run_name(thread.name.as_deref()))
+    {
         return Ok(());
     }
     delete_channel_if_present(client, thread.id).await?;
@@ -624,6 +666,9 @@ pub async fn delete_workspace_channel(
     let Some(channel_id) = workspace_channel_id(channels, workspace_id) else {
         return Ok(());
     };
+    if !production_topology_enabled() && !channel_is_test_run(channels, channel_id) {
+        return Ok(());
+    }
     if ignore_test_runs {
         if channel_is_test_run(channels, channel_id)
             || active_threads.iter().any(|thread| {
@@ -704,6 +749,14 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
         .map(|channel| channel.id)
         .collect();
     for channel in absent {
+        if !production_topology_enabled()
+            && !is_test_run_name(channel.name.as_deref())
+            && !channel
+                .parent_id
+                .is_some_and(|parent| channel_is_test_run(channels, parent))
+        {
+            continue;
+        }
         if ignore_test_runs
             && (is_test_run_name(channel.name.as_deref())
                 || channel

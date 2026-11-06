@@ -28,6 +28,12 @@ impl From<ChatError> for String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatScope {
+    TestRuns,
+    Service,
+}
+
 pub enum Ack<'a> {
     Ephemeral(&'a str),
     Defer,
@@ -81,6 +87,27 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Deletion: Display + Send + 'static;
 
     fn owner_id(&self) -> &str;
+    fn scope(&self) -> ChatScope;
+    fn accepts_herdr_route(
+        &self,
+        workspace: &str,
+        tab: &str,
+    ) -> impl Future<Output = Result<bool, ChatError>> + Send {
+        async move {
+            if self.scope() == ChatScope::Service {
+                return Ok(true);
+            }
+            let (workspace, tab) = (workspace.to_owned(), tab.to_owned());
+            tokio::task::spawn_blocking(move || crate::route_is_test_run(&workspace, &tab))
+                .await
+                .map_err(|error| ChatError(error.to_string()))?
+                .map_err(ChatError)
+        }
+    }
+    fn accepts_route(
+        &self,
+        route: &Self::Route,
+    ) -> impl Future<Output = Result<bool, ChatError>> + Send;
     fn owner_message_accepted(
         &self,
         _route: &Self::Route,

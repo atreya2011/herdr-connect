@@ -16,12 +16,12 @@ use herdr_connect_rs::{
     send_activity_frame,
 };
 use herdr_connect_rs::{
-    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, Discord, ENV_DISCORD_GUILD_ID,
-    ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
-    OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Slack,
-    TopologyCache, TopologyClosure, TopologyRoute, Transition, TransitionMessage,
-    agent_read_detection, create_transition_messages, dialog_shows_question, drive_gateway,
-    fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
+    AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, ChatScope, Discord,
+    ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY,
+    HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE,
+    STATUS_WORKING, Slack, TopologyCache, TopologyClosure, TopologyRoute, Transition,
+    TransitionMessage, agent_read_detection, create_transition_messages, dialog_shows_question,
+    drive_gateway, fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
     format_detection_question, hook_timeout, is_postable_transition, list_agents, list_mirrored,
     live_message_nonce, load_discord_config, name_unlabeled_tabs, read_claude_incremental,
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
@@ -398,7 +398,26 @@ fn tab_is_working(agents: &[AgentSnapshot], tab_id: &str) -> bool {
         .any(|agent| agent.tab_id == tab_id && agent.agent_status == STATUS_WORKING)
 }
 
+#[cfg(test)]
 async fn process_snapshot<C: Chat>(
+    snapshot: &AgentSnapshot,
+    agents: &[AgentSnapshot],
+    tabs: &[HerdrTab],
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
+) {
+    match discord
+        .0
+        .accepts_herdr_route(&snapshot.workspace_id, &snapshot.tab_id)
+        .await
+    {
+        Ok(true) => process_scoped_snapshot(snapshot, agents, tabs, discord, state).await,
+        Ok(false) => {}
+        Err(error) => bridge_eprintln!("herdr snapshot scope error: {error}"),
+    }
+}
+
+async fn process_scoped_snapshot<C: Chat>(
     snapshot: &AgentSnapshot,
     agents: &[AgentSnapshot],
     tabs: &[HerdrTab],
@@ -1333,6 +1352,7 @@ fn prune_departed_state<C: Chat>(
 async fn discord_connection(
     topology_cache: TopologyCache,
     ignore_test_runs: bool,
+    scope: ChatScope,
 ) -> Result<(ChatConnection<Discord>, GatewayTask), Box<dyn std::error::Error>> {
     let mut environment: Vec<(&str, String)> = Vec::new();
     for name in [
@@ -1370,7 +1390,8 @@ async fn discord_connection(
             config.owner_id,
             topology_cache,
         )
-        .with_ignore_test_runs(ignore_test_runs),
+        .with_ignore_test_runs(ignore_test_runs)
+        .with_scope(scope),
     );
     let responder = Arc::new(
         PermissionResponder::new(Arc::clone(&chat)).with_ignore_test_runs(ignore_test_runs),
@@ -1881,7 +1902,17 @@ fn spawn_startup_topology_sweep<C: Chat>(
     ignore_test_runs: bool,
 ) {
     match list_topology(ignore_test_runs) {
-        Ok((agents, mut tabs)) => {
+        Ok((mut agents, mut tabs)) => {
+            if discord.0.scope() == ChatScope::TestRuns {
+                let workspaces = match workspace_list_result() {
+                    Ok(workspaces) => workspaces,
+                    Err(error) => {
+                        bridge_eprintln!("herdr startup scope error: {error}");
+                        return;
+                    }
+                };
+                herdr_connect_rs::retain_test_runs(&mut agents, &mut tabs, &workspaces);
+            }
             for error in name_unlabeled_tabs(&agents, &mut tabs, rename_errors_reported) {
                 bridge_eprintln!("herdr startup topology error: {error}");
             }
@@ -2071,6 +2102,14 @@ async fn apply_herdr_snapshot<C: Chat>(
 ) -> Result<Vec<String>, String> {
     let mut agents = list_agents()?;
     let mut tabs = tab_list_result()?;
+    let workspaces = if discord.0.scope() == ChatScope::TestRuns || state.ignore_test_runs {
+        workspace_list_result()?
+    } else {
+        Vec::new()
+    };
+    if discord.0.scope() == ChatScope::TestRuns {
+        herdr_connect_rs::retain_test_runs(&mut agents, &mut tabs, &workspaces);
+    }
     #[cfg(test)]
     if let Some(panes) = &state.included_panes {
         agents.retain(|agent| panes.contains(&agent.pane_id));
@@ -2078,7 +2117,6 @@ async fn apply_herdr_snapshot<C: Chat>(
     }
     let mut excluded_terminals = HashSet::new();
     if state.ignore_test_runs {
-        let workspaces = workspace_list_result()?;
         let all_terminals: HashSet<String> = agents
             .iter()
             .map(|agent| agent.terminal_id.clone())
@@ -2136,7 +2174,7 @@ async fn apply_herdr_snapshot<C: Chat>(
         expire_departed_card(discord, &terminal, card).await;
     }
     for snapshot in &agents {
-        process_snapshot(snapshot, &agents, &tabs, discord, state).await;
+        process_scoped_snapshot(snapshot, &agents, &tabs, discord, state).await;
     }
     Ok(pane_ids_from_agents(&agents))
 }
@@ -2187,13 +2225,20 @@ async fn next_status_event(
 }
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    herdr_connect_rs::enable_production_topology();
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
-    let (connection, gateway) = discord_connection(topology_cache, true).await?;
+    let (connection, gateway) =
+        discord_connection(topology_cache, true, ChatScope::Service).await?;
     run_connected_bridge(connection, gateway).await
 }
 
 async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    let chat = Arc::new(Slack::from_env().await?.with_ignore_test_runs(true));
+    let chat = Arc::new(
+        Slack::from_env()
+            .await?
+            .with_ignore_test_runs(true)
+            .with_scope(ChatScope::Service),
+    );
     chat.connect_socket(std::env::var("SLACK_APP_TOKEN")?)
         .await?;
     let identity = chat.owner_identity().clone();
@@ -2799,8 +2844,12 @@ mod tests {
                 std::ffi::OsString::from_vec(b"secret-token\xff".to_vec()),
             );
         }
-        let result =
-            super::discord_connection(Arc::new(tokio::sync::Mutex::new(None)), false).await;
+        let result = super::discord_connection(
+            Arc::new(tokio::sync::Mutex::new(None)),
+            false,
+            super::ChatScope::TestRuns,
+        )
+        .await;
         unsafe {
             match original {
                 Some(value) => std::env::set_var("DISCORD_TOKEN", value),

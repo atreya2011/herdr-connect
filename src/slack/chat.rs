@@ -40,6 +40,9 @@ impl Slack {
         let route = SlackRoute {
             channel: channel.id.clone(),
         };
+        if !self.accepts_channel(&route.channel).await? {
+            return Ok(None);
+        }
         let mut topology = self.state.topology.lock().await;
         if !topology.tabs.values().any(|entry| entry == &route) {
             self.load(&mut topology).await?;
@@ -109,11 +112,23 @@ impl Chat for Slack {
     fn owner_id(&self) -> &str {
         &self.owner.0
     }
+    fn scope(&self) -> crate::ChatScope {
+        self.scope
+    }
+    async fn accepts_route(&self, route: &SlackRoute) -> Result<bool, ChatError> {
+        if self.scope == crate::ChatScope::Service {
+            return Ok(true);
+        }
+        self.accepts_channel(&route.channel).await
+    }
     async fn owner_message_accepted(
         &self,
         route: &SlackRoute,
         message: &SlackTs,
     ) -> Result<(), ChatError> {
+        if !self.accepts_route(route).await? {
+            return Ok(());
+        }
         self.use_status_message(route, message).await;
         self.track_working(route, true).await
     }
@@ -143,14 +158,25 @@ impl Chat for Slack {
         Ok((channel.clone(), channel))
     }
     async fn cached_route(&self, route: &TopologyRoute) -> Result<Option<SlackRoute>, ChatError> {
-        Ok(self
+        if self.scope == crate::ChatScope::TestRuns
+            && self.excluded(&route.workspace_id, &route.tab_id).await?
+        {
+            return Ok(None);
+        }
+        let found = self
             .state
             .topology
             .lock()
             .await
             .tabs
             .get(&route.tab_id)
-            .cloned())
+            .cloned();
+        if let Some(found) = &found
+            && !self.accepts_route(found).await?
+        {
+            return Ok(None);
+        }
+        Ok(found)
     }
     async fn register_archived(&self) -> Result<(), ChatError> {
         Ok(())
@@ -168,8 +194,9 @@ impl Chat for Slack {
         let state = self.state.clone();
         let closure = closure.clone();
         let ignore_test_runs = self.ignore_test_runs;
+        let scope = self.scope;
         tokio::spawn(async move {
-            if let Err(failure) = state.close(&closure, ignore_test_runs).await {
+            if let Err(failure) = state.close(&closure, scope, ignore_test_runs).await {
                 crate::bridge_eprintln!("Slack topology closure error: {failure}");
             }
         });
@@ -290,6 +317,14 @@ impl Chat for Slack {
             .user
             .as_ref()
             .ok_or_else(|| error("Slack interaction has no user"))?;
+        if !self
+            .accepts_route(&SlackRoute {
+                channel: channel.id.clone(),
+            })
+            .await?
+        {
+            return Ok(());
+        }
         self.state
             .client
             .open_session(&self.state.token)
@@ -317,6 +352,9 @@ impl Chat for Slack {
         _message: &SlackTs,
         text: &str,
     ) -> Result<(), ChatError> {
+        if !self.accepts_route(route).await? {
+            return Ok(());
+        }
         if text.starts_with("accepted:") {
             self.state
                 .client
@@ -353,10 +391,31 @@ impl Chat for Slack {
                 SlackSocketEvent::Failure(failure) => return Some(Err(failure)),
                 SlackSocketEvent::Push(event) => match event.event {
                     SlackEventCallbackBody::Message(message) => {
-                        return Some(Ok(Inbound::Posted(message)));
+                        let Some(channel) = message.origin.channel.as_ref() else {
+                            continue;
+                        };
+                        match self
+                            .accepts_route(&SlackRoute {
+                                channel: channel.clone(),
+                            })
+                            .await
+                        {
+                            Ok(true) => return Some(Ok(Inbound::Posted(message))),
+                            Ok(false) => {}
+                            Err(failure) => return Some(Err(failure)),
+                        }
                     }
                     SlackEventCallbackBody::ChannelArchive(archive) => {
-                        return Some(Ok(Inbound::Deleted(SlackArchive(archive))));
+                        match self
+                            .accepts_route(&SlackRoute {
+                                channel: archive.channel.clone(),
+                            })
+                            .await
+                        {
+                            Ok(true) => return Some(Ok(Inbound::Deleted(SlackArchive(archive)))),
+                            Ok(false) => {}
+                            Err(failure) => return Some(Err(failure)),
+                        }
                     }
                     _ => {}
                 },

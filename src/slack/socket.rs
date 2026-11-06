@@ -190,12 +190,7 @@ impl Slack {
             .await
             .map_err(error)?
             .channel;
-        if self.ignore_test_runs
-            && info
-                .name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("testrun-"))
-        {
+        if !super::channel_scope(self.scope, self.ignore_test_runs, &info) {
             return Ok(None);
         }
         let Some((workspace, tab)) = identity(&info) else {
@@ -220,14 +215,38 @@ impl Slack {
     }
 
     pub(super) async fn excluded(&self, workspace: &str, tab: &str) -> Result<bool, ChatError> {
-        if !self.ignore_test_runs {
+        if self.scope == crate::ChatScope::Service && !self.ignore_test_runs {
             return Ok(false);
         }
         let (workspace, tab) = (workspace.to_owned(), tab.to_owned());
-        tokio::task::spawn_blocking(move || crate::route_is_test_run(&workspace, &tab))
+        let test_run =
+            tokio::task::spawn_blocking(move || crate::route_is_test_run(&workspace, &tab))
+                .await
+                .map_err(error)?
+                .map_err(error)?;
+        Ok((self.scope == crate::ChatScope::TestRuns && !test_run)
+            || (self.ignore_test_runs && test_run))
+    }
+
+    pub(super) async fn accepts_channel(
+        &self,
+        channel: &SlackChannelId,
+    ) -> Result<bool, ChatError> {
+        let channel = self
+            .state
+            .client
+            .open_session(&self.state.token)
+            .conversations_info(&SlackApiConversationsInfoRequest::new(channel.clone()))
             .await
             .map_err(error)?
-            .map_err(error)
+            .channel;
+        if !super::channel_scope(self.scope, self.ignore_test_runs, &channel) {
+            return Ok(false);
+        }
+        let Some((workspace, tab)) = identity(&channel) else {
+            return Ok(false);
+        };
+        Ok(!self.excluded(workspace, tab).await?)
     }
 
     pub async fn close_archived<F>(&self, event: SlackArchive, close: F) -> Result<(), ChatError>
@@ -248,12 +267,7 @@ impl Slack {
             .await
             .map_err(error)?
             .channel;
-        if self.ignore_test_runs
-            && channel
-                .name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("testrun-"))
-        {
+        if !super::channel_scope(self.scope, self.ignore_test_runs, &channel) {
             return Ok(());
         }
         let Some((workspace, tab)) = identity(&channel) else {

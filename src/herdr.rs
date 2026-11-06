@@ -371,6 +371,27 @@ pub fn retain_mirrored(
     });
 }
 
+pub fn retain_test_runs(
+    agents: &mut Vec<AgentSnapshot>,
+    tabs: &mut Vec<HerdrTab>,
+    workspaces: &[HerdrWorkspace],
+) {
+    let test_workspaces = workspaces
+        .iter()
+        .filter(|workspace| workspace.label.starts_with(TEST_RUN_PREFIX))
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect::<HashSet<_>>();
+    tabs.retain(|tab| {
+        test_workspaces.contains(tab.workspace_id.as_str())
+            || tab.label.starts_with(TEST_RUN_PREFIX)
+    });
+    let test_tabs = tabs
+        .iter()
+        .map(|tab| tab.tab_id.as_str())
+        .collect::<HashSet<_>>();
+    agents.retain(|agent| test_tabs.contains(agent.tab_id.as_str()));
+}
+
 pub fn list_mirrored() -> Result<(Vec<AgentSnapshot>, Vec<HerdrTab>), String> {
     let mut agents = list_agents()?;
     let mut tabs = tab_list_result()?;

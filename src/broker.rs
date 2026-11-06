@@ -553,6 +553,14 @@ pub async fn handle_component<C: Chat>(
     responder: Arc<PermissionResponder<C>>,
     component: Component<C>,
 ) {
+    match responder.chat.accepts_route(&component.route).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            bridge_eprintln!("interaction scope check failed: {error}");
+            return;
+        }
+    }
     let text = if !component.authorized {
         Some("not authorized")
     } else if let Some(token) = component.custom_id.strip_prefix("herdrask-multi:") {

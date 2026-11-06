@@ -19,7 +19,7 @@ use twilight_model::id::{
 };
 
 use crate::chat::{
-    Ack, Chat, ChatError, Closed, Component, Inbound, OwnerMessage, TopologyClosure,
+    Ack, Chat, ChatError, ChatScope, Closed, Component, Inbound, OwnerMessage, TopologyClosure,
 };
 use crate::deletion::{GuildDeletion, handle_guild_deletion};
 use crate::delivery::expire_permission_card;
@@ -48,6 +48,7 @@ pub struct Discord {
     webhooks: Mutex<WebhookCache>,
     shard: tokio::sync::Mutex<Shard>,
     ignore_test_runs: bool,
+    scope: ChatScope,
 }
 
 pub async fn fetch_startup_owner_identity(
@@ -126,6 +127,7 @@ impl Discord {
             webhooks: Mutex::new(HashMap::new()),
             shard: tokio::sync::Mutex::new(shard),
             ignore_test_runs: false,
+            scope: ChatScope::TestRuns,
         }
     }
 
@@ -133,6 +135,158 @@ impl Discord {
     pub const fn with_ignore_test_runs(mut self, ignore_test_runs: bool) -> Self {
         self.ignore_test_runs = ignore_test_runs;
         self
+    }
+
+    #[must_use]
+    pub const fn with_scope(mut self, scope: ChatScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    async fn chat_channel_in_scope(
+        &self,
+        channel_id: Id<ChannelMarker>,
+    ) -> Result<bool, ChatError> {
+        if self.scope == ChatScope::Service {
+            return Ok(true);
+        }
+        let channel = self
+            .client
+            .channel(channel_id)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        if is_test_run_name(channel.name.as_deref()) {
+            return Ok(true);
+        }
+        let Some(parent) = channel
+            .parent_id
+            .filter(|_| is_thread_channel(channel.kind))
+        else {
+            return Ok(false);
+        };
+        let parent = self
+            .client
+            .channel(parent)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        Ok(is_test_run_name(parent.name.as_deref()))
+    }
+
+    async fn check_channel_scope(&self, channel: Id<ChannelMarker>) -> Result<(), ChatError> {
+        if self.chat_channel_in_scope(channel).await? {
+            Ok(())
+        } else {
+            Err(chat_error(
+                "test bridge refused a non-testrun Discord channel",
+            ))
+        }
+    }
+
+    pub async fn channel_in_scope(&self, channel_id: Id<ChannelMarker>) -> Result<bool, ChatError> {
+        if self.scope == ChatScope::Service {
+            return Ok(true);
+        }
+        let channel = self
+            .client
+            .channel(channel_id)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        let Some(parent) = channel
+            .parent_id
+            .filter(|_| is_thread_channel(channel.kind))
+        else {
+            return Ok(false);
+        };
+        let parent = self
+            .client
+            .channel(parent)
+            .await
+            .map_err(chat_error)?
+            .model()
+            .await
+            .map_err(chat_error)?;
+        if !is_test_run_name(channel.name.as_deref()) && !is_test_run_name(parent.name.as_deref()) {
+            return Ok(false);
+        }
+        let Some((tab, workspace)) = channel
+            .name
+            .as_deref()
+            .zip(parent.topic.as_deref())
+            .and_then(|(name, topic)| prompt_surface_markers(name, topic))
+        else {
+            return Ok(false);
+        };
+        self.accepts_herdr_route(workspace, tab).await
+    }
+
+    async fn check_topology_route(&self, route: &TopologyRoute) -> Result<(), ChatError> {
+        if self
+            .accepts_herdr_route(&route.workspace_id, &route.tab_id)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(chat_error("test bridge refused a non-testrun Herdr route"))
+        }
+    }
+
+    async fn fetch_scoped_topology(
+        &self,
+    ) -> Result<
+        (
+            Vec<twilight_model::channel::Channel>,
+            Vec<twilight_model::channel::Channel>,
+        ),
+        String,
+    > {
+        let (mut channels, mut threads) = fetch_topology_lists(&self.client, self.guild).await?;
+        if self.scope == ChatScope::TestRuns {
+            channels.retain(|channel| is_test_run_name(channel.name.as_deref()));
+            threads.retain(|thread| {
+                thread
+                    .parent_id
+                    .is_some_and(|parent| channels.iter().any(|channel| channel.id == parent))
+            });
+        }
+        Ok((channels, threads))
+    }
+
+    async fn deletion_in_scope(&self, deletion: &GuildDeletion) -> Result<bool, ChatError> {
+        if self.scope == ChatScope::Service {
+            return Ok(true);
+        }
+        match deletion {
+            GuildDeletion::Channel(channel) => {
+                if !is_test_run_name(channel.name.as_deref()) {
+                    return Ok(false);
+                }
+                let Some(workspace) = crate::resolve_owner_deleted_workspace(channel) else {
+                    return Ok(false);
+                };
+                self.accepts_herdr_route(&workspace, "").await
+            }
+            GuildDeletion::Thread { id } => {
+                if !owned_thread_is_test_run(*id) {
+                    return Ok(false);
+                }
+                let Some((tab, _)) = crate::resolve_owner_deleted_tab(*id) else {
+                    return Ok(false);
+                };
+                let Some((workspace, _)) = tab.split_once(':') else {
+                    return Ok(false);
+                };
+                self.accepts_herdr_route(workspace, &tab).await
+            }
+        }
     }
 
     pub async fn channel_in_test_run(
@@ -305,7 +459,16 @@ impl Chat for Discord {
         &self.owner_id
     }
 
+    fn scope(&self) -> ChatScope {
+        self.scope
+    }
+
+    async fn accepts_route(&self, route: &Self::Route) -> Result<bool, ChatError> {
+        self.channel_in_scope(*route).await
+    }
+
     async fn sync_route(&self, route: &TopologyRoute) -> Result<Self::Route, ChatError> {
+        self.check_topology_route(route).await?;
         Ok(sync_route(
             &self.client,
             self.guild,
@@ -320,6 +483,7 @@ impl Chat for Discord {
         &self,
         route: &TopologyRoute,
     ) -> Result<(Self::Route, Self::Route), ChatError> {
+        self.check_topology_route(route).await?;
         let thread = sync_route(
             &self.client,
             self.guild,
@@ -342,6 +506,7 @@ impl Chat for Discord {
     }
 
     async fn cached_route(&self, route: &TopologyRoute) -> Result<Option<Self::Route>, ChatError> {
+        self.check_topology_route(route).await?;
         let guard = self.topology_cache.lock().await;
         let Some((channels, active_threads)) = guard.as_ref() else {
             return Ok(None);
@@ -359,7 +524,7 @@ impl Chat for Discord {
     where
         F: FnOnce() -> Result<(HashSet<String>, HashSet<String>), String> + Send,
     {
-        let fetched = match fetch_topology_lists(&self.client, self.guild).await {
+        let fetched = match self.fetch_scoped_topology().await {
             Ok(lists) => lists,
             Err(error) => {
                 bridge_eprintln!("herdr startup topology error: {error}");
@@ -377,12 +542,16 @@ impl Chat for Discord {
                     continue;
                 }
             };
+            if let Err(error) = self.check_topology_route(&route).await {
+                bridge_eprintln!("herdr startup topology error: {error}");
+                continue;
+            }
             let mut guard = self.topology_cache.lock().await;
             let (channels, active_threads) =
                 if let Some((channels, active_threads)) = guard.as_mut() {
                     (channels, active_threads)
                 } else {
-                    let fetched = match fetch_topology_lists(&self.client, self.guild).await {
+                    let fetched = match self.fetch_scoped_topology().await {
                         Ok(fetched) => fetched,
                         Err(error) => {
                             bridge_eprintln!("herdr startup topology error: {error}");
@@ -418,7 +587,7 @@ impl Chat for Discord {
         let (channels, active_threads) = if let Some((channels, active_threads)) = guard.as_mut() {
             (channels, active_threads)
         } else {
-            let fetched = match fetch_topology_lists(&self.client, self.guild).await {
+            let fetched = match self.fetch_scoped_topology().await {
                 Ok(fetched) => fetched,
                 Err(error) => {
                     bridge_eprintln!("herdr startup topology error: {error}");
@@ -443,7 +612,7 @@ impl Chat for Discord {
     }
 
     async fn close_topology(&self, closure: &TopologyClosure) -> Result<(), ChatError> {
-        let fetched = fetch_topology_lists(&self.client, self.guild).await?;
+        let fetched = self.fetch_scoped_topology().await?;
         let mut guard = self.topology_cache.lock().await;
         let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
         let result = match closure {
@@ -484,7 +653,8 @@ impl Chat for Discord {
     }
 
     async fn sync_route_fresh(&self, route: &TopologyRoute) -> Result<Self::Route, ChatError> {
-        let fetched = fetch_topology_lists(&self.client, self.guild).await?;
+        self.check_topology_route(route).await?;
+        let fetched = self.fetch_scoped_topology().await?;
         let mut guard = self.topology_cache.lock().await;
         let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
         Ok(sync_topology(
@@ -504,6 +674,7 @@ impl Chat for Discord {
         text: &str,
         nonce: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         match deliver_live_message(&self.client, *route, text, nonce).await {
             Ok(_) => Ok(()),
             Err(error) => Err(self.gone(error, None).await),
@@ -516,6 +687,7 @@ impl Chat for Discord {
         card: &TransitionMessage,
         nonce: &str,
     ) -> Result<Self::Message, ChatError> {
+        self.check_channel_scope(*route).await?;
         match deliver_transition_card(&self.client, *route, card, nonce).await {
             Ok(message) => Ok(message),
             Err(error) => Err(self.gone(error, None).await),
@@ -527,6 +699,7 @@ impl Chat for Discord {
         route: &Self::Route,
         text: &str,
     ) -> Result<Self::Message, ChatError> {
+        self.check_channel_scope(*route).await?;
         match deliver_activity_message(&self.client, *route, text).await {
             Ok(message) => Ok(message),
             Err(error) => Err(self.gone(error, None).await),
@@ -539,6 +712,7 @@ impl Chat for Discord {
         message: &Self::Message,
         text: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         match update_activity_message(&self.client, *route, *message, text).await {
             Ok(()) => Ok(()),
             Err(error) => Err(self.gone(error, None).await),
@@ -552,6 +726,8 @@ impl Chat for Discord {
         owner: &OwnerIdentity,
         text: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*parent).await?;
+        self.check_channel_scope(*thread).await?;
         let result = async {
             let (webhook_id, webhook_token) = self.terminal_prompt_webhook(*parent).await?;
             execute_terminal_prompt_webhook(
@@ -578,6 +754,7 @@ impl Chat for Discord {
         message: &Self::Message,
         text: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         Ok(expire_informational_card(&self.client, *route, *message, text).await?)
     }
 
@@ -587,6 +764,7 @@ impl Chat for Discord {
         question: &Question,
         token: &str,
     ) -> Result<Self::Message, ChatError> {
+        self.check_channel_scope(*route).await?;
         Ok(deliver_question_card(&self.client, *route, question, token, &self.owner_id).await?)
     }
 
@@ -597,6 +775,7 @@ impl Chat for Discord {
         question: &Question,
         token: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         Ok(update_question_card(
             &self.client,
             *route,
@@ -616,6 +795,7 @@ impl Chat for Discord {
         command: &str,
         token: &str,
     ) -> Result<Self::Message, ChatError> {
+        self.check_channel_scope(*route).await?;
         Ok(deliver_permission_card(&self.client, *route, vendor, tool, command, token).await?)
     }
 
@@ -626,6 +806,7 @@ impl Chat for Discord {
         token: &str,
         text: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         Ok(expire_permission_card(&self.client, *route, *message, token, text).await?)
     }
 
@@ -634,6 +815,15 @@ impl Chat for Discord {
         interaction: &Self::Interaction,
         ack: Ack<'_>,
     ) -> Result<(), ChatError> {
+        if self.scope == ChatScope::TestRuns {
+            let Some(channel) = interaction.channel.as_ref() else {
+                return Ok(());
+            };
+            if !self.channel_in_scope(channel.id).await? {
+                return Ok(());
+            }
+        }
+
         let interactions = self.client.interaction(interaction.application_id);
         match ack {
             Ack::Ephemeral(text) => {
@@ -675,6 +865,7 @@ impl Chat for Discord {
     }
 
     async fn typing(&self, route: &Self::Route) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         self.client
             .create_typing_trigger(*route)
             .await
@@ -688,6 +879,7 @@ impl Chat for Discord {
         message: &Self::Message,
         text: &str,
     ) -> Result<(), ChatError> {
+        self.check_channel_scope(*route).await?;
         self.client
             .create_message(*route)
             .content(text)
@@ -735,6 +927,12 @@ impl Chat for Discord {
         let Some(thread_name) = thread.name.as_deref() else {
             return Ok(None);
         };
+        if self.scope == ChatScope::TestRuns
+            && !is_test_run_name(Some(thread_name))
+            && !is_test_run_name(parent.name.as_deref())
+        {
+            return Ok(None);
+        }
         if self.ignore_test_runs
             && (is_test_run_name(Some(thread_name)) || is_test_run_name(parent.name.as_deref()))
         {
@@ -752,6 +950,9 @@ impl Chat for Discord {
         let Some((tab_id, workspace_id)) = prompt_surface_markers(thread_name, topic) else {
             return Ok(None);
         };
+        if !self.accepts_herdr_route(workspace_id, tab_id).await? {
+            return Ok(None);
+        }
         Ok(Some(OwnerMessage {
             route: posted.channel_id,
             message: posted.id,
@@ -779,9 +980,23 @@ impl Chat for Discord {
                 )
                 .await?;
             match event {
-                Ok(Event::MessageCreate(message)) => return Some(Ok(Inbound::Posted(message.0))),
+                Ok(Event::MessageCreate(message)) => {
+                    if message.guild_id != Some(self.guild) {
+                        continue;
+                    }
+                    match self.chat_channel_in_scope(message.channel_id).await {
+                        Ok(true) => return Some(Ok(Inbound::Posted(message.0))),
+                        Ok(false) => {}
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
                 Ok(Event::InteractionCreate(interaction)) => {
                     if let Some(component) = self.component(interaction.0) {
+                        match self.channel_in_scope(component.route).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => return Some(Err(error)),
+                        }
                         match self.channel_in_test_run(component.route).await {
                             Ok(true) => {}
                             Ok(false) => return Some(Ok(Inbound::Component(component))),
@@ -790,6 +1005,13 @@ impl Chat for Discord {
                     }
                 }
                 Ok(Event::ThreadDelete(thread)) if thread.guild_id == self.guild => {
+                    let test_run = owned_thread_is_test_run(thread.id)
+                        || crate::topology::owned_channel_is_test_run(thread.parent_id);
+                    if (self.scope == ChatScope::TestRuns && !test_run)
+                        || (self.ignore_test_runs && test_run)
+                    {
+                        continue;
+                    }
                     let deletion = GuildDeletion::Thread { id: thread.id };
                     match self.deletion_in_test_run(&deletion).await {
                         Ok(true) => {}
@@ -798,6 +1020,11 @@ impl Chat for Discord {
                     }
                 }
                 Ok(Event::ChannelDelete(channel)) if channel.guild_id == Some(self.guild) => {
+                    if self.scope == ChatScope::TestRuns
+                        && !is_test_run_name(channel.name.as_deref())
+                    {
+                        continue;
+                    }
                     let deletion = GuildDeletion::Channel(Box::new(channel.0));
                     match self.deletion_in_test_run(&deletion).await {
                         Ok(true) => {}
@@ -827,6 +1054,9 @@ impl Chat for Discord {
     where
         F: FnOnce(Closed) -> Result<(), String> + Send + 'static,
     {
+        if !self.deletion_in_scope(&deletion).await? {
+            return Ok(());
+        }
         Ok(handle_guild_deletion(
             &self.client,
             self.guild,

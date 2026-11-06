@@ -1,4 +1,6 @@
-use crate::{ChatError, TopologyClosure, TopologyRoute, tab_list_result, workspace_list_result};
+use crate::{
+    ChatError, ChatScope, TopologyClosure, TopologyRoute, tab_list_result, workspace_list_result,
+};
 use slack_morphism::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -40,6 +42,7 @@ pub struct Slack {
     bot: SlackUserId,
     team: String,
     ignore_test_runs: bool,
+    scope: ChatScope,
     listener: Mutex<Option<SlackClientSocketModeListener<SlackClientHyperHttpsConnector>>>,
     events: Mutex<tokio::sync::mpsc::UnboundedReceiver<SlackSocketEvent>>,
     question_text: Mutex<HashMap<SlackTs, String>>,
@@ -58,6 +61,13 @@ fn identity(channel: &SlackChannelInfo) -> Option<(&str, &str)> {
     let tab = tab.strip_suffix(']')?;
     let (parent, short) = tab.split_once(':')?;
     (parent == workspace && short.starts_with('t')).then_some((workspace, tab))
+}
+fn channel_scope(scope: ChatScope, ignore_test_runs: bool, channel: &SlackChannelInfo) -> bool {
+    let test_run = channel
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("testrun-"));
+    (scope != ChatScope::TestRuns || test_run) && (!ignore_test_runs || !test_run)
 }
 fn normalize(label: &str) -> String {
     label
@@ -183,6 +193,7 @@ impl Slack {
             bot: auth.user_id,
             team: auth.team_id.to_string(),
             ignore_test_runs: false,
+            scope: ChatScope::TestRuns,
             listener: Mutex::new(None),
             events: Mutex::new(events),
             question_text: Mutex::new(HashMap::new()),
@@ -207,6 +218,17 @@ impl Slack {
     pub const fn with_ignore_test_runs(mut self, ignore: bool) -> Self {
         self.ignore_test_runs = ignore;
         self
+    }
+    #[must_use]
+    pub const fn with_scope(mut self, scope: ChatScope) -> Self {
+        self.scope = scope;
+        self
+    }
+    pub(super) async fn require_route(&self, route: &SlackRoute) -> Result<(), ChatError> {
+        if self.scope == ChatScope::TestRuns && !self.accepts_channel(&route.channel).await? {
+            return Err(error("Slack route excluded from test scope"));
+        }
+        Ok(())
     }
     pub async fn channels(&self) -> Result<Vec<SlackChannelInfo>, ChatError> {
         self.state.channels(false).await
@@ -239,19 +261,19 @@ impl Slack {
         }
     }
     async fn load(&self, topology: &mut Topology) -> Result<(), ChatError> {
-        let channels = self.channels().await?;
+        let channels = self
+            .channels()
+            .await?
+            .into_iter()
+            .filter(|channel| channel_scope(self.scope, self.ignore_test_runs, channel))
+            .collect::<Vec<_>>();
         let mut tabs = HashMap::new();
         for channel in &channels {
-            if self.ignore_test_runs
-                && channel
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.starts_with("testrun-"))
-            {
-                continue;
-            }
-            if let Some((_, tab)) = identity(channel)
-                && tabs
+            if let Some((workspace, tab)) = identity(channel) {
+                if self.scope == ChatScope::TestRuns && self.excluded(workspace, tab).await? {
+                    continue;
+                }
+                if tabs
                     .insert(
                         tab.to_owned(),
                         SlackRoute {
@@ -259,8 +281,9 @@ impl Slack {
                         },
                     )
                     .is_some()
-            {
-                return Err(error("duplicate Slack tab channels"));
+                {
+                    return Err(error("duplicate Slack tab channels"));
+                }
             }
         }
         topology.validated.clear();
@@ -270,11 +293,17 @@ impl Slack {
         Ok(())
     }
     pub async fn sync(&self, route: &TopologyRoute, fresh: bool) -> Result<SlackRoute, ChatError> {
+        if self.scope == ChatScope::TestRuns
+            && self.excluded(&route.workspace_id, &route.tab_id).await?
+        {
+            return Err(error("Herdr route excluded from Slack scope"));
+        }
         let mut topology = self.state.topology.lock().await;
         if fresh || !topology.loaded {
             self.load(&mut topology).await?;
         }
         if let Some(found) = topology.tabs.get(&route.tab_id).cloned() {
+            self.require_route(&found).await?;
             if !topology.validated.contains(&found.channel) {
                 self.ensure_owner(&found.channel).await?;
                 topology.validated.insert(found.channel.clone());
@@ -285,8 +314,10 @@ impl Slack {
         let (name, test_run) = tokio::task::spawn_blocking(move || named_tab(&workspace, &tab))
             .await
             .map_err(error)??;
-        if self.ignore_test_runs && test_run {
-            return Err(error("test run excluded from service"));
+        if (self.ignore_test_runs && test_run)
+            || (self.scope == ChatScope::TestRuns && !name.starts_with("testrun-"))
+        {
+            return Err(error("Slack channel excluded from scope"));
         }
         let session = self.state.client.open_session(&self.state.token);
         let topic = format!(
@@ -390,7 +421,10 @@ impl Slack {
         Ok(())
     }
     async fn queue_rename(&self, channel: SlackChannelInfo, name: String) {
-        if channel.name.as_ref() == Some(&name) {
+        if channel.name.as_ref() == Some(&name)
+            || !channel_scope(self.scope, self.ignore_test_runs, &channel)
+            || (self.scope == ChatScope::TestRuns && !name.starts_with("testrun-"))
+        {
             return;
         }
         let mut jobs = self.state.renames.lock().await;
@@ -469,13 +503,11 @@ impl Slack {
             else {
                 continue;
             };
-            if self.ignore_test_runs
-                && (workspace.label.starts_with("testrun-")
-                    || tab.label.starts_with("testrun-")
-                    || channel
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.starts_with("testrun-")))
+            let test_run =
+                workspace.label.starts_with("testrun-") || tab.label.starts_with("testrun-");
+            if !channel_scope(self.scope, self.ignore_test_runs, &channel)
+                || (self.scope == ChatScope::TestRuns && !test_run)
+                || (self.ignore_test_runs && test_run)
             {
                 continue;
             }
@@ -499,10 +531,14 @@ impl Slack {
         Ok(())
     }
     async fn archive(&self, channel: SlackChannelInfo) -> Result<(), ChatError> {
-        self.state.archive(channel, self.ignore_test_runs).await
+        self.state
+            .archive(channel, self.scope, self.ignore_test_runs)
+            .await
     }
     pub async fn close(&self, closure: &TopologyClosure) -> Result<(), ChatError> {
-        self.state.close(closure, self.ignore_test_runs).await
+        self.state
+            .close(closure, self.scope, self.ignore_test_runs)
+            .await
     }
     pub async fn sweep<F>(
         &self,
@@ -584,14 +620,10 @@ impl SlackState {
     async fn archive(
         &self,
         channel: SlackChannelInfo,
+        scope: ChatScope,
         ignore_test_runs: bool,
     ) -> Result<(), ChatError> {
-        if ignore_test_runs
-            && channel
-                .name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("testrun-"))
-        {
+        if !channel_scope(scope, ignore_test_runs, &channel) {
             return Ok(());
         }
         let job = self.renames.lock().await.remove(&channel.id);
@@ -639,6 +671,7 @@ impl SlackState {
     async fn close(
         &self,
         closure: &TopologyClosure,
+        scope: ChatScope,
         ignore_test_runs: bool,
     ) -> Result<(), ChatError> {
         for channel in self.channels(false).await? {
@@ -649,7 +682,7 @@ impl SlackState {
                 } => workspace == workspace_id && tab == tab_id,
                 TopologyClosure::Workspace { workspace_id } => workspace == workspace_id,
             }) {
-                self.archive(channel, ignore_test_runs).await?;
+                self.archive(channel, scope, ignore_test_runs).await?;
             }
         }
         Ok(())

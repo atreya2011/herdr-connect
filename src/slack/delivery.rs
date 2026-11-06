@@ -21,6 +21,7 @@ impl Slack {
         route: &SlackRoute,
         content: SlackMessageContent,
     ) -> Result<SlackTs, ChatError> {
+        self.require_route(route).await?;
         let request = SlackApiChatPostMessageRequest::new(route.channel.clone(), content)
             .with_parse("none".into())
             .with_unfurl_links(false)
@@ -74,6 +75,7 @@ impl Slack {
         message: &SlackTs,
         content: SlackMessageContent,
     ) -> Result<(), ChatError> {
+        self.require_route(route).await?;
         self.state
             .client
             .open_session(&self.state.token)
@@ -100,6 +102,7 @@ impl Slack {
     }
 
     pub async fn mirror_prompt(&self, route: &SlackRoute, text: &str) -> Result<(), ChatError> {
+        self.require_route(route).await?;
         let request = SlackApiChatPostMessageRequest::new(
             route.channel.clone(),
             SlackMessageContent::new().with_text(escape(text)),
@@ -151,9 +154,11 @@ impl Slack {
     }
 
     pub async fn set_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
+        self.require_route(route).await?;
         self.state.set_working(route, working).await
     }
     pub async fn track_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
+        self.require_route(route).await?;
         self.state.track_working(route, working).await
     }
 }
