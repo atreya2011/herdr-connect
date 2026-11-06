@@ -574,6 +574,43 @@ pub async fn delete_workspace_channel(
     Ok(())
 }
 
+pub async fn topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>(
+    client: &twilight_http::Client,
+    channels: &[Channel],
+    active_threads: &[Channel],
+    live_workspace_ids: &HashSet<&str, S>,
+    live_tab_ids: &HashSet<&str, S>,
+) -> Result<Vec<Channel>, String> {
+    let mut absent = Vec::new();
+    for channel in channels {
+        let Some(workspace_id) = workspace_topic_id(channel) else {
+            continue;
+        };
+        let workspace_absent = !live_workspace_ids.contains(workspace_id);
+        if workspace_absent {
+            absent.push(channel.clone());
+        }
+        let mut threads: Vec<Channel> = active_threads
+            .iter()
+            .filter(|thread| thread.parent_id == Some(channel.id))
+            .cloned()
+            .collect();
+        threads.extend(archived_threads(client, channel.id).await?);
+        let tab_id_prefix = format!("{workspace_id}:t");
+        absent.extend(threads.into_iter().filter(|thread| {
+            workspace_absent
+                || thread
+                    .name
+                    .as_deref()
+                    .and_then(thread_tab_suffix)
+                    .is_some_and(|tab_id| {
+                        tab_id.starts_with(&tab_id_prefix) && !live_tab_ids.contains(tab_id)
+                    })
+        }));
+    }
+    Ok(absent)
+}
+
 pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>(
     client: &twilight_http::Client,
     channels: &mut Vec<Channel>,
@@ -581,38 +618,28 @@ pub async fn delete_topology_absent_from_herdr<S: std::hash::BuildHasher + Sync>
     live_workspace_ids: &HashSet<&str, S>,
     live_tab_ids: &HashSet<&str, S>,
 ) -> Result<(), String> {
-    let orphaned_workspace_ids: Vec<String> = channels
+    let absent = topology_absent_from_herdr(
+        client,
+        channels,
+        active_threads,
+        live_workspace_ids,
+        live_tab_ids,
+    )
+    .await?;
+    let orphaned_channels: HashSet<_> = absent
         .iter()
-        .filter_map(workspace_topic_id)
-        .filter(|workspace_id| !live_workspace_ids.contains(workspace_id))
-        .map(ToOwned::to_owned)
+        .filter(|channel| workspace_topic_id(channel).is_some())
+        .map(|channel| channel.id)
         .collect();
-    for workspace_id in orphaned_workspace_ids {
-        delete_workspace_channel(client, channels, &workspace_id).await?;
-    }
-    let surviving_channels: Vec<(Id<ChannelMarker>, String)> = channels
-        .iter()
-        .filter_map(|channel| {
-            workspace_topic_id(channel).map(|workspace_id| (channel.id, workspace_id.to_owned()))
-        })
-        .collect();
-    for (workspace_channel, workspace_id) in surviving_channels {
-        let mut threads: Vec<Channel> = active_threads
-            .iter()
-            .filter(|thread| thread.parent_id == Some(workspace_channel))
-            .cloned()
-            .collect();
-        threads.extend(archived_threads(client, workspace_channel).await?);
-        let tab_id_prefix = format!("{workspace_id}:t");
-        for thread in threads {
-            let Some(tab_id) = thread.name.as_deref().and_then(thread_tab_suffix) else {
-                continue;
-            };
-            if tab_id.starts_with(&tab_id_prefix) && !live_tab_ids.contains(tab_id) {
-                delete_channel_if_present(client, thread.id).await?;
-                active_threads.retain(|entry| entry.id != thread.id);
-                delete_thread_created_message(client, workspace_channel, thread.id).await?;
+    for channel in absent {
+        if let Some(workspace_id) = workspace_topic_id(&channel) {
+            delete_workspace_channel(client, channels, workspace_id).await?;
+        } else if let Some(parent) = channel.parent_id {
+            if !orphaned_channels.contains(&parent) {
+                delete_channel_if_present(client, channel.id).await?;
+                delete_thread_created_message(client, parent, channel.id).await?;
             }
+            active_threads.retain(|entry| entry.id != channel.id);
         }
     }
     Ok(())

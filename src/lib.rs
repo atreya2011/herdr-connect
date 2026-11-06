@@ -79,8 +79,8 @@ pub use topology::{
     delete_thread_created_message, delete_topology_absent_from_herdr, delete_workspace_channel,
     fetch_topology_lists, forget_owned, reconcile_topology_cache, register_archived_tab_threads,
     remember_tab_threads, remember_workspace_channels, resolve_owner_deleted_tab,
-    resolve_owner_deleted_workspace, route_topology, sync_topology, workspace_channel_id,
-    workspace_channel_name,
+    resolve_owner_deleted_workspace, route_topology, sync_topology, topology_absent_from_herdr,
+    workspace_channel_id, workspace_channel_name,
 };
 pub use watcher::{Transition, is_postable_transition};
 
