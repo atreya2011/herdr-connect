@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 
 use crate::{ChatError, TopologyClosure, TopologyRoute, workspace_list_result};
 
+mod cards;
+mod chat;
 mod delivery;
 mod socket;
 pub use socket::{SlackArchive, SlackSocketEvent};
@@ -35,6 +37,7 @@ pub struct Slack {
     listener: Mutex<Option<SlackClientSocketModeListener<SlackClientHyperHttpsConnector>>>,
     events_tx: tokio::sync::mpsc::UnboundedSender<SlackSocketEvent>,
     events: Mutex<tokio::sync::mpsc::UnboundedReceiver<SlackSocketEvent>>,
+    working: Mutex<HashMap<SlackRoute, Option<tokio::task::JoinHandle<()>>>>,
 }
 
 fn error(error: impl Display) -> ChatError {
@@ -114,6 +117,7 @@ impl Slack {
             listener: Mutex::new(None),
             events_tx,
             events: Mutex::new(events),
+            working: Mutex::new(HashMap::new()),
         })
     }
 
@@ -311,6 +315,16 @@ impl Slack {
         {
             return Ok(());
         }
+        let routes: Vec<_> = topology
+            .threads
+            .values()
+            .filter(|route| route.channel == channel.id)
+            .cloned()
+            .collect();
+        for route in routes {
+            self.track_working(&route, false).await?;
+            self.working.lock().await.remove(&route);
+        }
         let session = self.client.open_session(&self.token);
         let name = format!(
             "{}-archived-{}",
@@ -365,6 +379,8 @@ impl Slack {
                 tab_id,
             } => {
                 if let Some(route) = topology.threads.get(tab_id).cloned() {
+                    self.track_working(&route, false).await?;
+                    self.working.lock().await.remove(&route);
                     self.client
                         .open_session(&self.token)
                         .chat_delete(&SlackApiChatDeleteRequest::new(

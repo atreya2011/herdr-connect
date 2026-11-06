@@ -179,6 +179,13 @@ pub trait Chat: Send + Sync + Sized + 'static {
         ack: Ack<'_>,
     ) -> impl Future<Output = Result<(), ChatError>> + Send;
     fn typing(&self, route: &Self::Route) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn agent_status(
+        &self,
+        _route: &TopologyRoute,
+        _working: bool,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send {
+        async { Ok(()) }
+    }
     fn reply(
         &self,
         route: &Self::Route,

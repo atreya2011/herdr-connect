@@ -3,8 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Slack, SlackArchive, SlackSocketEvent, TopologyClosure, TopologyRoute, tab_list_result,
-    workspace_list_result,
+    Chat, PermissionVendor, Question, QuestionOption, Slack, SlackArchive, SlackSocketEvent,
+    TopologyClosure, TopologyRoute, tab_list_result, workspace_list_result,
 };
 use serde_json::Value;
 use slack_morphism::prelude::*;
@@ -370,4 +370,131 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
         assert!(passed, "{name}");
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn slack_cards_real_thread() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("SLACK_BOT_TOKEN")?;
+    let slack = Slack::new(token.clone(), "U0CEYEYSKT5".into(), "T0CF6JNT0KB").await?;
+    let route = create_route()?;
+    let result = async {
+        let found = slack.sync_route(&route).await?;
+        let permission = slack
+            .post_permission_card(
+                &found,
+                PermissionVendor::Claude,
+                "Bash",
+                "printf testrun",
+                "testrun-permission",
+            )
+            .await?;
+        let mut question = test_question();
+        let card = slack
+            .post_question_card(&found, &question, "testrun-question")
+            .await?;
+        let client = SlackClient::new(SlackClientHyperConnector::new()?);
+        let token = SlackApiToken::new(token.into());
+        let session = client.open_session(&token);
+        let request = SlackApiConversationsRepliesRequest::new(
+            found.channel.clone(),
+            found.thread.clone().ok_or("no parent")?,
+        );
+        let initial = session.conversations_replies(&request).await?.messages;
+        let permission_blocks = message_blocks(&initial, &permission)?;
+        let single_blocks = message_blocks(&initial, &card)?;
+        question.multi_select = true;
+        slack
+            .edit_question_card(&found, &card, &question, "testrun-question")
+            .await?;
+        let multi = session.conversations_replies(&request).await?.messages;
+        let multi_blocks = message_blocks(&multi, &card)?;
+        slack
+            .expire_permission_card(
+                &found,
+                &permission,
+                "testrun-permission",
+                "testrun resolved",
+            )
+            .await?;
+        slack.expire_card(&found, &card, "testrun answered").await?;
+        slack.agent_status(&route, true).await?;
+        slack.agent_status(&route, false).await?;
+        let retired = session.conversations_replies(&request).await?.messages;
+        let checks = vec![
+            (
+                "permission allow button",
+                permission_blocks[2]["elements"][0]["action_id"]
+                    == "herdr:allow:testrun-permission",
+            ),
+            (
+                "permission deny button",
+                permission_blocks[2]["elements"][1]["action_id"] == "herdr:deny:testrun-permission",
+            ),
+            (
+                "single-choice button",
+                single_blocks[2]["elements"][1]["action_id"] == "herdrask:testrun-question:1",
+            ),
+            (
+                "multiple-choice menu",
+                multi_blocks[2]["accessory"]["type"] == "multi_static_select",
+            ),
+            (
+                "multiple-choice submit button",
+                multi_blocks[3]["elements"][0]["action_id"] == "herdrask-multi:testrun-question",
+            ),
+            (
+                "retired permission has no actions",
+                !message_blocks(&retired, &permission)?
+                    .to_string()
+                    .contains("action_id"),
+            ),
+            (
+                "retired question has no actions",
+                !message_blocks(&retired, &card)?
+                    .to_string()
+                    .contains("action_id"),
+            ),
+        ];
+        Ok::<_, Box<dyn std::error::Error>>(checks)
+    }
+    .await;
+    slack.shutdown_socket().await;
+    let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    assert_eq!(
+        leftovers, 0,
+        "zero-leftover check: unarchived testrun- Slack channels"
+    );
+    for (name, passed) in result? {
+        assert!(passed, "{name}");
+    }
+    Ok(())
+}
+
+fn message_blocks(
+    messages: &[SlackHistoryMessage],
+    ts: &SlackTs,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let message = messages
+        .iter()
+        .find(|message| &message.origin.ts == ts)
+        .ok_or("card missing from real Slack thread")?;
+    Ok(serde_json::to_value(&message.content.blocks)?)
+}
+
+fn test_question() -> Question {
+    Question {
+        question: "testrun: which option?".into(),
+        header: "Choice".into(),
+        options: vec![
+            QuestionOption {
+                label: "First".into(),
+                description: "first choice".into(),
+            },
+            QuestionOption {
+                label: "Second".into(),
+                description: "second choice".into(),
+            },
+        ],
+        multi_select: false,
+    }
 }

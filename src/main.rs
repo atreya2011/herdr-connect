@@ -18,7 +18,7 @@ use herdr_connect_rs::{
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, Discord, ENV_DISCORD_GUILD_ID,
     ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, HerdrSubscription, HerdrTab,
-    OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
+    OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Slack,
     TopologyCache, TopologyClosure, TopologyRoute, Transition, TransitionMessage,
     agent_read_detection, create_transition_messages, dialog_shows_question, drive_gateway,
     fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
@@ -395,6 +395,14 @@ async fn process_snapshot<C: Chat>(
     maybe_establish_terminal_prompt_baseline(snapshot, state);
     ensure_live_watch_started(discord, snapshot, agents, tabs, state).await;
     maybe_sync_fresh_session_topology(snapshot, agents, tabs, discord, state).await;
+    if let Some(watch) = state.live_watches.get(&terminal)
+        && let Err(error) = discord
+            .0
+            .agent_status(&watch.route, status == STATUS_WORKING)
+            .await
+    {
+        bridge_eprintln!("agent status error: {error}");
+    }
     if let Some(old) = state.previous.get(&terminal).cloned()
         && old != status
     {
@@ -1385,6 +1393,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args: Vec<String> = args.collect();
             return run_broker(&args).await;
         }
+        Some("slack") => {
+            if args.next().is_some() {
+                return Err("slack takes no arguments".into());
+            }
+            return run_slack_bridge().await;
+        }
         None => {}
         Some(other) => return Err(format!("unknown subcommand: {other}").into()),
     }
@@ -2185,8 +2199,48 @@ async fn next_status_event(
 
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+    let (connection, gateway) = discord_connection(topology_cache, true).await?;
+    run_connected_bridge(connection, gateway).await
+}
+
+async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    let chat = Arc::new(
+        Slack::new(
+            std::env::var("SLACK_BOT_TOKEN")?,
+            "U0CEYEYSKT5".into(),
+            "T0CF6JNT0KB",
+        )
+        .await?
+        .with_ignore_test_runs(true),
+    );
+    chat.connect_socket(std::env::var("SLACK_APP_TOKEN")?)
+        .await?;
+    let identity = OwnerIdentity {
+        display_name: chat.owner_id().to_owned(),
+        avatar_url: None,
+    };
+    let responder = Arc::new(PermissionResponder::new(chat.clone()).with_ignore_test_runs(true));
+    let (notices_tx, notices_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(notice) = notices_rx.recv() {
+            bridge_eprintln!("{notice}");
+        }
+    });
+    let gateway = tokio::spawn(drive_gateway(responder.clone(), notices_tx));
+    let abort = gateway.abort_handle();
+    let result = run_connected_bridge((chat.clone(), responder, identity), gateway)
+        .await
+        .map_err(|error| error.to_string());
+    abort.abort();
+    chat.shutdown_socket().await;
+    result.map_err(Into::into)
+}
+
+async fn run_connected_bridge<C: Chat>(
+    connection: ChatConnection<C>,
+    mut gateway: GatewayTask,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-    let (connection, mut gateway) = discord_connection(Arc::clone(&topology_cache), true).await?;
     let mut broker = start_broker(&connection, activity_tx);
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {

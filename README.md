@@ -1,12 +1,14 @@
 # herdr-connect-rs
 
-Two-way Rust bridge between one Discord guild and agents in local Herdr panes.
+Two-way Rust bridge between Discord or Slack and agents in local Herdr panes, through a shared chat interface.
 
 The Slack adapter uses `slack-morphism` with `SLACK_BOT_TOKEN`. It creates a public workspace channel from the Herdr workspace label, stores `herdr workspace [workspace_id]` in its topic, invites the owner, and posts `<tab label> [<tab id>]` as each tab thread parent. Startup recovers these identities from Slack history. Closing a tab deletes its bot parent message; closing a workspace renames its channel to release the original name, then archives it. Slack tests use the `herdr-connect-test` workspace and count only unarchived `testrun-` channels in their zero-leftover check.
 
 Slack replies and activity messages go into the tab thread. Terminal prompts are labeled bot messages identifying the owner; they do not impersonate the owner. Working status uses `assistant.threads.setStatus`, with an empty status clearing it. A successful API call does not establish that the Slack app displays the indicator; that still needs owner verification.
 
 Socket Mode uses `SLACK_APP_TOKEN` and one connection. Messages qualify only when authored by the owner in a bot tab thread under a workspace topic. Only a `channel_archive` event naming the owner can close the corresponding Herdr workspace. Bot archives, other users, channel deletion events, and deleted parent messages do not prove owner intent and close nothing.
+
+The `slack` subcommand runs the shared bridge loop against team `T0CF6JNT0KB`, owner `U0CEYEYSKT5`, with the same `testrun-` exclusion as the no-argument Discord run. The service continues to use Discord only. Permission cards have Allow and Deny buttons; single-choice questions have option buttons, and multiple-choice questions have a menu followed by Submit choices. Button taps arrive over Socket Mode and use the existing permission and question responders. Tests instantiate Slack directly with filtering disabled; run Slack tests serially and never keep another connection to the test app open.
 
 ## Architecture
 

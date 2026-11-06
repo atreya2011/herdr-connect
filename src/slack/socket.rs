@@ -11,6 +11,7 @@ use crate::{ChatError, Closed};
 pub enum SlackSocketEvent {
     Push(Box<SlackPushEventCallback>),
     Action(Box<SlackInteractionBlockActionsEvent>),
+    Failure(ChatError),
 }
 
 pub struct SlackArchive(pub SlackChannelArchiveEvent);
@@ -124,6 +125,23 @@ impl Slack {
     }
 
     pub async fn shutdown_socket(&self) {
+        let routes: Vec<_> = self
+            .working
+            .lock()
+            .await
+            .drain()
+            .filter_map(|(route, task)| {
+                task.map(|task| {
+                    task.abort();
+                    route
+                })
+            })
+            .collect();
+        for route in routes {
+            if let Err(failure) = self.set_working(&route, false).await {
+                crate::bridge_eprintln!("Slack status cleanup error: {failure}");
+            }
+        }
         let listener = self.listener.lock().await.take();
         if let Some(listener) = listener {
             listener.shutdown().await;
@@ -136,6 +154,7 @@ impl Slack {
             let team = match &event {
                 SlackSocketEvent::Push(event) => &event.team_id,
                 SlackSocketEvent::Action(event) => &event.team.id,
+                SlackSocketEvent::Failure(_) => return Some(event),
             };
             if team.to_string() == self.team {
                 return Some(event);

@@ -1,7 +1,7 @@
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 
-use super::{Slack, SlackRoute, error};
+use super::{Slack, SlackRoute, SlackSocketEvent, error};
 use crate::ChatError;
 
 pub(super) fn escape(text: &str) -> String {
@@ -32,7 +32,18 @@ impl Slack {
             .chat_post_message(&request)
             .await;
         match result {
-            Ok(response) => Ok(response.ts),
+            Ok(response) => {
+                if self
+                    .working
+                    .lock()
+                    .await
+                    .get(route)
+                    .is_some_and(Option::is_some)
+                {
+                    self.set_working(route, true).await?;
+                }
+                Ok(response.ts)
+            }
             Err(failure) => {
                 self.invalidate_if_gone(&failure).await;
                 Err(error(failure))
@@ -114,5 +125,66 @@ impl Slack {
             .await
             .map_err(error)?;
         Ok(())
+    }
+
+    pub async fn track_working(&self, route: &SlackRoute, working: bool) -> Result<(), ChatError> {
+        let mut tasks = self.working.lock().await;
+        if tasks
+            .get(route)
+            .is_some_and(|task| task.is_some() == working)
+        {
+            return Ok(());
+        }
+        if let Some(Some(task)) = tasks.remove(route) {
+            task.abort();
+        }
+        self.set_working(route, working).await?;
+        if working {
+            let (client, token, route, events) = (
+                self.client.clone(),
+                self.token.clone(),
+                route.clone(),
+                self.events_tx.clone(),
+            );
+            let thread = route
+                .thread
+                .clone()
+                .ok_or_else(|| error("working status needs a tab thread"))?;
+            let key = route.clone();
+            tasks.insert(
+                key,
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        if let Err(failure) = client
+                            .open_session(&token)
+                            .assistant_threads_set_status(
+                                &SlackApiAssistantThreadsSetStatusRequest::new(
+                                    route.channel.clone(),
+                                    "is working…".into(),
+                                    thread.clone(),
+                                ),
+                            )
+                            .await
+                        {
+                            let _ = events.send(SlackSocketEvent::Failure(error(failure)));
+                            return;
+                        }
+                    }
+                })),
+            );
+        } else {
+            tasks.insert(route.clone(), None);
+        }
+        drop(tasks);
+        Ok(())
+    }
+}
+
+impl Drop for Slack {
+    fn drop(&mut self) {
+        for task in self.working.get_mut().values().flatten() {
+            task.abort();
+        }
     }
 }
