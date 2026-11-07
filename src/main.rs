@@ -2200,6 +2200,21 @@ async fn apply_herdr_snapshot<C: Chat>(
     let current_terminals: HashSet<String> = agents.iter().map(|s| s.terminal_id.clone()).collect();
     let current_tabs: HashSet<String> = tabs.iter().map(|tab| tab.tab_id.clone()).collect();
     let current_panes: HashSet<String> = agents.iter().map(|s| s.pane_id.clone()).collect();
+    let mut cleared_tabs = HashSet::new();
+    for (terminal, watch) in &state.live_watches {
+        if !current_terminals.contains(terminal)
+            && !excluded_terminals.contains(terminal)
+            && state
+                .previous
+                .get(terminal)
+                .is_some_and(|status| status == STATUS_WORKING)
+            && !tab_is_working(&agents, &watch.route.tab_id)
+            && cleared_tabs.insert(watch.route.tab_id.clone())
+            && let Err(error) = discord.0.agent_status(&watch.route, false).await
+        {
+            bridge_eprintln!("agent status error: {error}");
+        }
+    }
     state
         .previous
         .retain(|terminal, _| current_terminals.contains(terminal));
