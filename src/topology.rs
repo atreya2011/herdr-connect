@@ -88,18 +88,19 @@ pub fn workspace_channel_name(workspace_id: &str, label: &str) -> Result<String,
     Ok(name)
 }
 
-pub struct NameChange {
+pub struct HerdrName {
     pub id: Id<ChannelMarker>,
     pub name: String,
+    pub current: bool,
     pub test_run: bool,
 }
 
-pub fn name_changes(
+pub fn herdr_names(
     channels: &[Channel],
     active_threads: &[Channel],
     workspaces: &[HerdrWorkspace],
     tabs: &[HerdrTab],
-) -> Vec<NameChange> {
+) -> Vec<HerdrName> {
     let mut changes = Vec::new();
     for channel in channels {
         let Some(workspace) = workspace_topic_id(channel).and_then(|id| {
@@ -110,14 +111,12 @@ pub fn name_changes(
             continue;
         };
         match workspace_channel_name(&workspace.workspace_id, &workspace.label) {
-            Ok(name) if channel.name.as_deref() != Some(name.as_str()) => {
-                changes.push(NameChange {
-                    id: channel.id,
-                    name,
-                    test_run: workspace.label.starts_with(TEST_RUN_PREFIX),
-                });
-            }
-            Ok(_) => {}
+            Ok(name) => changes.push(HerdrName {
+                id: channel.id,
+                current: channel.name.as_deref() == Some(name.as_str()),
+                name,
+                test_run: workspace.label.starts_with(TEST_RUN_PREFIX),
+            }),
             Err(error) => bridge_eprintln!("Discord name reconciliation error: {error}"),
         }
         for thread in active_threads
@@ -136,15 +135,13 @@ pub fn name_changes(
                 continue;
             };
             match format_thread_name(&tab.label, &tab.tab_id) {
-                Ok(name) if thread.name.as_deref() != Some(name.as_str()) => {
-                    changes.push(NameChange {
-                        id: thread.id,
-                        name,
-                        test_run: workspace.label.starts_with(TEST_RUN_PREFIX)
-                            || tab.label.starts_with(TEST_RUN_PREFIX),
-                    });
-                }
-                Ok(_) => {}
+                Ok(name) => changes.push(HerdrName {
+                    id: thread.id,
+                    current: thread.name.as_deref() == Some(name.as_str()),
+                    name,
+                    test_run: workspace.label.starts_with(TEST_RUN_PREFIX)
+                        || tab.label.starts_with(TEST_RUN_PREFIX),
+                }),
                 Err(error) => bridge_eprintln!("Discord name reconciliation error: {error}"),
             }
         }
@@ -518,7 +515,8 @@ pub fn enable_production_topology() {
     owned_topology().production = true;
 }
 
-fn production_topology_enabled() -> bool {
+#[must_use]
+pub fn production_topology_enabled() -> bool {
     owned_topology().production
 }
 

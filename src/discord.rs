@@ -25,16 +25,16 @@ use crate::deletion::{GuildDeletion, handle_guild_deletion};
 use crate::delivery::expire_permission_card;
 
 use crate::{
-    NameChange, OwnerIdentity, PermissionVendor, Question, TEST_RUN_PREFIX, TopologyCache,
+    HerdrName, OwnerIdentity, PermissionVendor, Question, TEST_RUN_PREFIX, TopologyCache,
     TopologyRoute, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
     UNKNOWN_WEBHOOK_DELIVERY_ERROR, bridge_eprintln, cached_route, delete_tab_thread,
     delete_topology_absent_from_herdr, delete_workspace_channel, deliver_activity_message,
     deliver_live_message, deliver_permission_card, deliver_question_card, deliver_transition_card,
     execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
-    fetch_topology_lists, is_test_run_name, name_changes, owned_thread_is_test_run,
-    reconcile_topology_cache, register_archived_tab_threads, resolve_terminal_prompt_webhook,
-    should_handle_owner_message, sync_topology, tab_list_result, update_activity_message,
-    update_question_card, workspace_channel_id, workspace_list_result,
+    fetch_topology_lists, herdr_names, is_test_run_name, owned_thread_is_test_run,
+    production_topology_enabled, reconcile_topology_cache, register_archived_tab_threads,
+    resolve_terminal_prompt_webhook, should_handle_owner_message, sync_topology, tab_list_result,
+    update_activity_message, update_question_card, workspace_channel_id, workspace_list_result,
 };
 
 pub const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
@@ -233,14 +233,21 @@ impl Discord {
         self.accepts_herdr_route(workspace, tab).await
     }
 
-    async fn queue_rename(&self, change: NameChange) {
+    async fn queue_rename(&self, change: HerdrName) {
         if (self.ignore_test_runs && change.test_run)
+            || (!change.test_run && !production_topology_enabled())
             || (self.scope == ChatScope::TestRuns
                 && !(change.test_run && change.name.starts_with(TEST_RUN_PREFIX)))
         {
             return;
         }
         let mut jobs = self.renames.lock().await;
+        if change.current {
+            if let Some((_, job)) = jobs.remove(&change.id) {
+                job.abort();
+            }
+            return;
+        }
         if jobs
             .get(&change.id)
             .is_some_and(|(desired, job)| desired == &change.name && !job.is_finished())
@@ -288,15 +295,36 @@ impl Discord {
         .map_err(chat_error)?
         .map_err(chat_error)?;
         let changes = {
-            let guard = self.topology_cache.lock().await;
+            let mut guard = self.topology_cache.lock().await;
+            if guard.is_none() {
+                let fetched = self.fetch_scoped_topology().await.map_err(chat_error)?;
+                reconcile_topology_cache(&mut guard, fetched);
+            }
             guard.as_ref().map_or_else(Vec::new, |(channels, threads)| {
-                name_changes(channels, threads, &workspaces, &tabs)
+                herdr_names(channels, threads, &workspaces, &tabs)
             })
         };
         for change in changes {
             self.queue_rename(change).await;
         }
         Ok(())
+    }
+
+    async fn reconcile_synced_name(&self, route: &TopologyRoute, thread: Id<ChannelMarker>) {
+        let stale = self
+            .topology_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(_, threads)| {
+                threads.iter().any(|cached| {
+                    cached.id == thread
+                        && cached.name.as_deref() != Some(route.thread_name.as_str())
+                })
+            });
+        if stale && let Err(error) = self.refresh_names().await {
+            bridge_eprintln!("Discord name reconciliation error: {error}");
+        }
     }
 
     async fn check_topology_route(&self, route: &TopologyRoute) -> Result<(), ChatError> {
@@ -553,14 +581,16 @@ impl Chat for Discord {
 
     async fn sync_route(&self, route: &TopologyRoute) -> Result<Self::Route, ChatError> {
         self.check_topology_route(route).await?;
-        Ok(sync_route(
+        let thread = sync_route(
             &self.client,
             self.guild,
             route,
             &self.topology_cache,
             &self.owner_id,
         )
-        .await?)
+        .await?;
+        self.reconcile_synced_name(route, thread).await;
+        Ok(thread)
     }
 
     async fn sync_route_with_parent(
@@ -576,6 +606,7 @@ impl Chat for Discord {
             &self.owner_id,
         )
         .await?;
+        self.reconcile_synced_name(route, thread).await;
         let guard = self.topology_cache.lock().await;
         let found = guard
             .as_ref()
@@ -744,7 +775,7 @@ impl Chat for Discord {
         let fetched = self.fetch_scoped_topology().await?;
         let mut guard = self.topology_cache.lock().await;
         let (channels, active_threads) = reconcile_topology_cache(&mut guard, fetched);
-        Ok(sync_topology(
+        let thread = sync_topology(
             &self.client,
             self.guild,
             channels,
@@ -752,7 +783,10 @@ impl Chat for Discord {
             route,
             &self.owner_id,
         )
-        .await?)
+        .await?;
+        drop(guard);
+        self.reconcile_synced_name(route, thread).await;
+        Ok(thread)
     }
 
     async fn post_live(
