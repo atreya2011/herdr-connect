@@ -55,6 +55,9 @@ enum Goal {
     ReviewConfirmation(&'static str),
     MarkdownReply(Vec<SlackTs>),
     ActivityTurn,
+    ActivityPosted,
+    MainTurnEnded,
+    BackgroundTurn,
 }
 
 enum Exercise {
@@ -62,6 +65,8 @@ enum Exercise {
     Review,
     Markdown,
     Activity,
+    BackgroundActivity,
+    RestartActivity,
 }
 
 struct Driver {
@@ -84,7 +89,8 @@ struct Driver {
     working_confirmed: bool,
     working_observed: bool,
     archived_by_owner: bool,
-    activity_ts: Option<SlackTs>,
+    activity_posted: Vec<SlackTs>,
+    turn_ends: usize,
     goal: Goal,
     directory: PathBuf,
     team: String,
@@ -123,10 +129,11 @@ fn hook_settings(directory: &Path) -> Result<PathBuf, String> {
         quote(&directory.join("broker.sock"))
     );
     let settings = json!({
-        "permissions": {"allow": ["Bash(python3 -c *)"], "ask": ["Bash(touch *)"]},
+        "permissions": {"allow": ["Bash(python3 -c *)", "Bash(sleep *)", "Bash(echo *)"], "ask": ["Bash(touch *)"]},
         "hooks": {
             "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command, "timeout": 1200}]}],
-            "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": activity, "async": true}]}]
+            "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": activity, "async": true}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": activity, "async": true}]}]
         }
     });
     let path = directory.join("settings.json");
@@ -273,7 +280,8 @@ impl Owned {
             working_confirmed: false,
             working_observed: false,
             archived_by_owner: false,
-            activity_ts: None,
+            activity_posted: Vec::new(),
+            turn_ends: 0,
             goal: Goal::Message,
             directory: self.directory.clone(),
             team: self.chat.team_id().to_owned(),
@@ -416,7 +424,7 @@ fn start_agent(name: &str, pane: &str, settings: &Path) -> Result<(), String> {
     let settings = settings.to_str().ok_or("settings path is not UTF-8")?;
     herdr_json(&[
         "agent", "start", name, "--kind", "claude", "--pane", pane, "--timeout", "60000", "--",
-        "--permission-mode", "manual", "--tools", "Bash,AskUserQuestion", "--settings", settings,
+        "--permission-mode", "manual", "--tools", "Bash,AskUserQuestion,Agent", "--settings", settings,
         "--append-system-prompt", "You are a real testrun Slack acceptance agent. Follow only the test prompts. Run only their exact commands in this temporary directory. Never inspect secrets or touch other workspaces, tabs, channels, or production data. Never add Co-Authored-By or tool attribution lines. Never commit or push. After a denied command, do not retry or choose another tool. Answer question tools exactly as requested.",
         "Reply with exactly READY and use no tools.",
     ]).map(drop)
@@ -575,8 +583,14 @@ impl Driver {
                 if !self.archived_by_owner { handle_live_event(&self.connection, &terminal, &mut self.state).await; }
             }
             Some(frame) = self.activity.recv() => {
+                let turn_end = frame.turn_end && frame.pane_id == self.pane;
                 if frame.pane_id == self.pane && !self.archived_by_owner { handle_activity_event(&self.connection, frame, &mut self.state).await; }
-                if let Some(activity) = self.state.activity_messages.get(&self.pane) { self.activity_ts = Some(activity.message.clone()); }
+                if let Some(activity) = self.state.activity_messages.get(&self.pane)
+                    && self.activity_posted.last() != Some(&activity.message)
+                {
+                    self.activity_posted.push(activity.message.clone());
+                }
+                self.turn_ends += usize::from(turn_end);
             }
             Some(result) = self.tasks.join_next() => result.map_err(|error| error.to_string())??,
         }
@@ -682,8 +696,15 @@ impl Driver {
             Goal::MarkdownReply(before) => {
                 Ok(self.agent_messages(before).next().is_some() && self.settled()?)
             }
-            Goal::ActivityTurn => Ok(self.activity_ts.is_some()
+            Goal::ActivityTurn => Ok(!self.activity_posted.is_empty()
                 && self.bot_said("ACTIVITY DONE")
+                && self.settled()?),
+            Goal::ActivityPosted => Ok(!self.activity_posted.is_empty()),
+            Goal::MainTurnEnded => Ok(!self.activity_posted.is_empty()
+                && self.turn_ends > 0
+                && self.bot_said("STARTED")),
+            Goal::BackgroundTurn => Ok(self.activity_posted.len() > 1
+                && self.bot_said("BACKGROUND DONE")
                 && self.settled()?),
             Goal::Archived => Ok(self.archived_by_owner
                 && tab_list_result()?.iter().all(|tab| tab.tab_id != self.tab)
@@ -793,8 +814,9 @@ impl Driver {
         self.prompt("Use Bash to run exactly python3 -c 'print(1)'. Use no other tools. Then reply with exactly ACTIVITY DONE.")?;
         self.wait(Goal::ActivityTurn).await?;
         let posted = self
-            .activity_ts
-            .clone()
+            .activity_posted
+            .last()
+            .cloned()
             .ok_or("no activity message was posted during the turn")?;
         if self
             .messages
@@ -806,6 +828,86 @@ impl Driver {
             ));
         }
         println!("OWNER OBSERVED: activity message {posted} deleted after the turn ended");
+        Ok(())
+    }
+
+    fn activity_remaining(&self) -> Vec<&SlackTs> {
+        self.activity_posted
+            .iter()
+            .filter(|posted| {
+                self.messages
+                    .iter()
+                    .any(|message| &message.origin.ts == *posted)
+            })
+            .collect()
+    }
+
+    async fn background_activity_deleted(&mut self) -> Result<(), String> {
+        self.ready().await?;
+        self.prompt("Use the Agent tool with run_in_background set to true and subagent_type general-purpose to start one background agent with this exact task: 'Run these Bash commands one at a time, in order: sleep 10, then echo one, then sleep 10, then echo two. Then reply DONE.' Immediately after launching it, reply exactly STARTED and end your turn without waiting for it. When you are later told that the background agent finished, reply exactly BACKGROUND DONE and use no tools.")?;
+        self.wait(Goal::MainTurnEnded).await?;
+        let status = snapshot_for_pane(&self.pane)?.agent_status;
+        if status != "working" {
+            return Err(format!(
+                "pane status was {status} at the main turn end, so background work did not keep it working"
+            ));
+        }
+        let remaining = self.activity_remaining();
+        if !remaining.is_empty() {
+            return Err(format!(
+                "activity messages {remaining:?} remain after the main turn ended"
+            ));
+        }
+        println!(
+            "OWNER OBSERVED: activity messages {:?} deleted at the main turn end while background work kept the pane working",
+            self.activity_posted
+        );
+        let main_turn = self.activity_posted.len();
+        self.wait(Goal::BackgroundTurn).await?;
+        let remaining = self.activity_remaining();
+        if !remaining.is_empty() {
+            return Err(format!(
+                "background activity messages {remaining:?} remain after the background work ended"
+            ));
+        }
+        println!(
+            "OWNER OBSERVED: background activity messages {:?} deleted after the background work ended",
+            &self.activity_posted[main_turn..]
+        );
+        Ok(())
+    }
+
+    async fn restart_activity_deleted(&mut self) -> Result<(), String> {
+        self.ready().await?;
+        self.prompt("Use Bash to run exactly python3 -c 'import time; time.sleep(30)' in the foreground. Use no other tools. Then reply with exactly RESTART DONE.")?;
+        self.wait(Goal::ActivityPosted).await?;
+        let posted = self
+            .activity_posted
+            .last()
+            .cloned()
+            .ok_or("no activity message was posted during the turn")?;
+        let restarted = Slack::new(
+            test_env("SLACK_TEST_BOT_TOKEN")?,
+            test_env("SLACK_TEST_OWNER_ID")?,
+        )
+        .await
+        .map_err(String::from)?;
+        restarted
+            .delete_stale_activity(&self.route)
+            .await
+            .map_err(String::from)?;
+        let history = restarted
+            .history(&self.route.channel)
+            .await
+            .map_err(String::from)?;
+        if history.iter().any(|message| message.origin.ts == posted) {
+            return Err(format!(
+                "activity message {posted} posted before the restart remains after the restarted bridge cleaned the channel"
+            ));
+        }
+        println!(
+            "OWNER OBSERVED: activity message {posted} posted before the restart deleted by the restarted bridge"
+        );
         Ok(())
     }
 
@@ -1165,6 +1267,8 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
                     Exercise::Review => driver.review().await,
                     Exercise::Markdown => driver.markdown().await,
                     Exercise::Activity => driver.activity_deleted().await,
+                    Exercise::BackgroundActivity => driver.background_activity_deleted().await,
+                    Exercise::RestartActivity => driver.restart_activity_deleted().await,
                 }
             } => result,
             _ = tokio::signal::ctrl_c() => Err("owner acceptance interrupted; cleaning up owned fixtures".into()),
@@ -1201,4 +1305,18 @@ async fn real_claude_markdown_reply_renders_in_slack() -> Result<(), String> {
 #[serial]
 async fn real_claude_activity_message_is_deleted_after_the_turn() -> Result<(), String> {
     run_owner_exercise(Exercise::Activity).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn real_claude_activity_message_is_deleted_when_the_main_turn_ends_during_background_work()
+-> Result<(), String> {
+    run_owner_exercise(Exercise::BackgroundActivity).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn real_claude_activity_message_posted_before_a_restart_is_deleted_after_it()
+-> Result<(), String> {
+    run_owner_exercise(Exercise::RestartActivity).await
 }
