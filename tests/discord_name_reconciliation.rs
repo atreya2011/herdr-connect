@@ -345,4 +345,138 @@ mod real_guild {
         })
         .await;
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn renaming_a_tab_back_while_its_rename_waits_keeps_the_original_name() {
+        run(|guild| async move {
+            let n = nonce()?;
+            let label = format!("testrun-back-{n}");
+            let first_tab = format!("testrun-one-{n}");
+            let fixture = create_fixture(&label, &first_tab)?;
+            let result = async {
+                let chat = discord(&guild)?;
+                let thread = chat
+                    .sync_route(&route(&fixture, &label, &first_tab)?)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for step in ["two", "three"] {
+                    let tab = format!("testrun-{step}-{n}");
+                    herdr(&["tab", "rename", &fixture.tab_id, &tab])?;
+                    chat.topology_changed()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    wait_for_names(
+                        &guild,
+                        thread,
+                        &label,
+                        &format!("{tab} [{}]", fixture.tab_id),
+                    )
+                    .await?;
+                }
+                let kept = format!("testrun-three-{n}");
+                herdr(&[
+                    "tab",
+                    "rename",
+                    &fixture.tab_id,
+                    &format!("testrun-four-{n}"),
+                ])?;
+                chat.topology_changed()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                herdr(&["tab", "rename", &fixture.tab_id, &kept])?;
+                chat.topology_changed()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tokio::time::sleep(Duration::from_secs(630)).await;
+                assert_eq!(
+                    names(&guild, thread).await?.1,
+                    format!("{kept} [{}]", fixture.tab_id),
+                    "the abandoned rename ran after the limit reset"
+                );
+                Ok(())
+            }
+            .await;
+            let removed = remove_fixture(&fixture);
+            result.and(removed)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_thread_archived_before_its_tab_was_renamed_is_renamed_when_it_returns() {
+        run(|guild| async move {
+            let n = nonce()?;
+            let label = format!("testrun-archived-{n}");
+            let first_tab = format!("testrun-old-{n}");
+            let fixture = create_fixture(&label, &first_tab)?;
+            let result = async {
+                let thread = discord(&guild)?
+                    .sync_route(&route(&fixture, &label, &first_tab)?)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                guild
+                    .client
+                    .update_thread(thread)
+                    .archived(true)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let renamed_tab = format!("testrun-new-{n}");
+                herdr(&["tab", "rename", &fixture.tab_id, &renamed_tab])?;
+                let restarted = discord(&guild)?;
+                restarted
+                    .sync_route(&route(&fixture, &label, &renamed_tab)?)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                wait_for_names(
+                    &guild,
+                    thread,
+                    &label,
+                    &format!("{renamed_tab} [{}]", fixture.tab_id),
+                )
+                .await
+            }
+            .await;
+            let removed = remove_fixture(&fixture);
+            result.and(removed)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_rename_after_the_topology_cache_was_cleared_still_happens() {
+        run(|guild| async move {
+            let n = nonce()?;
+            let label = format!("testrun-cleared-{n}");
+            let first_tab = format!("testrun-before-{n}");
+            let fixture = create_fixture(&label, &first_tab)?;
+            let result = async {
+                let chat = discord(&guild)?;
+                let thread = chat
+                    .sync_route(&route(&fixture, &label, &first_tab)?)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                *chat.topology_cache().lock().await = None;
+                let renamed_tab = format!("testrun-after-{n}");
+                herdr(&["tab", "rename", &fixture.tab_id, &renamed_tab])?;
+                chat.topology_changed()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                wait_for_names(
+                    &guild,
+                    thread,
+                    &label,
+                    &format!("{renamed_tab} [{}]", fixture.tab_id),
+                )
+                .await
+            }
+            .await;
+            let removed = remove_fixture(&fixture);
+            result.and(removed)
+        })
+        .await;
+    }
 }
