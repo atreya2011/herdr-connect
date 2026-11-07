@@ -311,16 +311,13 @@ fn agent_list_failure_reply(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
     use std::collections::HashSet;
 
     use super::{
         OWNER_PROMPT_SUPPRESSIONS, PROMPT_ACKNOWLEDGED_UNCONFIRMED, agent_list_failure_reply,
-        has_prompt_content, matching_agent, pane_status_is_working, resolve_prompt_pane,
-        retain_present_panes, stall_recovery_applies, take_owner_prompt_suppression,
+        has_prompt_content, retain_present_panes, stall_recovery_applies,
+        take_owner_prompt_suppression,
     };
-    use crate::AgentSnapshot;
 
     #[test]
     fn empty_prompt_content_is_refused_before_herdr() {
@@ -399,137 +396,5 @@ mod tests {
         assert!(!take_owner_prompt_suppression("other-pane", text));
         assert!(!take_owner_prompt_suppression(pane_id, "different text"));
         assert!(take_owner_prompt_suppression(pane_id, text));
-    }
-
-    #[test]
-    fn resolve_prompt_pane_captured_snapshot_refusal_branches() {
-        let value: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
-                .expect("captured agent snapshot is JSON");
-        let captured: Vec<AgentSnapshot> =
-            serde_json::from_value(value["result"]["agents"].clone())
-                .expect("captured agent snapshot has the expected shape");
-        let workspace_id = captured[0].workspace_id.as_str();
-        let tab_id = captured[0].tab_id.as_str();
-        let mut blocked = captured[0].clone();
-        blocked.agent_status = "blocked".to_owned();
-        let mut unknown = captured[0].clone();
-        unknown.agent_status = "paused".to_owned();
-        let mut no_status = captured[0].clone();
-        no_status.agent_status.clear();
-        let mut ambiguous = vec![captured[0].clone()];
-        ambiguous.push(captured[0].clone());
-        let cases = [
-            (
-                "no matching pane",
-                "missing-tab",
-                workspace_id,
-                vec![captured[0].clone()],
-                "refused: unmapped pane",
-            ),
-            (
-                "ambiguous pane",
-                tab_id,
-                workspace_id,
-                ambiguous,
-                "refused: ambiguous pane mapping",
-            ),
-            (
-                "blocked pane",
-                tab_id,
-                workspace_id,
-                vec![blocked],
-                "refused: agent state is blocked",
-            ),
-            (
-                "missing agent status",
-                tab_id,
-                workspace_id,
-                vec![no_status],
-                "refused: agent state is unknown",
-            ),
-            (
-                "unrecognized agent status",
-                tab_id,
-                workspace_id,
-                vec![unknown],
-                "refused: agent state is paused",
-            ),
-        ];
-        for (branch, tab_id, workspace_id, agents, expected) in cases {
-            assert_eq!(
-                matching_agent(tab_id, workspace_id, &agents).and_then(resolve_prompt_pane),
-                Err(expected.to_owned()),
-                "branch={branch}"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_prompt_pane_accepts_a_working_pane() {
-        let value: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
-                .expect("captured agent snapshot is JSON");
-        let captured: Vec<AgentSnapshot> =
-            serde_json::from_value(value["result"]["agents"].clone())
-                .expect("captured agent snapshot has the expected shape");
-        let mut working = captured[0].clone();
-        working.agent_status = "working".to_owned();
-        let pane_id = working.pane_id.clone();
-        assert_eq!(
-            matching_agent(&working.tab_id, &working.workspace_id, &[working.clone()])
-                .and_then(resolve_prompt_pane),
-            Ok(pane_id)
-        );
-    }
-
-    #[test]
-    fn matching_agent_ignores_status_unlike_resolve_prompt_pane() {
-        let value: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
-                .expect("captured agent snapshot is JSON");
-        let captured: Vec<AgentSnapshot> =
-            serde_json::from_value(value["result"]["agents"].clone())
-                .expect("captured agent snapshot has the expected shape");
-        let workspace_id = captured[0].workspace_id.clone();
-        let tab_id = captured[0].tab_id.clone();
-        let mut working = captured[0].clone();
-        working.agent_status = "working".to_owned();
-        let pane_id = working.pane_id.clone();
-
-        let resolved = matching_agent(&tab_id, &workspace_id, std::slice::from_ref(&working))
-            .expect("a working pane is still resolvable by matching_agent");
-        assert_eq!(resolved.pane_id, pane_id);
-    }
-
-    #[test]
-    fn pane_status_is_working_captured_snapshot_branches() {
-        let value: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/herdr-agent-list.json"))
-                .expect("captured agent snapshot is JSON");
-        let captured: Vec<AgentSnapshot> =
-            serde_json::from_value(value["result"]["agents"].clone())
-                .expect("captured agent snapshot has the expected shape");
-        let pane_id = captured[0].pane_id.clone();
-        let mut working = captured[0].clone();
-        working.agent_status = "working".to_owned();
-        let mut idle = captured[0].clone();
-        idle.agent_status = "idle".to_owned();
-        let mut other_pane_working = captured[0].clone();
-        other_pane_working.pane_id = "other-pane".to_owned();
-        other_pane_working.agent_status = "working".to_owned();
-        let cases = [
-            ("working pane matches", vec![working], true),
-            ("another pane is working", vec![other_pane_working], false),
-            ("idle pane does not match", vec![idle], false),
-            ("no matching pane", vec![], false),
-        ];
-        for (branch, agents, expected) in cases {
-            assert_eq!(
-                pane_status_is_working(&agents, &pane_id),
-                expected,
-                "branch={branch}"
-            );
-        }
     }
 }

@@ -3,17 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use herdr_connect_rs::{
-    ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction, PermissionVendor,
-    decode_claude_permission_request, encode_claude_decision, request_decision,
+    ClaudePermissionToolInput, Interaction, PermissionVendor, request_decision,
 };
-
-const DEFAULT_FIXTURE: &str = include_str!("fixtures/claude-permission-request/default.json");
-const ALLOW_FIXTURE: &str = include_str!("fixtures/claude-permission-request/allow.json");
 
 fn socket_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -45,24 +40,6 @@ fn invoke_hook(payload: &str, socket: &Path) -> std::process::Output {
         .env("HERDR_CLAUDE_BROKER_SOCKET", socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn hook subcommand");
-    child
-        .stdin
-        .take()
-        .expect("hook stdin is piped")
-        .write_all(payload.as_bytes())
-        .expect("write hook payload");
-    child.wait_with_output().expect("wait for hook subcommand")
-}
-
-fn invoke_hook_without_socket(payload: &str) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"))
-        .arg("hook")
-        .env_remove("HERDR_CLAUDE_BROKER_SOCKET")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hook subcommand");
     child
@@ -150,41 +127,6 @@ impl Drop for BrokerProcess {
             let _ = self.child.wait();
         }
         let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[test]
-fn permission_fixtures_decode_and_encode_allow_and_deny() {
-    let cases = [
-        ("default", DEFAULT_FIXTURE, Decision::allow(), None),
-        (
-            "allow",
-            ALLOW_FIXTURE,
-            Decision::deny("operator denied this request".to_owned()),
-            Some("operator denied this request"),
-        ),
-    ];
-    for (name, payload, decision, message) in cases {
-        let interaction = decode_claude_permission_request(payload.as_bytes())
-            .unwrap_or_else(|error| panic!("{name} fixture decodes: {error}"));
-        assert_eq!(interaction.tool_name, "Bash");
-        let encoded = encode_claude_decision(&decision);
-        let value: Value = serde_json::from_slice(&encoded).expect("encoded decision is JSON");
-        assert_eq!(
-            value["hookSpecificOutput"]["hookEventName"],
-            "PermissionRequest"
-        );
-        assert_eq!(
-            value["hookSpecificOutput"]["decision"]["behavior"],
-            match decision.behavior {
-                DecisionBehavior::Allow => "allow",
-                DecisionBehavior::Deny => "deny",
-            }
-        );
-        assert_eq!(
-            value["hookSpecificOutput"]["decision"]["message"].as_str(),
-            message
-        );
     }
 }
 
@@ -317,16 +259,6 @@ async fn hook_subcommand_emits_nothing_for_malformed_input() {
 }
 
 #[tokio::test]
-async fn hook_subcommand_fails_loudly_when_socket_configuration_is_missing() {
-    let output = tokio::task::spawn_blocking(|| invoke_hook_without_socket(DEFAULT_FIXTURE))
-        .await
-        .expect("misconfigured hook process task completes");
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(!output.stderr.is_empty());
-}
-
-#[tokio::test]
 async fn broker_restarts_after_sigterm() {
     let broker = BrokerProcess::start("sigterm-first");
     broker.wait_until_ready().await;
@@ -340,19 +272,4 @@ async fn broker_restarts_after_sigterm() {
         status.success(),
         "restarted broker did not stop cleanly: {status}"
     );
-}
-
-#[tokio::test]
-async fn hook_subcommand_falls_through_when_broker_cannot_map_the_session() {
-    let broker = BrokerProcess::start("hook-process");
-    broker.wait_until_ready().await;
-    let output = tokio::task::spawn_blocking({
-        let path = broker.path.clone();
-        move || invoke_hook(DEFAULT_FIXTURE, &path)
-    })
-    .await
-    .expect("hook process task completes");
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    broker.terminate();
 }

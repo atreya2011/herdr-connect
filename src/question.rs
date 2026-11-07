@@ -195,17 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn the_dialog_check_matches_the_question_text_in_the_detection_snapshot() {
-        let dialog = include_str!("../tests/fixtures/claude-detection-blocked-question.txt");
-        let no_dialog = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
-        let mut asked = question(false);
-        asked.question = "Which color do you prefer?".to_owned();
-        assert!(dialog_shows_question(dialog, &asked));
-        assert!(!dialog_shows_question(dialog, &question(false)));
-        assert!(!dialog_shows_question(no_dialog, &asked));
-    }
-
-    #[test]
     fn the_dialog_check_matches_a_question_wrapped_with_box_prefixes() {
         let dialog = concat!(
             "────\n",

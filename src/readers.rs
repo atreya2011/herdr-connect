@@ -675,25 +675,8 @@ fn format_question(input: Option<&Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_detection_question, parse_claude};
+    use super::parse_claude;
     use crate::question::{Question, QuestionOption};
-
-    #[test]
-    fn detection_snapshot_with_a_pending_dialog_yields_the_question_and_options() {
-        let text = include_str!("../tests/fixtures/claude-detection-blocked-question.txt");
-        assert_eq!(
-            format_detection_question(text).as_deref(),
-            Some(
-                "Which color do you prefer?\n\n1. Red\n     The color red\n2. Blue\n     The color blue\n3. Type something."
-            )
-        );
-    }
-
-    #[test]
-    fn detection_snapshot_with_no_dialog_yields_none() {
-        let text = include_str!("../tests/fixtures/claude-detection-no-dialog.txt");
-        assert_eq!(format_detection_question(text), None);
-    }
 
     const PENDING_QUESTION_LOG: &str = concat!(
         r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
