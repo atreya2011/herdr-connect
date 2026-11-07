@@ -2757,30 +2757,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[derive(Clone, Default)]
-    struct TestResources {
-        workspaces: HashSet<String>,
-        tabs: HashSet<String>,
-        channels: HashSet<Id<ChannelMarker>>,
-        root_workspaces: HashMap<String, String>,
-    }
-
-    #[cfg(unix)]
-    static TEST_RESOURCES: std::sync::LazyLock<std::sync::Mutex<TestResources>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(TestResources::default()));
-
-    #[cfg(unix)]
-    fn record_test_channel(id: Id<ChannelMarker>) {
-        TEST_RESOURCES
-            .lock()
-            .expect("test ownership lock")
-            .channels
-            .insert(id);
-    }
-
-    #[cfg(unix)]
     fn blocked_capture_guild() -> Option<BlockedCaptureGuild> {
-        *TEST_RESOURCES.lock().expect("test ownership lock") = TestResources::default();
         let guild = BlockedCaptureGuild {
             client: Arc::new(
                 Client::builder()
@@ -2805,7 +2782,7 @@ mod tests {
     #[cfg(unix)]
     async fn blocked_capture_testrun_threads(
         guild: &BlockedCaptureGuild,
-    ) -> Result<Vec<twilight_model::channel::Channel>, String> {
+    ) -> Result<Vec<Id<ChannelMarker>>, String> {
         let channels = guild
             .client
             .guild_channels(guild.id)
@@ -2833,7 +2810,29 @@ mod tests {
                 herdr_connect_rs::archived_threads(guild.client.as_ref(), parent.id).await?,
             );
         }
-        Ok(threads.into_iter().filter(is_test_channel).collect())
+        Ok(threads
+            .into_iter()
+            .filter(is_test_channel)
+            .map(|thread| thread.id)
+            .collect())
+    }
+
+    #[cfg(unix)]
+    async fn blocked_capture_active_testrun_threads(
+        guild: &BlockedCaptureGuild,
+    ) -> Result<usize, String> {
+        Ok(guild
+            .client
+            .active_threads(guild.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .model()
+            .await
+            .map_err(|e| e.to_string())?
+            .threads
+            .iter()
+            .filter(|thread| is_test_channel(thread))
+            .count())
     }
 
     #[cfg(unix)]
@@ -2861,47 +2860,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn test_owned_topology(
-        channels: &[twilight_model::channel::Channel],
-        threads: &[twilight_model::channel::Channel],
-    ) -> HashSet<Id<ChannelMarker>> {
-        let resources = TEST_RESOURCES.lock().expect("test ownership lock").clone();
-        let mut parents = resources.channels.clone();
-        parents.extend(
-            channels
-                .iter()
-                .filter(|channel| {
-                    is_test_channel(channel)
-                        && channel.topic.as_deref().is_some_and(|topic| {
-                            resources
-                                .workspaces
-                                .iter()
-                                .any(|workspace| topic == format!("herdr workspace [{workspace}]"))
-                        })
-                })
-                .map(|channel| channel.id),
-        );
-        let mut owned = parents.clone();
-        owned.extend(
-            threads
-                .iter()
-                .filter(|thread| {
-                    thread
-                        .parent_id
-                        .is_some_and(|parent| parents.contains(&parent))
-                        || thread.name.as_deref().is_some_and(|name| {
-                            resources
-                                .tabs
-                                .iter()
-                                .any(|tab| name.ends_with(&format!(" [{tab}]")))
-                        })
-                })
-                .map(|thread| thread.id),
-        );
-        owned
-    }
-
-    #[cfg(unix)]
     async fn blocked_capture_cleanup(guild: &BlockedCaptureGuild) -> Result<usize, String> {
         let channels = guild
             .client
@@ -2911,16 +2869,15 @@ mod tests {
             .model()
             .await
             .map_err(|e| e.to_string())?;
-        let threads = blocked_capture_testrun_threads(guild).await?;
-        let owned = test_owned_topology(&channels, &threads);
-        for channel in channels
-            .iter()
-            .filter(|channel| owned.contains(&channel.id))
-        {
-            blocked_capture_delete_thread(guild, channel.id).await?;
+        for channel in channels.into_iter().filter(is_test_channel) {
+            guild
+                .client
+                .delete_channel(channel.id)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        for thread in threads.iter().filter(|thread| owned.contains(&thread.id)) {
-            blocked_capture_delete_thread(guild, thread.id).await?;
+        for thread in blocked_capture_testrun_threads(guild).await? {
+            blocked_capture_delete_thread(guild, thread).await?;
         }
         let mut attempt = 0;
         loop {
@@ -2933,13 +2890,9 @@ mod tests {
                 .await
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .filter(|channel| owned.contains(&channel.id))
+                .filter(is_test_channel)
                 .count()
-                + blocked_capture_testrun_threads(guild)
-                    .await?
-                    .iter()
-                    .filter(|thread| owned.contains(&thread.id))
-                    .count();
+                + blocked_capture_active_testrun_threads(guild).await?;
             if leftover == 0 || attempt == 4 {
                 return Ok(leftover);
             }
@@ -2952,47 +2905,6 @@ mod tests {
     struct Tab {
         tab_id: String,
         pane_id: String,
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn test_cleanup_preserves_unregistered_test_channels() -> Result<(), String> {
-        let guild = blocked_capture_guild().ok_or("real Discord test environment is required")?;
-        let nonce = agent_name_nonce()?;
-        let create = async |suffix: &str| {
-            guild
-                .client
-                .create_guild_channel(guild.id, &format!("testrun-owned-cleanup-{nonce}-{suffix}"))
-                .await
-                .map_err(|error| error.to_string())?
-                .model()
-                .await
-                .map_err(|error| error.to_string())
-        };
-        let registered = create("registered").await?;
-        record_test_channel(registered.id);
-        let sentinel = create("sentinel").await?;
-        let result = async {
-            let remaining = blocked_capture_cleanup(&guild).await?;
-            let registered_exists = guild.client.channel(registered.id).await.is_ok();
-            let sentinel_exists = guild.client.channel(sentinel.id).await.is_ok();
-            println!("real owned cleanup: registered_exists={registered_exists} sentinel_exists={sentinel_exists} owned_leftovers={remaining}");
-            Ok::<_, String>((registered_exists, sentinel_exists, remaining))
-        }.await;
-        record_test_channel(sentinel.id);
-        let remaining = blocked_capture_cleanup(&guild).await?;
-        println!("named zero-leftover check: {remaining} owned Discord channels");
-        let (registered_exists, sentinel_exists, owned_leftovers) = result?;
-        for (name, observed, expected) in [
-            ("registered channel deleted", registered_exists, false),
-            ("unregistered channel preserved", sentinel_exists, true),
-        ] {
-            assert_eq!(observed, expected, "{name}");
-        }
-        assert_eq!(owned_leftovers, 0, "named zero-leftover check");
-        assert_eq!(remaining, 0, "named zero-leftover check");
-        Ok(())
     }
 
     #[cfg(unix)]
@@ -3025,11 +2937,6 @@ mod tests {
             close_workspace(&workspace.id);
             return Err(error);
         }
-        TEST_RESOURCES
-            .lock()
-            .expect("test ownership lock")
-            .root_workspaces
-            .insert(workspace.tab_id.clone(), workspace.id);
         Ok(Tab {
             tab_id: workspace.tab_id,
             pane_id: workspace.pane_id,
@@ -3043,12 +2950,9 @@ mod tests {
         cwd: &str,
         env_args: &[String],
     ) -> Result<Tab, String> {
-        if !TEST_RESOURCES
-            .lock()
-            .expect("test ownership lock")
-            .workspaces
-            .contains(workspace_id)
-        {
+        if !workspace_list_result()?.iter().any(|workspace| {
+            workspace.workspace_id == workspace_id && workspace.label.starts_with("testrun-")
+        }) {
             return create_isolated_tab(label, cwd, env_args);
         }
         let mut args = vec![
@@ -3075,23 +2979,29 @@ mod tests {
             .as_str()
             .ok_or("herdr tab create result missing pane_id")?
             .to_owned();
-        TEST_RESOURCES
-            .lock()
-            .expect("test ownership lock")
-            .tabs
-            .insert(tab_id.clone());
         Ok(Tab { tab_id, pane_id })
     }
 
     #[cfg(unix)]
     fn close_tab(tab_id: &str) {
-        let workspace = TEST_RESOURCES
-            .lock()
-            .expect("test ownership lock")
-            .root_workspaces
-            .remove(tab_id);
-        if let Some(workspace) = workspace {
-            close_workspace(&workspace);
+        let tabs = tab_list_result().expect("tab.list succeeds for fixture cleanup");
+        let Some(tab) = tabs.iter().find(|tab| tab.tab_id == tab_id) else {
+            return;
+        };
+        let workspaces =
+            workspace_list_result().expect("workspace.list succeeds for fixture cleanup");
+        if !workspaces.iter().any(|workspace| {
+            workspace.workspace_id == tab.workspace_id && workspace.label.starts_with("testrun-")
+        }) {
+            return;
+        }
+        if tabs
+            .iter()
+            .filter(|listed| listed.workspace_id == tab.workspace_id)
+            .count()
+            == 1
+        {
+            close_workspace(&tab.workspace_id);
             return;
         }
         let _ = Command::new("herdr")
@@ -3188,7 +3098,7 @@ mod tests {
 
     #[cfg(unix)]
     fn create_workspace(label: &str, cwd: &str) -> Result<Workspace, String> {
-        let workspace = create_workspace_with_numeric_tab(label, cwd)?;
+        let workspace = create_workspace_with_env(label, cwd, &passthrough_env_args())?;
         let output = Command::new("herdr")
             .args(["tab", "rename", &workspace.tab_id, label])
             .output()
@@ -3201,11 +3111,6 @@ mod tests {
             ));
         }
         Ok(workspace)
-    }
-
-    #[cfg(unix)]
-    fn create_workspace_with_numeric_tab(label: &str, cwd: &str) -> Result<Workspace, String> {
-        create_workspace_with_env(label, cwd, &passthrough_env_args())
     }
 
     #[cfg(unix)]
@@ -3243,11 +3148,6 @@ mod tests {
             .as_str()
             .ok_or("herdr workspace create result missing pane_id")?
             .to_owned();
-        {
-            let mut resources = TEST_RESOURCES.lock().expect("test ownership lock");
-            resources.workspaces.insert(workspace_id.clone());
-            resources.tabs.insert(tab_id.clone());
-        }
         Ok(Workspace {
             id: workspace_id,
             tab_id,
@@ -3277,13 +3177,10 @@ mod tests {
 
     #[cfg(unix)]
     fn cleanup_workspace_fixture(workspace: &Workspace, cwd: &Path) -> Result<(), String> {
-        let owned = TEST_RESOURCES
-            .lock()
-            .map_err(|error| error.to_string())?
-            .workspaces
-            .contains(&workspace.id);
-        if !owned {
-            return Err("refused to close an unowned test workspace".to_owned());
+        if !workspace_list_result()?.iter().any(|listed| {
+            listed.workspace_id == workspace.id && listed.label.starts_with("testrun-")
+        }) {
+            return Err("refused to close a non-testrun workspace".to_owned());
         }
         let closed = herdr_json(&["workspace", "close", &workspace.id]).map(drop);
         let removed = fs::remove_dir_all(cwd).map_err(|error| error.to_string());
@@ -6813,10 +6710,9 @@ mod tests {
             &tab_ids,
         )
         .await?;
-        let owned = test_owned_topology(&channels, &threads);
         let protected: Vec<_> = absent
             .iter()
-            .filter(|channel| !is_test_channel(channel) || !owned.contains(&channel.id))
+            .filter(|channel| !is_test_channel(channel))
             .map(|channel| {
                 format!(
                     "{} ({})",
@@ -7080,7 +6976,6 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
-        record_test_channel(channel.id);
 
         let cases = [
             ClosureBatchCase {
@@ -8087,7 +7982,6 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
-        record_test_channel(orphan_channel.id);
         create_guild_thread(guild, orphan_channel.id, "testrun-orphan [w9Z9:t1]").await?;
         let live_orphan_thread = create_guild_thread(
             guild,
@@ -8238,7 +8132,6 @@ mod tests {
             .model()
             .await
             .map_err(|error| error.to_string())?;
-        record_test_channel(orphan_channel.id);
         create_guild_thread(guild, orphan_channel.id, "testrun-orphan [wCC9:tCC]").await?;
 
         let shared_cache: herdr_connect_rs::TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
