@@ -1230,6 +1230,12 @@ async fn handle_activity_event<C: Chat>(
     frame: ActivityFrame,
     state: &mut BridgeState<C>,
 ) {
+    if frame.turn_end {
+        if C::DELETES_ACTIVITY {
+            delete_activity_message(discord, state, &frame.pane_id).await;
+        }
+        return;
+    }
     if !state.activity_eligible_panes.contains(&frame.pane_id) {
         return;
     }
@@ -1671,6 +1677,7 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         session_id: request.session_id,
         tool: request.tool,
         summary: request.summary,
+        turn_end: request.turn_end,
     };
     send_activity_frame(&frame, &socket_path, Duration::from_secs(1)).await;
     Ok(())
@@ -4966,6 +4973,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn late_activity_frame(vendor: &str, route: &TopologyRoute) -> herdr_connect_rs::ActivityFrame {
+        herdr_connect_rs::ActivityFrame {
+            kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
+            vendor: vendor.to_owned(),
+            workspace_id: route.workspace_id.clone(),
+            tab_id: route.tab_id.clone(),
+            pane_id: route.pane_id.clone(),
+            session_id: "late-frame-synthetic".to_owned(),
+            tool: "LateGhost".to_owned(),
+            summary: "late-frame-should-be-dropped".to_owned(),
+            turn_end: false,
+        }
+    }
+
+    #[cfg(unix)]
     fn activity_frame_line(
         started: Instant,
         frame: &herdr_connect_rs::ActivityFrame,
@@ -5111,16 +5133,7 @@ mod tests {
         let after_first_turn = thread_messages(guild, thread).await?;
         let first_activity_id = assert_first_turn_activity(&after_first_turn, &frames)?;
 
-        let late_frame = herdr_connect_rs::ActivityFrame {
-            kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
-            vendor: VENDOR_CLAUDE.to_owned(),
-            workspace_id: route.workspace_id.clone(),
-            tab_id: route.tab_id.clone(),
-            pane_id: route.pane_id.clone(),
-            session_id: "late-frame-synthetic".to_owned(),
-            tool: "LateGhost".to_owned(),
-            summary: "late-frame-should-be-dropped".to_owned(),
-        };
+        let late_frame = late_activity_frame(VENDOR_CLAUDE, &route);
         let late_started = Instant::now();
         herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
             .await;
@@ -6027,16 +6040,7 @@ mod tests {
         let after_first_turn = thread_messages(guild, thread).await?;
         let first_activity_id = assert_first_turn_activity(&after_first_turn, &frames)?;
 
-        let late_frame = herdr_connect_rs::ActivityFrame {
-            kind: herdr_connect_rs::ACTIVITY_KIND.to_owned(),
-            vendor: VENDOR_CODEX.to_owned(),
-            workspace_id: route.workspace_id.clone(),
-            tab_id: route.tab_id.clone(),
-            pane_id: route.pane_id.clone(),
-            session_id: "late-frame-synthetic".to_owned(),
-            tool: "LateGhost".to_owned(),
-            summary: "late-frame-should-be-dropped".to_owned(),
-        };
+        let late_frame = late_activity_frame(VENDOR_CODEX, &route);
         let late_started = Instant::now();
         herdr_connect_rs::send_activity_frame(&late_frame, broker_socket, Duration::from_secs(1))
             .await;

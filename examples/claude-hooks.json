@@ -11,6 +11,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "herdr-connect-rs activity --vendor claude",
+            "async": true
+          }
+        ]
+      }
     ]
   }
 }

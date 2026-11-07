@@ -85,6 +85,7 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Interaction: Clone + Send + Sync + 'static;
     type Posted: Send + 'static;
     type Deletion: Display + Send + 'static;
+    const DELETES_ACTIVITY: bool = false;
 
     fn owner_id(&self) -> &str;
     fn scope(&self) -> ChatScope;

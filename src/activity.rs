@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 const ACTIVITY_HOOK_EVENT: &str = "PreToolUse";
 const CURSOR_ACTIVITY_HOOK_EVENT: &str = "preToolUse";
+const CLAUDE_TURN_END_HOOK_EVENT: &str = "Stop";
 
 pub const ACTIVITY_KIND: &str = "activity";
 
@@ -17,6 +18,14 @@ pub struct ActivityFrame {
     pub session_id: String,
     pub tool: String,
     pub summary: String,
+    #[serde(default)]
+    pub turn_end: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeHookHeader {
+    session_id: String,
+    hook_event_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,9 +64,20 @@ pub struct ClaudeActivityRequest {
     pub session_id: String,
     pub tool: String,
     pub summary: String,
+    pub turn_end: bool,
 }
 
 pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequest, String> {
+    let header: ClaudeHookHeader =
+        serde_json::from_slice(input).map_err(|error| error.to_string())?;
+    if header.hook_event_name == CLAUDE_TURN_END_HOOK_EVENT {
+        return Ok(ClaudeActivityRequest {
+            session_id: header.session_id,
+            tool: String::new(),
+            summary: String::new(),
+            turn_end: true,
+        });
+    }
     let request: ClaudePreToolUseRequest =
         serde_json::from_slice(input).map_err(|error| error.to_string())?;
     if request.hook_event_name != ACTIVITY_HOOK_EVENT {
@@ -76,6 +96,7 @@ pub fn decode_claude_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
         session_id: request.session_id,
         tool: request.tool_name,
         summary,
+        turn_end: false,
     })
 }
 
@@ -96,6 +117,7 @@ pub fn decode_codex_activity_request(input: &[u8]) -> Result<ClaudeActivityReque
         session_id: request.session_id,
         tool: request.tool_name,
         summary,
+        turn_end: false,
     })
 }
 
@@ -109,6 +131,7 @@ pub fn decode_cursor_activity_request(input: &[u8]) -> Result<ClaudeActivityRequ
         session_id: request.conversation_id,
         tool: request.tool_name,
         summary: truncate_chars(&request.agent_message),
+        turn_end: false,
     })
 }
 
@@ -176,6 +199,20 @@ mod tests {
     fn rejects_a_different_hook_event() {
         let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cmd"}}"#;
         assert!(decode_claude_activity_request(payload.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn decodes_the_stop_hook_as_a_turn_end() {
+        let payload = r#"{"session_id":"s","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"STARTED","background_tasks":[{"id":"a","type":"subagent","status":"running"}]}"#;
+        let request = decode_claude_activity_request(payload.as_bytes()).expect("decodes");
+        assert!(request.turn_end);
+        assert_eq!(request.session_id, "s");
+        let tool_use = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cmd"}}"#;
+        assert!(
+            !decode_claude_activity_request(tool_use.as_bytes())
+                .expect("decodes")
+                .turn_end
+        );
     }
 
     #[test]

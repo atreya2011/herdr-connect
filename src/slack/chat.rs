@@ -108,6 +108,7 @@ impl Chat for Slack {
     type Interaction = SlackInteractionBlockActionsEvent;
     type Posted = SlackMessageEvent;
     type Deletion = SlackArchive;
+    const DELETES_ACTIVITY: bool = true;
 
     fn owner_id(&self) -> &str {
         &self.owner.0
