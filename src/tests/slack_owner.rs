@@ -85,6 +85,10 @@ struct Driver {
     team: String,
 }
 
+fn test_env(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|error| format!("{name}: {error}"))
+}
+
 fn action(text: &str) -> Result<(), String> {
     println!("OWNER ACTION: {text}");
     std::io::stdout().flush().map_err(|error| error.to_string())
@@ -204,7 +208,7 @@ impl Owned {
             return Err("real Claude agent did not report a session".into());
         }
         self.chat
-            .connect_socket(std::env::var("SLACK_APP_TOKEN").map_err(|error| error.to_string())?)
+            .connect_socket(test_env("SLACK_TEST_APP_TOKEN")?)
             .await
             .map_err(String::from)?;
         let tab = matching_tab(&workspace.tab_id)?;
@@ -327,11 +331,7 @@ impl Owned {
         let mut errors = Vec::new();
         let client =
             SlackClient::new(SlackClientHyperConnector::new().map_err(|error| error.to_string())?);
-        let token = SlackApiToken::new(
-            std::env::var("SLACK_BOT_TOKEN")
-                .map_err(|error| error.to_string())?
-                .into(),
-        );
+        let token = SlackApiToken::new(test_env("SLACK_TEST_BOT_TOKEN")?.into());
         for channel in self
             .chat
             .channels()
@@ -985,7 +985,14 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
             .as_millis()
     );
     let directory = std::env::temp_dir().join(&label);
-    let chat = Arc::new(Slack::from_env().await.map_err(String::from)?);
+    let chat = Arc::new(
+        Slack::new(
+            test_env("SLACK_TEST_BOT_TOKEN")?,
+            test_env("SLACK_TEST_OWNER_ID")?,
+        )
+        .await
+        .map_err(String::from)?,
+    );
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&directory)

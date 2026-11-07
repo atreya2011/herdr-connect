@@ -8,6 +8,18 @@ use herdr_connect_rs::{
 use serde_json::Value;
 use slack_morphism::prelude::*;
 
+fn test_env(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|error| format!("{name}: {error}"))
+}
+
+async fn test_slack() -> Result<Slack, Box<dyn std::error::Error>> {
+    Ok(Slack::new(
+        test_env("SLACK_TEST_BOT_TOKEN")?,
+        test_env("SLACK_TEST_OWNER_ID")?,
+    )
+    .await?)
+}
+
 fn herdr(args: &[&str]) -> Result<Value, String> {
     let output = Command::new("herdr")
         .args(args)
@@ -21,8 +33,8 @@ fn herdr(args: &[&str]) -> Result<Value, String> {
 
 #[tokio::test]
 async fn slack_topology_real_workspace() -> Result<(), Box<dyn std::error::Error>> {
-    let token = std::env::var("SLACK_BOT_TOKEN")?;
-    let slack = Slack::from_env().await?;
+    let token = test_env("SLACK_TEST_BOT_TOKEN")?;
+    let slack = test_slack().await?;
     let label = format!(
         "testrun-slack-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
@@ -198,7 +210,7 @@ async fn cleanup(
             .is_some_and(|name| name.starts_with(label))
         {
             let client = SlackClient::new(SlackClientHyperConnector::new()?);
-            let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
+            let token = SlackApiToken::new(test_env("SLACK_TEST_BOT_TOKEN")?.into());
             client
                 .open_session(&token)
                 .conversations_archive(&SlackApiConversationsArchiveRequest::new(channel.id))
@@ -261,8 +273,8 @@ fn create_route() -> Result<TopologyRoute, Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>> {
-    let token = std::env::var("SLACK_BOT_TOKEN")?;
-    let slack = Slack::from_env().await?;
+    let token = test_env("SLACK_TEST_BOT_TOKEN")?;
+    let slack = test_slack().await?;
     let route = create_route()?;
     let result = async {
         let (parent, found) = slack.sync_route_with_parent(&route).await?;
@@ -320,11 +332,11 @@ async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
-    let slack = Slack::from_env().await?;
+    let slack = test_slack().await?;
     let route = create_route()?;
     let result = async {
         slack
-            .connect_socket(std::env::var("SLACK_APP_TOKEN")?)
+            .connect_socket(test_env("SLACK_TEST_APP_TOKEN")?)
             .await?;
         let found = slack.sync(&route, false).await?;
         let sent = slack.send(&found, "testrun socket delivery").await?;
@@ -357,7 +369,7 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn slack_cards_real_channel() -> Result<(), Box<dyn std::error::Error>> {
-    let slack = Slack::from_env().await?;
+    let slack = test_slack().await?;
     let route = create_route()?;
     let result = async {
         let found = slack.sync_route(&route).await?;
@@ -549,7 +561,7 @@ async fn preserve_service_orphan(
     channel: &SlackChannelId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = SlackClient::new(SlackClientHyperConnector::new()?);
-    let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
+    let token = SlackApiToken::new(test_env("SLACK_TEST_BOT_TOKEN")?.into());
     let session = client.open_session(&token);
     let request = SlackApiConversationsInfoRequest::new(channel.clone());
     let name = session
@@ -584,11 +596,11 @@ async fn preserve_service_orphan(
 
 #[tokio::test]
 async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
-    let token = std::env::var("SLACK_BOT_TOKEN")?;
-    let slack = Slack::from_env().await?;
+    let token = test_env("SLACK_TEST_BOT_TOKEN")?;
+    let slack = test_slack().await?;
     let route = create_route()?;
     let result = async {
-        let filtered = Slack::from_env()
+        let filtered = test_slack()
             .await?
             .with_scope(ChatScope::Service)
             .with_ignore_test_runs(true);
@@ -619,7 +631,7 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
         let old = slack.sync_route(&obsolete).await?;
         herdr(&["tab", "close", tab])?;
         herdr(&["tab", "rename", &route.tab_id, "testrun-renamed"])?;
-        let restarted = Slack::from_env().await?;
+        let restarted = test_slack().await?;
         sweep_preserving_channels(&restarted, Vec::new()).await?;
         let mut checks = Vec::new();
         for (name, fresh) in [("cached route", false), ("restart recovery", true)] {
