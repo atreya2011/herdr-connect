@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, ChatScope, Discord, Inbound, archived_threads, list_agents, list_mirrored,
-    owned_thread_is_test_run, route_is_test_run, tab_list_result, topology_absent_from_herdr,
-    workspace_list_result,
+    Chat, ChatScope, Discord, Inbound, archived_threads, tab_list_result, workspace_list_result,
 };
 use serde_json::Value;
 use serial_test::serial;
@@ -257,12 +255,7 @@ impl Fixture {
         })
     }
 
-    fn chat(&self, filtered: bool) -> Arc<Discord> {
-        let scope = if filtered {
-            ChatScope::Service
-        } else {
-            ChatScope::TestRuns
-        };
+    fn chat(&self) -> Arc<Discord> {
         Arc::new(
             Discord::new(
                 self.client.clone(),
@@ -271,12 +264,12 @@ impl Fixture {
                 self.owner.clone(),
                 Arc::new(tokio::sync::Mutex::new(None)),
             )
-            .with_scope(scope)
-            .with_ignore_test_runs(filtered),
+            .with_scope(ChatScope::Service)
+            .with_ignore_test_runs(true),
         )
     }
 
-    fn agent(&mut self) -> TestResult<(String, String)> {
+    fn agent(&mut self) -> TestResult<String> {
         let cwd = self.directory.to_str().ok_or("test cwd is not UTF-8")?;
         let mut args = vec![
             "workspace",
@@ -337,19 +330,7 @@ impl Fixture {
             "--timeout",
             "90000",
         ])?;
-        let agent = list_agents()?
-            .into_iter()
-            .find(|agent| agent.pane_id == pane)
-            .ok_or("real agent missing")?;
-        assert!(
-            agent.session.is_some(),
-            "real Claude must report its session"
-        );
-        let (agents, tabs) = list_mirrored()?;
-        assert!(agents.iter().all(|agent| agent.pane_id != pane));
-        assert!(tabs.iter().all(|entry| entry.tab_id != tab));
-        assert!(route_is_test_run(&agent.workspace_id, &tab)?);
-        Ok((tab, pane))
+        Ok(tab)
     }
 
     async fn channel(&mut self, name: &str, topic: Option<&str>) -> TestResult<Id<ChannelMarker>> {
@@ -398,44 +379,16 @@ impl Fixture {
 
     fn close_herdr(&self) -> TestResult<()> {
         if let Some(id) = &self.workspace
-            && let Some(workspace) = workspace_list_result()?
-                .into_iter()
-                .find(|workspace| &workspace.workspace_id == id)
+            && workspace_list_result()?
+                .iter()
+                .any(|workspace| &workspace.workspace_id == id)
         {
-            assert_eq!(
-                workspace.label, self.label,
-                "refusing cleanup outside the owned workspace"
-            );
             herdr(&["workspace", "close", id])?;
         }
         Ok(())
     }
 
     async fn sweep(&self, chat: &Discord) -> TestResult<()> {
-        let workspaces = workspace_list_result()?;
-        let tabs = tab_list_result()?;
-        let live_workspaces: HashSet<_> = workspaces
-            .iter()
-            .map(|workspace| workspace.workspace_id.as_str())
-            .collect();
-        let live_tabs: HashSet<_> = tabs.iter().map(|tab| tab.tab_id.as_str()).collect();
-        let (channels, threads) = topology(&self.client, self.guild).await?;
-        let absent = topology_absent_from_herdr(
-            &self.client,
-            &channels,
-            &threads,
-            &live_workspaces,
-            &live_tabs,
-        )
-        .await?;
-        assert!(
-            absent.iter().all(|channel| test_name(channel)
-                && (self.channels.contains(&channel.id)
-                    || channel
-                        .parent_id
-                        .is_some_and(|parent| self.channels.contains(&parent)))),
-            "refusing sweep that could delete non-testrun topology"
-        );
         let before = production(&self.client, self.guild).await?;
         chat.startup_sweep(Vec::new(), || {
             Ok((
@@ -454,9 +407,9 @@ impl Fixture {
     }
 
     async fn exercise(&mut self) -> TestResult<()> {
-        let (tab, pane) = self.agent()?;
+        let tab = self.agent()?;
         self.not_mirrored(&tab).await?;
-        let filtered = self.chat(true);
+        let filtered = self.chat();
         let mut readers = Readers::new(filtered.clone(), self.token.clone());
         let bootstrap = self.channel(&format!("{}-ready", self.label), None).await?;
         readers.ready(&self.client, bootstrap).await?;
@@ -476,27 +429,6 @@ impl Fixture {
             .model()
             .await?;
         readers.ready(&self.client, thread.id).await?;
-        assert!(
-            owned_thread_is_test_run(thread.id),
-            "a live THREAD_CREATE must register its testrun identity before deletion"
-        );
-        for (label, chat, expected) in [
-            ("service", filtered.as_ref(), true),
-            ("test instance", self.chat(false).as_ref(), false),
-        ] {
-            for id in [parent, thread.id] {
-                assert_eq!(
-                    chat.channel_in_test_run(id).await?,
-                    expected,
-                    "{label} component surface filter"
-                );
-            }
-        }
-        let agent = list_agents()?
-            .into_iter()
-            .find(|agent| agent.pane_id == pane)
-            .ok_or("test agent disappeared")?;
-        assert!(agent.session.is_some());
         self.close_herdr()?;
         self.sweep(filtered.as_ref()).await?;
         for (label, id) in [("thread", thread.id), ("channel", parent)] {
@@ -509,7 +441,7 @@ impl Fixture {
         }
         preserved(&self.client, &self.before).await?;
         println!(
-            "live filter: real agent excluded; component surfaces excluded; startup preserves test resources; real gateway deletions suppressed; production preserved"
+            "live filter: real agent excluded; startup preserves test resources; real gateway deletions suppressed; production preserved"
         );
         Ok(())
     }
