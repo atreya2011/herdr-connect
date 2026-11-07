@@ -1,1 +1,0 @@
-❯ Use the AskUserQuestion tool to ask me one question: which color do you prefer, with options Red and Blue. Wait for my answer.
