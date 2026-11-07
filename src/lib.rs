@@ -25,6 +25,7 @@ mod watcher;
 pub use activity::{
     ACTIVITY_KIND, ActivityFrame, ClaudeActivityRequest, activity_message_text,
     decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
+    is_activity_message_text,
 };
 pub use broker::{
     PermissionResponder, QuestionOutcome, handle_component, hook_timeout, request_decision,

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 const ACTIVITY_HOOK_EVENT: &str = "PreToolUse";
 const CURSOR_ACTIVITY_HOOK_EVENT: &str = "preToolUse";
 const CLAUDE_TURN_END_HOOK_EVENT: &str = "Stop";
+const ACTIVITY_PREFIX: &str = "⚙️ ";
+const SLACK_STORED_ACTIVITY_PREFIX: &str = ":gear: ";
+const ACTIVITY_SEPARATOR: &str = " · ";
 
 pub const ACTIVITY_KIND: &str = "activity";
 
@@ -142,16 +145,27 @@ fn truncate_chars(value: &str) -> String {
 #[must_use]
 pub fn activity_message_text(count: u32, tool: &str, summary: &str) -> String {
     if summary.is_empty() {
-        format!("⚙️ {count} · {tool}")
+        format!("{ACTIVITY_PREFIX}{count}{ACTIVITY_SEPARATOR}{tool}")
     } else {
-        format!("⚙️ {count} · {tool}: {summary}")
+        format!("{ACTIVITY_PREFIX}{count}{ACTIVITY_SEPARATOR}{tool}: {summary}")
     }
+}
+
+#[must_use]
+pub fn is_activity_message_text(text: &str) -> bool {
+    text.strip_prefix(ACTIVITY_PREFIX)
+        .or_else(|| text.strip_prefix(SLACK_STORED_ACTIVITY_PREFIX))
+        .and_then(|rest| rest.split_once(ACTIVITY_SEPARATOR))
+        .is_some_and(|(count, _)| {
+            !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         activity_message_text, decode_claude_activity_request, decode_codex_activity_request,
+        is_activity_message_text,
     };
 
     #[test]
@@ -213,6 +227,25 @@ mod tests {
                 .expect("decodes")
                 .turn_end
         );
+    }
+
+    #[test]
+    fn recognizes_only_activity_message_text() {
+        let cases = [
+            (activity_message_text(1, "Bash", ""), true),
+            (activity_message_text(43, "Bash", "ls -la"), true),
+            (
+                ":gear: 1 · Bash: python3 -c \"import time\"".to_owned(),
+                true,
+            ),
+            (":gear: Bash".to_owned(), false),
+            ("⚙️ settings changed · Bash".to_owned(), false),
+            ("⚙️ 3 Bash".to_owned(), false),
+            ("done ⚙️ 3 · Bash".to_owned(), false),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(is_activity_message_text(&text), expected, "{text}");
+        }
     }
 
     #[test]

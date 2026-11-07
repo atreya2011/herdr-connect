@@ -43,6 +43,7 @@ pub struct Slack {
     listener: Mutex<Option<SlackClientSocketModeListener<SlackClientHyperHttpsConnector>>>,
     events: Mutex<tokio::sync::mpsc::UnboundedReceiver<SlackSocketEvent>>,
     question_text: Mutex<HashMap<SlackTs, String>>,
+    started: SlackTs,
 }
 
 fn error(error: impl Display) -> ChatError {
@@ -134,6 +135,14 @@ fn named_tab(workspace: &str, tab: &str) -> Result<(String, bool), ChatError> {
 }
 impl Slack {
     pub async fn new(token: String, owner: String) -> Result<Self, ChatError> {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(error)?;
+        let started = SlackTs::new(format!(
+            "{}.{:06}",
+            started.as_secs(),
+            started.subsec_micros()
+        ));
         let connector = SlackClientHyperConnector::new()
             .map_err(error)?
             .with_rate_control(SlackApiRateControlConfig::new().with_max_retries(5));
@@ -194,6 +203,7 @@ impl Slack {
             listener: Mutex::new(None),
             events: Mutex::new(events),
             question_text: Mutex::new(HashMap::new()),
+            started,
         })
     }
     pub async fn from_env() -> Result<Self, ChatError> {
@@ -256,6 +266,38 @@ impl Slack {
             }
             request = request.opt_cursor(cursor);
         }
+    }
+    pub async fn delete_stale_activity(&self, route: &SlackRoute) -> Result<(), ChatError> {
+        self.require_route(route).await?;
+        let session = self.state.client.open_session(&self.state.token);
+        let messages = session
+            .conversations_history(
+                &SlackApiConversationsHistoryRequest::new()
+                    .with_channel(route.channel.clone())
+                    .with_latest(self.started.clone())
+                    .with_limit(100),
+            )
+            .await
+            .map_err(error)?
+            .messages;
+        for message in messages {
+            if message.sender.user.as_ref() == Some(&self.bot)
+                && message
+                    .content
+                    .text
+                    .as_deref()
+                    .is_some_and(crate::is_activity_message_text)
+            {
+                session
+                    .chat_delete(&SlackApiChatDeleteRequest::new(
+                        route.channel.clone(),
+                        message.origin.ts,
+                    ))
+                    .await
+                    .map_err(error)?;
+            }
+        }
+        Ok(())
     }
     async fn load(&self, topology: &mut Topology) -> Result<(), ChatError> {
         let channels = self
@@ -488,7 +530,10 @@ impl Slack {
         let mut failure = None;
         for route in routes {
             let result = match route {
-                Ok(route) => self.sync(&route, false).await.map(drop),
+                Ok(route) => match self.sync(&route, false).await {
+                    Ok(channel) => self.delete_stale_activity(&channel).await,
+                    Err(failure) => Err(failure),
+                },
                 Err(failure) => Err(error(failure)),
             };
             if let Err(error) = result {
