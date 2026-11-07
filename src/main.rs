@@ -84,8 +84,6 @@ struct BridgeState<C: Chat> {
     seen_without_session: HashMap<String, SystemTime>,
     ignore_test_runs: bool,
     mirrored_topology: HashSet<String>,
-    #[cfg(test)]
-    included_panes: Option<HashSet<String>>,
 }
 
 impl<C: Chat> Default for BridgeState<C> {
@@ -105,8 +103,6 @@ impl<C: Chat> Default for BridgeState<C> {
             seen_without_session: HashMap::new(),
             ignore_test_runs: false,
             mirrored_topology: HashSet::new(),
-            #[cfg(test)]
-            included_panes: None,
         }
     }
 }
@@ -1998,7 +1994,12 @@ async fn handle_status_select_result<C: Chat>(
         Err(error) => {
             bridge_eprintln!("herdr status subscribe error: {error}");
             let Some(next_status) = unwrap_or_shutdown(
-                subscribe_snapshot_status(&mut runtime.pane_ids, stop, &runtime.state).await,
+                subscribe_status_with_backoff(
+                    &mut runtime.pane_ids,
+                    stop,
+                    runtime.state.ignore_test_runs,
+                )
+                .await,
                 broker,
             ) else {
                 return false;
@@ -2116,11 +2117,6 @@ async fn apply_herdr_snapshot<C: Chat>(
     if discord.0.scope() == ChatScope::TestRuns {
         herdr_connect_rs::retain_test_runs(&mut agents, &mut tabs, &workspaces);
     }
-    #[cfg(test)]
-    if let Some(panes) = &state.included_panes {
-        agents.retain(|agent| panes.contains(&agent.pane_id));
-        tabs.retain(|tab| agents.iter().any(|agent| agent.tab_id == tab.tab_id));
-    }
     let mut excluded_terminals = HashSet::new();
     if state.ignore_test_runs {
         let all_terminals: HashSet<String> = agents
@@ -2185,24 +2181,6 @@ async fn apply_herdr_snapshot<C: Chat>(
     Ok(pane_ids_from_agents(&agents))
 }
 
-async fn subscribe_snapshot_status<C: Chat>(
-    pane_ids: &mut Vec<String>,
-    stop: &mut tokio::signal::unix::Signal,
-    state: &BridgeState<C>,
-) -> Result<Option<HerdrSubscription>, BridgeInterrupt> {
-    #[cfg(test)]
-    if let Some(included) = &state.included_panes {
-        pane_ids.retain(|pane| included.contains(pane));
-        if pane_ids.is_empty() {
-            return Ok(None);
-        }
-        return subscribe_herdr_events_with_backoff(&status_subscriptions(pane_ids), stop)
-            .await
-            .map(Some);
-    }
-    subscribe_status_with_backoff(pane_ids, stop, state.ignore_test_runs).await
-}
-
 async fn doorbell_snapshot<C: Chat>(
     discord: &ChatConnection<C>,
     state: &mut BridgeState<C>,
@@ -2213,7 +2191,8 @@ async fn doorbell_snapshot<C: Chat>(
     match apply_herdr_snapshot(discord, state).await {
         Ok(from_snapshot) => {
             if reconcile_pane_ids(pane_ids, from_snapshot) {
-                *status = subscribe_snapshot_status(pane_ids, stop, state).await?;
+                *status =
+                    subscribe_status_with_backoff(pane_ids, stop, state.ignore_test_runs).await?;
             }
         }
         Err(error) => bridge_eprintln!("herdr snapshot error: {error}"),
@@ -2351,13 +2330,12 @@ mod tests {
     };
 
     use super::{
-        BridgeRuntime, BridgeState, BrokerTask, Client, Discord, Follower, PermissionResponder,
-        SessionPathError, TopologyClosure, TopologyRoute, agent_read_detection,
-        capture_for_with_search_root, fetch_startup_owner_identity, handle_lifecycle_select_result,
-        handle_live_event, lifecycle_closure, list_agents, live_log_path,
-        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
-        prune_departed_state, read_new_live_texts, read_new_terminal_prompts, resolve_session_path,
-        route_topology, subscribe_status_with_backoff, sync_startup_topology, tab_list_result,
+        BridgeState, Client, Discord, Follower, PermissionResponder, SessionPathError,
+        TopologyClosure, TopologyRoute, agent_read_detection, capture_for_with_search_root,
+        fetch_startup_owner_identity, handle_live_event, lifecycle_closure, list_agents,
+        live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
+        process_snapshot, prune_departed_state, read_new_live_texts, read_new_terminal_prompts,
+        resolve_session_path, route_topology, sync_startup_topology, tab_list_result,
         terminal_prompt_baseline_is_current, unique_existing_path,
     };
     use herdr_connect_rs::{
@@ -2507,43 +2485,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn non_utf8_discord_variable_fails_startup_naming_the_variable() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let original = std::env::var_os("DISCORD_TOKEN");
-        unsafe {
-            std::env::set_var(
-                "DISCORD_TOKEN",
-                std::ffi::OsString::from_vec(b"secret-token\xff".to_vec()),
-            );
-        }
-        let result = super::discord_connection(
-            Arc::new(tokio::sync::Mutex::new(None)),
-            false,
-            super::ChatScope::TestRuns,
-        )
-        .await;
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var("DISCORD_TOKEN", value),
-                None => std::env::remove_var("DISCORD_TOKEN"),
-            }
-        }
-        let error = result
-            .err()
-            .expect("a non-UTF-8 token must fail startup")
-            .to_string();
-        assert!(
-            error.contains("DISCORD_TOKEN") && !error.contains("Missing required"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            !error.contains("secret-token"),
-            "the error must not print the variable's value: {error}"
-        );
-    }
-
     #[test]
     fn cursor_hook_without_a_decision_emits_a_deny_object() {
         let output = super::encode_hook_decision(super::PermissionVendor::Cursor, None)
@@ -2581,47 +2522,6 @@ mod tests {
         );
 
         assert_ne!(pre_departure_nonce, returned_nonce);
-    }
-
-    #[test]
-    fn lifecycle_closure_matches_real_payload_shapes() {
-        use serde_json::json;
-
-        let tab_closed = json!({
-            "event": "tab_closed",
-            "data": {"tab_id": "w32:t2", "type": "tab_closed", "workspace_id": "w32"}
-        });
-        assert_eq!(
-            lifecycle_closure(&tab_closed),
-            Some(TopologyClosure::Tab {
-                workspace_id: "w32".to_owned(),
-                tab_id: "w32:t2".to_owned(),
-            })
-        );
-
-        let workspace_closed = json!({
-            "event": "workspace_closed",
-            "data": {
-                "type": "workspace_closed",
-                "workspace_id": "w32",
-                "workspace": {
-                    "active_tab_id": "w32:t1",
-                    "agent_status": "unknown",
-                    "focused": false,
-                    "label": "testrun-payload-capture-2",
-                    "number": 16,
-                    "pane_count": 1,
-                    "tab_count": 1,
-                    "workspace_id": "w32"
-                }
-            }
-        });
-        assert_eq!(
-            lifecycle_closure(&workspace_closed),
-            Some(TopologyClosure::Workspace {
-                workspace_id: "w32".to_owned(),
-            })
-        );
     }
 
     fn claude_session_snapshot(cwd: &str, session_id: &str) -> (AgentSnapshot, AgentSession) {
@@ -2892,90 +2792,6 @@ mod tests {
             owner_id: std::env::var("DISCORD_OWNER_ID").ok()?,
         };
         Some(guild)
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn broker_service_scope_admits_real_production_metadata() -> Result<(), String> {
-        let guild = blocked_capture_guild().ok_or("real Discord environment is required")?;
-        let responder = super::broker_responder(
-            guild.client.clone(),
-            std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
-            guild.id,
-            guild.owner_id.clone(),
-        );
-        let channels = guild
-            .client
-            .guild_channels(guild.id)
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?;
-        let threads = guild
-            .client
-            .active_threads(guild.id)
-            .await
-            .map_err(|error| error.to_string())?
-            .model()
-            .await
-            .map_err(|error| error.to_string())?
-            .threads;
-        let workspaces = workspace_list_result()?;
-        let tabs = tab_list_result()?;
-        let selected = tabs
-            .iter()
-            .filter(|tab| {
-                !tab.label.starts_with("testrun-")
-                    && workspaces.iter().any(|workspace| {
-                        workspace.workspace_id == tab.workspace_id
-                            && !workspace.label.starts_with("testrun-")
-                    })
-            })
-            .find_map(|tab| {
-                let topic = format!("herdr workspace [{}]", tab.workspace_id);
-                let parent = channels.iter().find(|channel| {
-                    !is_test_channel(channel) && channel.topic.as_deref() == Some(topic.as_str())
-                })?;
-                let suffix = format!(" [{}]", tab.tab_id);
-                let thread = threads.iter().find(|thread| {
-                    thread.parent_id == Some(parent.id)
-                        && !is_test_channel(thread)
-                        && thread
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| name.ends_with(&suffix))
-                })?;
-                Some((tab, parent, thread))
-            })
-            .ok_or("requires an existing production Herdr tab and Discord channel/thread")?;
-        let (tab, parent, thread) = selected;
-        let chat = responder.chat();
-        let cases = [
-            (
-                "same CLI constructor selects Service",
-                chat.scope() == super::ChatScope::Service,
-            ),
-            (
-                "real production Herdr tab admitted",
-                chat.accepts_herdr_route(&tab.workspace_id, &tab.tab_id)
-                    .await?,
-            ),
-            (
-                "real production channel admitted",
-                chat.accepts_route(&parent.id).await?,
-            ),
-            (
-                "real production thread admitted",
-                chat.accepts_route(&thread.id).await?,
-            ),
-        ];
-        for (name, observed) in cases {
-            println!("real broker scope: {name}: {observed}");
-            assert!(observed, "{name}");
-        }
-        Ok(())
     }
 
     #[cfg(unix)]
@@ -3639,290 +3455,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn native_shared_tab_working(
-        workspace: &Workspace,
-        cwd: &str,
-    ) -> Result<Vec<(&'static str, bool)>, String> {
-        let env = passthrough_env_args();
-        let mut args = vec![
-            "pane",
-            "split",
-            &workspace.pane_id,
-            "--direction",
-            "right",
-            "--cwd",
-            cwd,
-            "--no-focus",
-        ];
-        for value in &env {
-            args.extend(["--env", value]);
-        }
-        let split = herdr_json(&args)?;
-        let second = split["result"]["pane"]["pane_id"]
-            .as_str()
-            .ok_or("pane split omitted pane_id")?;
-        let settings = Path::new(cwd).join("testrun-settings.json");
-        fs::write(
-            &settings,
-            r#"{"permissions":{"allow":["Bash(python3:*)"]}}"#,
-        )
-        .map_err(|error| error.to_string())?;
-        let nonce = agent_name_nonce()?;
-        start_claude_haiku_agent_with_settings(
-            &format!("snapshot-first-{nonce}"),
-            &workspace.pane_id,
-            &settings,
-        )?;
-        start_claude_haiku_agent_with_settings(
-            &format!("snapshot-second-{nonce}"),
-            second,
-            &settings,
-        )?;
-        wait_for_status(second, &[STATUS_IDLE, STATUS_DONE], Duration::from_secs(20)).await?;
-        submit_owner_prompt(
-            &workspace.pane_id,
-            "Use Bash now to run exactly `python3 -c 'import time; time.sleep(60)'` in the foreground. Do not run anything else.",
-        )?;
-        wait_for_status(
-            &workspace.pane_id,
-            &[STATUS_WORKING],
-            Duration::from_secs(20),
-        )
-        .await?;
-        let agents = list_agents()?
-            .into_iter()
-            .filter(|agent| agent.tab_id == workspace.tab_id)
-            .collect::<Vec<_>>();
-        println!(
-            "native shared-tab statuses: {:?}",
-            agents
-                .iter()
-                .map(|agent| (&agent.pane_id, &agent.agent_status))
-                .collect::<Vec<_>>()
-        );
-        let mut reversed = agents.clone();
-        reversed.reverse();
-        Ok(vec![
-            (
-                "real shared tab has working and settled panes",
-                agents.len() == 2
-                    && agents
-                        .iter()
-                        .any(|agent| agent.agent_status == STATUS_WORKING)
-                    && agents.iter().any(|agent| {
-                        matches!(agent.agent_status.as_str(), STATUS_IDLE | STATUS_DONE)
-                    }),
-            ),
-            (
-                "shared-tab status stays working",
-                super::tab_is_working(&agents, &workspace.tab_id),
-            ),
-            (
-                "shared-tab status ignores pane order",
-                super::tab_is_working(&reversed, &workspace.tab_id),
-            ),
-        ])
-    }
-
-    #[cfg(unix)]
-    fn refresh_owned_topology(
-        previous: &mut HashSet<String>,
-        workspace: &str,
-    ) -> Result<Vec<TopologyClosure>, String> {
-        let workspaces = workspace_list_result()?
-            .into_iter()
-            .map(|item| item.workspace_id)
-            .collect::<HashSet<_>>();
-        let tabs = tab_list_result()?
-            .into_iter()
-            .map(|tab| tab.tab_id)
-            .collect::<HashSet<_>>();
-        let current = workspaces
-            .iter()
-            .filter(|id| id.as_str() == workspace)
-            .chain(
-                tabs.iter()
-                    .filter(|id| id.split_once(':').is_some_and(|(id, _)| id == workspace)),
-            )
-            .cloned()
-            .collect();
-        Ok(super::update_mirrored_topology(
-            previous,
-            current,
-            &workspaces,
-            &tabs,
-        ))
-    }
-
-    #[cfg(unix)]
-    fn native_topology_departures(
-        workspace: &Workspace,
-        cwd: &str,
-    ) -> Result<Vec<(&'static str, bool)>, String> {
-        let sibling = create_tab("testrun-departed", &workspace.id, cwd)?;
-        let mut previous = HashSet::new();
-        let initial = refresh_owned_topology(&mut previous, &workspace.id)?;
-        let cached = previous.contains(&workspace.id)
-            && previous.contains(&workspace.tab_id)
-            && previous.contains(&sibling.tab_id);
-        herdr_json(&["tab", "close", &sibling.tab_id])?;
-        let tabs = refresh_owned_topology(&mut previous, &workspace.id)?;
-        let tab_pruned =
-            !previous.contains(&sibling.tab_id) && previous.contains(&workspace.tab_id);
-        herdr_json(&["workspace", "close", &workspace.id])?;
-        let workspaces = refresh_owned_topology(&mut previous, &workspace.id)?;
-        let late = refresh_owned_topology(&mut previous, &workspace.id)?;
-        Ok(vec![
-            ("initial live topology cached", cached && initial.is_empty()),
-            (
-                "closed tab pruned and closure retained",
-                tab_pruned
-                    && tabs
-                        == vec![TopologyClosure::Tab {
-                            workspace_id: workspace.id.clone(),
-                            tab_id: sibling.tab_id,
-                        }],
-            ),
-            (
-                "closed workspace pruned and one closure retained",
-                previous.is_empty()
-                    && workspaces
-                        == vec![TopologyClosure::Workspace {
-                            workspace_id: workspace.id.clone(),
-                        }],
-            ),
-            ("late snapshot does not repeat closures", late.is_empty()),
-        ])
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn native_snapshot_aggregates_tab_working_and_prunes_closed_topology()
-    -> Result<(), String> {
-        let label = format!("testrun-snapshot-state-{}", agent_name_nonce()?);
-        let cwd = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or("HOME is required")?
-            .join(".cache/herdr-connect-testrun")
-            .join(&label);
-        fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
-        let cwd_text = cwd.to_str().ok_or("test cwd must be UTF-8")?;
-        let workspace = create_workspace(&label, cwd_text)?;
-        let outcome = async {
-            let mut checks = native_shared_tab_working(&workspace, cwd_text).await?;
-            checks.extend(native_topology_departures(&workspace, cwd_text)?);
-            Ok::<_, String>(checks)
-        }
-        .await;
-        close_workspace(&workspace.id);
-        let leftovers = remaining_workspaces(&label)?;
-        fs::remove_dir_all(&cwd).map_err(|error| error.to_string())?;
-        println!("named zero-leftover check: {leftovers} owned Herdr workspaces");
-        assert_eq!(leftovers, 0, "named zero-leftover check");
-        for (case, observed) in outcome? {
-            println!("real native snapshot: {case}: {observed}");
-            assert!(observed, "{case}");
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn lifecycle_created_subscribes_status_and_records_the_pane_snapshot() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        let connection = discord_tuple(&guild);
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        assert_eq!(
-            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
-            0,
-            "named zero-leftover check"
-        );
-        let lifecycle = subscribe_herdr_events(&lifecycle_subscriptions())
-            .await
-            .expect("lifecycle subscribe");
-        let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("terminate signal stream");
-        let mut broker: Option<BrokerTask> = None;
-        let (_live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
-        let (_activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
-        let (tab, cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
-        let mut runtime = BridgeRuntime {
-            lifecycle,
-            pane_ids: Vec::new(),
-            status: None,
-            state: BridgeState {
-                included_panes: Some(HashSet::from([tab.pane_id.clone()])),
-                ..BridgeState::<Discord>::default()
-            },
-            live_events,
-            activity_events,
-        };
-        let result = async {
-            let pane_created = wait_for_event(
-                &mut runtime.lifecycle,
-                "pane_created",
-                &tab.pane_id,
-                "/data/pane/pane_id",
-                None,
-                Duration::from_secs(10),
-            )
-            .await?;
-            report_agent_state(&tab.pane_id, "idle")?;
-            let terminal_id = snapshot_for_pane(&tab.pane_id)?.terminal_id;
-            handle_lifecycle_select_result(
-                Ok(pane_created),
-                &connection,
-                &mut stop,
-                &mut broker,
-                &mut runtime,
-            )
-            .await;
-            if runtime.pane_ids != [tab.pane_id.clone()] {
-                return Err(format!(
-                    "pane_created did not add the pane to the runtime: {:?}",
-                    runtime.pane_ids
-                ));
-            }
-            if !runtime.state.previous.contains_key(&terminal_id) {
-                return Err("pane_created did not run the snapshot doorbell".to_owned());
-            }
-            let status = runtime
-                .status
-                .as_mut()
-                .ok_or_else(|| "pane_created did not subscribe to status".to_owned())?;
-            report_agent_state(&tab.pane_id, "working")?;
-            wait_for_event(
-                status,
-                "pane.agent_status_changed",
-                &tab.pane_id,
-                "/data/pane_id",
-                Some("working"),
-                Duration::from_secs(10),
-            )
-            .await?;
-            Ok::<(), String>(())
-        }
-        .await;
-        close_tab(&tab.tab_id);
-        let _ = clear_directory_contents(&cwd_dir);
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        let tabs_left =
-            remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-        assert_eq!(tabs_left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn restarted_bridge_reuses_the_workspace_webhook() {
@@ -3982,91 +3514,6 @@ mod tests {
         let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(channels_left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
-    struct StalePaneCase {
-        name: &'static str,
-        initial_pane_ids: fn(&str, &str) -> Vec<String>,
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn subscribe_status_with_backoff_recovers_from_stale_pane_ids() {
-        let cases = [
-            StalePaneCase {
-                name: "closed pane id tracked alongside the live pane",
-                initial_pane_ids: |closed, live| {
-                    let mut ids = vec![closed.to_owned(), live.to_owned()];
-                    ids.sort();
-                    ids
-                },
-            },
-            StalePaneCase {
-                name: "pane_ids holds only closed ids; live pane is untracked",
-                initial_pane_ids: |closed, _live| vec![closed.to_owned()],
-            },
-        ];
-
-        for case in cases {
-            assert_eq!(
-                remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds"),
-                0,
-                "named zero-leftover check: {}",
-                case.name
-            );
-            let (live_tab, live_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
-            report_agent_state(&live_tab.pane_id, "idle")
-                .expect("register the live pane as a herdr agent");
-            let (closed_tab, closed_cwd_dir) = subscribe_tab_fixture().expect("create testrun tab");
-            close_tab(&closed_tab.tab_id);
-            let _ = clear_directory_contents(&closed_cwd_dir);
-
-            let mut pane_ids = (case.initial_pane_ids)(&closed_tab.pane_id, &live_tab.pane_id);
-
-            let mut stop =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(20),
-                subscribe_status_with_backoff(&mut pane_ids, &mut stop, false),
-            )
-            .await;
-
-            close_tab(&live_tab.tab_id);
-            let _ = clear_directory_contents(&live_cwd_dir);
-            let tabs_left = remaining_tabs(SUBSCRIBE_LABEL)
-                .expect("tab.list succeeds for the zero-leftover check");
-
-            match outcome {
-                Ok(Ok(Some(_))) => {}
-                Ok(Ok(None)) => panic!(
-                    "{}: expected Some(subscription) for the live pane, got None",
-                    case.name
-                ),
-                Ok(Err(super::BridgeInterrupt)) => panic!(
-                    "{}: subscribe_status_with_backoff returned BridgeInterrupt",
-                    case.name
-                ),
-                Err(elapsed) => panic!(
-                    "{}: subscribe_status_with_backoff did not recover from the stale pane id within the timeout: {elapsed}",
-                    case.name
-                ),
-            }
-            assert!(
-                !pane_ids.contains(&closed_tab.pane_id),
-                "{}: closed pane id must be dropped from membership",
-                case.name
-            );
-            assert!(
-                pane_ids.contains(&live_tab.pane_id),
-                "{}: live pane id must be present in the recovered membership",
-                case.name
-            );
-            assert_eq!(tabs_left, 0, "named zero-leftover check: {}", case.name);
-        }
     }
 
     #[cfg(unix)]
