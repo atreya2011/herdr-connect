@@ -53,11 +53,13 @@ enum Goal {
     ReviewPrompt,
     ReviewAnswer(String),
     ReviewConfirmation(&'static str),
+    MarkdownReply(Vec<SlackTs>),
 }
 
 enum Exercise {
     Acceptance,
     Review,
+    Markdown,
 }
 
 struct Driver {
@@ -663,12 +665,110 @@ impl Driver {
             Goal::ReviewConfirmation(expected) => {
                 Ok(self.owner_texts.iter().any(|text| text.trim() == *expected))
             }
+            Goal::MarkdownReply(before) => {
+                Ok(self.agent_messages(before).next().is_some() && self.settled()?)
+            }
             Goal::Archived => Ok(self.archived_by_owner
                 && tab_list_result()?.iter().all(|tab| tab.tab_id != self.tab)
                 && workspace_list_result()?
                     .iter()
                     .any(|workspace| workspace.workspace_id == self.workspace)),
         }
+    }
+
+    fn agent_messages<'a>(
+        &'a self,
+        before: &'a [SlackTs],
+    ) -> impl Iterator<Item = &'a SlackHistoryMessage> + 'a {
+        self.messages.iter().filter(move |message| {
+            message.sender.bot_id.is_some()
+                && message.sender.username.as_deref()
+                    != Some(self.connection.0.owner_identity().display_name.as_str())
+                && !before.contains(&message.origin.ts)
+        })
+    }
+
+    async fn markdown(&mut self) -> Result<(), String> {
+        self.ready().await?;
+        let before: Vec<SlackTs> = self
+            .messages
+            .iter()
+            .map(|message| message.origin.ts.clone())
+            .collect();
+        self.prompt("Reply with a short Markdown status note about a fictional build. Use bold text, a bulleted list, and a fenced code block. Mention the comparison a < b && c > d once in plain text. Use no tools.")?;
+        self.wait(Goal::MarkdownReply(before.clone())).await?;
+        let reply = self
+            .agent_messages(&before)
+            .next()
+            .ok_or("real agent reply missing from Slack")?;
+        let prompt = self
+            .messages
+            .iter()
+            .find(|message| {
+                message.sender.username.as_deref()
+                    == Some(self.connection.0.owner_identity().display_name.as_str())
+                    && !before.contains(&message.origin.ts)
+            })
+            .ok_or("mirrored terminal prompt missing from Slack")?;
+        let blocks =
+            serde_json::to_value(&reply.content.blocks).map_err(|error| error.to_string())?;
+        let prompt_blocks =
+            serde_json::to_value(&prompt.content.blocks).map_err(|error| error.to_string())?;
+        let nodes = rich_nodes(&blocks);
+        let rendered: String = nodes
+            .iter()
+            .filter(|node| node["type"] == "text")
+            .filter_map(|node| node["text"].as_str())
+            .collect();
+        let fallback = reply.content.text.as_deref().unwrap_or_default();
+        let checks = [
+            (
+                "reply stored as rich text",
+                blocks[0]["type"] == "rich_text",
+            ),
+            (
+                "bold rendered",
+                nodes.iter().any(|node| node["style"]["bold"] == true),
+            ),
+            (
+                "bulleted list rendered",
+                nodes
+                    .iter()
+                    .any(|node| node["type"] == "rich_text_list" && node["style"] == "bullet"),
+            ),
+            (
+                "code block rendered",
+                nodes
+                    .iter()
+                    .any(|node| node["type"] == "rich_text_preformatted"),
+            ),
+            ("no literal bold markers", !rendered.contains("**")),
+            (
+                "entities decoded in rendered text",
+                rendered.contains('<')
+                    && rendered.contains('&')
+                    && !["&lt;", "&gt;", "&amp;"]
+                        .iter()
+                        .any(|entity| rendered.contains(entity)),
+            ),
+            (
+                "notification fallback keeps escaped text",
+                fallback.contains("**") && fallback.contains("&lt;"),
+            ),
+            (
+                "mirrored prompt stored as rich text",
+                prompt_blocks[0]["type"] == "rich_text",
+            ),
+        ];
+        for (case, observed) in checks {
+            if !observed {
+                return Err(format!(
+                    "real Slack Markdown observation failed: {case}; text={fallback:?}; blocks={blocks}; prompt={prompt_blocks}"
+                ));
+            }
+        }
+        println!("OWNER OBSERVED: real agent Markdown reply stored as Slack rich text");
+        Ok(())
     }
 
     fn decoded_review_text(&self, prefix: &str, rich: bool) -> Result<Option<&str>, String> {
@@ -975,6 +1075,18 @@ impl Driver {
     }
 }
 
+fn rich_nodes(value: &Value) -> Vec<&Value> {
+    let mut nodes = vec![value];
+    match value {
+        Value::Array(items) => items.iter().for_each(|item| nodes.extend(rich_nodes(item))),
+        Value::Object(fields) => fields
+            .values()
+            .for_each(|field| nodes.extend(rich_nodes(field))),
+        _ => {}
+    }
+    nodes
+}
+
 async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
     let label = format!(
         "testrun-slack-owner-{}-{}",
@@ -1013,6 +1125,7 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
                 match exercise {
                     Exercise::Acceptance => driver.exercise().await,
                     Exercise::Review => driver.review().await,
+                    Exercise::Markdown => driver.markdown().await,
                 }
             } => result,
             _ = tokio::signal::ctrl_c() => Err("owner acceptance interrupted; cleaning up owned fixtures".into()),
@@ -1037,4 +1150,10 @@ async fn owner_acceptance_runs_in_order() -> Result<(), String> {
 #[ignore = "requires the real Slack owner to post encoded messages and use question cards"]
 async fn owner_review_decodes_messages_and_refuses_empty_choices() -> Result<(), String> {
     run_owner_exercise(Exercise::Review).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn real_claude_markdown_reply_renders_in_slack() -> Result<(), String> {
+    run_owner_exercise(Exercise::Markdown).await
 }
