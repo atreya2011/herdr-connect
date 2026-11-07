@@ -2341,9 +2341,9 @@ mod tests {
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Chat, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, VENDOR_CLAUDE,
         VENDOR_CODEX, VENDOR_CURSOR, fetch_topology_lists, lifecycle_subscriptions,
-        name_unlabeled_tabs, read_claude_incremental, read_codex_incremental,
-        read_cursor_incremental, status_subscriptions, submit_owner_prompt, subscribe_herdr_events,
-        sync_route, transition_card_nonce, workspace_list_result,
+        read_claude_incremental, read_codex_incremental, read_cursor_incremental,
+        status_subscriptions, submit_owner_prompt, subscribe_herdr_events, sync_route,
+        transition_card_nonce, workspace_list_result,
     };
 
     #[test]
@@ -3452,68 +3452,6 @@ mod tests {
             remaining_tabs(SUBSCRIBE_LABEL).expect("tab.list succeeds for the zero-leftover check");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(tabs_left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn restarted_bridge_reuses_the_workspace_webhook() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        let result = async {
-            let channel = guild
-                .client
-                .create_guild_channel(guild.id, "testrun-webhook-reuse")
-                .await
-                .map_err(|error| error.to_string())?
-                .model()
-                .await
-                .map_err(|error| error.to_string())?;
-            record_test_channel(channel.id);
-            let first = herdr_connect_rs::resolve_terminal_prompt_webhook(
-                guild.client.as_ref(),
-                channel.id,
-                herdr_connect_rs::TERMINAL_PROMPT_WEBHOOK_NAME,
-            )
-            .await?;
-            let second = herdr_connect_rs::resolve_terminal_prompt_webhook(
-                guild.client.as_ref(),
-                channel.id,
-                herdr_connect_rs::TERMINAL_PROMPT_WEBHOOK_NAME,
-            )
-            .await?;
-            if first.0 != second.0 {
-                return Err(format!("webhook was not reused: {first:?} then {second:?}"));
-            }
-            let owned = guild
-                .client
-                .channel_webhooks(channel.id)
-                .await
-                .map_err(|error| error.to_string())?
-                .model()
-                .await
-                .map_err(|error| error.to_string())?
-                .iter()
-                .filter(|webhook| {
-                    webhook.name.as_deref() == Some(herdr_connect_rs::TERMINAL_PROMPT_WEBHOOK_NAME)
-                })
-                .count();
-            if owned != 1 {
-                return Err(format!("expected one bridge-owned webhook, found {owned}"));
-            }
-            Ok::<(), String>(())
-        }
-        .await;
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(channels_left, 0, "named zero-leftover check");
     }
 
     #[cfg(unix)]
@@ -5264,136 +5202,6 @@ mod tests {
         multiSelect must be true. Do not do anything else and do not say anything else.";
 
     #[cfg(unix)]
-    async fn blocked_dialog_discovery_exercise(
-        guild: &BlockedCaptureGuild,
-        tab: &Tab,
-        directory: &Path,
-        question: bool,
-    ) -> Result<(Duration, bool, bool, bool), String> {
-        let settings = directory.join("settings.json");
-        fs::write(
-            &settings,
-            serde_json::to_vec(&json!({"permissions": {"ask": ["Bash(touch *)"]}}))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        let name = format!("dialog-claude-{}", agent_name_nonce()?);
-        herdr_json(&[
-            "pane",
-            "wait-output",
-            &tab.pane_id,
-            "--match",
-            "╰─",
-            "--timeout",
-            "15000",
-        ])?;
-        herdr_json(&[
-            "agent",
-            "start",
-            &name,
-            "--kind",
-            "claude",
-            "--pane",
-            &tab.pane_id,
-            "--timeout",
-            "60000",
-            "--",
-            "--model",
-            "haiku",
-            "--permission-mode",
-            "manual",
-            "--settings",
-            settings.to_str().ok_or("settings path is not UTF-8")?,
-        ])?;
-        let connection = discord_tuple(guild);
-        let idle = snapshot_for_pane(&tab.pane_id)?;
-        let tabs = [matching_tab(&tab.tab_id)?];
-        let route = route_topology(std::slice::from_ref(&idle), &tabs, &idle.terminal_id)?;
-        let thread = connection.0.sync_route(&route).await?;
-        let mut state = BridgeState::<Discord>::default();
-        own(&idle, &tabs, &connection, &mut state).await;
-        let prompt = if question {
-            MULTI_QUESTION_FORCE_PROMPT
-        } else {
-            "Run exactly `touch testrun-permission-marker` using Bash now. Do nothing else."
-        };
-        submit_owner_prompt(&tab.pane_id, prompt)?;
-        let blocked = poll_snapshot(&tab.pane_id, Duration::from_secs(90), |snapshot| {
-            snapshot.agent_status == "blocked"
-        })?;
-        let session = blocked
-            .session
-            .as_ref()
-            .ok_or("blocked pane has no session")?;
-        let detection = agent_read_detection(&tab.pane_id)?;
-        println!("real blocked dialog question={question}:\n{detection}");
-        let start = Instant::now();
-        let discovered = super::shown_question(&blocked, session, Some(&detection)).await;
-        let elapsed = start.elapsed();
-        state
-            .previous
-            .insert(blocked.terminal_id.clone(), STATUS_WORKING.to_owned());
-        own(&blocked, &tabs, &connection, &mut state).await;
-        let interactive = connection.1.pending_question_token(&thread).is_some();
-        let card = thread_messages(guild, thread)
-            .await?
-            .iter()
-            .any(|(_, has_embed, _)| *has_embed);
-        println!(
-            "real blocked delivery question={question} discovery={elapsed:?} matched={} interactive={interactive} card={card}",
-            discovered.is_some()
-        );
-        Ok((elapsed, discovered.is_some(), interactive, card))
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn blocked_dialog_discovery_waits_only_for_questions() {
-        let guild = blocked_capture_guild().expect("real Discord test environment is configured");
-        for question in [false, true] {
-            let (tab, directory) = question_tab_fixture().expect("create real dialog test tab");
-            let outcome =
-                blocked_dialog_discovery_exercise(&guild, &tab, &directory, question).await;
-            let home = std::env::var("HOME")
-                .map(PathBuf::from)
-                .expect("HOME is set");
-            cleanup_real_claude_session_dir(&home, &tab.pane_id);
-            close_tab(&tab.tab_id);
-            clear_directory_contents(&directory).expect("clean dialog test directory");
-            let remaining = blocked_capture_cleanup(&guild)
-                .await
-                .expect("clean Discord topology");
-            println!(
-                "dialog discovery outcome question={question}: {outcome:?}; leftovers={remaining}"
-            );
-            let (elapsed, matched, interactive, card) =
-                outcome.expect("real blocked dialog exercise succeeds");
-            assert_eq!(
-                matched, question,
-                "only question dialogs match the vendor log"
-            );
-            assert_eq!(
-                interactive, question,
-                "only questions get an interactive card"
-            );
-            assert!(card, "the blocked dialog posts a real Discord card");
-            if !question {
-                assert!(
-                    elapsed < super::PENDING_QUESTION_POLL,
-                    "permission discovery must not wait for the question log: {elapsed:?}"
-                );
-            }
-            assert_eq!(remaining, 0, "named zero-leftover check");
-            assert_eq!(
-                remaining_tabs(&format!("{QUESTION_LABEL}-claude")).expect("list real test tabs"),
-                0,
-                "named zero-leftover check"
-            );
-        }
-    }
-
-    #[cfg(unix)]
     fn question_tab_fixture() -> Result<(Tab, PathBuf), String> {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
@@ -6531,91 +6339,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const FRESH_IDLE_SESSION_LABEL: &str = "testrun-fresh-idle-session";
-
-    #[cfg(unix)]
-    async fn fresh_idle_session_exercise(
-        guild: &BlockedCaptureGuild,
-        workspace: &Workspace,
-        vendor: &str,
-    ) -> Result<(), String> {
-        let name = format!("fresh-{vendor}-{}", agent_name_nonce()?);
-        start_live_capture_agent(vendor, &name, &workspace.pane_id)?;
-        prompt_claude_agent_and_wait(&name, "Reply with exactly: testrun-first-snapshot-ready")?;
-        let snapshot = wait_for_status(
-            &workspace.pane_id,
-            &[STATUS_IDLE, STATUS_DONE],
-            Duration::from_secs(30),
-        )
-        .await?;
-        if snapshot
-            .session
-            .as_ref()
-            .is_none_or(|session| session.agent != vendor)
-        {
-            return Err(format!(
-                "fresh {vendor} native session is missing: {snapshot:?}"
-            ));
-        }
-        let tabs = [matching_tab(&workspace.tab_id)?];
-        let agents = [snapshot.clone()];
-        let connection = discord_tuple(guild);
-        let mut state = BridgeState::<Discord>::default();
-        process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
-        let route = route_topology(&agents, &tabs, &snapshot.terminal_id)?;
-        let topic = format!("herdr workspace [{}]", route.workspace_id);
-        let channel = guild_channel_with_topic(guild, &topic).await?;
-        let suffix = format!(" [{}]", route.tab_id);
-        let has_thread = active_threads_for_guild(guild).await?.iter().any(|thread| {
-            thread.parent_id == Some(channel.id)
-                && thread
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.ends_with(&suffix))
-        });
-        if !has_thread {
-            return Err(format!(
-                "{vendor} fresh idle session did not create its tab thread"
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn fresh_idle_session_discovery_is_mirrored_on_first_snapshot() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        let cases = [VENDOR_CLAUDE, VENDOR_CODEX];
-        let mut outcomes = Vec::new();
-        for vendor in cases {
-            let label = format!("{FRESH_IDLE_SESSION_LABEL}-{vendor}");
-            let outcome = match temporary_workspace_fixture(&label) {
-                Ok((workspace, cwd)) => {
-                    let outcome = fresh_idle_session_exercise(&guild, &workspace, vendor).await;
-                    let cleanup = cleanup_workspace_fixture(&workspace, &cwd);
-                    cleanup.and(outcome)
-                }
-                Err(error) => Err(error),
-            };
-            outcomes.push((vendor, outcome));
-        }
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        for (vendor, outcome) in outcomes {
-            assert!(outcome.is_ok(), "{vendor}: {outcome:?}");
-        }
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-    }
-
-    #[cfg(unix)]
     const PREFETCH_REUSE_LABEL: &str = "testrun-startup-prefetch-reuse";
 
     #[cfg(unix)]
@@ -6766,58 +6489,6 @@ mod tests {
         assert_eq!(workspaces_left, 0, "named zero-leftover check");
     }
 
-    #[cfg(unix)]
-    async fn unlabeled_tab_gets_a_generated_name_exercise(
-        guild: &BlockedCaptureGuild,
-        tab: &Tab,
-    ) -> Result<(), String> {
-        report_idle_with_session(&tab.pane_id)?;
-        let snapshot = snapshot_for_pane(&tab.pane_id)?;
-        let listed = matching_tab(&tab.tab_id)?;
-        if !herdr_connect_rs::is_numeric_label(&listed.label) {
-            return Err(format!(
-                "expected a numeric auto-assigned label for an unlabeled tab, herdr reported label {:?}",
-                listed.label
-            ));
-        }
-        let expected_name = herdr_connect_rs::generated_tab_name(&tab.tab_id);
-        let agents = [snapshot.clone()];
-        let mut tabs = vec![listed];
-
-        let errors = name_unlabeled_tabs(&agents, &mut tabs, &mut HashSet::new());
-        if !errors.is_empty() {
-            return Err(format!("renaming the unlabeled tab failed: {errors:?}"));
-        }
-        let renamed = matching_tab(&tab.tab_id)?;
-        if renamed.label != expected_name {
-            return Err(format!(
-                "expected herdr label {expected_name:?}, got {:?}",
-                renamed.label
-            ));
-        }
-
-        let connection = discord_tuple(guild);
-        let mut state = BridgeState::<Discord>::default();
-        process_snapshot(&snapshot, &agents, &tabs, &connection, &mut state).await;
-        let topic = format!("herdr workspace [{}]", renamed.workspace_id);
-        let channel = guild_channel_with_topic(guild, &topic).await?;
-        let expected_thread = format!("{expected_name} [{}]", tab.tab_id);
-        let threads = active_threads_for_guild(guild).await?;
-        let thread_names: Vec<_> = threads
-            .iter()
-            .filter(|thread| thread.parent_id == Some(channel.id))
-            .filter_map(|thread| thread.name.as_deref())
-            .filter(|name| name.ends_with(&format!(" [{}]", tab.tab_id)))
-            .collect();
-        if thread_names != [expected_thread.as_str()] {
-            return Err(format!(
-                "expected exactly the thread {expected_thread:?}, found {thread_names:?}"
-            ));
-        }
-
-        Ok(())
-    }
-
     #[test]
     fn rename_errors_are_pruned_with_their_closed_tab() {
         let mut state = BridgeState::<Discord>::default();
@@ -6829,67 +6500,6 @@ mod tests {
         assert_eq!(
             state.rename_errors_reported,
             HashSet::from(["w-1:4".to_owned()])
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn unlabeled_tab_is_renamed_and_its_thread_takes_the_generated_name() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-
-        let cwd_dir = std::env::temp_dir().join(format!(
-            "testrun-unlabeled-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&cwd_dir).expect("create unlabeled-tab test cwd");
-        let cwd = cwd_dir.to_str().expect("temp cwd is valid UTF-8");
-
-        let workspace = create_workspace_with_numeric_tab("testrun-unlabeled", cwd)
-            .expect("testrun workspace is created");
-        let tab = Tab {
-            tab_id: workspace.tab_id,
-            pane_id: workspace.pane_id,
-        };
-        let result = unlabeled_tab_gets_a_generated_name_exercise(&guild, &tab).await;
-        let topic = format!("herdr workspace [{}]", workspace.id);
-        let thread_cleanup = delete_tab_threads(&guild, &topic, &tab.tab_id).await;
-        close_workspace(&workspace.id);
-        let _ = fs::remove_dir_all(&cwd_dir);
-
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        assert!(result.is_ok(), "{result:?}");
-        assert!(thread_cleanup.is_ok(), "{thread_cleanup:?}");
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-        if let Some(channel) = guild_channels_for_guild(&guild)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|channel| channel.topic.as_deref() == Some(topic.as_str()))
-        {
-            assert!(
-                !thread_with_suffix_survives(&guild, channel.id, &format!(" [{}]", tab.tab_id))
-                    .await
-                    .unwrap(),
-                "named zero-leftover check"
-            );
-        }
-        let tabs = tab_list_result().expect("tab.list succeeds for the zero-leftover check");
-        assert!(
-            !tabs.iter().any(|listed| listed.tab_id == tab.tab_id),
-            "named zero-leftover check"
         );
     }
 
@@ -7430,36 +7040,6 @@ mod tests {
                         .is_some_and(|reference| reference.channel_id == Some(thread_id))
             })
             .collect())
-    }
-
-    #[cfg(unix)]
-    async fn delete_tab_threads(
-        guild: &BlockedCaptureGuild,
-        topic: &str,
-        tab_id: &str,
-    ) -> Result<(), String> {
-        let Some(channel) = guild_channels_for_guild(guild)
-            .await?
-            .into_iter()
-            .find(|channel| channel.topic.as_deref() == Some(topic))
-        else {
-            return Ok(());
-        };
-        let suffix = format!(" [{tab_id}]");
-        let mut threads = active_threads_for_guild(guild)
-            .await?
-            .into_iter()
-            .filter(|thread| thread.parent_id == Some(channel.id))
-            .collect::<Vec<_>>();
-        threads
-            .extend(herdr_connect_rs::archived_threads(guild.client.as_ref(), channel.id).await?);
-        for thread in threads
-            .iter()
-            .filter(|thread| thread.name.as_deref().is_some_and(|n| n.ends_with(&suffix)))
-        {
-            blocked_capture_delete_thread(guild, thread.id).await?;
-        }
-        Ok(())
     }
 
     #[cfg(unix)]
@@ -8462,113 +8042,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const SELF_DELETE_LABEL: &str = "testrun-self";
-
-    #[cfg(unix)]
     const DELETION_DISPATCH_WAIT: Duration = Duration::from_secs(30);
 
     #[cfg(unix)]
     const DELETION_ERROR_WINDOW: Duration = Duration::from_secs(4);
-
-    #[cfg(unix)]
-    async fn bridge_deletion_gateway_errors(
-        guild: &BlockedCaptureGuild,
-        delete_thread: bool,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        let label = format!("{SELF_DELETE_LABEL}-{}", agent_name_nonce()?);
-        let (workspace, cwd) = temporary_workspace_fixture(&label)?;
-        let result = async {
-            let connection = discord_tuple(guild);
-            let route = TopologyRoute {
-                workspace_id: workspace.id.clone(),
-                tab_id: workspace.tab_id.clone(),
-                pane_id: workspace.pane_id.clone(),
-                channel_name: label,
-                thread_name: format!("testrun-bridge [{}]", workspace.tab_id),
-            };
-            connection.0.sync_route(&route).await?;
-            let (mut channels, mut threads) =
-                fetch_topology_lists(guild.client.as_ref(), guild.id).await?;
-            let (gateway, notices) = start_owner_deletion_gateway(&connection).await?;
-            let deleted = if delete_thread {
-                herdr_connect_rs::delete_tab_thread(
-                    guild.client.as_ref(),
-                    &channels,
-                    &mut threads,
-                    &mut HashMap::new(),
-                    &workspace.id,
-                    &workspace.tab_id,
-                    false,
-                )
-                .await
-            } else {
-                herdr_connect_rs::delete_workspace_channel(
-                    guild.client.as_ref(),
-                    &mut channels,
-                    &threads,
-                    &workspace.id,
-                    false,
-                )
-                .await
-            };
-            let dispatch = if delete_thread {
-                "chat gateway deletion: THREAD_DELETE"
-            } else {
-                "chat gateway deletion: CHANNEL_DELETE"
-            };
-            let seen = deletion_notices(notices, dispatch).await;
-            gateway.abort();
-            deleted?;
-            matching_tab(&workspace.tab_id)
-                .map_err(|error| format!("the bridge deletion closed its Herdr tab: {error}"))?;
-            seen
-        }
-        .await;
-        cleanup_workspace_fixture(&workspace, &cwd)?;
-        result
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn bridge_deletions_are_not_forwarded_to_herdr_as_owner_deletions() {
-        let Some(guild) = blocked_capture_guild() else {
-            eprintln!("skipped: Discord real-guild environment is not configured");
-            return;
-        };
-        assert_eq!(
-            blocked_capture_cleanup(&guild).await.unwrap(),
-            0,
-            "named zero-leftover check"
-        );
-        let cases = [
-            ("the bridge's tab thread deletion", true),
-            ("the bridge's workspace channel deletion", false),
-        ];
-        let mut outcomes = Vec::new();
-        for (name, delete_thread) in cases {
-            outcomes.push((
-                name,
-                bridge_deletion_gateway_errors(&guild, delete_thread).await,
-            ));
-        }
-        let channels_left = blocked_capture_cleanup(&guild).await.unwrap();
-        for ((name, delete_thread), (_, outcome)) in cases.into_iter().zip(outcomes) {
-            let dispatch = if delete_thread {
-                "chat gateway deletion: THREAD_DELETE"
-            } else {
-                "chat gateway deletion: CHANNEL_DELETE"
-            };
-            assert_eq!(
-                outcome.and_then(|(dispatched, errors)| {
-                    expect_no_deletion_errors(&errors).map(|()| dispatched)
-                }),
-                Ok(vec![dispatch.to_owned()]),
-                "{name}"
-            );
-        }
-        assert_eq!(channels_left, 0, "named zero-leftover check");
-    }
 
     #[cfg(unix)]
     const STARTUP_RECONCILE_LABEL: &str = "testrun-startup-reconcile";
