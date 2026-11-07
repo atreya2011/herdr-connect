@@ -137,7 +137,7 @@ async fn real_broker_failure_cases_fall_through() {
     broker.signal("STOP");
     let decision = request_decision(
         &interaction("failure-session", "timeout"),
-        &broker.path,
+        std::slice::from_ref(&broker.path),
         Duration::from_millis(20),
     )
     .await;
@@ -157,7 +157,7 @@ async fn real_broker_failure_cases_fall_through() {
             },
             vendor: PermissionVendor::Claude,
         },
-        &broker.path,
+        std::slice::from_ref(&broker.path),
         Duration::from_millis(20),
     )
     .await;

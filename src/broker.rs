@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -668,27 +668,45 @@ fn correlate_decision(
 
 pub async fn request_decision(
     interaction: &Interaction,
-    socket_path: &Path,
+    socket_paths: &[PathBuf],
     timeout_duration: Duration,
 ) -> Option<Decision> {
+    let mut requests = tokio::task::JoinSet::new();
+    for socket_path in socket_paths {
+        let interaction = interaction.clone();
+        let socket_path = socket_path.clone();
+        requests.spawn(async move { request_broker_decision(&interaction, &socket_path).await });
+    }
     tokio::time::timeout(timeout_duration, async {
-        let mut stream = match UnixStream::connect(socket_path).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                bridge_eprintln!(
-                    "broker request failed: connect to {}: {error}",
-                    socket_path.display()
-                );
-                return None;
+        while let Some(result) = requests.join_next().await {
+            if let Ok(Some(decision)) = result {
+                return Some(decision);
             }
-        };
-        write_json_line(&mut stream, interaction).await.ok()?;
-        let response: BrokerResponse = read_json_line(&mut stream).await.ok()?;
-        correlate_decision(interaction, response).ok()
+        }
+        None
     })
     .await
     .ok()
     .flatten()
+}
+
+async fn request_broker_decision(
+    interaction: &Interaction,
+    socket_path: &Path,
+) -> Option<Decision> {
+    let mut stream = match UnixStream::connect(socket_path).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            bridge_eprintln!(
+                "broker request failed: connect to {}: {error}",
+                socket_path.display()
+            );
+            return None;
+        }
+    };
+    write_json_line(&mut stream, interaction).await.ok()?;
+    let response: BrokerResponse = read_json_line(&mut stream).await.ok()?;
+    correlate_decision(interaction, response).ok()
 }
 
 pub async fn send_activity_frame(

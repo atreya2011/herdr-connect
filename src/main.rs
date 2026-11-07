@@ -1485,7 +1485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (explicit_vendor, requested_socket) = parse_hook_args(args)
+    let (explicit_vendor, requested_sockets) = parse_hook_args(args)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let mut input = Vec::new();
     tokio::io::stdin().read_to_end(&mut input).await?;
@@ -1500,23 +1500,22 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     {
         return write_hook_decision(PermissionVendor::Cursor, Some(&Decision::allow())).await;
     }
-    let socket_path = match requested_socket
-        .or_else(|| std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET").map(std::path::PathBuf::from))
-    {
-        Some(path) => Some(path),
-        None if matches!(interaction.vendor, PermissionVendor::Cursor) => None,
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "hook requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>",
-            )
-            .into());
-        }
+    let socket_paths: Vec<std::path::PathBuf> = if requested_sockets.is_empty() {
+        std::env::var_os("HERDR_CLAUDE_BROKER_SOCKET")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect()
+    } else {
+        requested_sockets
     };
-    let decision = match socket_path.as_deref() {
-        Some(path) => request_decision(&interaction, path, hook_timeout()).await,
-        None => None,
-    };
+    if socket_paths.is_empty() && !matches!(interaction.vendor, PermissionVendor::Cursor) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hook requires HERDR_CLAUDE_BROKER_SOCKET or --socket <path>",
+        )
+        .into());
+    }
+    let decision = request_decision(&interaction, &socket_paths, hook_timeout()).await;
     write_hook_decision(interaction.vendor, decision.as_ref()).await
 }
 
@@ -1602,9 +1601,9 @@ fn encode_hook_decision(
 
 fn parse_hook_args(
     args: &[String],
-) -> Result<(Option<PermissionVendor>, Option<std::path::PathBuf>), String> {
+) -> Result<(Option<PermissionVendor>, Vec<std::path::PathBuf>), String> {
     let mut vendor = None;
-    let mut socket = None;
+    let mut sockets = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1626,13 +1625,13 @@ fn parse_hook_args(
                     .get(index)
                     .filter(|value| !value.is_empty())
                     .ok_or("--socket requires a path")?;
-                socket = Some(std::path::PathBuf::from(value));
+                sockets.push(std::path::PathBuf::from(value));
             }
             argument => return Err(format!("unknown hook argument: {argument}")),
         }
         index += 1;
     }
-    Ok((vendor, socket))
+    Ok((vendor, sockets))
 }
 
 async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -6044,6 +6043,339 @@ mod tests {
     #[serial]
     async fn codex_activity_hook_keeps_messages_inside_their_turn() {
         run_codex_activity_hook_test().await;
+    }
+
+    #[cfg(unix)]
+    const FIRST_DECISION_LABEL: &str = "testrun-first-decision";
+
+    #[cfg(unix)]
+    struct FirstDecisionRoutes {
+        session_id: String,
+        thread: Id<ChannelMarker>,
+        slack_channel: slack_morphism::prelude::SlackChannelId,
+    }
+
+    #[cfg(unix)]
+    async fn first_decision_routes(
+        discord: &Discord,
+        slack: &herdr_connect_rs::Slack,
+        tab: &Tab,
+    ) -> Result<FirstDecisionRoutes, String> {
+        let session_id = generate_claude_session_id()?;
+        report_agent_state(&tab.pane_id, "idle")?;
+        report_agent_session(&tab.pane_id, &session_id)?;
+        let terminal_id = snapshot_for_pane(&tab.pane_id)?.terminal_id;
+        let route = route_topology(&list_agents()?, &tab_list_result()?, &terminal_id)?;
+        let thread = discord.sync_route_fresh(&route).await?;
+        let slack_channel = slack.sync_route_fresh(&route).await?.channel;
+        Ok(FirstDecisionRoutes {
+            session_id,
+            thread,
+            slack_channel,
+        })
+    }
+
+    #[cfg(unix)]
+    async fn start_test_broker<C: Chat>(
+        responder: Arc<PermissionResponder<C>>,
+        socket: &Path,
+    ) -> Result<tokio::task::AbortHandle, String> {
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
+        let broker_socket = socket.to_path_buf();
+        let broker = tokio::spawn(async move {
+            let _activity_rx = activity_rx;
+            super::run_permission_broker(&broker_socket, responder, activity_tx).await
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !socket.exists() {
+            if Instant::now() >= deadline || broker.is_finished() {
+                broker.abort();
+                return Err(format!("test broker did not bind {}", socket.display()));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(broker.abort_handle())
+    }
+
+    #[cfg(unix)]
+    fn spawn_permission_hook(
+        session_id: &str,
+        sockets: &[PathBuf],
+    ) -> Result<std::process::Child, String> {
+        let mut command = Command::new(activity_binary_path()?);
+        command.args(["hook", "--vendor", "claude"]);
+        for socket in sockets {
+            command.arg("--socket").arg(socket);
+        }
+        let mut child = command
+            .env_remove("HERDR_CLAUDE_BROKER_SOCKET")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let payload = json!({
+            "session_id": session_id,
+            "prompt_id": format!("testrun-{session_id}"),
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {"command": "printf testrun", "description": "testrun first decision"},
+        });
+        child
+            .stdin
+            .take()
+            .ok_or("hook stdin is not piped")?
+            .write_all(payload.to_string().as_bytes())
+            .map_err(|error| error.to_string())?;
+        Ok(child)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_discord_allow_token(
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let messages = guild
+                .client
+                .channel_messages(thread)
+                .await
+                .map_err(|error| error.to_string())?
+                .model()
+                .await
+                .map_err(|error| error.to_string())?;
+            let token = messages.iter().find_map(|message| {
+                let components = serde_json::to_string(&message.components).ok()?;
+                let (_, rest) = components.split_once("herdr:allow:")?;
+                rest.split('"').next().map(str::to_owned)
+            });
+            if let Some(token) = token {
+                return Ok(token);
+            }
+            if Instant::now() >= deadline {
+                return Err("Discord permission card did not appear".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_slack_message(
+        slack: &herdr_connect_rs::Slack,
+        channel: &slack_morphism::prelude::SlackChannelId,
+        what: &str,
+        matches: impl Fn(&slack_morphism::prelude::SlackTs, &str) -> bool + Send,
+    ) -> Result<(slack_morphism::prelude::SlackTs, String), String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            for message in slack.history(channel).await? {
+                let content =
+                    serde_json::to_string(&message.content).map_err(|error| error.to_string())?;
+                if matches(&message.origin.ts, &content) {
+                    return Ok((message.origin.ts, content));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{what} did not appear"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn first_decision_exercise(
+        guild: &BlockedCaptureGuild,
+        slack: &Arc<herdr_connect_rs::Slack>,
+        tab: &Tab,
+        sockets: &[PathBuf; 3],
+    ) -> Result<(Value, String), String> {
+        let discord = discord_tuple(guild);
+        let routes = first_decision_routes(&discord.0, slack, tab).await?;
+        let _discord_broker = RemoveSocketOnDrop {
+            socket: &sockets[1],
+            broker: start_test_broker(Arc::clone(&discord.1), &sockets[1]).await?,
+        };
+        let _slack_broker = RemoveSocketOnDrop {
+            socket: &sockets[2],
+            broker: start_test_broker(
+                Arc::new(PermissionResponder::new(Arc::clone(slack))),
+                &sockets[2],
+            )
+            .await?,
+        };
+        let hook = spawn_permission_hook(&routes.session_id, sockets)?;
+        let hook_output = tokio::task::spawn_blocking(move || hook.wait_with_output());
+        let token = wait_for_discord_allow_token(guild, routes.thread).await?;
+        let (slack_card, _) = wait_for_slack_message(
+            slack,
+            &routes.slack_channel,
+            "Slack permission card",
+            |_, content| content.contains("herdr:allow:"),
+        )
+        .await?;
+        let channel = guild
+            .client
+            .channel(routes.thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?;
+        let allow = synthetic_component_interaction(
+            guild.id,
+            &guild.owner_id,
+            &channel,
+            &format!("herdr:allow:{token}"),
+            &[],
+        )?;
+        click_component(&discord.1, allow).await?;
+        let output = tokio::time::timeout(Duration::from_secs(20), hook_output)
+            .await
+            .map_err(|_| "hook did not exit after the Discord decision".to_owned())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let decision = serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+        let (_, expired_card) = wait_for_slack_message(
+            slack,
+            &routes.slack_channel,
+            "expired Slack permission card",
+            |ts, content| ts == &slack_card && !content.contains("action_id"),
+        )
+        .await?;
+        Ok((decision, expired_card))
+    }
+
+    #[cfg(unix)]
+    async fn delete_workspace_discord_channel(
+        guild: &BlockedCaptureGuild,
+        workspace_id: &str,
+    ) -> Result<bool, String> {
+        let topic = format!("herdr workspace [{workspace_id}]");
+        for channel in guild_channels_for_guild(guild).await? {
+            if is_test_channel(&channel) && channel.topic.as_deref() == Some(topic.as_str()) {
+                guild
+                    .client
+                    .delete_channel(channel.id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        channel_with_topic_is_absent(guild, &topic).await
+    }
+
+    #[cfg(unix)]
+    fn slack_channel_of_workspace(
+        channel: &slack_morphism::prelude::SlackChannelInfo,
+        workspace_id: &str,
+    ) -> bool {
+        channel.name.as_deref().is_some_and(|name| {
+            name.starts_with("testrun-")
+                && (name.contains(&format!("-{}-", workspace_id.to_lowercase()))
+                    || channel.topic.as_ref().is_some_and(|topic| {
+                        topic
+                            .value
+                            .starts_with(&format!("herdr workspace [{workspace_id}] tab ["))
+                    }))
+        })
+    }
+
+    #[cfg(unix)]
+    async fn archive_workspace_slack_channels(
+        slack: &herdr_connect_rs::Slack,
+        workspace_id: &str,
+    ) -> Result<usize, String> {
+        use slack_morphism::prelude::{
+            SlackApiConversationsArchiveRequest, SlackApiToken, SlackClient,
+            SlackClientHyperConnector,
+        };
+        let client =
+            SlackClient::new(SlackClientHyperConnector::new().map_err(|error| error.to_string())?);
+        let token = SlackApiToken::new(
+            std::env::var("SLACK_TEST_BOT_TOKEN")
+                .map_err(|error| error.to_string())?
+                .into(),
+        );
+        for channel in slack.channels().await? {
+            if slack_channel_of_workspace(&channel, workspace_id) {
+                client
+                    .open_session(&token)
+                    .conversations_archive(&SlackApiConversationsArchiveRequest::new(channel.id))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(slack
+            .channels()
+            .await?
+            .iter()
+            .filter(|channel| slack_channel_of_workspace(channel, workspace_id))
+            .count())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn first_permission_decision_wins_and_the_other_chat_card_expires() {
+        let (Some(guild), Ok(slack_token), Ok(slack_owner)) = (
+            blocked_capture_guild(),
+            std::env::var("SLACK_TEST_BOT_TOKEN"),
+            std::env::var("SLACK_TEST_OWNER_ID"),
+        ) else {
+            eprintln!("skipped: Discord and Slack test environments are not configured");
+            return;
+        };
+        let slack = Arc::new(
+            herdr_connect_rs::Slack::new(slack_token, slack_owner)
+                .await
+                .expect("Slack test app connects"),
+        );
+        let label = format!(
+            "{FIRST_DECISION_LABEL}-{}",
+            agent_name_nonce().expect("system clock is after unix epoch")
+        );
+        let sockets = ["missing", "discord", "slack"]
+            .map(|name| std::env::temp_dir().join(format!("{label}-{name}.sock")));
+        let cwd = std::env::temp_dir();
+        let tab = create_isolated_tab(&label, cwd.to_str().expect("temp dir is UTF-8"), &[])
+            .expect("testrun tab is created");
+        let workspace_id = matching_tab(&tab.tab_id).map(|listed| listed.workspace_id);
+        let result = match &workspace_id {
+            Ok(_) => tokio::time::timeout(
+                Duration::from_secs(120),
+                first_decision_exercise(&guild, &slack, &tab, &sockets),
+            )
+            .await
+            .unwrap_or_else(|_| Err("first decision exercise timed out".to_owned())),
+            Err(error) => Err(error.clone()),
+        };
+        close_tab(&tab.tab_id);
+        let workspace_id = workspace_id.expect("testrun tab has a workspace");
+        let discord_absent = delete_workspace_discord_channel(&guild, &workspace_id).await;
+        let slack_left = archive_workspace_slack_channels(&slack, &workspace_id).await;
+        let (decision, expired_card) = result.expect("first decision exercise succeeds");
+        assert_eq!(
+            discord_absent,
+            Ok(true),
+            "named zero-leftover check: Discord channel of this workspace"
+        );
+        assert_eq!(
+            slack_left,
+            Ok(0),
+            "named zero-leftover check: Slack channels of this workspace"
+        );
+        assert_eq!(
+            remaining_tabs(&label),
+            Ok(0),
+            "named zero-leftover check: Herdr tabs of this test"
+        );
+        assert_eq!(
+            decision["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        assert!(
+            expired_card.contains("expired: hook disconnected"),
+            "{expired_card}"
+        );
     }
 
     #[cfg(unix)]
