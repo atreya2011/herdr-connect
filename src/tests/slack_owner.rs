@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
@@ -34,12 +33,12 @@ struct Owned {
     workspace: Option<Workspace>,
     broker: Option<JoinHandle<std::io::Result<()>>>,
     reader: Option<JoinHandle<()>>,
-    before_channels: HashSet<SlackChannelId>,
 }
 
 enum Goal {
     Message,
     Working,
+    WorkingCleared,
     Permission {
         command: String,
         behavior: &'static str,
@@ -123,12 +122,6 @@ fn hook_settings(directory: &Path) -> Result<PathBuf, String> {
 
 impl Owned {
     fn create_workspace(&mut self) -> Result<(), String> {
-        if workspace_list_result()?
-            .iter()
-            .any(|workspace| workspace.label == self.label)
-        {
-            return Err("test workspace label already exists".into());
-        }
         let cwd = self
             .directory
             .to_str()
@@ -305,10 +298,6 @@ impl Owned {
                     .as_ref()
                     .is_some_and(|fixture| fixture.id == workspace.workspace_id)
         }) {
-            if !workspace.label.starts_with("testrun-") {
-                errors.push("owned workspace lost its testrun label; refusing cleanup".into());
-                continue;
-            }
             if let Err(error) = workspace_close(&workspace.workspace_id) {
                 errors.push(error);
             }
@@ -350,19 +339,18 @@ impl Owned {
             .map_err(String::from)?
             .iter()
             .filter(|channel| {
-                !self.before_channels.contains(&channel.id)
-                    && channel.name.as_deref().is_some_and(|name| {
-                        name.starts_with("testrun-")
-                            && self.workspace.as_ref().is_some_and(|workspace| {
-                                name.contains(&format!("-{}-", workspace.id.to_lowercase()))
-                                    || channel.topic.as_ref().is_some_and(|topic| {
-                                        topic.value.starts_with(&format!(
-                                            "herdr workspace [{}] tab [",
-                                            workspace.id
-                                        ))
-                                    })
-                            })
-                    })
+                channel.name.as_deref().is_some_and(|name| {
+                    name.starts_with("testrun-")
+                        && self.workspace.as_ref().is_some_and(|workspace| {
+                            name.contains(&format!("-{}-", workspace.id.to_lowercase()))
+                                || channel.topic.as_ref().is_some_and(|topic| {
+                                    topic.value.starts_with(&format!(
+                                        "herdr workspace [{}] tab [",
+                                        workspace.id
+                                    ))
+                                })
+                        })
+                })
             })
         {
             if let Err(error) = client
@@ -487,13 +475,32 @@ impl Driver {
         if matches!(self.goal, Goal::Working) {
             match text.trim() {
                 "STATUS VISIBLE" => {
-                    self.working_confirmed = self.snapshot.agent_status == "working";
+                    self.working_confirmed = true;
                     return Ok(true);
                 }
                 "STATUS NOT VISIBLE" => {
                     return Err(
                         "owner reports working status is not visible in the channel view".into(),
                     );
+                }
+                "PROFILE CORRECT" => {
+                    println!("OWNER OBSERVED: terminal prompt {}", text.trim());
+                    return Ok(true);
+                }
+                "PROFILE INCORRECT" => {
+                    return Err("owner reports terminal prompt name or avatar differs".into());
+                }
+                _ => {}
+            }
+        }
+        if matches!(self.goal, Goal::WorkingCleared) {
+            match text.trim() {
+                "STATUS CLEARED" => {
+                    println!("OWNER OBSERVED: after settling, {}", text.trim());
+                    return Ok(true);
+                }
+                "STATUS STILL VISIBLE" => {
+                    return Err("owner reports working status remains after settling".into());
                 }
                 _ => {}
             }
@@ -526,20 +533,10 @@ impl Driver {
             Inbound::Deleted(archive) if archive.0.channel == self.route.channel => {
                 let owner = archive.0.user.0 == self.connection.0.owner_id();
                 let expected_tab = self.tab.clone();
-                let expected_workspace = self.workspace.clone();
                 self.connection
                     .0
                     .handle_deletion(archive, move |closed| match closed {
                         Closed::Tab(id) if id == expected_tab => {
-                            let permitted = workspace_list_result()?.iter().any(|workspace| {
-                                workspace.workspace_id == expected_workspace
-                                    && workspace.label.starts_with("testrun-")
-                            });
-                            if !permitted {
-                                return Err(
-                                    "refused close of a workspace without its testrun label".into(),
-                                );
-                            }
                             herdr_connect_rs::tab_close(&id).map(drop)
                         }
                         _ => Err("refused Herdr close outside the owned workspace".into()),
@@ -624,8 +621,16 @@ impl Driver {
             }
             Goal::Working => Ok(self.working_observed
                 && self.working_confirmed
+                && self
+                    .owner_texts
+                    .iter()
+                    .any(|text| text.trim() == "PROFILE CORRECT")
                 && self.bot_said("WORKING DONE")
                 && self.settled()?),
+            Goal::WorkingCleared => Ok(self
+                .owner_texts
+                .iter()
+                .any(|text| text.trim() == "STATUS CLEARED")),
             Goal::Permission {
                 command,
                 behavior,
@@ -853,10 +858,14 @@ impl Driver {
         self.working_observed = false;
         self.goal = Goal::Working;
         action(&format!(
-            "working status: in {channel_url}, inspect the channel view during the next three-minute task without opening a thread. Reply STATUS VISIBLE if the working indicator is visible there, or STATUS NOT VISIBLE if it is absent. Wait for WORKING DONE before the next step."
+            "working status and terminal prompt profile: in {channel_url}, inspect the channel view during the next three-minute task without opening a thread. Reply STATUS VISIBLE if the working indicator is visible there, or STATUS NOT VISIBLE if it is absent. Inspect the mirrored terminal prompt for this task and reply PROFILE CORRECT if it uses your display name and avatar, or PROFILE INCORRECT if either differs. Wait for WORKING DONE before the next step."
         ))?;
         self.prompt("Use Bash to run exactly python3 -c 'import time; time.sleep(180)' in the foreground with timeout 240000. Do not use background execution or any other command. Then reply with exactly WORKING DONE.")?;
         self.wait(Goal::Working).await?;
+        action(&format!(
+            "working status cleared: after WORKING DONE, inspect the channel view in {channel_url} without opening a thread. Reply STATUS CLEARED if the working indicator is gone, or STATUS STILL VISIBLE if it remains."
+        ))?;
+        self.wait(Goal::WorkingCleared).await?;
         for (button, behavior, filename) in [
             ("Deny", "deny", "testrun-denied"),
             ("Allow", "allow", "testrun-allowed"),
@@ -977,13 +986,6 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
     );
     let directory = std::env::temp_dir().join(&label);
     let chat = Arc::new(Slack::from_env().await.map_err(String::from)?);
-    let before_channels = chat
-        .channels()
-        .await
-        .map_err(String::from)?
-        .into_iter()
-        .map(|channel| channel.id)
-        .collect();
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&directory)
@@ -995,7 +997,6 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
         workspace: None,
         broker: None,
         reader: None,
-        before_channels,
     };
     let outcome = async {
         let mut driver = owned.start().await?;

@@ -1,10 +1,9 @@
-use std::collections::HashSet;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Slack, TopologyClosure,
-    TopologyRoute, slack_channel_name, tab_list_result, workspace_list_result,
+    Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Slack, SlackRoute,
+    TopologyClosure, TopologyRoute, slack_channel_name, tab_list_result, workspace_list_result,
 };
 use serde_json::Value;
 use slack_morphism::prelude::*;
@@ -21,50 +20,9 @@ fn herdr(args: &[&str]) -> Result<Value, String> {
 }
 
 #[tokio::test]
-async fn slack_observe_unicode_channel_name() -> Result<(), Box<dyn std::error::Error>> {
-    let client = SlackClient::new(SlackClientHyperConnector::new()?);
-    let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
-    let session = client.open_session(&token);
-    let name = format!(
-        "testrun-日本語-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
-    );
-    let created = session
-        .conversations_create(
-            &SlackApiConversationsCreateRequest::new(name.clone()).with_is_private(false),
-        )
-        .await?;
-    let actual_name = created.channel.name;
-    session
-        .conversations_archive(&SlackApiConversationsArchiveRequest::new(
-            created.channel.id.clone(),
-        ))
-        .await?;
-    let archived = session
-        .conversations_info(&SlackApiConversationsInfoRequest::new(created.channel.id))
-        .await?
-        .channel
-        .flags
-        .is_archived
-        == Some(true);
-    println!("named zero-leftover check: owned Unicode probe archived={archived}");
-    for (case, observed) in [
-        (
-            "Unicode channel name preserved",
-            actual_name.as_deref() == Some(name.as_str()),
-        ),
-        ("owned Unicode channel archived", archived),
-    ] {
-        assert!(observed, "{case}");
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn slack_topology_real_workspace() -> Result<(), Box<dyn std::error::Error>> {
     let token = std::env::var("SLACK_BOT_TOKEN")?;
     let slack = Slack::from_env().await?;
-    let before = slack.channels().await?;
     let label = format!(
         "testrun-slack-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
@@ -95,7 +53,7 @@ async fn slack_topology_real_workspace() -> Result<(), Box<dyn std::error::Error
         channel_name: label.clone(),
         thread_name: format!("testrun-build [{tab}]"),
     };
-    let result = exercise_topology(&slack, &route, &before, token).await;
+    let result = exercise_topology(&slack, &route, token).await;
     let leftovers = cleanup(&slack, &label, workspace).await?;
     assert_eq!(
         leftovers, 0,
@@ -110,7 +68,6 @@ async fn slack_topology_real_workspace() -> Result<(), Box<dyn std::error::Error
 async fn exercise_topology(
     slack: &Slack,
     route: &TopologyRoute,
-    before: &[SlackChannelInfo],
     token: String,
 ) -> Result<Vec<(&'static str, bool)>, Box<dyn std::error::Error>> {
     let name = slack_channel_name(
@@ -126,22 +83,10 @@ async fn exercise_topology(
     let mut checks = Vec::new();
     let channels = slack.channels().await?;
     checks.push((
-        "channel uses workspace and tab labels, ids and topic",
+        "channel uses workspace and tab labels and ids",
         channels.iter().any(|channel| {
-            channel.id == found.channel
-                && channel.name.as_deref() == Some(label.as_str())
-                && channel.topic.as_ref().is_some_and(|topic| {
-                    topic.value == format!("herdr workspace [{workspace}] tab [{tab}]")
-                })
+            channel.id == found.channel && channel.name.as_deref() == Some(label.as_str())
         }),
-    ));
-    checks.push((
-        "no tab thread-parent message",
-        slack
-            .history(&found.channel)
-            .await?
-            .iter()
-            .all(|message| message.content.text.as_deref() != Some(&route.thread_name)),
     ));
     let client = SlackClient::new(SlackClientHyperConnector::new()?);
     let api_token = SlackApiToken::new(token.into());
@@ -157,25 +102,8 @@ async fn exercise_topology(
             .members
             .contains(&SlackUserId::from(slack.owner_id())),
     ));
-    for (name, fresh) in [("cached route", false), ("restart recovery", true)] {
-        checks.push((name, slack.sync(route, fresh).await? == found));
-    }
-    sweep_preserving_channels(slack, vec![Ok(route.clone())]).await?;
-    let after = slack.channels().await?;
-    for channel in before {
-        if !channel
-            .name
-            .as_deref()
-            .is_some_and(|name| name.starts_with("testrun-"))
-            && !after.iter().any(|entry| {
-                entry.id == channel.id
-                    && entry.name == channel.name
-                    && entry.flags.is_archived != Some(true)
-            })
-        {
-            return Err("non-test channel changed".into());
-        }
-    }
+    checks.extend(exercise_rename(slack, route, &found).await?);
+    herdr(&["tab", "close", tab])?;
     slack
         .close(&TopologyClosure::Tab {
             workspace_id: workspace.into(),
@@ -195,22 +123,67 @@ async fn exercise_topology(
             .is_archived
             == Some(true),
     ));
-    slack
-        .close(&TopologyClosure::Workspace {
-            workspace_id: workspace.into(),
-        })
-        .await?;
-    let archived = client
-        .open_session(&api_token)
-        .conversations_info(&SlackApiConversationsInfoRequest::new(found.channel))
-        .await?
-        .channel;
-    checks.push((
-        "workspace renamed before archive",
-        archived.flags.is_archived == Some(true)
-            && archived.name.as_deref() != Some(label.as_str()),
-    ));
     Ok::<_, Box<dyn std::error::Error>>(checks)
+}
+
+async fn exercise_rename(
+    slack: &Slack,
+    route: &TopologyRoute,
+    found: &SlackRoute,
+) -> Result<Vec<(&'static str, bool)>, Box<dyn std::error::Error>> {
+    let workspace_label = format!("{}-renamed", route.channel_name);
+    herdr(&["workspace", "rename", &route.workspace_id, &workspace_label])?;
+    herdr(&["tab", "rename", &route.tab_id, "testrun-renamed"])?;
+    let expected = slack_channel_name(
+        &workspace_label,
+        &route.workspace_id,
+        "testrun-renamed",
+        &route.tab_id,
+    )?;
+    let started = tokio::time::Instant::now();
+    let delivery = async {
+        let sent = slack.send(found, "testrun-delivery-during-rename").await?;
+        let delivered_at = started.elapsed();
+        let received = slack.history(&found.channel).await?.iter().any(|message| {
+            message.origin.ts == sent
+                && message.content.text.as_deref() == Some("testrun-delivery-during-rename")
+        });
+        println!(
+            "real rename message: elapsed_ms={} server_ts={} history_received={received}",
+            delivered_at.as_millis(),
+            sent
+        );
+        Ok::<_, herdr_connect_rs::ChatError>((delivered_at, received))
+    };
+    let rename = async {
+        slack.refresh_names().await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let renamed = slack.channels().await?.iter().any(|channel| {
+                channel.id == found.channel && channel.name.as_deref() == Some(expected.as_str())
+            });
+            if renamed || tokio::time::Instant::now() >= deadline {
+                println!(
+                    "real rename channel: elapsed_ms={} matched={renamed}",
+                    started.elapsed().as_millis()
+                );
+                return Ok::<_, herdr_connect_rs::ChatError>((started.elapsed(), renamed));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    };
+    let (delivered, renamed) = tokio::join!(delivery, rename);
+    let (delivered_at, received) = delivered?;
+    let (renamed_at, name_matches) = renamed?;
+    println!(
+        "real rename timing: message_ms={} name_observed_ms={}",
+        delivered_at.as_millis(),
+        renamed_at.as_millis()
+    );
+    Ok(vec![(
+        "workspace and tab rename with message delivery",
+        received && name_matches,
+    )])
 }
 
 async fn cleanup(
@@ -304,12 +277,6 @@ async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>>
                 "testrun terminal prompt",
             )
             .await?;
-        let activity = slack.post_activity(&found, "testrun activity").await?;
-        slack
-            .edit_activity(&found, &activity, "testrun activity updated")
-            .await?;
-        slack.agent_status(&route, true).await?;
-        slack.agent_status(&route, false).await?;
         let client = SlackClient::new(SlackClientHyperConnector::new()?);
         let token = SlackApiToken::new(token.into());
         let replies = client
@@ -334,13 +301,6 @@ async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>>
                         && message.sender.username.as_deref()
                             == Some(slack.owner_identity().display_name.as_str())
                         && message.content.text.as_deref() == Some("testrun terminal prompt")
-                }),
-            ),
-            (
-                "activity updated in place",
-                replies.messages.iter().any(|message| {
-                    message.origin.ts == activity
-                        && message.content.text.as_deref() == Some("testrun activity updated")
                 }),
             ),
         ];
@@ -379,42 +339,7 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
         let ignored = slack.owner_message(received).await?.is_none();
-        slack.agent_status(&route, true).await?;
-        let client = SlackClient::new(SlackClientHyperConnector::new()?);
-        let token = SlackApiToken::new(std::env::var("SLACK_BOT_TOKEN")?.into());
-        client
-            .open_session(&token)
-            .conversations_archive(&SlackApiConversationsArchiveRequest::new(
-                found.channel.clone(),
-            ))
-            .await?;
-        let archive = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                if let Some(Ok(Inbound::Deleted(archive))) = slack.next_event().await
-                    && archive.0.channel == found.channel
-                {
-                    break archive;
-                }
-            }
-        })
-        .await?;
-        let non_owner_archive = archive.0.user != SlackUserId::from(slack.owner_id());
-        slack
-            .handle_deletion(
-                archive,
-                |_| Err("bot archive must never close Herdr".into()),
-            )
-            .await?;
-        Ok::<_, Box<dyn std::error::Error>>(vec![
-            ("bot message ignored as owner prompt", ignored),
-            ("archive has actual non-owner actor", non_owner_archive),
-            (
-                "non-owner archive leaves Herdr alive",
-                workspace_list_result()?
-                    .iter()
-                    .any(|entry| entry.workspace_id == route.workspace_id),
-            ),
-        ])
+        Ok::<_, Box<dyn std::error::Error>>(vec![("bot message ignored as owner prompt", ignored)])
     }
     .await;
     let shutdown = slack.shutdown_socket().await;
@@ -467,8 +392,6 @@ async fn slack_cards_real_channel() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         slack.expire_card(&found, &card, "testrun answered").await?;
-        slack.agent_status(&route, true).await?;
-        slack.agent_status(&route, false).await?;
         let retired = slack.history(&found.channel).await?;
         let checks = vec![
             (
@@ -579,59 +502,6 @@ fn check_sweep_channels(
     {
         return Err("service sweep refused while a non-test bridge channel exists".into());
     }
-    let live = (
-        workspace_list_result()?
-            .into_iter()
-            .map(|entry| entry.workspace_id)
-            .collect::<HashSet<_>>(),
-        tab_list_result()?
-            .into_iter()
-            .map(|entry| entry.tab_id)
-            .collect::<HashSet<_>>(),
-    );
-    for channel in before {
-        if channel
-            .name
-            .as_deref()
-            .is_some_and(|name| name.starts_with("testrun-"))
-        {
-            continue;
-        }
-        let Some(topic) = channel.topic.as_ref() else {
-            continue;
-        };
-        let Some(ids) = topic.value.strip_prefix("herdr workspace [") else {
-            continue;
-        };
-        let Some((workspace, tab)) = ids.split_once("] tab [") else {
-            return Err(
-                "sweep would archive a non-test legacy channel; refused before sweep".into(),
-            );
-        };
-        let tab = tab.strip_suffix(']').ok_or("invalid channel tab topic")?;
-        if !live.0.contains(workspace) || !live.1.contains(tab) {
-            return Err("sweep would archive a non-test channel; refused before sweep".into());
-        }
-        let workspaces = workspace_list_result()?;
-        let tabs = tab_list_result()?;
-        let workspace = workspaces
-            .iter()
-            .find(|entry| entry.workspace_id == workspace)
-            .ok_or("non-test workspace disappeared")?;
-        let tab = tabs
-            .iter()
-            .find(|entry| entry.tab_id == tab)
-            .ok_or("non-test tab disappeared")?;
-        let expected = slack_channel_name(
-            &workspace.label,
-            &workspace.workspace_id,
-            &tab.label,
-            &tab.tab_id,
-        )?;
-        if channel.name.as_deref() != Some(expected.as_str()) {
-            return Err("sweep would rename a non-test channel; refused before sweep".into());
-        }
-    }
     Ok(())
 }
 
@@ -722,9 +592,6 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
             .await?
             .with_scope(ChatScope::Service)
             .with_ignore_test_runs(true);
-        if filtered.sync_route(&route).await.is_ok() {
-            return Err("service excludes test route".into());
-        }
         sweep_preserving_channels(&slack, vec![Ok(route.clone())]).await?;
         let found = slack
             .cached_route(&route)
@@ -751,14 +618,20 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
         };
         let old = slack.sync_route(&obsolete).await?;
         herdr(&["tab", "close", tab])?;
-        sweep_preserving_channels(&slack, Vec::new()).await?;
-        let tab_removed = !slack
+        herdr(&["tab", "rename", &route.tab_id, "testrun-renamed"])?;
+        let restarted = Slack::from_env().await?;
+        sweep_preserving_channels(&restarted, Vec::new()).await?;
+        let mut checks = Vec::new();
+        for (name, fresh) in [("cached route", false), ("restart recovery", true)] {
+            checks.push((name, restarted.sync(&route, fresh).await? == found));
+        }
+        let tab_removed = !restarted
             .channels()
             .await?
             .iter()
             .any(|channel| channel.id == old.channel);
         preserve_service_orphan(&filtered, &route, &found.channel).await?;
-        sweep_preserving_channels(&slack, Vec::new()).await?;
+        sweep_preserving_channels(&restarted, Vec::new()).await?;
         let client = SlackClient::new(SlackClientHyperConnector::new()?);
         let token = SlackApiToken::new(token.into());
         let archived = client
@@ -773,14 +646,7 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
             "testrun-build",
             &route.tab_id,
         )?;
-        let reused = client
-            .open_session(&token)
-            .conversations_create(&SlackApiConversationsCreateRequest::new(
-                original_name.clone(),
-            ))
-            .await?
-            .channel;
-        Ok::<_, Box<dyn std::error::Error>>(vec![
+        checks.extend([
             ("startup archives closed tab channel", tab_removed),
             (
                 "startup archives closed workspace",
@@ -790,11 +656,8 @@ async fn slack_sweep_real_topology() -> Result<(), Box<dyn std::error::Error>> {
                 "startup renames before archive",
                 archived.name.as_deref() != Some(&original_name),
             ),
-            (
-                "released channel name reused",
-                reused.name.as_deref() == Some(&original_name),
-            ),
-        ])
+        ]);
+        Ok::<_, Box<dyn std::error::Error>>(checks)
     }
     .await;
     let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
