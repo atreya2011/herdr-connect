@@ -15,7 +15,7 @@ Never print or commit `.env`. Real-guild tests create only `testrun-` channels, 
 ## Laws
 
 - **Behavior first**: build the behavior, verify it on the real services, then write tests that assert what you observed. Never write tests first.
-- **Real services only**: no mocked, stubbed, faked, or emulated service clients or responses, and no test-run servers posing as a service. Socket tests connect to the real running herdr socket. Discord tests run against the real guild. Vendor-log tests use committed fixtures mirroring real on-disk records.
+- **Real services only**: no mocked, stubbed, faked, or emulated service clients or responses, and no test-run servers posing as a service. Socket tests connect to the real running herdr socket. Discord tests run against the real guild. Vendor-log tests read native agent logs or temporary local records and databases.
 - **Barebones**: overengineering is evil. No abstractions beyond what tests force, no speculative configurability.
 - **No fallbacks**: mandatory behavior that fails must fail fast through the error surface. Placeholder values, invented defaults, and silent recovery are forbidden.
 - **No reinvented wheels**: use battle-tested crates where they replace real hand-rolled complexity — and only then. A crate earns its place; speculative dependencies are overengineering.
