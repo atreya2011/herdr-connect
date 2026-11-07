@@ -54,12 +54,14 @@ enum Goal {
     ReviewAnswer(String),
     ReviewConfirmation(&'static str),
     MarkdownReply(Vec<SlackTs>),
+    ActivityTurn,
 }
 
 enum Exercise {
     Acceptance,
     Review,
     Markdown,
+    Activity,
 }
 
 struct Driver {
@@ -82,6 +84,7 @@ struct Driver {
     working_confirmed: bool,
     working_observed: bool,
     archived_by_owner: bool,
+    activity_ts: Option<SlackTs>,
     goal: Goal,
     directory: PathBuf,
     team: String,
@@ -113,9 +116,18 @@ fn hook_settings(directory: &Path) -> Result<PathBuf, String> {
         "python3 '{}'",
         script.to_string_lossy().replace('\'', "'\\''")
     );
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    let activity = format!(
+        "{} activity --vendor claude --socket {}",
+        quote(&activity_binary_path()?),
+        quote(&directory.join("broker.sock"))
+    );
     let settings = json!({
         "permissions": {"allow": ["Bash(python3 -c *)"], "ask": ["Bash(touch *)"]},
-        "hooks": {"PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command, "timeout": 1200}]}]}
+        "hooks": {
+            "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command, "timeout": 1200}]}],
+            "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": activity, "async": true}]}]
+        }
     });
     let path = directory.join("settings.json");
     fs::write(
@@ -261,6 +273,7 @@ impl Owned {
             working_confirmed: false,
             working_observed: false,
             archived_by_owner: false,
+            activity_ts: None,
             goal: Goal::Message,
             directory: self.directory.clone(),
             team: self.chat.team_id().to_owned(),
@@ -563,6 +576,7 @@ impl Driver {
             }
             Some(frame) = self.activity.recv() => {
                 if frame.pane_id == self.pane && !self.archived_by_owner { handle_activity_event(&self.connection, frame, &mut self.state).await; }
+                if let Some(activity) = self.state.activity_messages.get(&self.pane) { self.activity_ts = Some(activity.message.clone()); }
             }
             Some(result) = self.tasks.join_next() => result.map_err(|error| error.to_string())??,
         }
@@ -668,6 +682,9 @@ impl Driver {
             Goal::MarkdownReply(before) => {
                 Ok(self.agent_messages(before).next().is_some() && self.settled()?)
             }
+            Goal::ActivityTurn => Ok(self.activity_ts.is_some()
+                && self.bot_said("ACTIVITY DONE")
+                && self.settled()?),
             Goal::Archived => Ok(self.archived_by_owner
                 && tab_list_result()?.iter().all(|tab| tab.tab_id != self.tab)
                 && workspace_list_result()?
@@ -768,6 +785,27 @@ impl Driver {
             }
         }
         println!("OWNER OBSERVED: real agent Markdown reply stored as Slack rich text");
+        Ok(())
+    }
+
+    async fn activity_deleted(&mut self) -> Result<(), String> {
+        self.ready().await?;
+        self.prompt("Use Bash to run exactly python3 -c 'print(1)'. Use no other tools. Then reply with exactly ACTIVITY DONE.")?;
+        self.wait(Goal::ActivityTurn).await?;
+        let posted = self
+            .activity_ts
+            .clone()
+            .ok_or("no activity message was posted during the turn")?;
+        if self
+            .messages
+            .iter()
+            .any(|message| message.origin.ts == posted)
+        {
+            return Err(format!(
+                "activity message {posted} remains in the channel after the turn ended"
+            ));
+        }
+        println!("OWNER OBSERVED: activity message {posted} deleted after the turn ended");
         Ok(())
     }
 
@@ -1126,6 +1164,7 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
                     Exercise::Acceptance => driver.exercise().await,
                     Exercise::Review => driver.review().await,
                     Exercise::Markdown => driver.markdown().await,
+                    Exercise::Activity => driver.activity_deleted().await,
                 }
             } => result,
             _ = tokio::signal::ctrl_c() => Err("owner acceptance interrupted; cleaning up owned fixtures".into()),
@@ -1156,4 +1195,10 @@ async fn owner_review_decodes_messages_and_refuses_empty_choices() -> Result<(),
 #[serial]
 async fn real_claude_markdown_reply_renders_in_slack() -> Result<(), String> {
     run_owner_exercise(Exercise::Markdown).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn real_claude_activity_message_is_deleted_after_the_turn() -> Result<(), String> {
+    run_owner_exercise(Exercise::Activity).await
 }
