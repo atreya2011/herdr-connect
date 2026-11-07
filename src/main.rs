@@ -2331,12 +2331,12 @@ mod tests {
 
     use super::{
         BridgeState, Client, Discord, Follower, PermissionResponder, SessionPathError,
-        TopologyClosure, TopologyRoute, agent_read_detection, capture_for_with_search_root,
-        fetch_startup_owner_identity, handle_live_event, lifecycle_closure, list_agents,
-        live_log_path, maybe_establish_terminal_prompt_baseline, next_state_change_sequence,
-        process_snapshot, prune_departed_state, read_new_live_texts, read_new_terminal_prompts,
-        resolve_session_path, route_topology, sync_startup_topology, tab_list_result,
-        terminal_prompt_baseline_is_current, unique_existing_path,
+        TopologyClosure, TopologyRoute, capture_for_with_search_root, fetch_startup_owner_identity,
+        handle_live_event, lifecycle_closure, list_agents, live_log_path,
+        maybe_establish_terminal_prompt_baseline, next_state_change_sequence, process_snapshot,
+        prune_departed_state, read_new_terminal_prompts, resolve_session_path, route_topology,
+        sync_startup_topology, tab_list_result, terminal_prompt_baseline_is_current,
+        unique_existing_path,
     };
     use herdr_connect_rs::{
         AgentSession, AgentSnapshot, Chat, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, VENDOR_CLAUDE,
@@ -4129,10 +4129,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             own(&working, tabs, connection, state).await;
         }
-        println!(
-            "real queued prompt: pane state before submission={}",
-            snapshot_for_pane(&tab.pane_id)?.agent_status
-        );
         let queued_pane = tab.pane_id.clone();
         let queued_text = queued_prompt.to_owned();
         let queued_task = tokio::task::spawn_blocking(move || {
@@ -4211,22 +4207,7 @@ mod tests {
         let messages = thread_full_messages(guild, thread).await?;
         assert_prompt_was_not_mirrored(&messages, &long_prompt)?;
         assert_prompt_was_not_mirrored(&messages, &queued_prompt)?;
-        match assert_queued_reply_follows_first_reply(&messages, &long_reply, &queued_reply) {
-            Ok(()) => Ok(()),
-            Err(error) if vendor == VENDOR_CLAUDE => {
-                let evidence =
-                    record_terminal_prompt_failure(fixture, state, live_events, &messages)
-                        .await
-                        .map_err(|diagnostic| {
-                            format!("{error}; diagnostic failed: {diagnostic}")
-                        })?;
-                Err(format!(
-                    "{error}; diagnostic evidence: {}",
-                    evidence.display()
-                ))
-            }
-            Err(error) => Err(error),
-        }
+        assert_queued_reply_follows_first_reply(&messages, &long_reply, &queued_reply)
     }
 
     #[cfg(unix)]
@@ -4322,104 +4303,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn record_terminal_prompt_failure(
-        fixture: &TerminalPromptFixture<'_>,
-        state: &BridgeState<Discord>,
-        events: &tokio::sync::mpsc::UnboundedReceiver<String>,
-        messages: &[twilight_model::channel::Message],
-    ) -> Result<PathBuf, String> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos();
-        let evidence = std::env::temp_dir().join(format!(
-            "testrun-terminal-origin-evidence-{}-{nonce}",
-            std::process::id(),
-        ));
-        fs::create_dir(&evidence).map_err(|error| error.to_string())?;
-        fs::write(
-            evidence.join("discord-history.json"),
-            serde_json::to_vec_pretty(messages).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        let home = std::env::var("HOME").map_err(|error| error.to_string())?;
-        for sample in 0..2 {
-            if sample > 0 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let snapshot = snapshot_for_pane(&fixture.tab.pane_id)?;
-            let session = snapshot
-                .session
-                .as_ref()
-                .ok_or("diagnostic pane has no session")?;
-            let capture = capture_for_with_search_root(&snapshot, session, Path::new(&home));
-            let path = resolve_session_path(Path::new(&home), &snapshot, session)
-                .map_err(|error| error.to_string())?;
-            let assistant_texts = read_new_live_texts(&path, Follower::Claude(0));
-            let owner_prompts = read_new_terminal_prompts(&path, Follower::Claude(0));
-            let detection = agent_read_detection(&fixture.tab.pane_id);
-            let follower = state
-                .live_watches
-                .get(fixture.terminal)
-                .map(|watch| watch.follower);
-            let errors = state
-                .live_errors_reported
-                .iter()
-                .filter(|(terminal, _)| terminal == fixture.terminal)
-                .collect::<Vec<_>>();
-            let record = json!({
-                "sample": sample,
-                "snapshot": format!("{snapshot:?}"),
-                "vendor_capture": format!("{capture:?}"),
-                "all_assistant_texts": format!("{assistant_texts:?}"),
-                "all_owner_prompts": format!("{owner_prompts:?}"),
-                "pane_detection": format!("{detection:?}"),
-                "live_follower": format!("{follower:?}"),
-                "prompt_positions": format!("{:?}", state.terminal_prompt_positions.get(fixture.terminal)),
-                "pending_events": events.len(),
-                "delivery_errors": errors,
-            });
-            fs::write(
-                evidence.join(format!("sample-{sample}.json")),
-                serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        Ok(evidence)
-    }
-
-    #[cfg(unix)]
-    async fn check_terminal_prompt_turn(
-        fixture: &TerminalPromptFixture<'_>,
-        guild: &BlockedCaptureGuild,
-        state: &BridgeState<Discord>,
-        events: &tokio::sync::mpsc::UnboundedReceiver<String>,
-        thread: Id<ChannelMarker>,
-        prompt: &str,
-        reply: &str,
-    ) -> Result<(), String> {
-        let messages = thread_full_messages(guild, thread).await?;
-        match assert_terminal_prompt_mirrored_before_reply(
-            &messages,
-            prompt,
-            reply,
-            &fixture.connection.2.display_name,
-        ) {
-            Ok(()) => Ok(()),
-            Err(error) if fixture.vendor == VENDOR_CLAUDE => {
-                let evidence = record_terminal_prompt_failure(fixture, state, events, &messages)
-                    .await
-                    .map_err(|diagnostic| format!("{error}; diagnostic failed: {diagnostic}"))?;
-                Err(format!(
-                    "{error}; diagnostic evidence: {}",
-                    evidence.display()
-                ))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(unix)]
     fn assert_prompt_was_not_mirrored(
         messages: &[twilight_model::channel::Message],
         prompt: &str,
@@ -4487,16 +4370,13 @@ mod tests {
             &first_prompt,
         )
         .await?;
-        check_terminal_prompt_turn(
-            &fixture,
-            guild,
-            &state,
-            &live_events,
-            thread,
+        let first_messages = thread_full_messages(guild, thread).await?;
+        assert_terminal_prompt_mirrored_before_reply(
+            &first_messages,
             &first_prompt,
             &first_reply,
-        )
-        .await?;
+            &connection.2.display_name,
+        )?;
 
         let mirrored_reply = format!("terminal-origin-{vendor}-mirrored-{nonce}");
         let mirrored_prompt = format!("Reply with exactly: {mirrored_reply}");
@@ -4508,16 +4388,13 @@ mod tests {
             &mirrored_prompt,
         )
         .await?;
-        check_terminal_prompt_turn(
-            &fixture,
-            guild,
-            &state,
-            &live_events,
-            thread,
+        let mirrored_messages = thread_full_messages(guild, thread).await?;
+        assert_terminal_prompt_mirrored_before_reply(
+            &mirrored_messages,
             &mirrored_prompt,
             &mirrored_reply,
-        )
-        .await?;
+            &connection.2.display_name,
+        )?;
 
         let suppressed_reply = format!("terminal-origin-{vendor}-suppressed-{nonce}");
         let suppressed_prompt = format!("Reply with exactly: {suppressed_reply}");
