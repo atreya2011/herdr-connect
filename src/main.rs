@@ -165,7 +165,13 @@ async fn handle_blocked_card<C: Chat>(context: BlockedCardContext<'_, C>) {
     let detection = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
         .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten();
-    let question = shown_question(snapshot, session, detection.as_deref()).await;
+    let question = shown_question(
+        snapshot,
+        session,
+        detection.as_deref(),
+        state_change_seq.is_some(),
+    )
+    .await;
     if question.is_none() && state_change_seq.is_none() {
         return;
     }
@@ -231,6 +237,7 @@ async fn shown_question(
     snapshot: &AgentSnapshot,
     session: &AgentSession,
     detection: Option<&str>,
+    wait_for_pending: bool,
 ) -> Option<(Vec<Question>, usize)> {
     let mut detection = detection?.to_owned();
     let question_dialog = |text: &str| {
@@ -251,7 +258,7 @@ async fn shown_question(
             }
             Err(error) => last_error = Some(error),
         }
-        if tokio::time::Instant::now() >= deadline {
+        if !wait_for_pending || tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(PENDING_QUESTION_POLL).await;
