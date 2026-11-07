@@ -1,6 +1,6 @@
 # Rust implementation resume
 
-This file preserves the product information needed after the historical TypeScript worktrees are removed. Current Rust code, tests, fixtures, and laws remain authoritative.
+This file preserves the product information needed after the historical TypeScript worktrees are removed. Current Rust code, tests, and laws remain authoritative.
 
 ## Resume gate
 
@@ -23,7 +23,7 @@ The Cursor decoder, decision encoder, fail-closed hook behavior, broker adapter,
 
 The startup sweep fetches guild channels and active threads once at its start into a mutex-guarded `TopologyCache`, reusing that pair across every tab it syncs instead of refetching per tab. The delivery path (`sync_route`) now serves a route straight from that cache when it already holds the route's workspace channel and tab thread, and refetches only when the cache is empty or does not yet hold the route. A send against a cached thread that fails as an unknown channel clears the cache and logs; the next event resolves the route again through the cache-first path, rather than re-resolving and retrying inside the same call. The lock is held for the whole call so concurrent requests still serialize correctly instead of racing a duplicate create. The permission path (`sync_channel`) still fetches a fresh pair on every call; port the same cache-first behavior there only with its own real-service tests, not by assuming this note is enough. Preserve the outcome of [historical issue #27](https://github.com/atreya2011/herdr-connect/issues/27): ordinary checks read the fetched lists, while archived-thread listing is a miss-path HTTP read, skipped whenever the active list already resolves the tab. Port the behavior, not the old discord.js implementation details.
 
-Slack caches tab channels separately and queues name reconciliation and channel closure in background tasks. It repairs a bot-created channel with the expected name and matching or empty topic after a partial create, restores an archived live tab channel, and checks owner membership when mapping an existing channel. Startup reads fresh Herdr workspace and tab lists after syncing routes, immediately before loading channels for orphan cleanup. A route, archive, or invalid-label failure is logged without skipping other resources or name reconciliation.
+Slack caches tab channels separately and queues name reconciliation and channel closure in background tasks. Startup reads fresh Herdr workspace and tab lists after syncing routes, immediately before loading channels for orphan cleanup. A route, archive, or invalid-label failure is logged without skipping other resources or name reconciliation.
 
 ## Unported product backlog
 

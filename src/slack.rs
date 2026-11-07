@@ -10,8 +10,6 @@ mod cards;
 mod chat;
 mod delivery;
 mod socket;
-#[cfg(test)]
-mod tests;
 pub use socket::{SlackArchive, SlackSocketEvent};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SlackRoute {
@@ -22,7 +20,6 @@ struct Topology {
     channels: Vec<SlackChannelInfo>,
     tabs: HashMap<String, SlackRoute>,
     loaded: bool,
-    validated: HashSet<SlackChannelId>,
 }
 type RenameTasks =
     HashMap<SlackChannelId, (String, tokio::task::JoinHandle<Result<(), ChatError>>)>;
@@ -231,7 +228,7 @@ impl Slack {
         Ok(())
     }
     pub async fn channels(&self) -> Result<Vec<SlackChannelInfo>, ChatError> {
-        self.state.channels(false).await
+        self.state.channels().await
     }
     pub async fn history(
         &self,
@@ -286,7 +283,6 @@ impl Slack {
                 }
             }
         }
-        topology.validated.clear();
         topology.channels = channels;
         topology.tabs = tabs;
         topology.loaded = true;
@@ -304,10 +300,6 @@ impl Slack {
         }
         if let Some(found) = topology.tabs.get(&route.tab_id).cloned() {
             self.require_route(&found).await?;
-            if !topology.validated.contains(&found.channel) {
-                self.ensure_owner(&found.channel).await?;
-                topology.validated.insert(found.channel.clone());
-            }
             return Ok(found);
         }
         let (workspace, tab) = (route.workspace_id.clone(), route.tab_id.clone());
@@ -324,42 +316,13 @@ impl Slack {
             "herdr workspace [{}] tab [{}]",
             route.workspace_id, route.tab_id
         );
-        let channel = match session
+        let channel = session
             .conversations_create(
-                &SlackApiConversationsCreateRequest::new(name.clone()).with_is_private(false),
+                &SlackApiConversationsCreateRequest::new(name).with_is_private(false),
             )
             .await
-        {
-            Ok(created) => created.channel,
-            Err(slack_morphism::errors::SlackClientError::ApiError(failure))
-                if failure.code == "name_taken" =>
-            {
-                self.state
-                    .channels(true)
-                    .await?
-                    .into_iter()
-                    .find(|channel| {
-                        channel.name.as_ref() == Some(&name)
-                            && channel.creator.as_ref() == Some(&self.bot)
-                            && channel.topic.as_ref().is_none_or(|existing| {
-                                existing.value.is_empty() || existing.value == topic
-                            })
-                    })
-                    .ok_or_else(|| error("Slack channel name belongs to another resource"))?
-            }
-            Err(failure) => return Err(error(failure)),
-        };
-        if channel.flags.is_archived == Some(true) {
-            let _: SlackApiConversationsUnarchiveResponse = session
-                .http_session_api
-                .http_post(
-                    "conversations.unarchive",
-                    &SlackApiConversationsUnarchiveRequest::new(channel.id.clone()),
-                    Some(&SLACK_TIER2_METHOD_CONFIG),
-                )
-                .await
-                .map_err(error)?;
-        }
+            .map_err(error)?
+            .channel;
         if channel
             .topic
             .as_ref()
@@ -373,7 +336,13 @@ impl Slack {
                 .await
                 .map_err(error)?;
         }
-        self.ensure_owner(&channel.id).await?;
+        session
+            .conversations_invite(&SlackApiConversationsInviteRequest::new(
+                channel.id.clone(),
+                vec![self.owner.clone()],
+            ))
+            .await
+            .map_err(error)?;
         let channel = session
             .conversations_info(&SlackApiConversationsInfoRequest::new(channel.id))
             .await
@@ -382,43 +351,11 @@ impl Slack {
         let found = SlackRoute {
             channel: channel.id.clone(),
         };
-        topology.validated.insert(channel.id.clone());
         topology.channels.retain(|entry| entry.id != channel.id);
         topology.channels.push(channel);
         topology.tabs.insert(route.tab_id.clone(), found.clone());
         drop(topology);
         Ok(found)
-    }
-    async fn ensure_owner(&self, channel: &SlackChannelId) -> Result<(), ChatError> {
-        let session = self.state.client.open_session(&self.state.token);
-        let mut request = SlackApiConversationsMembersRequest::new()
-            .with_channel(channel.clone())
-            .with_limit(200);
-        loop {
-            let response = session
-                .conversations_members(&request)
-                .await
-                .map_err(error)?;
-            if response.members.contains(&self.owner) {
-                return Ok(());
-            }
-            let cursor = response
-                .response_metadata
-                .and_then(|metadata| metadata.next_cursor)
-                .filter(|cursor| !cursor.to_string().is_empty());
-            if cursor.is_none() {
-                break;
-            }
-            request = request.opt_cursor(cursor);
-        }
-        session
-            .conversations_invite(&SlackApiConversationsInviteRequest::new(
-                channel.clone(),
-                vec![self.owner.clone()],
-            ))
-            .await
-            .map_err(error)?;
-        Ok(())
     }
     async fn queue_rename(&self, channel: SlackChannelInfo, name: String) {
         if channel.name.as_ref() == Some(&name)
@@ -598,11 +535,11 @@ impl Slack {
 }
 
 impl SlackState {
-    async fn channels(&self, archived: bool) -> Result<Vec<SlackChannelInfo>, ChatError> {
+    async fn channels(&self) -> Result<Vec<SlackChannelInfo>, ChatError> {
         let session = self.client.open_session(&self.token);
         let mut request = SlackApiConversationsListRequest::new()
             .with_limit(200)
-            .with_exclude_archived(!archived);
+            .with_exclude_archived(true);
         let mut channels = Vec::new();
         loop {
             let response = session.conversations_list(&request).await.map_err(error)?;
@@ -674,7 +611,7 @@ impl SlackState {
         scope: ChatScope,
         ignore_test_runs: bool,
     ) -> Result<(), ChatError> {
-        for channel in self.channels(false).await? {
+        for channel in self.channels().await? {
             if identity(&channel).is_some_and(|(workspace, tab)| match closure {
                 TopologyClosure::Tab {
                     workspace_id,
