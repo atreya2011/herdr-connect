@@ -88,7 +88,7 @@ fn extract_tolerant(
     lines: &[PositionedLine<'_>],
     start_offset: u64,
     extract: impl Fn(&Value) -> Vec<String>,
-) -> Result<(Vec<(String, u64)>, u64), String> {
+) -> (Vec<(String, u64)>, u64) {
     let mut texts = Vec::new();
     let mut new_offset = start_offset;
     for (index, line) in lines.iter().enumerate() {
@@ -100,10 +100,10 @@ fn extract_tolerant(
                 new_offset = line.end_offset;
             }
             Err(_) if index + 1 == lines.len() => break,
-            Err(error) => return Err(error.to_string()),
+            Err(_) => new_offset = line.end_offset,
         }
     }
-    Ok((texts, new_offset))
+    (texts, new_offset)
 }
 
 pub fn read_claude_incremental(
@@ -113,7 +113,7 @@ pub fn read_claude_incremental(
     let (bytes, complete_len) = read_new_bytes(path, offset)?;
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
-    extract_tolerant(&lines, offset, |record| {
+    Ok(extract_tolerant(&lines, offset, |record| {
         if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(ASSISTANT_RECORD_TYPE_VALUE)
         {
             return Vec::new();
@@ -135,7 +135,7 @@ pub fn read_claude_incremental(
                     .collect()
             })
             .unwrap_or_default()
-    })
+    }))
 }
 
 pub fn read_codex_incremental(
@@ -145,7 +145,7 @@ pub fn read_codex_incremental(
     let (bytes, complete_len) = read_new_bytes(path, offset)?;
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
-    extract_tolerant(&lines, offset, |record| {
+    Ok(extract_tolerant(&lines, offset, |record| {
         let Some(payload) = record.get(PAYLOAD_KEY) else {
             return Vec::new();
         };
@@ -171,7 +171,7 @@ pub fn read_codex_incremental(
                     .collect()
             })
             .unwrap_or_default()
-    })
+    }))
 }
 
 const COMPACT_SUMMARY_KEY: &str = "isCompactSummary";
@@ -209,7 +209,7 @@ pub fn read_claude_prompts_incremental(
     let (bytes, complete_len) = read_new_bytes(path, offset)?;
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
-    extract_tolerant(&lines, offset, |record| {
+    Ok(extract_tolerant(&lines, offset, |record| {
         let content = if is_qualifying_claude_user_record(record)
             && record.get(COMPACT_SUMMARY_KEY) != Some(&Value::Bool(true))
         {
@@ -240,7 +240,7 @@ pub fn read_claude_prompts_incremental(
             .into_iter()
             .filter(|text| is_owner_typed_claude_text(text))
             .collect()
-    })
+    }))
 }
 
 const INJECTED_CODEX_TEXT_PREFIXES: &[&str] = &[
@@ -264,7 +264,7 @@ pub fn read_codex_prompts_incremental(
     let (bytes, complete_len) = read_new_bytes(path, offset)?;
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
-    extract_tolerant(&lines, offset, |record| {
+    Ok(extract_tolerant(&lines, offset, |record| {
         let Some(payload) = record.get(PAYLOAD_KEY) else {
             return Vec::new();
         };
@@ -291,7 +291,7 @@ pub fn read_codex_prompts_incremental(
                     .collect()
             })
             .unwrap_or_default()
-    })
+    }))
 }
 
 pub fn read_cursor_incremental(
@@ -417,21 +417,11 @@ fn parse_cursor_path(path: &Path) -> Result<AgentLog, String> {
     parse_cursor_rows(&rows).map_err(|error| error.to_string())
 }
 
-fn lines(text: &str) -> Result<Vec<Value>, serde_json::Error> {
-    let relevant: Vec<&str> = text
-        .lines()
+fn lines(text: &str) -> Vec<Value> {
+    text.lines()
         .filter(|line| !line.trim().is_empty())
-        .collect();
-    let last = relevant.len().saturating_sub(1);
-    let mut records = Vec::with_capacity(relevant.len());
-    for (i, line) in relevant.into_iter().enumerate() {
-        match serde_json::from_str(line) {
-            Ok(value) => records.push(value),
-            Err(_) if i == last => break,
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(records)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 fn is_qualifying_claude_user_record(record: &Value) -> bool {
     if record.get(RECORD_TYPE_KEY).and_then(Value::as_str) != Some(USER_RECORD_TYPE_VALUE)
@@ -452,7 +442,7 @@ fn is_qualifying_claude_user_record(record: &Value) -> bool {
 }
 
 fn parse_claude(text: &str) -> Result<AgentLog, serde_json::Error> {
-    let records = lines(text)?;
+    let records = lines(text);
     let start = records
         .iter()
         .rposition(is_qualifying_claude_user_record)
@@ -544,7 +534,7 @@ fn is_codex_turn_boundary_record(record: &Value) -> bool {
 }
 
 fn parse_codex(text: &str) -> Result<AgentLog, serde_json::Error> {
-    let records = lines(text)?;
+    let records = lines(text);
     let start = records
         .iter()
         .rposition(is_codex_turn_boundary_record)

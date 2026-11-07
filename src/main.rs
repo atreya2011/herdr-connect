@@ -2555,6 +2555,105 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn terminal_prompt_baseline_skips_a_malformed_complete_line_in_the_middle_of_the_log() {
+        let original_home = std::env::var_os("HOME");
+        let temp_home = std::env::temp_dir().join(format!(
+            "testrun-malformed-line-baseline-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_home);
+        fs::create_dir_all(&temp_home).expect("create temp HOME");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+        }
+
+        let test_result = std::panic::catch_unwind(|| {
+            let cwd_dir = temp_home.join("project");
+            fs::create_dir_all(&cwd_dir).expect("create project cwd");
+            let cwd = cwd_dir.to_str().expect("utf8 cwd").to_owned();
+            let cwd_slug: String = cwd
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let cases = [
+                (
+                    VENDOR_CLAUDE,
+                    "testrun-claude-session",
+                    temp_home
+                        .join(".claude/projects")
+                        .join(&cwd_slug)
+                        .join("testrun-claude-session.jsonl"),
+                    [
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"history one"}]}}"#,
+                        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+                        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+                    ],
+                    Follower::Claude as fn(u64) -> Follower,
+                ),
+                (
+                    VENDOR_CODEX,
+                    "testrun-codex-session",
+                    temp_home.join(
+                        ".codex/sessions/2026/11/08/rollout-2026-11-08T00-00-00-testrun-codex-session.jsonl",
+                    ),
+                    [
+                        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"history one"}]}}"#,
+                        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"half{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"history two"}]}}"#,
+                        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+                    ],
+                    Follower::Codex as fn(u64) -> Follower,
+                ),
+            ];
+            for (vendor, session, log_path, records, follower) in cases {
+                fs::create_dir_all(log_path.parent().expect("log has a parent"))
+                    .expect("create session log dir");
+                fs::write(&log_path, format!("{}\n", records.join("\n")))
+                    .expect("write session log with a malformed middle line");
+                let end = fs::metadata(&log_path).expect("stat session log").len();
+                let terminal = format!("terminal-{vendor}");
+                let snapshot = AgentSnapshot {
+                    agent: Some(vendor.to_owned()),
+                    terminal_id: terminal.clone(),
+                    agent_status: STATUS_IDLE.to_owned(),
+                    tab_id: "w1:t1".to_owned(),
+                    workspace_id: "w1".to_owned(),
+                    pane_id: "w1:p1".to_owned(),
+                    cwd: Some(cwd.clone()),
+                    session: Some(AgentSession {
+                        agent: vendor.to_owned(),
+                        value: session.to_owned(),
+                    }),
+                };
+
+                let mut state = BridgeState::<Discord>::default();
+                maybe_establish_terminal_prompt_baseline(&snapshot, &mut state);
+
+                assert_eq!(
+                    state.terminal_prompt_positions.get(&terminal),
+                    Some(&(log_path.clone(), follower(end), follower(end))),
+                    "{vendor}: one malformed complete line must not stop the baseline"
+                );
+            }
+        });
+
+        match original_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(&temp_home);
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
     fn cursor_hook_without_a_decision_emits_a_deny_object() {
         let output = super::encode_hook_decision(super::PermissionVendor::Cursor, None)
             .expect("a missing decision must encode")
