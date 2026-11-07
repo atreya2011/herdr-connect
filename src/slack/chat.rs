@@ -208,7 +208,7 @@ impl Chat for Slack {
         text: &str,
         _nonce: &str,
     ) -> Result<(), ChatError> {
-        self.send(route, text).await.map(drop)
+        self.send_markdown(route, text).await.map(drop)
     }
     async fn post_transition_card(
         &self,

@@ -10,10 +10,24 @@ pub(super) fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn markdown(text: &str) -> SlackMessageContent {
+    SlackMessageContent::new()
+        .with_text(escape(text))
+        .with_blocks(vec![SlackMarkdownBlock::new(escape(text)).into()])
+}
+
 impl Slack {
     pub async fn send(&self, route: &SlackRoute, text: &str) -> Result<SlackTs, ChatError> {
         self.send_content(route, SlackMessageContent::new().with_text(escape(text)))
             .await
+    }
+
+    pub(super) async fn send_markdown(
+        &self,
+        route: &SlackRoute,
+        text: &str,
+    ) -> Result<SlackTs, ChatError> {
+        self.send_content(route, markdown(text)).await
     }
 
     pub(super) async fn send_content(
@@ -103,15 +117,12 @@ impl Slack {
 
     pub async fn mirror_prompt(&self, route: &SlackRoute, text: &str) -> Result<(), ChatError> {
         self.require_route(route).await?;
-        let request = SlackApiChatPostMessageRequest::new(
-            route.channel.clone(),
-            SlackMessageContent::new().with_text(escape(text)),
-        )
-        .with_username(self.owner_identity.display_name.clone())
-        .opt_icon_url(self.owner_identity.avatar_url.clone())
-        .with_parse("none".into())
-        .with_unfurl_links(false)
-        .with_unfurl_media(false);
+        let request = SlackApiChatPostMessageRequest::new(route.channel.clone(), markdown(text))
+            .with_username(self.owner_identity.display_name.clone())
+            .opt_icon_url(self.owner_identity.avatar_url.clone())
+            .with_parse("none".into())
+            .with_unfurl_links(false)
+            .with_unfurl_media(false);
         self.state
             .client
             .open_session(&self.state.token)
