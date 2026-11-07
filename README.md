@@ -2,7 +2,7 @@
 
 Two-way Rust bridge between Discord or Slack and agents in local Herdr panes, through a shared chat interface.
 
-The Slack adapter uses `slack-morphism` with `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `SLACK_OWNER_ID`; the team ID comes from `auth.test`. Each mirrored Herdr tab has one public Slack channel named `<workspace label>-<workspace id>-<tab label>-<short tab id>` in lowercase Slack channel-name format, retaining Unicode letters and numbers. The short tab id follows the colon. Labels are shortened to fit 80 characters; IDs are preserved. The topic stores `herdr workspace [workspace_id] tab [full_tab_id]`. The owner is invited when the channel is created. There are no workspace channels or bot thread-parent messages.
+The Slack adapter uses `slack-morphism`. The `slack` bridge reads `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `SLACK_OWNER_ID`; tests read the Slack test app's `SLACK_TEST_BOT_TOKEN`, `SLACK_TEST_APP_TOKEN`, and `SLACK_TEST_OWNER_ID`. The team ID comes from `auth.test`. Each mirrored Herdr tab has one public Slack channel named `<workspace label>-<workspace id>-<tab label>-<short tab id>` in lowercase Slack channel-name format, retaining Unicode letters and numbers. The short tab id follows the colon. Labels are shortened to fit 80 characters; IDs are preserved. The topic stores `herdr workspace [workspace_id] tab [full_tab_id]`. The owner is invited when the channel is created. There are no workspace channels or bot thread-parent messages.
 
 Owner messages, agent replies, activity, permission cards, and question cards use the tab channel. Terminal prompts use the owner's display name and avatar, fetched once at startup through `users.info`; profile lookup failure stops startup. Prompt-submission and free-text-answer acknowledgements are ephemeral messages to the owner. Working status uses `assistant.threads.setStatus` on the latest accepted owner message; it is visible in the channel view. It remains set while any pane in the tab works. Status errors are logged without failing accepted prompts or successful posts.
 
@@ -76,10 +76,11 @@ The no-argument Discord bridge and the `slack` bridge exclude `testrun-` Herdr w
 - `SLACK_BOT_TOKEN`
 - `SLACK_APP_TOKEN`
 - `SLACK_OWNER_ID`
+- `SLACK_TEST_BOT_TOKEN`, `SLACK_TEST_APP_TOKEN`, and `SLACK_TEST_OWNER_ID` for the Slack test app; tests never read the production Slack variables
 
 Set `HERDR_SOCKET_PATH` if the Herdr socket is not the default. Slack discovers its team through `auth.test`. Its bot needs `users:read` and `chat:write.customize` to mirror prompts with the owner profile. Never print or commit `.env`. Keep one production bridge per chat destination. Both adapters default to test-only scope; the no-argument, `slack`, and `broker` entry points select service scope. Standalone `broker` keeps test-run exclusion disabled.
 
-The no-argument command selects Discord. Use `cargo run -- slack` for Slack; keep that connection closed while tests use the same Slack app.
+The no-argument command selects Discord. Use `cargo run -- slack` for Slack. Tests connect only to the Slack test app, so the production Slack bridge can stay connected while tests run.
 
 ```bash
 set -a; . ./.env >/dev/null 2>&1; set +a; cargo run
