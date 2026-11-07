@@ -193,6 +193,15 @@ fn is_owner_typed_claude_text(text: &str) -> bool {
         .any(|prefix| text.starts_with(prefix))
 }
 
+fn owner_queued_claude_prompt(record: &Value) -> Option<&Value> {
+    let attachment = record.get("attachment")?;
+    (attachment.get(PAYLOAD_TYPE_KEY).and_then(Value::as_str) == Some("queued_command")
+        && attachment.pointer("/origin/kind").and_then(Value::as_str) == Some("human")
+        && attachment.get("isMeta") != Some(&Value::Bool(true)))
+    .then(|| attachment.get("prompt"))
+    .flatten()
+}
+
 pub fn read_claude_prompts_incremental(
     path: &Path,
     offset: u64,
@@ -201,17 +210,18 @@ pub fn read_claude_prompts_incremental(
     let text = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| error.to_string())?;
     let lines = positioned_complete_lines(text, offset);
     extract_tolerant(&lines, offset, |record| {
-        let Some(content) = record
-            .get(MESSAGE_KEY)
-            .and_then(|message| message.get(CONTENT_KEY))
-        else {
+        let content = if is_qualifying_claude_user_record(record)
+            && record.get(COMPACT_SUMMARY_KEY) != Some(&Value::Bool(true))
+        {
+            record
+                .get(MESSAGE_KEY)
+                .and_then(|message| message.get(CONTENT_KEY))
+        } else {
+            owner_queued_claude_prompt(record)
+        };
+        let Some(content) = content else {
             return Vec::new();
         };
-        if !is_qualifying_claude_user_record(record)
-            || record.get(COMPACT_SUMMARY_KEY) == Some(&Value::Bool(true))
-        {
-            return Vec::new();
-        }
         let texts: Vec<String> = match content {
             Value::String(text) if !text.is_empty() => vec![text.clone()],
             Value::Array(parts) => parts
