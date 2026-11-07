@@ -4469,6 +4469,119 @@ mod tests {
             &nonce,
         )
         .await?;
+        mid_turn_prompt_exercise(
+            &fixture,
+            guild,
+            thread,
+            &mut state,
+            &mut live_events,
+            &nonce,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn mid_turn_prompt_exercise(
+        fixture: &TerminalPromptFixture<'_>,
+        guild: &BlockedCaptureGuild,
+        thread: Id<ChannelMarker>,
+        state: &mut BridgeState<Discord>,
+        live_events: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        nonce: &str,
+    ) -> Result<(), String> {
+        let TerminalPromptFixture {
+            tab,
+            agent_name,
+            vendor,
+            connection,
+            tabs,
+            terminal,
+        } = *fixture;
+        if vendor != VENDOR_CLAUDE {
+            return Ok(());
+        }
+        let mid_turn_prompt =
+            format!("Reply with exactly: terminal-origin-{vendor}-mid-turn-{nonce}");
+        let subs = status_subscriptions(std::slice::from_ref(&tab.pane_id));
+        let mut sub = subscribe_herdr_events(&subs).await?;
+        let pane_id = tab.pane_id.clone();
+        let name = agent_name.to_owned();
+        let typed = mid_turn_prompt.clone();
+        let typing_task = tokio::task::spawn_blocking(move || {
+            herdr_json(&["agent", "prompt", &name, LIVE_CAPTURE_FORCE_PROMPT])?;
+            herdr_json(&[
+                "pane",
+                "wait-output",
+                &pane_id,
+                "--match",
+                "Running…",
+                "--timeout",
+                "30000",
+            ])?;
+            herdr_json(&["agent", "prompt", &name, &typed]).map(drop)
+        });
+        wait_for_event(
+            &mut sub,
+            "pane.agent_status_changed",
+            &tab.pane_id,
+            "/data/pane_id",
+            Some(STATUS_WORKING),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let working = poll_snapshot(&tab.pane_id, Duration::from_secs(10), |snapshot| {
+            snapshot.session.is_some()
+        })?;
+        own(&working, tabs, connection, state).await;
+        let watch_deadline = Instant::now() + Duration::from_secs(5);
+        while !state.live_watches.contains_key(terminal) && Instant::now() < watch_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            own(&working, tabs, connection, state).await;
+        }
+        loop {
+            tokio::select! {
+                Some(event_terminal) = live_events.recv() => {
+                    handle_live_event(connection, &event_terminal, state).await;
+                }
+                event = wait_for_event(
+                    &mut sub,
+                    "pane.agent_status_changed",
+                    &tab.pane_id,
+                    "/data/pane_id",
+                    None,
+                    Duration::from_secs(90),
+                ) => {
+                    if typing_task.is_finished() && matches!(
+                        event?.pointer("/data/agent_status").and_then(Value::as_str),
+                        Some(STATUS_DONE | STATUS_IDLE)
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+        typing_task
+            .await
+            .map_err(|error| format!("mid-turn typing task failed: {error}"))??;
+        let settled = poll_snapshot(&tab.pane_id, Duration::from_secs(2), |_| true)?;
+        wait_for_readable_capture(&settled).await?;
+        own(&settled, tabs, connection, state).await;
+        while let Ok(event_terminal) = live_events.try_recv() {
+            handle_live_event(connection, &event_terminal, state).await;
+        }
+        handle_live_event(connection, terminal, state).await;
+        let messages = thread_full_messages(guild, thread).await?;
+        let authors: Vec<&str> = messages
+            .iter()
+            .filter(|message| message.webhook_id.is_some() && message.content == mid_turn_prompt)
+            .map(|message| message.author.name.as_str())
+            .collect();
+        if authors != [connection.2.display_name.as_str()] {
+            return Err(format!(
+                "expected the mid-turn prompt mirrored once by {:?}, found authors {authors:?}",
+                connection.2.display_name
+            ));
+        }
         Ok(())
     }
 
