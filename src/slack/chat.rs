@@ -237,6 +237,23 @@ impl Chat for Slack {
     ) -> Result<(), ChatError> {
         self.update(route, message, text).await
     }
+    async fn delete_activity(
+        &self,
+        route: &SlackRoute,
+        message: &SlackTs,
+    ) -> Result<(), ChatError> {
+        self.require_route(route).await?;
+        self.state
+            .client
+            .open_session(&self.state.token)
+            .chat_delete(&SlackApiChatDeleteRequest::new(
+                route.channel.clone(),
+                message.clone(),
+            ))
+            .await
+            .map_err(error)?;
+        Ok(())
+    }
     async fn post_as_owner(
         &self,
         _parent: &SlackRoute,

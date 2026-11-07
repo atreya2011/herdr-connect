@@ -108,6 +108,7 @@ impl<C: Chat> Default for BridgeState<C> {
 }
 
 struct ActivityMessage<C: Chat> {
+    channel: C::Route,
     message: C::Message,
     count: u32,
 }
@@ -493,8 +494,8 @@ async fn process_scoped_snapshot<C: Chat>(
             state,
         )
         .await;
-        if status == STATUS_WORKING {
-            forget_activity_message(state, &snapshot.pane_id);
+        if matches!(status.as_str(), STATUS_WORKING | STATUS_IDLE | STATUS_DONE) {
+            delete_activity_message(discord, state, &snapshot.pane_id).await;
         }
     }
     remember_previous_status(state, &terminal, &status);
@@ -1207,8 +1208,21 @@ async fn handle_live_event<C: Chat>(
     }
 }
 
-fn forget_activity_message<C: Chat>(state: &mut BridgeState<C>, pane_id: &str) {
-    state.activity_messages.remove(pane_id);
+async fn delete_activity_message<C: Chat>(
+    discord: &ChatConnection<C>,
+    state: &mut BridgeState<C>,
+    pane_id: &str,
+) {
+    let Some(activity) = state.activity_messages.remove(pane_id) else {
+        return;
+    };
+    if let Err(error) = discord
+        .0
+        .delete_activity(&activity.channel, &activity.message)
+        .await
+    {
+        bridge_eprintln!("activity delete delivery error for pane {pane_id}: {error}");
+    }
 }
 
 async fn handle_activity_event<C: Chat>(
@@ -1261,9 +1275,14 @@ async fn handle_activity_event<C: Chat>(
     let text = activity_message_text(1, &frame.tool, &frame.summary);
     match responder.chat().post_activity(&channel, &text).await {
         Ok(message) => {
-            state
-                .activity_messages
-                .insert(frame.pane_id, ActivityMessage { message, count: 1 });
+            state.activity_messages.insert(
+                frame.pane_id,
+                ActivityMessage {
+                    channel,
+                    message,
+                    count: 1,
+                },
+            );
         }
         Err(error) => {
             bridge_eprintln!(

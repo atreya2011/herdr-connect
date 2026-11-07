@@ -172,6 +172,13 @@ pub trait Chat: Send + Sync + Sized + 'static {
         message: &Self::Message,
         text: &str,
     ) -> impl Future<Output = Result<(), ChatError>> + Send;
+    fn delete_activity(
+        &self,
+        _route: &Self::Route,
+        _message: &Self::Message,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send {
+        async { Ok(()) }
+    }
     fn post_as_owner(
         &self,
         parent: &Self::Route,
