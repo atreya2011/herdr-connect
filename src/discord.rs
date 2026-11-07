@@ -25,18 +25,21 @@ use crate::deletion::{GuildDeletion, handle_guild_deletion};
 use crate::delivery::expire_permission_card;
 
 use crate::{
-    OwnerIdentity, PermissionVendor, Question, TopologyCache, TopologyRoute, TransitionMessage,
-    UNKNOWN_CHANNEL_DELIVERY_ERROR, UNKNOWN_WEBHOOK_DELIVERY_ERROR, bridge_eprintln, cached_route,
-    delete_tab_thread, delete_topology_absent_from_herdr, delete_workspace_channel,
-    deliver_activity_message, deliver_live_message, deliver_permission_card, deliver_question_card,
-    deliver_transition_card, execute_terminal_prompt_webhook, expire_informational_card,
-    fetch_owner_identity, fetch_topology_lists, is_test_run_name, owned_thread_is_test_run,
+    NameChange, OwnerIdentity, PermissionVendor, Question, TEST_RUN_PREFIX, TopologyCache,
+    TopologyRoute, TransitionMessage, UNKNOWN_CHANNEL_DELIVERY_ERROR,
+    UNKNOWN_WEBHOOK_DELIVERY_ERROR, bridge_eprintln, cached_route, delete_tab_thread,
+    delete_topology_absent_from_herdr, delete_workspace_channel, deliver_activity_message,
+    deliver_live_message, deliver_permission_card, deliver_question_card, deliver_transition_card,
+    execute_terminal_prompt_webhook, expire_informational_card, fetch_owner_identity,
+    fetch_topology_lists, is_test_run_name, name_changes, owned_thread_is_test_run,
     reconcile_topology_cache, register_archived_tab_threads, resolve_terminal_prompt_webhook,
-    should_handle_owner_message, sync_topology, update_activity_message, update_question_card,
-    workspace_channel_id,
+    should_handle_owner_message, sync_topology, tab_list_result, update_activity_message,
+    update_question_card, workspace_channel_id, workspace_list_result,
 };
 
 pub const TERMINAL_PROMPT_WEBHOOK_NAME: &str = "herdr-connect owner";
+
+type RenameTasks = HashMap<Id<ChannelMarker>, (String, tokio::task::JoinHandle<()>)>;
 
 type WebhookCache = HashMap<Id<ChannelMarker>, (Id<WebhookMarker>, String)>;
 
@@ -49,6 +52,7 @@ pub struct Discord {
     shard: tokio::sync::Mutex<Shard>,
     ignore_test_runs: bool,
     scope: ChatScope,
+    renames: tokio::sync::Mutex<RenameTasks>,
 }
 
 pub async fn fetch_startup_owner_identity(
@@ -128,6 +132,7 @@ impl Discord {
             shard: tokio::sync::Mutex::new(shard),
             ignore_test_runs: false,
             scope: ChatScope::TestRuns,
+            renames: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -226,6 +231,72 @@ impl Discord {
             return Ok(false);
         };
         self.accepts_herdr_route(workspace, tab).await
+    }
+
+    async fn queue_rename(&self, change: NameChange) {
+        if (self.ignore_test_runs && change.test_run)
+            || (self.scope == ChatScope::TestRuns
+                && !(change.test_run && change.name.starts_with(TEST_RUN_PREFIX)))
+        {
+            return;
+        }
+        let mut jobs = self.renames.lock().await;
+        if jobs
+            .get(&change.id)
+            .is_some_and(|(desired, job)| desired == &change.name && !job.is_finished())
+        {
+            return;
+        }
+        if let Some((_, job)) = jobs.remove(&change.id) {
+            job.abort();
+        }
+        let (client, cache) = (self.client.clone(), self.topology_cache.clone());
+        let desired = change.name.clone();
+        jobs.insert(
+            change.id,
+            (
+                desired,
+                tokio::spawn(async move {
+                    let renamed = match client.update_channel(change.id).name(&change.name).await {
+                        Ok(response) => response.model().await.map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    match renamed {
+                        Ok(renamed) => {
+                            if let Some((channels, threads)) = cache.lock().await.as_mut() {
+                                for entry in channels.iter_mut().chain(threads.iter_mut()) {
+                                    if entry.id == renamed.id {
+                                        entry.name.clone_from(&renamed.name);
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            bridge_eprintln!("Discord rename error for {}: {error}", change.id);
+                        }
+                    }
+                }),
+            ),
+        );
+    }
+
+    async fn refresh_names(&self) -> Result<(), ChatError> {
+        let (workspaces, tabs) = tokio::task::spawn_blocking(|| {
+            Ok::<_, String>((workspace_list_result()?, tab_list_result()?))
+        })
+        .await
+        .map_err(chat_error)?
+        .map_err(chat_error)?;
+        let changes = {
+            let guard = self.topology_cache.lock().await;
+            guard.as_ref().map_or_else(Vec::new, |(channels, threads)| {
+                name_changes(channels, threads, &workspaces, &tabs)
+            })
+        };
+        for change in changes {
+            self.queue_rename(change).await;
+        }
+        Ok(())
     }
 
     async fn check_topology_route(&self, route: &TopologyRoute) -> Result<(), ChatError> {
@@ -463,6 +534,19 @@ impl Chat for Discord {
         self.scope
     }
 
+    fn lifecycle_subscriptions(&self) -> Vec<serde_json::Value> {
+        let mut subscriptions = crate::lifecycle_subscriptions();
+        subscriptions.extend([
+            serde_json::json!({"type":"workspace.renamed"}),
+            serde_json::json!({"type":"tab.renamed"}),
+        ]);
+        subscriptions
+    }
+
+    async fn topology_changed(&self) -> Result<(), ChatError> {
+        self.refresh_names().await
+    }
+
     async fn accepts_route(&self, route: &Self::Route) -> Result<bool, ChatError> {
         self.channel_in_scope(*route).await
     }
@@ -573,6 +657,9 @@ impl Chat for Discord {
             if let Err(error) = result {
                 bridge_eprintln!("herdr startup topology error: {error}");
             }
+        }
+        if let Err(error) = self.refresh_names().await {
+            bridge_eprintln!("herdr startup name reconciliation error: {error}");
         }
         let (workspaces, live_tabs) = match live() {
             Ok(ids) => ids,

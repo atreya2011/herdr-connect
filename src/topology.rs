@@ -6,7 +6,10 @@ use twilight_model::channel::Channel;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, GuildMarker, UserMarker};
 
-use crate::{AgentSnapshot, HerdrTab, TEST_RUN_PREFIX, format_thread_name};
+use crate::{
+    AgentSnapshot, HerdrTab, HerdrWorkspace, TEST_RUN_PREFIX, bridge_eprintln, format_thread_name,
+    workspace_list_result,
+};
 
 pub type TopologyCache = Arc<Mutex<Option<(Vec<Channel>, Vec<Channel>)>>>;
 
@@ -51,18 +54,12 @@ pub fn route_topology(
             "herdr topology error: tab {tab_id} workspace mismatch"
         ));
     }
-    let workspace_tabs: HashSet<&str> = tabs
+    let workspaces = workspace_list_result()?;
+    let workspace = workspaces
         .iter()
-        .filter(|candidate| candidate.workspace_id == workspace_id)
-        .map(|candidate| candidate.tab_id.as_str())
-        .collect();
-    let cwds: Vec<String> = agents
-        .iter()
-        .filter(|candidate| candidate.workspace_id == workspace_id)
-        .filter(|candidate| workspace_tabs.contains(candidate.tab_id.as_str()))
-        .filter_map(|candidate| candidate.cwd.clone())
-        .collect();
-    let channel_name = workspace_channel_name(workspace_id, &cwds)?;
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .ok_or_else(|| format!("herdr topology error: workspace {workspace_id} disappeared"))?;
+    let channel_name = workspace_channel_name(workspace_id, &workspace.label)?;
     let thread_name = format_thread_name(&tab.label, tab_id)?;
     Ok(TopologyRoute {
         workspace_id: workspace_id.to_owned(),
@@ -73,53 +70,86 @@ pub fn route_topology(
     })
 }
 
-pub fn workspace_channel_name(workspace_id: &str, cwds: &[String]) -> Result<String, String> {
-    let mut counts = std::collections::HashMap::new();
-    let mut common = None;
-    let mut common_count = 0;
-    for cwd in cwds {
-        let cwd = cwd.trim();
-        if !cwd.is_empty() {
-            let count = counts.entry(cwd).or_insert(0usize);
-            *count += 1;
-            if *count > common_count
-                || (*count == common_count && common.is_none_or(|current| cwd < current))
-            {
-                common = Some(cwd);
-                common_count = *count;
-            }
+pub fn workspace_channel_name(workspace_id: &str, label: &str) -> Result<String, String> {
+    let mut name = String::new();
+    for c in label.trim().to_lowercase().chars() {
+        if c.is_alphanumeric() || c == '_' {
+            name.push(c);
+        } else if (c == '-' || c.is_whitespace()) && !name.ends_with('-') {
+            name.push('-');
         }
     }
-    let common = common
-        .ok_or_else(|| format!("herdr workspace {workspace_id} has no agent cwd evidence"))?;
-    let folder = common
-        .rsplit('/')
-        .find(|part| !part.is_empty())
-        .unwrap_or("");
-    let slug = |value: &str| {
-        let mut output = String::new();
-        for c in value.to_ascii_lowercase().chars() {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                output.push(c);
-            } else if !output.ends_with('-') {
-                output.push('-');
-            }
-        }
-        output.trim_matches('-').to_owned()
-    };
-    let folder = slug(folder);
-    let workspace = slug(workspace_id);
-    let suffix = format!("-{workspace}");
-    if folder.is_empty() || workspace.is_empty() || suffix.len() >= 90 {
+    let name: String = name.trim_matches('-').chars().take(100).collect();
+    if name.is_empty() {
         return Err(format!(
             "herdr workspace {workspace_id} has no usable channel name"
         ));
     }
-    Ok(format!(
-        "{}{}",
-        &folder[..folder.len().min(90 - suffix.len())],
-        suffix
-    ))
+    Ok(name)
+}
+
+pub struct NameChange {
+    pub id: Id<ChannelMarker>,
+    pub name: String,
+    pub test_run: bool,
+}
+
+pub fn name_changes(
+    channels: &[Channel],
+    active_threads: &[Channel],
+    workspaces: &[HerdrWorkspace],
+    tabs: &[HerdrTab],
+) -> Vec<NameChange> {
+    let mut changes = Vec::new();
+    for channel in channels {
+        let Some(workspace) = workspace_topic_id(channel).and_then(|id| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == id)
+        }) else {
+            continue;
+        };
+        match workspace_channel_name(&workspace.workspace_id, &workspace.label) {
+            Ok(name) if channel.name.as_deref() != Some(name.as_str()) => {
+                changes.push(NameChange {
+                    id: channel.id,
+                    name,
+                    test_run: workspace.label.starts_with(TEST_RUN_PREFIX),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => bridge_eprintln!("Discord name reconciliation error: {error}"),
+        }
+        for thread in active_threads
+            .iter()
+            .filter(|thread| thread.parent_id == Some(channel.id))
+        {
+            let Some(tab) = thread
+                .name
+                .as_deref()
+                .and_then(thread_tab_suffix)
+                .and_then(|id| {
+                    tabs.iter()
+                        .find(|tab| tab.tab_id == id && tab.workspace_id == workspace.workspace_id)
+                })
+            else {
+                continue;
+            };
+            match format_thread_name(&tab.label, &tab.tab_id) {
+                Ok(name) if thread.name.as_deref() != Some(name.as_str()) => {
+                    changes.push(NameChange {
+                        id: thread.id,
+                        name,
+                        test_run: workspace.label.starts_with(TEST_RUN_PREFIX)
+                            || tab.label.starts_with(TEST_RUN_PREFIX),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => bridge_eprintln!("Discord name reconciliation error: {error}"),
+            }
+        }
+    }
+    changes
 }
 
 pub async fn fetch_topology_lists(

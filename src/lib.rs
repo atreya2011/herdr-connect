@@ -80,10 +80,10 @@ pub use readers::{
 };
 pub use slack::{Slack, SlackArchive, SlackRoute, SlackSocketEvent, slack_channel_name};
 pub use topology::{
-    TopologyCache, TopologyRoute, archived_threads, cached_route, channel_is_test_run,
+    NameChange, TopologyCache, TopologyRoute, archived_threads, cached_route, channel_is_test_run,
     delete_tab_thread, delete_thread_created_message, delete_topology_absent_from_herdr,
     delete_workspace_channel, enable_production_topology, fetch_topology_lists, forget_owned,
-    is_test_run_name, owned_thread_is_test_run, reconcile_topology_cache,
+    is_test_run_name, name_changes, owned_thread_is_test_run, reconcile_topology_cache,
     register_archived_tab_threads, remember_tab_threads, remember_workspace_channels,
     resolve_owner_deleted_tab, resolve_owner_deleted_workspace, route_topology, sync_topology,
     topology_absent_from_herdr, workspace_channel_id, workspace_channel_name,
