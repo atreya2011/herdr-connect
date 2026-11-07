@@ -119,7 +119,7 @@ struct BlockedCardContext<'a, C: Chat> {
     session: &'a AgentSession,
     terminal: &'a str,
     from_status: &'a str,
-    state_change_seq: u64,
+    state_change_seq: Option<u64>,
     informational_cards: &'a mut HashMap<String, InformationalCard<C>>,
 }
 
@@ -157,13 +157,6 @@ async fn handle_blocked_card<C: Chat>(context: BlockedCardContext<'_, C>) {
         state_change_seq,
         informational_cards,
     } = context;
-    let target = match responder.chat().sync_route(route).await {
-        Ok(target) => target,
-        Err(error) => {
-            bridge_eprintln!("{error}");
-            return;
-        }
-    };
     let supported_broker_pending = vendor_is_supported(snapshot.agent.as_deref())
         && responder.has_pending_session(&session.value);
     if supported_broker_pending {
@@ -172,8 +165,18 @@ async fn handle_blocked_card<C: Chat>(context: BlockedCardContext<'_, C>) {
     let detection = (snapshot.agent.as_deref() == Some(VENDOR_CLAUDE))
         .then(|| agent_read_detection(&route.pane_id).ok())
         .flatten();
-    if let Some((questions, index)) = shown_question(snapshot, session, detection.as_deref()).await
-    {
+    let question = shown_question(snapshot, session, detection.as_deref()).await;
+    if question.is_none() && state_change_seq.is_none() {
+        return;
+    }
+    let target = match responder.chat().sync_route(route).await {
+        Ok(target) => target,
+        Err(error) => {
+            bridge_eprintln!("{error}");
+            return;
+        }
+    };
+    if let Some((questions, index)) = question {
         match responder
             .deliver_question_card(&target, &route.pane_id, questions, index)
             .await
@@ -191,6 +194,9 @@ async fn handle_blocked_card<C: Chat>(context: BlockedCardContext<'_, C>) {
         }
         return;
     }
+    let Some(state_change_seq) = state_change_seq else {
+        return;
+    };
     let detection_question = detection.as_deref().and_then(format_detection_question);
     let capture = detection_question.map_or_else(
         || capture_for_blocked(snapshot, session),
@@ -433,6 +439,29 @@ async fn process_scoped_snapshot<C: Chat>(
     {
         bridge_eprintln!("agent status error: {error}");
     }
+    if status == STATUS_BLOCKED
+        && snapshot.agent.as_deref() == Some(VENDOR_CLAUDE)
+        && !state.informational_cards.contains_key(&terminal)
+        && state
+            .previous
+            .get(&terminal)
+            .is_some_and(|previous| previous == STATUS_BLOCKED)
+        && let Some(session) = snapshot.session.as_ref()
+        && let Some(watch) = state.live_watches.get(&terminal)
+    {
+        let route = watch.route.clone();
+        handle_blocked_card(BlockedCardContext {
+            responder: discord.1.as_ref(),
+            route: &route,
+            snapshot,
+            session,
+            terminal: &terminal,
+            from_status: STATUS_BLOCKED,
+            state_change_seq: None,
+            informational_cards: &mut state.informational_cards,
+        })
+        .await;
+    }
     if let Some(old) = state.previous.get(&terminal).cloned()
         && old != status
     {
@@ -512,7 +541,7 @@ async fn deliver_postable_transition<C: Chat>(
         session,
         terminal,
         from_status: &transition.from,
-        state_change_seq,
+        state_change_seq: Some(state_change_seq),
         informational_cards: &mut state.informational_cards,
     })
     .await;
