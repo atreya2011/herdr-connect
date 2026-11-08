@@ -2,8 +2,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Slack, SlackRoute,
-    TopologyClosure, TopologyRoute, slack_channel_name, tab_list_result, workspace_list_result,
+    Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Renamed, Slack,
+    SlackRoute, TopologyClosure, TopologyRoute, slack_channel_name, tab_list_result, tab_rename,
+    workspace_list_result,
 };
 use serde_json::Value;
 use slack_morphism::prelude::*;
@@ -353,6 +354,141 @@ async fn slack_socket_real_events() -> Result<(), Box<dyn std::error::Error>> {
         let ignored = slack.owner_message(received).await?.is_none();
         Ok::<_, Box<dyn std::error::Error>>(vec![("bot message ignored as owner prompt", ignored)])
     }
+    .await;
+    let shutdown = slack.shutdown_socket().await;
+    let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    shutdown?;
+    assert_eq!(
+        leftovers, 0,
+        "zero-leftover check: unarchived testrun- Slack channels"
+    );
+    for (name, passed) in result? {
+        assert!(passed, "{name}");
+    }
+    Ok(())
+}
+
+async fn next_rename(
+    slack: &Slack,
+    channel: &SlackChannelId,
+) -> Result<SlackMessageEvent, Box<dyn std::error::Error>> {
+    Ok(
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(Ok(Inbound::Renamed(renamed))) = slack.next_event().await
+                    && renamed.origin.channel.as_ref() == Some(channel)
+                {
+                    break renamed;
+                }
+            }
+        })
+        .await?,
+    )
+}
+
+async fn apply_rename(
+    slack: &Slack,
+    route: &TopologyRoute,
+    renamed: SlackMessageEvent,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let tab = route.tab_id.clone();
+    slack
+        .handle_rename(renamed, move |renamed| match renamed {
+            Renamed::Tab { tab_id, label } if tab_id == tab => tab_rename(&tab_id, &label),
+            other => Err(format!(
+                "refused Herdr rename outside the test tab: {other:?}"
+            )),
+        })
+        .await?;
+    Ok(tab_list_result()?
+        .into_iter()
+        .find(|entry| entry.tab_id == route.tab_id)
+        .ok_or("test tab disappeared")?
+        .label)
+}
+
+async fn wait_for_channel_name(
+    slack: &Slack,
+    channel: &SlackChannelId,
+    expected: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let matched = slack
+            .channels()
+            .await?
+            .iter()
+            .any(|entry| &entry.id == channel && entry.name.as_deref() == Some(expected));
+        if matched || tokio::time::Instant::now() >= deadline {
+            return Ok(matched);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+#[tokio::test]
+async fn slack_owner_channel_rename_renames_the_herdr_tab() -> Result<(), Box<dyn std::error::Error>>
+{
+    let token = test_env("SLACK_TEST_BOT_TOKEN")?;
+    let client = SlackClient::new(SlackClientHyperConnector::new()?);
+    let api_token = SlackApiToken::new(token.clone().into());
+    let bot = client.open_session(&api_token).auth_test().await?.user_id;
+    let creator = test_slack().await?;
+    let slack = Slack::new(token, bot.to_string()).await?;
+    let route = create_route()?;
+    let result = Box::pin(async {
+        creator.sync(&route, false).await?;
+        let found = slack.sync(&route, true).await?;
+        slack
+            .connect_socket(test_env("SLACK_TEST_APP_TOKEN")?)
+            .await?;
+        let whole = format!("{}-whole", route.channel_name);
+        let cases = [
+            (
+                "bridge prefix and suffix kept",
+                slack_channel_name(
+                    &route.channel_name,
+                    &route.workspace_id,
+                    "testrun-deploy",
+                    &route.tab_id,
+                )?,
+                "testrun-deploy".to_owned(),
+            ),
+            ("whole name", whole.clone(), whole),
+        ];
+        let mut checks = Vec::new();
+        for (name, renamed_to, expected_label) in cases {
+            client
+                .open_session(&api_token)
+                .conversations_rename(&SlackApiConversationsRenameRequest::new(
+                    found.channel.clone(),
+                    renamed_to.clone(),
+                ))
+                .await?;
+            let label = apply_rename(&slack, &route, next_rename(&slack, &found.channel).await?)
+                .await?;
+            slack.topology_changed().await?;
+            let bridge = slack_channel_name(
+                &route.channel_name,
+                &route.workspace_id,
+                &expected_label,
+                &route.tab_id,
+            )?;
+            let reconciled = wait_for_channel_name(&slack, &found.channel, &bridge).await?;
+            println!(
+                "real slack rename {name}: renamed_to={renamed_to} herdr_label={label} channel_reconciled={reconciled}"
+            );
+            checks.push((name, label == expected_label && reconciled));
+        }
+        let echoed = apply_rename(&slack, &route, next_rename(&slack, &found.channel).await?)
+            .await?;
+        println!("real slack rename bridge echo: herdr_label={echoed}");
+        checks.push((
+            "bridge rename back leaves the herdr label alone",
+            echoed == format!("{}-whole", route.channel_name),
+        ));
+        Ok::<_, Box<dyn std::error::Error>>(checks)
+    })
     .await;
     let shutdown = slack.shutdown_socket().await;
     let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
