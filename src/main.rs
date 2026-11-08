@@ -11,9 +11,9 @@ use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
 
 use herdr_connect_rs::{
-    ACTIVITY_KIND, ActivityFrame, activity_message_text, bridge_eprintln, bridge_println,
-    decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
-    send_activity_frame,
+    ACTIVITY_KIND, ActivityFrame, ActivityPlan, ActivityTask, activity_message_text,
+    activity_task_title, bridge_eprintln, bridge_println, decode_claude_activity_request,
+    decode_codex_activity_request, decode_cursor_activity_request, send_activity_frame,
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, ChatScope, Discord,
@@ -110,7 +110,7 @@ impl<C: Chat> Default for BridgeState<C> {
 struct ActivityMessage<C: Chat> {
     channel: C::Route,
     message: C::Message,
-    count: u32,
+    plan: ActivityPlan,
 }
 
 struct BlockedCardContext<'a, C: Chat> {
@@ -1262,13 +1262,14 @@ async fn handle_activity_event<C: Chat>(
         }
     };
     if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
-        let text = activity_message_text(existing.count + 1, &frame.tool, &frame.summary);
+        let plan = existing.plan.next_tool_call(&frame.tool, &frame.summary);
+        let text = activity_message_text(plan.count, &frame.tool, &frame.summary);
         match responder
             .chat()
-            .edit_activity(&channel, &existing.message, &text)
+            .edit_activity(&channel, &existing.message, &text, &plan)
             .await
         {
-            Ok(()) => existing.count += 1,
+            Ok(()) => existing.plan = plan,
             Err(error) => {
                 bridge_eprintln!(
                     "activity edit delivery error for pane {}: {error}",
@@ -1279,14 +1280,21 @@ async fn handle_activity_event<C: Chat>(
         return;
     }
     let text = activity_message_text(1, &frame.tool, &frame.summary);
-    match responder.chat().post_activity(&channel, &text).await {
+    let plan = ActivityPlan {
+        count: 1,
+        tasks: vec![ActivityTask {
+            id: 1,
+            title: activity_task_title(&frame.tool, &frame.summary),
+        }],
+    };
+    match responder.chat().post_activity(&channel, &text, &plan).await {
         Ok(message) => {
             state.activity_messages.insert(
                 frame.pane_id,
                 ActivityMessage {
                     channel,
                     message,
-                    count: 1,
+                    plan,
                 },
             );
         }

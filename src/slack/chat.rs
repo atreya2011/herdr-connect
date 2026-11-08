@@ -227,16 +227,32 @@ impl Chat for Slack {
         )
         .await
     }
-    async fn post_activity(&self, route: &SlackRoute, text: &str) -> Result<SlackTs, ChatError> {
-        self.send(route, text).await
+    async fn post_activity(
+        &self,
+        route: &SlackRoute,
+        text: &str,
+        plan: &crate::ActivityPlan,
+    ) -> Result<SlackTs, ChatError> {
+        self.send_content(route, super::delivery::activity_content(text, plan, None))
+            .await
     }
     async fn edit_activity(
         &self,
         route: &SlackRoute,
         message: &SlackTs,
         text: &str,
+        plan: &crate::ActivityPlan,
     ) -> Result<(), ChatError> {
-        self.update(route, message, text).await
+        self.update_content(
+            route,
+            message,
+            super::delivery::activity_content(
+                text,
+                plan,
+                Some(format!("activity-{message}-{}", plan.count)),
+            ),
+        )
+        .await
     }
     async fn delete_activity(
         &self,

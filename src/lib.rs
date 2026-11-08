@@ -24,8 +24,8 @@ mod watcher;
 
 pub use activity::{
     ACTIVITY_KIND, ActivityFrame, ClaudeActivityRequest, activity_message_text,
-    decode_claude_activity_request, decode_codex_activity_request, decode_cursor_activity_request,
-    is_activity_message_text,
+    activity_task_title, decode_claude_activity_request, decode_codex_activity_request,
+    decode_cursor_activity_request, is_activity_message_text,
 };
 pub use broker::{
     PermissionResponder, QuestionOutcome, handle_component, hook_timeout, request_decision,
@@ -36,7 +36,8 @@ pub use cards::{
     split_live_message,
 };
 pub use chat::{
-    Ack, Chat, ChatError, ChatScope, Closed, Component, Inbound, OwnerMessage, TopologyClosure,
+    Ack, ActivityPlan, ActivityTask, Chat, ChatError, ChatScope, Closed, Component, Inbound,
+    OwnerMessage, TopologyClosure,
 };
 pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,

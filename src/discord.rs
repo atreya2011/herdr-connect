@@ -819,6 +819,7 @@ impl Chat for Discord {
         &self,
         route: &Self::Route,
         text: &str,
+        _plan: &crate::ActivityPlan,
     ) -> Result<Self::Message, ChatError> {
         self.check_channel_scope(*route).await?;
         match deliver_activity_message(&self.client, *route, text).await {
@@ -832,6 +833,7 @@ impl Chat for Discord {
         route: &Self::Route,
         message: &Self::Message,
         text: &str,
+        _plan: &crate::ActivityPlan,
     ) -> Result<(), ChatError> {
         self.check_channel_scope(*route).await?;
         match update_activity_message(&self.client, *route, *message, text).await {

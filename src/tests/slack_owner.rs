@@ -90,6 +90,7 @@ struct Driver {
     working_observed: bool,
     archived_by_owner: bool,
     activity_posted: Vec<SlackTs>,
+    activity_snapshots: Vec<Value>,
     turn_ends: usize,
     goal: Goal,
     directory: PathBuf,
@@ -281,6 +282,7 @@ impl Owned {
             working_observed: false,
             archived_by_owner: false,
             activity_posted: Vec::new(),
+            activity_snapshots: Vec::new(),
             turn_ends: 0,
             goal: Goal::Message,
             directory: self.directory.clone(),
@@ -584,11 +586,40 @@ impl Driver {
             }
             Some(frame) = self.activity.recv() => {
                 let turn_end = frame.turn_end && frame.pane_id == self.pane;
+                let tool_call = !frame.turn_end && frame.pane_id == self.pane && !self.archived_by_owner;
                 if frame.pane_id == self.pane && !self.archived_by_owner { handle_activity_event(&self.connection, frame, &mut self.state).await; }
                 if let Some(activity) = self.state.activity_messages.get(&self.pane)
                     && self.activity_posted.last() != Some(&activity.message)
                 {
                     self.activity_posted.push(activity.message.clone());
+                }
+                if tool_call
+                    && let Some(message) = self.state.activity_messages.get(&self.pane).map(|activity| activity.message.clone())
+                {
+                    let history = self.connection.0.history(&self.route.channel).await.map_err(String::from)?;
+                    if let Some(activity) = history.iter().find(|entry| entry.origin.ts == message) {
+                        let blocks = serde_json::to_value(&activity.content.blocks).map_err(|error| error.to_string())?;
+                        let snapshot = json!({"text": activity.content.text, "blocks": blocks});
+                        let tasks = snapshot
+                            .pointer("/blocks/0/tasks")
+                            .and_then(Value::as_array)
+                            .map(|tasks| {
+                                tasks
+                                    .iter()
+                                    .filter_map(|task| {
+                                        Some(format!(
+                                            "{}={}",
+                                            task["title"].as_str()?,
+                                            task["status"].as_str()?
+                                        ))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let title = snapshot.pointer("/blocks/0/title");
+                        self.activity_snapshots.push(snapshot.clone());
+                        println!("OWNER OBSERVED: activity plan title {title:?}, tasks {tasks:?}, text {:?}", snapshot["text"]);
+                    }
                 }
                 self.turn_ends += usize::from(turn_end);
             }
@@ -696,7 +727,8 @@ impl Driver {
             Goal::MarkdownReply(before) => {
                 Ok(self.agent_messages(before).next().is_some() && self.settled()?)
             }
-            Goal::ActivityTurn => Ok(!self.activity_posted.is_empty()
+            Goal::ActivityTurn => Ok(self.activity_snapshots.len() >= 2
+                && !self.activity_posted.is_empty()
                 && self.bot_said("ACTIVITY DONE")
                 && self.settled()?),
             Goal::ActivityPosted => Ok(!self.activity_posted.is_empty()),
@@ -811,8 +843,72 @@ impl Driver {
 
     async fn activity_deleted(&mut self) -> Result<(), String> {
         self.ready().await?;
-        self.prompt("Use Bash to run exactly python3 -c 'print(1)'. Use no other tools. Then reply with exactly ACTIVITY DONE.")?;
+        self.prompt("Make exactly two separate Bash tool calls, in this order: run echo first, then run echo second. Use no other tools. Then reply with exactly ACTIVITY DONE.")?;
         self.wait(Goal::ActivityTurn).await?;
+        if self.activity_snapshots.len() != 2 {
+            return Err(format!(
+                "expected two activity plan snapshots, received {}",
+                self.activity_snapshots.len()
+            ));
+        }
+        let first = &self.activity_snapshots[0];
+        let second = &self.activity_snapshots[1];
+        let first_plan = &first["blocks"][0];
+        let second_plan = &second["blocks"][0];
+        let first_text = first["text"].as_str();
+        let second_text = second["text"].as_str();
+        let first_expected = herdr_connect_rs::activity_message_text(1, "Bash", "echo first");
+        let second_expected = herdr_connect_rs::activity_message_text(2, "Bash", "echo second");
+        let first_shortcode = ":gear: 1 · Bash: echo first";
+        let second_shortcode = ":gear: 2 · Bash: echo second";
+        let checks = [
+            (
+                "first update has one in-progress task and the one-call title",
+                first_plan["title"] == "1 tool call"
+                    && first_plan["tasks"].as_array().is_some_and(|tasks| {
+                        tasks.len() == 1
+                            && tasks[0]["title"] == "Bash: echo first"
+                            && tasks[0]["status"] == "in_progress"
+                    }),
+            ),
+            (
+                "second update completes the first task and marks the second in progress",
+                second_plan["title"] == "2 tool calls"
+                    && second_plan["tasks"].as_array().is_some_and(|tasks| {
+                        tasks.len() == 2
+                            && tasks[0]["title"] == "Bash: echo first"
+                            && tasks[0]["status"] == "complete"
+                            && tasks[1]["title"] == "Bash: echo second"
+                            && tasks[1]["status"] == "in_progress"
+                    }),
+            ),
+            (
+                "Slack receives a fresh plan block id on update",
+                first_plan["block_id"].as_str().is_some_and(|block_id| {
+                    second_plan["block_id"]
+                        .as_str()
+                        .is_some_and(|updated| block_id != updated)
+                }),
+            ),
+            (
+                "text fields preserve the activity notification and cleanup format",
+                first_text.is_some_and(|text| text == first_expected || text == first_shortcode)
+                    && second_text
+                        .is_some_and(|text| text == second_expected || text == second_shortcode)
+                    && first_text.is_some_and(herdr_connect_rs::is_activity_message_text)
+                    && second_text.is_some_and(herdr_connect_rs::is_activity_message_text),
+            ),
+        ];
+        for (case, observed) in checks {
+            if !observed {
+                return Err(format!(
+                    "real Slack activity plan observation failed: {case}; first={first}; second={second}"
+                ));
+            }
+        }
+        println!(
+            "OWNER OBSERVED: plan block showed two tool calls with complete and in-progress task states"
+        );
         let posted = self
             .activity_posted
             .last()
@@ -827,7 +923,7 @@ impl Driver {
                 "activity message {posted} remains in the channel after the turn ended"
             ));
         }
-        println!("OWNER OBSERVED: activity message {posted} deleted after the turn ended");
+        println!("OWNER OBSERVED: activity message deleted after the turn ended");
         Ok(())
     }
 

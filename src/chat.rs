@@ -34,6 +34,88 @@ pub enum ChatScope {
     Service,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityTask {
+    pub id: u32,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityPlan {
+    pub count: u32,
+    pub tasks: Vec<ActivityTask>,
+}
+
+impl ActivityPlan {
+    #[must_use]
+    pub fn next_tool_call(&self, tool: &str, summary: &str) -> Self {
+        let count = self.count + 1;
+        let mut tasks = self
+            .tasks
+            .iter()
+            .rev()
+            .take(49)
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.reverse();
+        tasks.push(ActivityTask {
+            id: count,
+            title: crate::activity_task_title(tool, summary),
+        });
+        Self { count, tasks }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActivityPlan, ActivityTask};
+
+    #[test]
+    fn activity_plan_keeps_the_newest_fifty_tool_calls() {
+        let cases = [
+            (0, Vec::new(), 1, 1, 1),
+            (
+                49,
+                (1..=49)
+                    .map(|id| ActivityTask {
+                        id,
+                        title: format!("call {id}"),
+                    })
+                    .collect(),
+                50,
+                50,
+                1,
+            ),
+            (
+                50,
+                (1..=50)
+                    .map(|id| ActivityTask {
+                        id,
+                        title: format!("call {id}"),
+                    })
+                    .collect(),
+                51,
+                50,
+                2,
+            ),
+        ];
+        for (count, tasks, expected_count, expected_len, expected_first_id) in cases {
+            let plan = ActivityPlan { count, tasks }.next_tool_call("Bash", "echo next");
+            assert_eq!(plan.count, expected_count);
+            assert_eq!(plan.tasks.len(), expected_len);
+            assert_eq!(
+                plan.tasks.first().map(|task| task.id),
+                Some(expected_first_id)
+            );
+            assert_eq!(plan.tasks.last().map(|task| task.id), Some(expected_count));
+            assert_eq!(
+                plan.tasks.last().map(|task| task.title.as_str()),
+                Some("Bash: echo next")
+            );
+        }
+    }
+}
+
 pub enum Ack<'a> {
     Ephemeral(&'a str),
     Defer,
@@ -166,12 +248,14 @@ pub trait Chat: Send + Sync + Sized + 'static {
         &self,
         route: &Self::Route,
         text: &str,
+        plan: &ActivityPlan,
     ) -> impl Future<Output = Result<Self::Message, ChatError>> + Send;
     fn edit_activity(
         &self,
         route: &Self::Route,
         message: &Self::Message,
         text: &str,
+        plan: &ActivityPlan,
     ) -> impl Future<Output = Result<(), ChatError>> + Send;
     fn delete_activity(
         &self,

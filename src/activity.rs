@@ -6,6 +6,7 @@ const CLAUDE_TURN_END_HOOK_EVENT: &str = "Stop";
 const ACTIVITY_PREFIX: &str = "⚙️ ";
 const SLACK_STORED_ACTIVITY_PREFIX: &str = ":gear: ";
 const ACTIVITY_SEPARATOR: &str = " · ";
+const MAX_ACTIVITY_TASK_TITLE_CHARS: usize = 255;
 
 pub const ACTIVITY_KIND: &str = "activity";
 
@@ -152,6 +153,16 @@ pub fn activity_message_text(count: u32, tool: &str, summary: &str) -> String {
 }
 
 #[must_use]
+pub fn activity_task_title(tool: &str, summary: &str) -> String {
+    let title = if summary.is_empty() {
+        tool.to_owned()
+    } else {
+        format!("{tool}: {summary}")
+    };
+    title.chars().take(MAX_ACTIVITY_TASK_TITLE_CHARS).collect()
+}
+
+#[must_use]
 pub fn is_activity_message_text(text: &str) -> bool {
     text.strip_prefix(ACTIVITY_PREFIX)
         .or_else(|| text.strip_prefix(SLACK_STORED_ACTIVITY_PREFIX))
@@ -164,8 +175,8 @@ pub fn is_activity_message_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_message_text, decode_claude_activity_request, decode_codex_activity_request,
-        is_activity_message_text,
+        activity_message_text, activity_task_title, decode_claude_activity_request,
+        decode_codex_activity_request, is_activity_message_text,
     };
 
     #[test]
@@ -245,6 +256,19 @@ mod tests {
         ];
         for (text, expected) in cases {
             assert_eq!(is_activity_message_text(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn activity_task_titles_match_the_tool_summary_and_block_limit() {
+        let long_tool = "B".repeat(300);
+        let cases = [
+            ("Bash", "echo one", "Bash: echo one".to_owned()),
+            ("Bash", "", "Bash".to_owned()),
+            (long_tool.as_str(), "", "B".repeat(255)),
+        ];
+        for (tool, summary, expected) in cases {
+            assert_eq!(activity_task_title(tool, summary), expected);
         }
     }
 

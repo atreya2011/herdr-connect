@@ -2,7 +2,7 @@ use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 
 use super::{Slack, SlackRoute, SlackSocketEvent, SlackState, error};
-use crate::ChatError;
+use crate::{ActivityPlan, ChatError};
 
 pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -14,6 +14,46 @@ fn markdown(text: &str) -> SlackMessageContent {
     SlackMessageContent::new()
         .with_text(escape(text))
         .with_blocks(vec![SlackMarkdownBlock::new(escape(text)).into()])
+}
+
+pub(super) fn activity_content(
+    text: &str,
+    plan: &ActivityPlan,
+    block_id: Option<String>,
+) -> SlackMessageContent {
+    let tasks = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| SlackTaskCardBlock {
+            task_id: SlackTaskId(format!("call_{}", task.id)),
+            title: task.title.clone(),
+            block_id: None,
+            status: Some(if index + 1 == plan.tasks.len() {
+                SlackTaskCardStatus::InProgress
+            } else {
+                SlackTaskCardStatus::Complete
+            }),
+            icon: None,
+            hide_title: None,
+            details: None,
+            output: None,
+            sources: None,
+        })
+        .collect();
+    let title = format!(
+        "{} tool {}",
+        plan.count,
+        if plan.count == 1 { "call" } else { "calls" }
+    );
+    let plan = SlackPlanBlock {
+        title,
+        tasks,
+        block_id: block_id.map(SlackBlockId),
+    };
+    SlackMessageContent::new()
+        .with_text(escape(text))
+        .with_blocks(vec![plan.into()])
 }
 
 impl Slack {
