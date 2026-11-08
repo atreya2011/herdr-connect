@@ -4617,7 +4617,7 @@ mod tests {
         )?;
 
         let suppressed_reply = format!("terminal-origin-{vendor}-suppressed-{nonce}");
-        let suppressed_prompt = format!("Reply with exactly: {suppressed_reply}");
+        let suppressed_prompt = format!("Reply with exactly: {suppressed_reply} ");
         run_terminal_prompt_turn(
             &fixture,
             &mut state,
@@ -4627,7 +4627,7 @@ mod tests {
         )
         .await?;
         let after_suppressed = thread_full_messages(guild, thread).await?;
-        assert_prompt_was_not_mirrored(&after_suppressed, &suppressed_prompt)?;
+        assert_prompt_was_not_mirrored(&after_suppressed, suppressed_prompt.trim_end())?;
 
         queued_prompt_exercise(
             &fixture,
