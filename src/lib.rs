@@ -61,8 +61,9 @@ pub use herdr::{
     STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING, TEST_RUN_PREFIX,
     agent_read_detection, generated_tab_name, is_numeric_label, lifecycle_subscriptions,
     list_agents, list_mirrored, name_unlabeled_tabs, request_rpc_result, retain_mirrored,
-    retain_test_runs, route_is_test_run, status_subscriptions, subscribe_herdr_events, tab_close,
-    tab_list_result, tab_rename, workspace_close, workspace_list_result, workspace_rename,
+    retain_test_runs, route_is_test_run, status_subscriptions, stop_agent, subscribe_herdr_events,
+    tab_close, tab_list_result, tab_rename, workspace_close, workspace_list_result,
+    workspace_rename,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,

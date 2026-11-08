@@ -343,7 +343,7 @@ async fn slack_working_status_loading_text_follows_the_newest_plan_task()
         let mut observed = vec![slack.loading_text(&found).await];
         let prompted = ActivityPlan::default().next_prompt();
         let message = slack
-            .post_activity(&found, &prompt_activity_text(), &prompted)
+            .post_activity(&found, &route.pane_id, &prompt_activity_text(), &prompted)
             .await?;
         slack.set_working(&found, true).await?;
         observed.push(slack.loading_text(&found).await);
@@ -352,6 +352,7 @@ async fn slack_working_status_loading_text_follows_the_newest_plan_task()
             .edit_activity(
                 &found,
                 &message,
+                &route.pane_id,
                 &activity_message_text(1, "Bash", "cargo test"),
                 &called,
             )

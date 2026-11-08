@@ -232,17 +232,22 @@ impl Chat for Slack {
     async fn post_activity(
         &self,
         route: &SlackRoute,
+        pane_id: &str,
         text: &str,
         plan: &crate::ActivityPlan,
     ) -> Result<SlackTs, ChatError> {
         self.follow_plan(route, plan).await;
-        self.send_content(route, super::delivery::activity_content(text, plan, None))
-            .await
+        self.send_content(
+            route,
+            super::delivery::activity_content(text, plan, pane_id, None),
+        )
+        .await
     }
     async fn edit_activity(
         &self,
         route: &SlackRoute,
         message: &SlackTs,
+        pane_id: &str,
         text: &str,
         plan: &crate::ActivityPlan,
     ) -> Result<(), ChatError> {
@@ -253,6 +258,7 @@ impl Chat for Slack {
             super::delivery::activity_content(
                 text,
                 plan,
+                pane_id,
                 Some(format!(
                     "activity-{message}-{}-{}",
                     plan.count, plan.prompts

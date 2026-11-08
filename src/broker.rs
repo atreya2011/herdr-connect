@@ -13,7 +13,9 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::chat::{Ack, Chat, Component};
-use crate::herdr::{STATUS_BLOCKED, agent_read_detection, agent_send_keys, pane_send_text};
+use crate::herdr::{
+    STATUS_BLOCKED, agent_read_detection, agent_send_keys, pane_send_text, stop_agent,
+};
 use crate::permission::{Decision, DecisionBehavior, Interaction};
 use crate::question::{Answer, AnswerStep, Question, answer_steps, dialog_shows_question};
 use crate::registry::{
@@ -582,6 +584,12 @@ pub async fn handle_component<C: Chat>(
             return;
         };
         answer_question_component(&responder, &component.interaction, token, vec![index]).await;
+        return;
+    } else if let Some(pane_id) = component.custom_id.strip_prefix("herdrstop:") {
+        let pane_id = pane_id.to_owned();
+        if let Err(error) = blocking(move || stop_agent(&pane_id)).await {
+            bridge_eprintln!("stop button failed: {error}");
+        }
         return;
     } else if let Some((action, token)) = component
         .custom_id

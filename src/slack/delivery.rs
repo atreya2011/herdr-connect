@@ -70,6 +70,7 @@ fn markdown(text: &str) -> SlackMessageContent {
 pub(super) fn activity_content(
     text: &str,
     plan: &ActivityPlan,
+    pane_id: &str,
     block_id: Option<String>,
 ) -> SlackMessageContent {
     let tasks = plan
@@ -102,9 +103,14 @@ pub(super) fn activity_content(
         tasks,
         block_id: block_id.map(SlackBlockId),
     };
+    let stop = SlackActionsBlock::new(vec![
+        SlackBlockButtonElement::new("Stop".into())
+            .with_action_id(SlackActionId(format!("herdrstop:{pane_id}")))
+            .into(),
+    ]);
     SlackMessageContent::new()
         .with_text(escape(text))
-        .with_blocks(vec![plan.into()])
+        .with_blocks(vec![plan.into(), stop.into()])
 }
 
 impl Slack {

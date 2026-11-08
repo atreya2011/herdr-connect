@@ -164,6 +164,16 @@ pub fn agent_send_keys(target: &str, keys: &[&str]) -> Result<String, String> {
     )
 }
 
+pub fn stop_agent(pane_id: &str) -> Result<(), String> {
+    if list_agents()?.iter().any(|agent| {
+        agent.pane_id == pane_id
+            && matches!(agent.agent_status.as_str(), STATUS_WORKING | STATUS_BLOCKED)
+    }) {
+        agent_send_keys(pane_id, &["esc"])?;
+    }
+    Ok(())
+}
+
 pub fn pane_send_text(pane_id: &str, text: &str) -> Result<String, String> {
     request_rpc_result_with_params("pane.send_text", &json!({"pane_id": pane_id, "text": text}))
 }

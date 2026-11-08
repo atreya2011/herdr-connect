@@ -821,6 +821,7 @@ impl Chat for Discord {
     async fn post_activity(
         &self,
         route: &Self::Route,
+        _pane_id: &str,
         text: &str,
         _plan: &crate::ActivityPlan,
     ) -> Result<Self::Message, ChatError> {
@@ -835,6 +836,7 @@ impl Chat for Discord {
         &self,
         route: &Self::Route,
         message: &Self::Message,
+        _pane_id: &str,
         text: &str,
         _plan: &crate::ActivityPlan,
     ) -> Result<(), ChatError> {

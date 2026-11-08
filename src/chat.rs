@@ -286,6 +286,7 @@ pub trait Chat: Send + Sync + Sized + 'static {
     fn post_activity(
         &self,
         route: &Self::Route,
+        pane_id: &str,
         text: &str,
         plan: &ActivityPlan,
     ) -> impl Future<Output = Result<Self::Message, ChatError>> + Send;
@@ -293,6 +294,7 @@ pub trait Chat: Send + Sync + Sized + 'static {
         &self,
         route: &Self::Route,
         message: &Self::Message,
+        pane_id: &str,
         text: &str,
         plan: &ActivityPlan,
     ) -> impl Future<Output = Result<(), ChatError>> + Send;

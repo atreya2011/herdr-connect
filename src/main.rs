@@ -1284,7 +1284,7 @@ async fn handle_activity_event<C: Chat>(
     if let Some(existing) = existing {
         match responder
             .chat()
-            .edit_activity(&channel, &existing.message, &text, &plan)
+            .edit_activity(&channel, &existing.message, &frame.pane_id, &text, &plan)
             .await
         {
             Ok(()) => {
@@ -1300,7 +1300,11 @@ async fn handle_activity_event<C: Chat>(
         }
         return;
     }
-    match responder.chat().post_activity(&channel, &text, &plan).await {
+    match responder
+        .chat()
+        .post_activity(&channel, &frame.pane_id, &text, &plan)
+        .await
+    {
         Ok(message) => {
             state.activity_messages.insert(
                 frame.pane_id,
