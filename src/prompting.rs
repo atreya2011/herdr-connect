@@ -257,7 +257,7 @@ pub fn take_owner_prompt_suppression(pane_id: &str, text: &str) -> bool {
         .unwrap_or_else(PoisonError::into_inner);
     let Some(index) = suppressions
         .iter()
-        .position(|(pane, expected)| pane == pane_id && expected == text)
+        .position(|(pane, expected)| pane == pane_id && expected.trim() == text.trim())
     else {
         return false;
     };
