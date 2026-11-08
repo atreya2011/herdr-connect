@@ -25,6 +25,7 @@ use crate::{
 };
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const PROMPT_ACTIVITY_PROMPT: &str = "Run exactly one Bash tool call: echo prompt. Use no other tools. Then reply with exactly PROMPT DONE.";
 
 struct Owned {
     label: String,
@@ -58,6 +59,7 @@ enum Goal {
     ActivityPosted,
     MainTurnEnded,
     BackgroundTurn,
+    PromptTurn,
 }
 
 enum Exercise {
@@ -67,6 +69,7 @@ enum Exercise {
     Activity,
     BackgroundActivity,
     RestartActivity,
+    PromptActivity,
 }
 
 struct Driver {
@@ -737,6 +740,9 @@ impl Driver {
                 && self.bot_said("ACTIVITY DONE")
                 && self.settled()?),
             Goal::ActivityPosted => Ok(!self.activity_posted.is_empty()),
+            Goal::PromptTurn => Ok(self.activity_snapshots.len() >= 2
+                && self.bot_said("PROMPT DONE")
+                && self.settled()?),
             Goal::MainTurnEnded => Ok(!self.activity_posted.is_empty()
                 && self.turn_ends > 0
                 && self.bot_said("STARTED")),
@@ -929,6 +935,72 @@ impl Driver {
             ));
         }
         println!("OWNER OBSERVED: activity message deleted after the turn ended");
+        Ok(())
+    }
+
+    async fn prompt_activity(&mut self) -> Result<(), String> {
+        let channel_url = self.ready().await?;
+        action(&format!(
+            "prompt activity: open {channel_url} and post exactly: {PROMPT_ACTIVITY_PROMPT}"
+        ))?;
+        self.wait(Goal::PromptTurn).await?;
+        action(&format!(
+            "prompt reply: in {channel_url}, post NO PROMPT EPHEMERAL if no ephemeral accepted: prompt submitted reply appeared for your prompt."
+        ))?;
+        self.wait(Goal::ReviewConfirmation("NO PROMPT EPHEMERAL"))
+            .await?;
+        if self.activity_snapshots.len() != 2 {
+            return Err(format!(
+                "expected two activity plan snapshots, received {}",
+                self.activity_snapshots.len()
+            ));
+        }
+        let first = &self.activity_snapshots[0];
+        let second = &self.activity_snapshots[1];
+        let first_plan = &first["blocks"][0];
+        let second_plan = &second["blocks"][0];
+        let prompt_text = herdr_connect_rs::prompt_activity_text();
+        let checks = [
+            (
+                "accepted prompt posts a plan block whose only task is Prompt submitted",
+                first_plan["title"] == "Prompt submitted"
+                    && first_plan["tasks"].as_array().is_some_and(|tasks| {
+                        tasks.len() == 1
+                            && tasks[0]["title"] == "Prompt submitted"
+                            && tasks[0]["status"] == "in_progress"
+                    })
+                    && first["text"].as_str().is_some_and(|text| {
+                        (text == prompt_text || text == ":gear: Prompt submitted")
+                            && herdr_connect_rs::is_activity_message_text(text)
+                    }),
+            ),
+            (
+                "next tool call completes the prompt task and adds an in-progress tool task",
+                second_plan["title"] == "1 tool call"
+                    && second_plan["tasks"].as_array().is_some_and(|tasks| {
+                        tasks.len() == 2
+                            && tasks[0]["title"] == "Prompt submitted"
+                            && tasks[0]["status"] == "complete"
+                            && tasks[1]["title"] == "Bash: echo prompt"
+                            && tasks[1]["status"] == "in_progress"
+                    }),
+            ),
+            (
+                "next tool call edits the same activity message",
+                self.activity_posted.len() == 1,
+            ),
+        ];
+        for (case, observed) in checks {
+            if !observed {
+                return Err(format!(
+                    "real Slack prompt activity observation failed: {case}; first={first}; second={second}; posted={:?}",
+                    self.activity_posted
+                ));
+            }
+        }
+        println!(
+            "OWNER OBSERVED: accepted prompt showed in the plan block without an ephemeral reply, and the tool call edited that message"
+        );
         Ok(())
     }
 
@@ -1370,6 +1442,7 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
                     Exercise::Activity => driver.activity_deleted().await,
                     Exercise::BackgroundActivity => driver.background_activity_deleted().await,
                     Exercise::RestartActivity => driver.restart_activity_deleted().await,
+                    Exercise::PromptActivity => driver.prompt_activity().await,
                 }
             } => result,
             _ = tokio::signal::ctrl_c() => Err("owner acceptance interrupted; cleaning up owned fixtures".into()),
@@ -1420,4 +1493,12 @@ async fn real_claude_activity_message_is_deleted_when_the_main_turn_ends_during_
 async fn real_claude_activity_message_posted_before_a_restart_is_deleted_after_it()
 -> Result<(), String> {
     run_owner_exercise(Exercise::RestartActivity).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires the real Slack owner to post the printed prompt and confirm the reply"]
+async fn owner_prompt_shows_as_the_only_plan_task_and_the_next_tool_call_edits_that_message()
+-> Result<(), String> {
+    run_owner_exercise(Exercise::PromptActivity).await
 }
