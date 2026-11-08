@@ -26,7 +26,7 @@ pub(super) fn activity_content(
         .iter()
         .enumerate()
         .map(|(index, task)| SlackTaskCardBlock {
-            task_id: SlackTaskId(format!("call_{}", task.id)),
+            task_id: SlackTaskId(task.id.clone()),
             title: task.title.clone(),
             block_id: None,
             status: Some(if index + 1 == plan.tasks.len() {
@@ -41,11 +41,11 @@ pub(super) fn activity_content(
             sources: None,
         })
         .collect();
-    let title = format!(
-        "{} tool {}",
-        plan.count,
-        if plan.count == 1 { "call" } else { "calls" }
-    );
+    let title = match plan.count {
+        0 => crate::PROMPT_TASK_TITLE.to_owned(),
+        1 => "1 tool call".to_owned(),
+        count => format!("{count} tool calls"),
+    };
     let plan = SlackPlanBlock {
         title,
         tasks,

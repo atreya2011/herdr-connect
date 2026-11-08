@@ -109,6 +109,7 @@ impl Chat for Slack {
     type Posted = SlackMessageEvent;
     type Deletion = SlackArchive;
     const DELETES_ACTIVITY: bool = true;
+    const PROMPT_ACTIVITY: bool = true;
 
     fn owner_id(&self) -> &str {
         &self.owner.0
@@ -249,7 +250,10 @@ impl Chat for Slack {
             super::delivery::activity_content(
                 text,
                 plan,
-                Some(format!("activity-{message}-{}", plan.count)),
+                Some(format!(
+                    "activity-{message}-{}-{}",
+                    plan.count, plan.prompts
+                )),
             ),
         )
         .await

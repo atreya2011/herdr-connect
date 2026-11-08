@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::activity::ActivityFrame;
 use crate::broker::{PermissionResponder, handle_component};
 use crate::chat::{Chat, Closed, Inbound};
 use crate::{tab_close, workspace_close};
@@ -12,6 +13,7 @@ struct OwnerPromptRequest<C: Chat> {
     responder: Arc<PermissionResponder<C>>,
     posted: C::Posted,
     notices: Sender<String>,
+    activity: UnboundedSender<ActivityFrame>,
 }
 
 async fn consume_in_order<T, F, Fut>(mut receiver: UnboundedReceiver<T>, mut process: F)
@@ -32,8 +34,12 @@ fn spawn_owner_prompt_consumer<C: Chat>() -> UnboundedSender<OwnerPromptRequest<
 }
 
 async fn process_owner_prompt<C: Chat>(request: OwnerPromptRequest<C>) {
-    let result =
-        crate::prompting::handle_owner_message(request.responder.as_ref(), request.posted).await;
+    let result = crate::prompting::handle_owner_message(
+        request.responder.as_ref(),
+        request.posted,
+        &request.activity,
+    )
+    .await;
     if let Err(error) = result {
         let _ = request
             .notices
@@ -52,6 +58,7 @@ pub fn close_in_herdr(closed: Closed) -> Result<(), String> {
 pub async fn drive_gateway<C: Chat>(
     responder: Arc<PermissionResponder<C>>,
     notices: Sender<String>,
+    activity: UnboundedSender<ActivityFrame>,
 ) -> Result<(), String> {
     let owner_prompt_sender = spawn_owner_prompt_consumer::<C>();
     while let Some(item) = responder.chat().next_event().await {
@@ -61,6 +68,7 @@ pub async fn drive_gateway<C: Chat>(
                     responder: Arc::clone(&responder),
                     posted,
                     notices: notices.clone(),
+                    activity: activity.clone(),
                 };
                 if owner_prompt_sender.send(request).is_err() {
                     "chat owner prompt error: owner prompt queue closed".to_owned()

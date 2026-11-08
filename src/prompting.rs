@@ -4,6 +4,9 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::activity::{ACTIVITY_KIND, ActivityFrame};
 use crate::broker::{PermissionResponder, QuestionOutcome};
 use crate::herdr::{
     PROMPT_ACKNOWLEDGED_UNCONFIRMED, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE, STATUS_WORKING,
@@ -25,6 +28,7 @@ static OWNER_PROMPT_SUPPRESSIONS: LazyLock<Mutex<Vec<OwnerPromptSuppression>>> =
 pub async fn handle_owner_message<C: Chat>(
     responder: &PermissionResponder<C>,
     posted: C::Posted,
+    activity: &UnboundedSender<ActivityFrame>,
 ) -> Result<(), String> {
     let chat = responder.chat();
     let Some(OwnerMessage {
@@ -87,6 +91,27 @@ pub async fn handle_owner_message<C: Chat>(
         .await
         .map_err(|error| format!("agent.prompt task failed: {error}"))?;
     match result {
+        Ok(_) if C::PROMPT_ACTIVITY => {
+            accepted_status(chat.as_ref(), &route, &message).await;
+            activity
+                .send(ActivityFrame {
+                    kind: ACTIVITY_KIND.to_owned(),
+                    vendor: agent.agent.clone().unwrap_or_default(),
+                    workspace_id: agent.workspace_id.clone(),
+                    tab_id: agent.tab_id.clone(),
+                    pane_id,
+                    session_id: agent
+                        .session
+                        .as_ref()
+                        .map(|session| session.value.clone())
+                        .unwrap_or_default(),
+                    tool: String::new(),
+                    summary: String::new(),
+                    turn_end: false,
+                    prompt: true,
+                })
+                .map_err(|_| "prompt activity queue closed".to_owned())
+        }
         Ok(_) => {
             accepted_status(chat.as_ref(), &route, &message).await;
             Ok(chat.reply(&route, &message, PROMPT_ACCEPTED_REPLY).await?)

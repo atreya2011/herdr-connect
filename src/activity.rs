@@ -9,6 +9,7 @@ const ACTIVITY_SEPARATOR: &str = " · ";
 const MAX_ACTIVITY_TASK_TITLE_CHARS: usize = 255;
 
 pub const ACTIVITY_KIND: &str = "activity";
+pub const PROMPT_TASK_TITLE: &str = "Prompt submitted";
 
 const MAX_SUMMARY_CHARS: usize = 80;
 
@@ -24,6 +25,8 @@ pub struct ActivityFrame {
     pub summary: String,
     #[serde(default)]
     pub turn_end: bool,
+    #[serde(default)]
+    pub prompt: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +156,11 @@ pub fn activity_message_text(count: u32, tool: &str, summary: &str) -> String {
 }
 
 #[must_use]
+pub fn prompt_activity_text() -> String {
+    format!("{ACTIVITY_PREFIX}{PROMPT_TASK_TITLE}")
+}
+
+#[must_use]
 pub fn activity_task_title(tool: &str, summary: &str) -> String {
     let title = if summary.is_empty() {
         tool.to_owned()
@@ -166,9 +174,13 @@ pub fn activity_task_title(tool: &str, summary: &str) -> String {
 pub fn is_activity_message_text(text: &str) -> bool {
     text.strip_prefix(ACTIVITY_PREFIX)
         .or_else(|| text.strip_prefix(SLACK_STORED_ACTIVITY_PREFIX))
-        .and_then(|rest| rest.split_once(ACTIVITY_SEPARATOR))
-        .is_some_and(|(count, _)| {
-            !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+        .is_some_and(|rest| {
+            rest == PROMPT_TASK_TITLE
+                || rest
+                    .split_once(ACTIVITY_SEPARATOR)
+                    .is_some_and(|(count, _)| {
+                        !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+                    })
         })
 }
 

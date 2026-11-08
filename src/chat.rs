@@ -36,13 +36,14 @@ pub enum ChatScope {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivityTask {
-    pub id: u32,
+    pub id: String,
     pub title: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ActivityPlan {
     pub count: u32,
+    pub prompts: u32,
     pub tasks: Vec<ActivityTask>,
 }
 
@@ -50,6 +51,30 @@ impl ActivityPlan {
     #[must_use]
     pub fn next_tool_call(&self, tool: &str, summary: &str) -> Self {
         let count = self.count + 1;
+        Self {
+            count,
+            prompts: self.prompts,
+            tasks: self.appended(ActivityTask {
+                id: format!("call_{count}"),
+                title: crate::activity_task_title(tool, summary),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn next_prompt(&self) -> Self {
+        let prompts = self.prompts + 1;
+        Self {
+            count: self.count,
+            prompts,
+            tasks: self.appended(ActivityTask {
+                id: format!("prompt_{prompts}"),
+                title: crate::PROMPT_TASK_TITLE.to_owned(),
+            }),
+        }
+    }
+
+    fn appended(&self, task: ActivityTask) -> Vec<ActivityTask> {
         let mut tasks = self
             .tasks
             .iter()
@@ -58,11 +83,8 @@ impl ActivityPlan {
             .cloned()
             .collect::<Vec<_>>();
         tasks.reverse();
-        tasks.push(ActivityTask {
-            id: count,
-            title: crate::activity_task_title(tool, summary),
-        });
-        Self { count, tasks }
+        tasks.push(task);
+        tasks
     }
 }
 
@@ -78,7 +100,7 @@ mod tests {
                 49,
                 (1..=49)
                     .map(|id| ActivityTask {
-                        id,
+                        id: format!("call_{id}"),
                         title: format!("call {id}"),
                     })
                     .collect(),
@@ -90,7 +112,7 @@ mod tests {
                 50,
                 (1..=50)
                     .map(|id| ActivityTask {
-                        id,
+                        id: format!("call_{id}"),
                         title: format!("call {id}"),
                     })
                     .collect(),
@@ -100,14 +122,22 @@ mod tests {
             ),
         ];
         for (count, tasks, expected_count, expected_len, expected_first_id) in cases {
-            let plan = ActivityPlan { count, tasks }.next_tool_call("Bash", "echo next");
+            let plan = ActivityPlan {
+                count,
+                prompts: 0,
+                tasks,
+            }
+            .next_tool_call("Bash", "echo next");
             assert_eq!(plan.count, expected_count);
             assert_eq!(plan.tasks.len(), expected_len);
             assert_eq!(
-                plan.tasks.first().map(|task| task.id),
-                Some(expected_first_id)
+                plan.tasks.first().map(|task| task.id.clone()),
+                Some(format!("call_{expected_first_id}"))
             );
-            assert_eq!(plan.tasks.last().map(|task| task.id), Some(expected_count));
+            assert_eq!(
+                plan.tasks.last().map(|task| task.id.clone()),
+                Some(format!("call_{expected_count}"))
+            );
             assert_eq!(
                 plan.tasks.last().map(|task| task.title.as_str()),
                 Some("Bash: echo next")
@@ -168,6 +198,7 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Posted: Send + 'static;
     type Deletion: Display + Send + 'static;
     const DELETES_ACTIVITY: bool = false;
+    const PROMPT_ACTIVITY: bool = false;
 
     fn owner_id(&self) -> &str;
     fn scope(&self) -> ChatScope;

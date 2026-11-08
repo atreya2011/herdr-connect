@@ -11,9 +11,9 @@ use twilight_http::Client;
 use twilight_model::id::{Id, marker::GuildMarker};
 
 use herdr_connect_rs::{
-    ACTIVITY_KIND, ActivityFrame, ActivityPlan, ActivityTask, activity_message_text,
-    activity_task_title, bridge_eprintln, bridge_println, decode_claude_activity_request,
-    decode_codex_activity_request, decode_cursor_activity_request, send_activity_frame,
+    ACTIVITY_KIND, ActivityFrame, ActivityPlan, activity_message_text, bridge_eprintln,
+    bridge_println, decode_claude_activity_request, decode_codex_activity_request,
+    decode_cursor_activity_request, prompt_activity_text, send_activity_frame,
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, ChatScope, Discord,
@@ -110,6 +110,7 @@ impl<C: Chat> Default for BridgeState<C> {
 struct ActivityMessage<C: Chat> {
     channel: C::Route,
     message: C::Message,
+    text: String,
     plan: ActivityPlan,
 }
 
@@ -475,6 +476,7 @@ async fn process_scoped_snapshot<C: Chat>(
     {
         let seq = next_state_change_sequence(&mut state.state_change_sequences, &terminal);
         let leaving_blocked = old == STATUS_BLOCKED && status != STATUS_BLOCKED;
+        let leaving_turn_end = matches!(old.as_str(), STATUS_IDLE | STATUS_DONE);
         let transition = Transition {
             from: old,
             to: status.clone(),
@@ -494,7 +496,9 @@ async fn process_scoped_snapshot<C: Chat>(
             state,
         )
         .await;
-        if matches!(status.as_str(), STATUS_WORKING | STATUS_IDLE | STATUS_DONE) {
+        if matches!(status.as_str(), STATUS_IDLE | STATUS_DONE)
+            || (status == STATUS_WORKING && !leaving_turn_end)
+        {
             delete_activity_message(discord, state, &snapshot.pane_id).await;
         }
     }
@@ -1236,7 +1240,7 @@ async fn handle_activity_event<C: Chat>(
         }
         return;
     }
-    if !state.activity_eligible_panes.contains(&frame.pane_id) {
+    if !frame.prompt && !state.activity_eligible_panes.contains(&frame.pane_id) {
         return;
     }
     if state.ignore_test_runs
@@ -1261,15 +1265,32 @@ async fn handle_activity_event<C: Chat>(
             return;
         }
     };
-    if let Some(existing) = state.activity_messages.get_mut(&frame.pane_id) {
-        let plan = existing.plan.next_tool_call(&frame.tool, &frame.summary);
+    let existing = state.activity_messages.get_mut(&frame.pane_id);
+    let previous = existing
+        .as_ref()
+        .map_or_else(ActivityPlan::default, |existing| existing.plan.clone());
+    let (plan, text) = if frame.prompt {
+        let plan = previous.next_prompt();
+        let text = match &existing {
+            Some(existing) if plan.count > 0 => existing.text.clone(),
+            _ => prompt_activity_text(),
+        };
+        (plan, text)
+    } else {
+        let plan = previous.next_tool_call(&frame.tool, &frame.summary);
         let text = activity_message_text(plan.count, &frame.tool, &frame.summary);
+        (plan, text)
+    };
+    if let Some(existing) = existing {
         match responder
             .chat()
             .edit_activity(&channel, &existing.message, &text, &plan)
             .await
         {
-            Ok(()) => existing.plan = plan,
+            Ok(()) => {
+                existing.plan = plan;
+                existing.text = text;
+            }
             Err(error) => {
                 bridge_eprintln!(
                     "activity edit delivery error for pane {}: {error}",
@@ -1279,14 +1300,6 @@ async fn handle_activity_event<C: Chat>(
         }
         return;
     }
-    let text = activity_message_text(1, &frame.tool, &frame.summary);
-    let plan = ActivityPlan {
-        count: 1,
-        tasks: vec![ActivityTask {
-            id: 1,
-            title: activity_task_title(&frame.tool, &frame.summary),
-        }],
-    };
     match responder.chat().post_activity(&channel, &text, &plan).await {
         Ok(message) => {
             state.activity_messages.insert(
@@ -1294,6 +1307,7 @@ async fn handle_activity_event<C: Chat>(
                 ActivityMessage {
                     channel,
                     message,
+                    text,
                     plan,
                 },
             );
@@ -1418,6 +1432,7 @@ async fn discord_connection(
     topology_cache: TopologyCache,
     ignore_test_runs: bool,
     scope: ChatScope,
+    activity_tx: tokio::sync::mpsc::UnboundedSender<ActivityFrame>,
 ) -> Result<(ChatConnection<Discord>, GatewayTask), Box<dyn std::error::Error>> {
     let mut environment: Vec<(&str, String)> = Vec::new();
     for name in [
@@ -1464,7 +1479,11 @@ async fn discord_connection(
     if let Err(error) = herdr_connect_rs::fetch_topology_lists(&client, guild).await {
         bridge_eprintln!("discord startup topology registration error: {error}");
     }
-    let gateway = tokio::spawn(drive_gateway(Arc::clone(&responder), notices_tx));
+    let gateway = tokio::spawn(drive_gateway(
+        Arc::clone(&responder),
+        notices_tx,
+        activity_tx,
+    ));
     Ok(((chat, responder, identity), gateway))
 }
 
@@ -1686,6 +1705,7 @@ async fn run_activity(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         tool: request.tool,
         summary: request.summary,
         turn_end: request.turn_end,
+        prompt: false,
     };
     send_activity_frame(&frame, &socket_path, Duration::from_secs(1)).await;
     Ok(())
@@ -2296,9 +2316,15 @@ async fn next_status_event(
 async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
     herdr_connect_rs::enable_production_topology();
     let topology_cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
-    let (connection, gateway) =
-        discord_connection(topology_cache, true, ChatScope::Service).await?;
-    run_connected_bridge(connection, gateway).await
+    let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
+    let (connection, gateway) = discord_connection(
+        topology_cache,
+        true,
+        ChatScope::Service,
+        activity_tx.clone(),
+    )
+    .await?;
+    run_connected_bridge(connection, gateway, activity_tx, activity_events).await
 }
 
 async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
@@ -2318,11 +2344,21 @@ async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
             bridge_eprintln!("{notice}");
         }
     });
-    let gateway = tokio::spawn(drive_gateway(responder.clone(), notices_tx));
+    let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = tokio::spawn(drive_gateway(
+        responder.clone(),
+        notices_tx,
+        activity_tx.clone(),
+    ));
     let abort = gateway.abort_handle();
-    let result = run_connected_bridge((chat.clone(), responder, identity), gateway)
-        .await
-        .map_err(|error| error.to_string());
+    let result = run_connected_bridge(
+        (chat.clone(), responder, identity),
+        gateway,
+        activity_tx,
+        activity_events,
+    )
+    .await
+    .map_err(|error| error.to_string());
     abort.abort();
     chat.shutdown_socket().await?;
     result.map_err(Into::into)
@@ -2331,8 +2367,9 @@ async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_connected_bridge<C: Chat>(
     connection: ChatConnection<C>,
     mut gateway: GatewayTask,
+    activity_tx: tokio::sync::mpsc::UnboundedSender<ActivityFrame>,
+    activity_events: tokio::sync::mpsc::UnboundedReceiver<ActivityFrame>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (activity_tx, activity_events) = tokio::sync::mpsc::unbounded_channel();
     let mut broker = start_broker(&connection, activity_tx);
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
@@ -4992,6 +5029,7 @@ mod tests {
             tool: "LateGhost".to_owned(),
             summary: "late-frame-should-be-dropped".to_owned(),
             turn_end: false,
+            prompt: false,
         }
     }
 
@@ -5532,7 +5570,8 @@ mod tests {
                 );
                 message.author.bot = false;
                 message.guild_id = Some(guild.id);
-                herdr_connect_rs::handle_owner_message(&responder, message).await?;
+                let (activity, _) = tokio::sync::mpsc::unbounded_channel();
+                herdr_connect_rs::handle_owner_message(&responder, message, &activity).await?;
             }
             QuestionAction::TwoQuestions(second) => {
                 let card_before = card_message_ids(guild, thread).await?;
@@ -7794,9 +7833,11 @@ mod tests {
         String,
     > {
         let (notices_tx, notices_rx) = std::sync::mpsc::channel();
+        let (activity, _) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(herdr_connect_rs::drive_gateway(
             Arc::clone(&connection.1),
             notices_tx,
+            activity,
         ));
         tokio::time::sleep(GATEWAY_READY_WAIT).await;
         Ok((task, notices_rx))

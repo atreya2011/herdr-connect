@@ -12,7 +12,7 @@ use herdr_connect_rs::{
 use serde_json::{Value, json};
 use serial_test::serial;
 use slack_morphism::prelude::*;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::{
@@ -80,6 +80,7 @@ struct Driver {
     events: UnboundedReceiver<Result<Inbound<Slack>, ChatError>>,
     live: UnboundedReceiver<String>,
     activity: UnboundedReceiver<herdr_connect_rs::ActivityFrame>,
+    activity_tx: UnboundedSender<herdr_connect_rs::ActivityFrame>,
     tasks: JoinSet<Result<(), String>>,
     clock: tokio::time::Interval,
     messages: Vec<SlackHistoryMessage>,
@@ -204,8 +205,9 @@ impl Owned {
         let socket = self.directory.join("broker.sock");
         let broker_responder = responder.clone();
         let broker_socket = socket.clone();
+        let broker_activity_tx = activity_tx.clone();
         self.broker = Some(tokio::spawn(async move {
-            herdr_connect_rs::run_broker(&broker_socket, broker_responder, activity_tx).await
+            herdr_connect_rs::run_broker(&broker_socket, broker_responder, broker_activity_tx).await
         }));
         tokio::time::timeout(Duration::from_secs(10), async {
             while !socket.exists() {
@@ -272,6 +274,7 @@ impl Owned {
             events,
             live,
             activity,
+            activity_tx,
             tasks: JoinSet::new(),
             clock: tokio::time::interval(Duration::from_secs(2)),
             messages: Vec::new(),
@@ -542,8 +545,10 @@ impl Driver {
                     return Ok(());
                 }
                 let responder = self.connection.1.clone();
-                self.tasks
-                    .spawn(async move { handle_owner_message(&responder, posted).await });
+                let activity = self.activity_tx.clone();
+                self.tasks.spawn(async move {
+                    handle_owner_message(&responder, posted, &activity).await
+                });
             }
             Inbound::Component(component)
                 if component.route == self.route && component.authorized =>
