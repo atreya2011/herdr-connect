@@ -1,5 +1,6 @@
 use crate::{
-    ChatError, ChatScope, TopologyClosure, TopologyRoute, tab_list_result, workspace_list_result,
+    ChatError, ChatScope, HerdrTab, HerdrWorkspace, TopologyClosure, TopologyRoute,
+    tab_list_result, workspace_list_result,
 };
 use slack_morphism::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -82,12 +83,12 @@ fn normalize(label: &str) -> String {
         .trim_matches('-')
         .to_owned()
 }
-pub fn slack_channel_name(
+fn slack_name_parts(
     workspace: &str,
     workspace_id: &str,
     tab: &str,
     tab_id: &str,
-) -> Result<String, ChatError> {
+) -> Result<[String; 4], ChatError> {
     let (parent, short) = tab_id
         .split_once(':')
         .ok_or_else(|| error("tab id has no workspace prefix"))?;
@@ -106,13 +107,47 @@ pub fn slack_channel_name(
     let first = workspace.chars().count().min(room.div_ceil(2));
     let second = tab.chars().count().min(room - first);
     let first = workspace.chars().count().min(room - second);
-    Ok(format!(
-        "{}-{parent}-{}-{short}",
-        workspace.chars().take(first).collect::<String>(),
-        tab.chars().take(second).collect::<String>()
+    Ok([
+        workspace.chars().take(first).collect(),
+        parent,
+        tab.chars().take(second).collect(),
+        short,
+    ])
+}
+pub fn slack_channel_name(
+    workspace: &str,
+    workspace_id: &str,
+    tab: &str,
+    tab_id: &str,
+) -> Result<String, ChatError> {
+    let [workspace, parent, tab, short] = slack_name_parts(workspace, workspace_id, tab, tab_id)?;
+    Ok(format!("{workspace}-{parent}-{tab}-{short}"))
+}
+fn renamed_tab_label(
+    name: &str,
+    workspace: &HerdrWorkspace,
+    tab: &HerdrTab,
+) -> Result<Option<String>, ChatError> {
+    let [workspace_part, parent, tab_part, short] = slack_name_parts(
+        &workspace.label,
+        &workspace.workspace_id,
+        &tab.label,
+        &tab.tab_id,
+    )?;
+    let prefix = format!("{workspace_part}-{parent}-");
+    let suffix = format!("-{short}");
+    if name == format!("{prefix}{tab_part}{suffix}") {
+        return Ok(None);
+    }
+    Ok(Some(
+        name.strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(&suffix))
+            .filter(|middle| !middle.is_empty())
+            .unwrap_or(name)
+            .to_owned(),
     ))
 }
-fn named_tab(workspace: &str, tab: &str) -> Result<(String, bool), ChatError> {
+fn herdr_tab(workspace: &str, tab: &str) -> Result<(HerdrWorkspace, HerdrTab), ChatError> {
     let workspace = workspace_list_result()
         .map_err(error)?
         .into_iter()
@@ -123,6 +158,10 @@ fn named_tab(workspace: &str, tab: &str) -> Result<(String, bool), ChatError> {
         .into_iter()
         .find(|entry| entry.tab_id == tab && entry.workspace_id == workspace.workspace_id)
         .ok_or_else(|| error("Herdr tab disappeared"))?;
+    Ok((workspace, tab))
+}
+fn named_tab(workspace: &str, tab: &str) -> Result<(String, bool), ChatError> {
+    let (workspace, tab) = herdr_tab(workspace, tab)?;
     Ok((
         slack_channel_name(
             &workspace.label,
@@ -674,4 +713,47 @@ impl SlackState {
 fn report_topology_failure(failure: ChatError, last: &mut Option<ChatError>) {
     crate::bridge_eprintln!("Slack startup topology error: {failure}");
     *last = Some(failure);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renamed_tab_label;
+    use crate::{HerdrTab, HerdrWorkspace};
+
+    #[test]
+    fn owner_channel_names_become_tab_labels_and_bridge_names_are_ignored() {
+        let workspace = HerdrWorkspace {
+            workspace_id: "w1F7".to_owned(),
+            label: "testrun-slack-1794106534313".to_owned(),
+        };
+        let tab = HerdrTab {
+            tab_id: "w1F7:t1".to_owned(),
+            workspace_id: "w1F7".to_owned(),
+            label: "testrun-build".to_owned(),
+        };
+        let cases = [
+            (
+                "a name that keeps the bridge prefix and suffix",
+                "testrun-slack-1794106534313-w1f7-testrun-deploy-t1",
+                Some("testrun-deploy"),
+            ),
+            (
+                "a name without the bridge prefix and suffix",
+                "testrun-slack-1794106534313-whole",
+                Some("testrun-slack-1794106534313-whole"),
+            ),
+            (
+                "the name the bridge sets",
+                "testrun-slack-1794106534313-w1f7-testrun-build-t1",
+                None,
+            ),
+        ];
+        for (name, channel, expected) in cases {
+            assert_eq!(
+                renamed_tab_label(channel, &workspace, &tab).ok(),
+                Some(expected.map(str::to_owned)),
+                "{name}"
+            );
+        }
+    }
 }

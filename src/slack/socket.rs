@@ -6,7 +6,7 @@ use slack_morphism::prelude::*;
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 
 use super::{Slack, SlackRoute, error, identity};
-use crate::{ChatError, Closed};
+use crate::{ChatError, Closed, Renamed};
 
 pub enum SlackSocketEvent {
     Push(Box<SlackPushEventCallback>),
@@ -285,6 +285,69 @@ impl Slack {
         topology.tabs.retain(|_, route| route.channel != channel.id);
         drop(topology);
         Ok(())
+    }
+
+    pub async fn rename_channel<F>(
+        &self,
+        renamed: SlackMessageEvent,
+        apply: F,
+    ) -> Result<(), ChatError>
+    where
+        F: FnOnce(Renamed) -> Result<(), String> + Send + 'static,
+    {
+        if renamed.sender.user.as_ref() != Some(&self.owner) {
+            return Ok(());
+        }
+        let Some(channel) = renamed.origin.channel else {
+            return Ok(());
+        };
+        let info = self
+            .state
+            .client
+            .open_session(&self.state.token)
+            .conversations_info(&SlackApiConversationsInfoRequest::new(channel))
+            .await
+            .map_err(error)?
+            .channel;
+        if !super::channel_scope(self.scope, self.ignore_test_runs, &info) {
+            return Ok(());
+        }
+        let Some((workspace, tab)) = identity(&info) else {
+            return Ok(());
+        };
+        if self.excluded(workspace, tab).await? {
+            return Ok(());
+        }
+        let Some(name) = info.name.clone() else {
+            return Ok(());
+        };
+        let (workspace, tab) = (workspace.to_owned(), tab.to_owned());
+        let (workspace, tab) =
+            tokio::task::spawn_blocking(move || super::herdr_tab(&workspace, &tab))
+                .await
+                .map_err(error)??;
+        let Some(label) = super::renamed_tab_label(&name, &workspace, &tab)? else {
+            return Ok(());
+        };
+        {
+            let mut topology = self.state.topology.lock().await;
+            if let Some(entry) = topology
+                .channels
+                .iter_mut()
+                .find(|entry| entry.id == info.id)
+            {
+                entry.name = Some(name);
+            }
+        }
+        tokio::task::spawn_blocking(move || {
+            apply(Renamed::Tab {
+                tab_id: tab.tab_id,
+                label,
+            })
+        })
+        .await
+        .map_err(error)?
+        .map_err(error)
     }
 }
 

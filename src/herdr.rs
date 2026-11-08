@@ -285,9 +285,17 @@ fn rename_failure_to_report(
     }
 }
 
-fn tab_rename(tab_id: &str, label: &str) -> Result<(), String> {
+pub fn tab_rename(tab_id: &str, label: &str) -> Result<(), String> {
     request_rpc_result_with_params("tab.rename", &json!({"tab_id": tab_id, "label": label}))
         .map(|_| ())
+}
+
+pub fn workspace_rename(workspace_id: &str, label: &str) -> Result<(), String> {
+    request_rpc_result_with_params(
+        "workspace.rename",
+        &json!({"workspace_id": workspace_id, "label": label}),
+    )
+    .map(|_| ())
 }
 
 #[derive(Clone, Deserialize, Debug)]

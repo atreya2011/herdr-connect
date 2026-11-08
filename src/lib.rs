@@ -18,6 +18,7 @@ mod prompting;
 mod question;
 mod readers;
 mod registry;
+mod rename;
 mod slack;
 mod topology;
 mod watcher;
@@ -37,7 +38,7 @@ pub use cards::{
 };
 pub use chat::{
     Ack, ActivityPlan, ActivityTask, Chat, ChatError, ChatScope, Closed, Component, Inbound,
-    OwnerMessage, TopologyClosure,
+    OwnerMessage, Renamed, TopologyClosure,
 };
 pub use config::{
     DiscordConfig, ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME,
@@ -61,7 +62,7 @@ pub use herdr::{
     agent_read_detection, generated_tab_name, is_numeric_label, lifecycle_subscriptions,
     list_agents, list_mirrored, name_unlabeled_tabs, request_rpc_result, retain_mirrored,
     retain_test_runs, route_is_test_run, status_subscriptions, subscribe_herdr_events, tab_close,
-    tab_list_result, workspace_close, workspace_list_result,
+    tab_list_result, tab_rename, workspace_close, workspace_list_result, workspace_rename,
 };
 pub use permission::{
     ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
@@ -80,6 +81,7 @@ pub use readers::{
     read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
     read_cursor_incremental, read_cursor_prompts_incremental,
 };
+pub use rename::{GuildRename, handle_guild_rename};
 pub use slack::{Slack, SlackArchive, SlackRoute, SlackSocketEvent, slack_channel_name};
 pub use topology::{
     HerdrName, TopologyCache, TopologyRoute, archived_threads, cached_route, channel_is_test_run,

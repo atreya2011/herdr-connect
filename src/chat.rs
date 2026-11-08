@@ -158,6 +158,12 @@ pub enum Closed {
     Workspace(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Renamed {
+    Tab { tab_id: String, label: String },
+    Workspace { workspace_id: String, label: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TopologyClosure {
     Tab {
@@ -189,6 +195,7 @@ pub enum Inbound<C: Chat> {
     Posted(C::Posted),
     Component(Component<C>),
     Deleted(C::Deletion),
+    Renamed(C::Rename),
 }
 
 pub trait Chat: Send + Sync + Sized + 'static {
@@ -197,6 +204,7 @@ pub trait Chat: Send + Sync + Sized + 'static {
     type Interaction: Clone + Send + Sync + 'static;
     type Posted: Send + 'static;
     type Deletion: Display + Send + 'static;
+    type Rename: Send + 'static;
     const DELETES_ACTIVITY: bool = false;
     const PROMPT_ACTIVITY: bool = false;
 
@@ -367,4 +375,11 @@ pub trait Chat: Send + Sync + Sized + 'static {
     ) -> impl Future<Output = Result<(), ChatError>> + Send
     where
         F: FnOnce(Closed) -> Result<(), String> + Send + 'static;
+    fn handle_rename<F>(
+        &self,
+        rename: Self::Rename,
+        apply: F,
+    ) -> impl Future<Output = Result<(), ChatError>> + Send
+    where
+        F: FnOnce(Renamed) -> Result<(), String> + Send + 'static;
 }

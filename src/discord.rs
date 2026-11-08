@@ -19,10 +19,12 @@ use twilight_model::id::{
 };
 
 use crate::chat::{
-    Ack, Chat, ChatError, ChatScope, Closed, Component, Inbound, OwnerMessage, TopologyClosure,
+    Ack, Chat, ChatError, ChatScope, Closed, Component, Inbound, OwnerMessage, Renamed,
+    TopologyClosure,
 };
 use crate::deletion::{GuildDeletion, handle_guild_deletion};
 use crate::delivery::expire_permission_card;
+use crate::rename::{GuildRename, handle_guild_rename, owned_rename};
 
 use crate::{
     HerdrName, OwnerIdentity, PermissionVendor, Question, TEST_RUN_PREFIX, TopologyCache,
@@ -553,6 +555,7 @@ impl Chat for Discord {
     type Interaction = DiscordInteraction;
     type Posted = twilight_model::channel::Message;
     type Deletion = GuildDeletion;
+    type Rename = GuildRename;
 
     fn owner_id(&self) -> &str {
         &self.owner_id
@@ -1160,12 +1163,18 @@ impl Chat for Discord {
                 }
                 Ok(Event::ChannelUpdate(channel)) if channel.guild_id == Some(self.guild) => {
                     crate::remember_workspace_channels(std::slice::from_ref(&channel.0));
+                    if let Some(rename) = owned_rename(channel.0) {
+                        return Some(Ok(Inbound::Renamed(rename)));
+                    }
                 }
                 Ok(Event::ThreadCreate(thread)) if thread.guild_id == Some(self.guild) => {
                     crate::remember_tab_threads(std::slice::from_ref(&thread.0));
                 }
                 Ok(Event::ThreadUpdate(thread)) if thread.guild_id == Some(self.guild) => {
                     crate::remember_tab_threads(std::slice::from_ref(&thread.0));
+                    if let Some(rename) = owned_rename(thread.0) {
+                        return Some(Ok(Inbound::Renamed(rename)));
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => return Some(Err(chat_error(error))),
@@ -1187,6 +1196,21 @@ impl Chat for Discord {
             &self.topology_cache,
             deletion,
             close,
+        )
+        .await?)
+    }
+
+    async fn handle_rename<F>(&self, rename: Self::Rename, apply: F) -> Result<(), ChatError>
+    where
+        F: FnOnce(Renamed) -> Result<(), String> + Send + 'static,
+    {
+        Ok(handle_guild_rename(
+            &self.client,
+            self.guild,
+            &self.owner_id,
+            (self.scope, self.ignore_test_runs),
+            rename,
+            apply,
         )
         .await?)
     }

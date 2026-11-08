@@ -109,7 +109,7 @@ impl Readers {
                     Ok(Inbound::Deleted(herdr_connect_rs::GuildDeletion::Channel(channel))) => {
                         Seen::Deleted(channel.id)
                     }
-                    Ok(Inbound::Component(_)) => continue,
+                    Ok(Inbound::Component(_) | Inbound::Renamed(_)) => continue,
                     Err(error) => {
                         let _ = filtered_sender.send(Err(error.to_string()));
                         return;

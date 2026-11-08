@@ -6,8 +6,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::activity::ActivityFrame;
 use crate::broker::{PermissionResponder, handle_component};
-use crate::chat::{Chat, Closed, Inbound};
-use crate::{tab_close, workspace_close};
+use crate::chat::{Chat, Closed, Inbound, Renamed};
+use crate::{tab_close, tab_rename, workspace_close, workspace_rename};
 
 struct OwnerPromptRequest<C: Chat> {
     responder: Arc<PermissionResponder<C>>,
@@ -55,6 +55,16 @@ pub fn close_in_herdr(closed: Closed) -> Result<(), String> {
     .map(drop)
 }
 
+pub fn rename_in_herdr(renamed: Renamed) -> Result<(), String> {
+    match renamed {
+        Renamed::Tab { tab_id, label } => tab_rename(&tab_id, &label),
+        Renamed::Workspace {
+            workspace_id,
+            label,
+        } => workspace_rename(&workspace_id, &label),
+    }
+}
+
 pub async fn drive_gateway<C: Chat>(
     responder: Arc<PermissionResponder<C>>,
     notices: Sender<String>,
@@ -85,6 +95,10 @@ pub async fn drive_gateway<C: Chat>(
                 spawn_deletion(&responder, &notices, deletion);
                 format!("chat gateway deletion: {label}")
             }
+            Ok(Inbound::Renamed(rename)) => {
+                spawn_rename(&responder, &notices, rename);
+                continue;
+            }
             Err(error) => format!("chat gateway error: {error}"),
         };
         if notices.send(notice).is_err() {
@@ -108,6 +122,24 @@ fn spawn_deletion<C: Chat>(
             .await
         {
             let _ = notices.send(format!("chat owner deletion error: {error}"));
+        }
+    });
+}
+
+fn spawn_rename<C: Chat>(
+    responder: &Arc<PermissionResponder<C>>,
+    notices: &Sender<String>,
+    rename: C::Rename,
+) {
+    let responder = Arc::clone(responder);
+    let notices = notices.clone();
+    tokio::spawn(async move {
+        if let Err(error) = responder
+            .chat()
+            .handle_rename(rename, rename_in_herdr)
+            .await
+        {
+            let _ = notices.send(format!("chat owner rename error: {error}"));
         }
     });
 }

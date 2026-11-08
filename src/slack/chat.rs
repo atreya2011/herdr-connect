@@ -5,7 +5,7 @@ use slack_morphism::prelude::*;
 use super::{Slack, SlackArchive, SlackRoute, SlackSocketEvent, delivery::escape, error, identity};
 use crate::{
     Ack, Chat, ChatError, Closed, Component, Inbound, OwnerIdentity, OwnerMessage,
-    PermissionVendor, Question, TopologyClosure, TopologyRoute, TransitionMessage,
+    PermissionVendor, Question, Renamed, TopologyClosure, TopologyRoute, TransitionMessage,
 };
 
 impl Slack {
@@ -108,6 +108,7 @@ impl Chat for Slack {
     type Interaction = SlackInteractionBlockActionsEvent;
     type Posted = SlackMessageEvent;
     type Deletion = SlackArchive;
+    type Rename = SlackMessageEvent;
     const DELETES_ACTIVITY: bool = true;
     const PROMPT_ACTIVITY: bool = true;
 
@@ -438,6 +439,11 @@ impl Chat for Slack {
                             })
                             .await
                         {
+                            Ok(true)
+                                if message.subtype == Some(SlackMessageEventType::ChannelName) =>
+                            {
+                                return Some(Ok(Inbound::Renamed(message)));
+                            }
                             Ok(true) => return Some(Ok(Inbound::Posted(message))),
                             Ok(false) => {}
                             Err(failure) => return Some(Err(failure)),
@@ -470,5 +476,11 @@ impl Chat for Slack {
         F: FnOnce(Closed) -> Result<(), String> + Send + 'static,
     {
         self.close_archived(deletion, close).await
+    }
+    async fn handle_rename<F>(&self, rename: SlackMessageEvent, apply: F) -> Result<(), ChatError>
+    where
+        F: FnOnce(Renamed) -> Result<(), String> + Send + 'static,
+    {
+        self.rename_channel(rename, apply).await
     }
 }
