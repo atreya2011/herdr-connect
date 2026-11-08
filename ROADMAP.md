@@ -36,7 +36,7 @@ These behaviors existed as TypeScript product decisions or reviewed branches but
 
 ## Do not port
 
-- Raw `!keys` and generic pane key injection from historical issues #4 and #6. Owner text uses semantic `agent.prompt`; supported permissions use vendor-native hooks and Discord or Slack interactions. The one exception is answering a Claude question card, which types the answer into Claude's own dialog.
+- Raw `!keys` and generic pane key injection from historical issues #4 and #6. Owner text uses semantic `agent.prompt`; supported permissions use vendor-native hooks and Discord or Slack interactions. There are two exceptions: answering a Claude question card, which types the answer into Claude's own dialog, and the Slack activity message's Stop button, which sends Esc to the pane's agent.
 - The TypeScript delivery scheduler race in historical issue #16. The Rust implementation does not contain that scheduler; require a Rust reproducer before changing Rust delivery.
 - Bun, discord.js, fake-client, pull-request, or TypeScript lint conventions. This repository is Rust, local-only, direct to `main`, and real-services-only.
 - Historical topology counts, pane identifiers, bridge process identifiers, or agent locations. They were observations, not product contracts.
