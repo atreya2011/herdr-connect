@@ -60,6 +60,7 @@ enum Goal {
     MainTurnEnded,
     BackgroundTurn,
     PromptTurn,
+    Stopped,
 }
 
 enum Exercise {
@@ -70,6 +71,7 @@ enum Exercise {
     BackgroundActivity,
     RestartActivity,
     PromptActivity,
+    Stop,
 }
 
 struct Driver {
@@ -749,6 +751,7 @@ impl Driver {
             Goal::BackgroundTurn => Ok(self.activity_posted.len() > 1
                 && self.bot_said("BACKGROUND DONE")
                 && self.settled()?),
+            Goal::Stopped => Ok(self.settled()? && self.activity_remaining().is_empty()),
             Goal::Archived => Ok(self.archived_by_owner
                 && tab_list_result()?.iter().all(|tab| tab.tab_id != self.tab)
                 && workspace_list_result()?
@@ -1080,6 +1083,60 @@ impl Driver {
         }
         println!(
             "OWNER OBSERVED: activity message {posted} posted before the restart deleted by the restarted bridge"
+        );
+        Ok(())
+    }
+
+    async fn stop_button_stops_the_turn(&mut self) -> Result<(), String> {
+        self.ready().await?;
+        self.prompt("Use Bash to run exactly python3 -c 'import time; time.sleep(120)' in the foreground with timeout 180000. Use no other tools. Then reply with exactly STOP DONE.")?;
+        self.wait(Goal::ActivityPosted).await?;
+        let snapshot = self
+            .activity_snapshots
+            .last()
+            .ok_or("no activity plan snapshot was recorded during the turn")?;
+        let button = snapshot
+            .pointer("/blocks/1")
+            .filter(|block| block["type"] == "actions")
+            .and_then(|block| block.pointer("/elements/0"))
+            .ok_or_else(|| format!("activity message has no actions block: {snapshot}"))?;
+        let expected = format!("herdrstop:{}", self.pane);
+        if button["type"] != "button"
+            || button["action_id"].as_str() != Some(expected.as_str())
+            || button.pointer("/text/text").and_then(Value::as_str) != Some("Stop")
+        {
+            return Err(format!("activity message Stop button differs: {button}"));
+        }
+        println!("OWNER OBSERVED: plan block carries the Stop button {button}");
+        let status = snapshot_for_pane(&self.pane)?.agent_status;
+        if status != "working" {
+            return Err(format!("pane status was {status} before the Stop tap"));
+        }
+        let pane = button["action_id"]
+            .as_str()
+            .and_then(|action| action.strip_prefix("herdrstop:"))
+            .ok_or("Stop action id lost its prefix")?
+            .to_owned();
+        tokio::task::spawn_blocking(move || herdr_connect_rs::stop_agent(&pane))
+            .await
+            .map_err(|error| error.to_string())??;
+        let stopped = tokio::time::Instant::now();
+        self.wait(Goal::Stopped).await?;
+        let elapsed = stopped.elapsed();
+        if self.bot_said("STOP DONE") || elapsed >= Duration::from_secs(100) {
+            return Err(format!(
+                "turn finished instead of stopping; elapsed {elapsed:?}"
+            ));
+        }
+        let remaining = self.activity_remaining();
+        if !remaining.is_empty() {
+            return Err(format!(
+                "activity messages {remaining:?} remain after the Stop tap"
+            ));
+        }
+        println!(
+            "OWNER OBSERVED: Stop ended the turn in {elapsed:?} and the plan block {:?} was deleted",
+            self.activity_posted
         );
         Ok(())
     }
@@ -1443,6 +1500,7 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
                     Exercise::BackgroundActivity => driver.background_activity_deleted().await,
                     Exercise::RestartActivity => driver.restart_activity_deleted().await,
                     Exercise::PromptActivity => driver.prompt_activity().await,
+                    Exercise::Stop => driver.stop_button_stops_the_turn().await,
                 }
             } => result,
             _ = tokio::signal::ctrl_c() => Err("owner acceptance interrupted; cleaning up owned fixtures".into()),
@@ -1501,4 +1559,10 @@ async fn real_claude_activity_message_posted_before_a_restart_is_deleted_after_i
 async fn owner_prompt_shows_as_the_only_plan_task_and_the_next_tool_call_edits_that_message()
 -> Result<(), String> {
     run_owner_exercise(Exercise::PromptActivity).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn real_claude_stop_button_ends_the_turn_and_deletes_the_plan_block() -> Result<(), String> {
+    run_owner_exercise(Exercise::Stop).await
 }
