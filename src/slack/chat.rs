@@ -235,6 +235,7 @@ impl Chat for Slack {
         text: &str,
         plan: &crate::ActivityPlan,
     ) -> Result<SlackTs, ChatError> {
+        self.follow_plan(route, plan).await;
         self.send_content(route, super::delivery::activity_content(text, plan, None))
             .await
     }
@@ -245,6 +246,7 @@ impl Chat for Slack {
         text: &str,
         plan: &crate::ActivityPlan,
     ) -> Result<(), ChatError> {
+        self.follow_plan(route, plan).await;
         self.update_content(
             route,
             message,
@@ -257,7 +259,9 @@ impl Chat for Slack {
                 )),
             ),
         )
-        .await
+        .await?;
+        self.refresh_working(route, "edit").await;
+        Ok(())
     }
     async fn delete_activity(
         &self,
@@ -265,6 +269,7 @@ impl Chat for Slack {
         message: &SlackTs,
     ) -> Result<(), ChatError> {
         self.require_route(route).await?;
+        self.forget_plan(route).await;
         self.state
             .client
             .open_session(&self.state.token)

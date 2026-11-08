@@ -1,8 +1,59 @@
+use std::collections::HashMap;
+
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
+use tokio::sync::Mutex;
 
 use super::{Slack, SlackRoute, SlackSocketEvent, SlackState, error};
 use crate::{ActivityPlan, ChatError};
+
+const WORKING_STATUS: &str = "is working…";
+const WORKING_LOADING_TEXT: &str = "Working…";
+
+#[derive(serde::Serialize)]
+struct WorkingStatus<'a> {
+    channel_id: &'a SlackChannelId,
+    thread_ts: &'a SlackTs,
+    status: &'a str,
+    loading_messages: [&'a str; 1],
+}
+
+async fn loading_text(
+    loading: &Mutex<HashMap<SlackChannelId, String>>,
+    channel: &SlackChannelId,
+) -> String {
+    loading
+        .lock()
+        .await
+        .get(channel)
+        .cloned()
+        .unwrap_or_else(|| WORKING_LOADING_TEXT.to_owned())
+}
+
+async fn show_working(
+    client: &SlackHyperClient,
+    token: &SlackApiToken,
+    loading: &Mutex<HashMap<SlackChannelId, String>>,
+    channel: &SlackChannelId,
+    thread: &SlackTs,
+) -> Result<(), SlackClientError> {
+    let text = loading_text(loading, channel).await;
+    client
+        .open_session(token)
+        .http_session_api
+        .http_post::<_, SlackApiAssistantThreadsSetStatusResponse>(
+            "assistant.threads.setStatus",
+            &WorkingStatus {
+                channel_id: channel,
+                thread_ts: thread,
+                status: WORKING_STATUS,
+                loading_messages: [&text],
+            },
+            Some(&ASSISTANT_THREAD_SET_STATUS_SPECIAL_LIMIT_RATE_CTL),
+        )
+        .await?;
+    Ok(())
+}
 
 pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -88,16 +139,7 @@ impl Slack {
             .await;
         match result {
             Ok(response) => {
-                let refresh_status = self
-                    .state
-                    .working
-                    .lock()
-                    .await
-                    .get(route)
-                    .is_some_and(Option::is_some);
-                if refresh_status && let Err(failure) = self.set_working(route, true).await {
-                    crate::bridge_eprintln!("Slack status refresh error after post: {failure}");
-                }
+                self.refresh_working(route, "post").await;
                 Ok(response.ts)
             }
             Err(failure) => {
@@ -140,6 +182,37 @@ impl Slack {
             .await
             .map_err(error)?;
         Ok(())
+    }
+
+    pub(super) async fn follow_plan(&self, route: &SlackRoute, plan: &ActivityPlan) {
+        if let Some(task) = plan.tasks.last() {
+            self.state
+                .loading
+                .lock()
+                .await
+                .insert(route.channel.clone(), task.title.clone());
+        }
+    }
+
+    pub(super) async fn forget_plan(&self, route: &SlackRoute) {
+        self.state.loading.lock().await.remove(&route.channel);
+    }
+
+    pub(super) async fn refresh_working(&self, route: &SlackRoute, after: &str) {
+        let working = self
+            .state
+            .working
+            .lock()
+            .await
+            .get(route)
+            .is_some_and(Option::is_some);
+        if working && let Err(failure) = self.set_working(route, true).await {
+            crate::bridge_eprintln!("Slack status refresh error after {after}: {failure}");
+        }
+    }
+
+    pub async fn loading_text(&self, route: &SlackRoute) -> String {
+        loading_text(&self.state.loading, &route.channel).await
     }
 
     async fn invalidate_if_gone(&self, failure: &SlackClientError) {
@@ -234,11 +307,22 @@ impl SlackState {
             .get(&route.channel)
             .cloned()
             .ok_or_else(|| error("working status needs an owner message"))?;
+        if working {
+            return show_working(
+                &self.client,
+                &self.token,
+                &self.loading,
+                &route.channel,
+                &thread,
+            )
+            .await
+            .map_err(error);
+        }
         self.client
             .open_session(&self.token)
             .assistant_threads_set_status(&SlackApiAssistantThreadsSetStatusRequest::new(
                 route.channel.clone(),
-                if working { "is working…" } else { "" }.into(),
+                String::new(),
                 thread,
             ))
             .await
@@ -268,9 +352,10 @@ impl SlackState {
         drop(tasks);
         self.set_working(route, working).await?;
         if working {
-            let (client, token, route, events) = (
+            let (client, token, loading, route, events) = (
                 self.client.clone(),
                 self.token.clone(),
+                self.loading.clone(),
                 route.clone(),
                 self.events_tx.clone(),
             );
@@ -287,16 +372,8 @@ impl SlackState {
                 Some(tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                        if let Err(failure) = client
-                            .open_session(&token)
-                            .assistant_threads_set_status(
-                                &SlackApiAssistantThreadsSetStatusRequest::new(
-                                    route.channel.clone(),
-                                    "is working…".into(),
-                                    thread.clone(),
-                                ),
-                            )
-                            .await
+                        if let Err(failure) =
+                            show_working(&client, &token, &loading, &route.channel, &thread).await
                         {
                             let _ = events.send(SlackSocketEvent::Failure(error(failure)));
                             return;

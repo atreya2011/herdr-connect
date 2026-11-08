@@ -31,6 +31,7 @@ struct SlackState {
     events_tx: tokio::sync::mpsc::UnboundedSender<SlackSocketEvent>,
     working: Mutex<HashMap<SlackRoute, Option<tokio::task::JoinHandle<()>>>>,
     status_messages: Mutex<HashMap<SlackChannelId, SlackTs>>,
+    loading: Arc<Mutex<HashMap<SlackChannelId, String>>>,
     renames: Mutex<RenameTasks>,
 }
 pub struct Slack {
@@ -231,6 +232,7 @@ impl Slack {
                 events_tx,
                 working: Mutex::new(HashMap::new()),
                 status_messages: Mutex::new(HashMap::new()),
+                loading: Arc::new(Mutex::new(HashMap::new())),
                 renames: Mutex::new(HashMap::new()),
             }),
             owner,
