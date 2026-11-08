@@ -2,9 +2,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Renamed, Slack,
-    SlackRoute, TopologyClosure, TopologyRoute, slack_channel_name, tab_list_result, tab_rename,
-    workspace_list_result,
+    ActivityPlan, Chat, ChatScope, Inbound, PermissionVendor, Question, QuestionOption, Renamed,
+    Slack, SlackRoute, TopologyClosure, TopologyRoute, activity_message_text, prompt_activity_text,
+    slack_channel_name, tab_list_result, tab_rename, workspace_list_result,
 };
 use serde_json::Value;
 use slack_morphism::prelude::*;
@@ -328,6 +328,57 @@ async fn slack_delivery_real_channel() -> Result<(), Box<dyn std::error::Error>>
     for (name, passed) in result? {
         assert!(passed, "{name}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn slack_working_status_loading_text_follows_the_newest_plan_task()
+-> Result<(), Box<dyn std::error::Error>> {
+    let slack = test_slack().await?;
+    let route = create_route()?;
+    let result = async {
+        let found = slack.sync(&route, false).await?;
+        let owner = slack.send(&found, "testrun owner prompt").await?;
+        slack.owner_message_accepted(&found, &owner).await?;
+        let mut observed = vec![slack.loading_text(&found).await];
+        let prompted = ActivityPlan::default().next_prompt();
+        let message = slack
+            .post_activity(&found, &prompt_activity_text(), &prompted)
+            .await?;
+        slack.set_working(&found, true).await?;
+        observed.push(slack.loading_text(&found).await);
+        let called = prompted.next_tool_call("Bash", "cargo test");
+        slack
+            .edit_activity(
+                &found,
+                &message,
+                &activity_message_text(1, "Bash", "cargo test"),
+                &called,
+            )
+            .await?;
+        slack.set_working(&found, true).await?;
+        observed.push(slack.loading_text(&found).await);
+        slack.delete_activity(&found, &message).await?;
+        observed.push(slack.loading_text(&found).await);
+        slack.agent_status(&route, false).await?;
+        Ok::<_, Box<dyn std::error::Error>>(observed)
+    }
+    .await;
+    let leftovers = cleanup(&slack, &route.channel_name, &route.workspace_id).await?;
+    assert_eq!(
+        leftovers, 0,
+        "zero-leftover check: unarchived testrun- Slack channels"
+    );
+    assert_eq!(
+        result?,
+        [
+            "Working…",
+            "Prompt submitted",
+            "Bash: cargo test",
+            "Working…"
+        ],
+        "loading text before any task, after the prompt task, after a tool call, and after the plan block is deleted"
+    );
     Ok(())
 }
 
