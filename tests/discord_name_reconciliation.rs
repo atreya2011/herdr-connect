@@ -9,12 +9,17 @@ mod real_guild {
     use std::time::{Duration, Instant};
 
     use serial_test::serial;
-    use twilight_model::id::{Id, marker::ChannelMarker};
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use twilight_model::id::{
+        Id,
+        marker::{ChannelMarker, MessageMarker},
+    };
 
     use super::support::{Guild, channel, cleanup, guild};
     use herdr_connect_rs::{
-        Chat, ChatScope, Discord, TopologyRoute, format_thread_name, tab_list_result,
-        workspace_channel_name, workspace_list_result,
+        Chat, ChatScope, Discord, GuildRename, Inbound, Renamed, TopologyCache, TopologyRoute,
+        format_thread_name, tab_list_result, tab_rename, workspace_channel_name,
+        workspace_list_result, workspace_rename,
     };
 
     struct Fixture {
@@ -176,6 +181,334 @@ mod real_guild {
         let left = cleanup(&cleanup_guild).await.unwrap();
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(left, 0, "named zero-leftover check");
+    }
+
+    enum Seen {
+        Posted(Id<MessageMarker>),
+        Renamed(GuildRename),
+    }
+
+    fn read_events(chat: Arc<Discord>) -> (UnboundedReceiver<Seen>, tokio::task::JoinHandle<()>) {
+        let (sender, events) = unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(event) = chat.next_event().await {
+                let seen = match event {
+                    Ok(Inbound::Posted(message)) => Seen::Posted(message.id),
+                    Ok(Inbound::Renamed(rename)) => Seen::Renamed(rename),
+                    Ok(_) => continue,
+                    Err(_) => return,
+                };
+                if sender.send(seen).is_err() {
+                    return;
+                }
+            }
+        });
+        (events, task)
+    }
+
+    async fn gateway_ready(
+        guild: &Guild,
+        thread: Id<ChannelMarker>,
+        events: &mut UnboundedReceiver<Seen>,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let mut sent = std::collections::HashSet::new();
+        while tokio::time::Instant::now() < deadline {
+            let message = guild
+                .client
+                .create_message(thread)
+                .content("testrun rename gateway readiness")
+                .await
+                .map_err(|error| error.to_string())?
+                .model()
+                .await
+                .map_err(|error| error.to_string())?;
+            sent.insert(message.id);
+            let tick = (tokio::time::Instant::now() + Duration::from_secs(2)).min(deadline);
+            while let Ok(seen) = tokio::time::timeout_at(tick, events.recv()).await {
+                if let Seen::Posted(id) = seen.ok_or("gateway reader stopped")?
+                    && sent.contains(&id)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err("Discord gateway did not deliver a readiness message".to_owned())
+    }
+
+    async fn next_rename(
+        events: &mut UnboundedReceiver<Seen>,
+        name: &str,
+    ) -> Result<GuildRename, String> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Seen::Renamed(rename) = events.recv().await.ok_or("gateway reader stopped")?
+                    && matches!(&rename, GuildRename::Thread { name: seen, .. } | GuildRename::Channel { name: seen, .. } if seen == name)
+                {
+                    return Ok(rename);
+                }
+            }
+        })
+        .await
+        .map_err(|_| format!("no rename event named {name:?} within 30 seconds"))?
+    }
+
+    async fn apply_owner_rename(
+        chat: &Discord,
+        workspace_id: &str,
+        tab_id: &str,
+        rename: GuildRename,
+    ) -> Result<(String, String), String> {
+        let (tab, workspace) = (tab_id.to_owned(), workspace_id.to_owned());
+        chat.handle_rename(rename, move |renamed| match renamed {
+            Renamed::Tab { tab_id, label } if tab_id == tab => tab_rename(&tab_id, &label),
+            Renamed::Workspace {
+                workspace_id,
+                label,
+            } if workspace_id == workspace => workspace_rename(&workspace_id, &label),
+            other => Err(format!(
+                "refused Herdr rename outside the fixture: {other:?}"
+            )),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        let tab = tab_list_result()?
+            .into_iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .ok_or("fixture tab disappeared")?;
+        let workspace = workspace_list_result()?
+            .into_iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .ok_or("fixture workspace disappeared")?;
+        Ok((workspace.label, tab.label))
+    }
+
+    fn second_route(
+        fixture: &Fixture,
+        label: &str,
+        tab_label: &str,
+    ) -> Result<TopologyRoute, String> {
+        let created = herdr(&[
+            "tab",
+            "create",
+            "--workspace",
+            &fixture.workspace_id,
+            "--cwd",
+            fixture.dir.to_str().ok_or("cwd is not UTF-8")?,
+            "--label",
+            tab_label,
+        ])?;
+        let text = |pointer: &str| {
+            created
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("herdr tab create result missing {pointer}"))
+        };
+        let tab_id = text("/result/tab/tab_id")?;
+        Ok(TopologyRoute {
+            workspace_id: fixture.workspace_id.clone(),
+            pane_id: text("/result/root_pane/pane_id")?,
+            channel_name: workspace_channel_name(&fixture.workspace_id, label)?,
+            thread_name: format_thread_name(tab_label, &tab_id)?,
+            tab_id,
+        })
+    }
+
+    async fn owner_as_bot(guild: &Guild, cache: TopologyCache) -> Result<Discord, String> {
+        let bot = guild
+            .client
+            .current_user()
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .id;
+        Ok(Discord::new(
+            Arc::clone(&guild.client),
+            std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
+            guild.id,
+            bot.to_string(),
+            cache,
+        )
+        .with_scope(ChatScope::TestRuns))
+    }
+
+    async fn rename_as_owner(
+        guild: &Guild,
+        target: Id<ChannelMarker>,
+        thread: bool,
+        name: &str,
+    ) -> Result<(), String> {
+        if thread {
+            guild
+                .client
+                .update_thread(target)
+                .name(name)
+                .await
+                .map(drop)
+        } else {
+            guild
+                .client
+                .update_channel(target)
+                .name(name)
+                .await
+                .map(drop)
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    struct Case {
+        name: &'static str,
+        target: Id<ChannelMarker>,
+        thread: Id<ChannelMarker>,
+        tab_id: String,
+        renamed_to: String,
+        labels: (String, String),
+    }
+
+    async fn check_case(
+        guild: &Guild,
+        creator: &Discord,
+        owner: &Discord,
+        events: &mut UnboundedReceiver<Seen>,
+        workspace_id: &str,
+        case: Case,
+    ) -> Result<(), String> {
+        rename_as_owner(
+            guild,
+            case.target,
+            case.target == case.thread,
+            &case.renamed_to,
+        )
+        .await?;
+        let rename = next_rename(events, &case.renamed_to).await?;
+        let labels = apply_owner_rename(owner, workspace_id, &case.tab_id, rename).await?;
+        println!(
+            "real discord rename {}: renamed_to={} herdr_labels={labels:?}",
+            case.name, case.renamed_to
+        );
+        if labels != case.labels {
+            return Err(format!(
+                "{}: Herdr labels {labels:?}, wanted {:?}",
+                case.name, case.labels
+            ));
+        }
+        creator
+            .topology_changed()
+            .await
+            .map_err(|error| error.to_string())?;
+        let channel_name = workspace_channel_name(workspace_id, &labels.0)?;
+        let thread_name = format_thread_name(&labels.1, &case.tab_id)?;
+        wait_for_names(guild, case.thread, &channel_name, &thread_name).await?;
+        println!(
+            "real discord rename {}: chat names {channel_name:?} {thread_name:?}",
+            case.name
+        );
+        let renamed_back = thread_name != case.renamed_to;
+        if case.target == case.thread && renamed_back {
+            let rename = next_rename(events, &thread_name).await?;
+            let echoed = apply_owner_rename(owner, workspace_id, &case.tab_id, rename).await?;
+            println!("real discord rename bridge echo: herdr_labels={echoed:?}");
+            if echoed != labels {
+                return Err(format!("bridge rename back changed Herdr to {echoed:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn owner_renames(guild: Guild, n: String, fixture: &Fixture) -> Result<(), String> {
+        let cache: TopologyCache = Arc::new(tokio::sync::Mutex::new(None));
+        let creator = Discord::new(
+            Arc::clone(&guild.client),
+            std::env::var("DISCORD_TOKEN").map_err(|error| error.to_string())?,
+            guild.id,
+            std::env::var("DISCORD_OWNER_ID").map_err(|error| error.to_string())?,
+            Arc::clone(&cache),
+        )
+        .with_scope(ChatScope::TestRuns);
+        let label = format!("testrun-owner-{n}");
+        let thread = creator
+            .sync_route(&route(fixture, &label, &format!("testrun-tab-{n}"))?)
+            .await
+            .map_err(|error| error.to_string())?;
+        let second = second_route(fixture, &label, &format!("testrun-second-{n}"))?;
+        let second_thread = creator
+            .sync_route(&second)
+            .await
+            .map_err(|error| error.to_string())?;
+        let parent = guild
+            .client
+            .channel(thread)
+            .await
+            .map_err(|error| error.to_string())?
+            .model()
+            .await
+            .map_err(|error| error.to_string())?
+            .parent_id
+            .ok_or("thread has no parent")?;
+        let owner = Arc::new(owner_as_bot(&guild, cache).await?);
+        let (mut events, reader) = read_events(Arc::clone(&owner));
+        let channel_label = format!("testrun-chan-{n}");
+        let cases = [
+            Case {
+                name: "thread name keeps the tab suffix",
+                target: second_thread,
+                thread: second_thread,
+                tab_id: second.tab_id.clone(),
+                renamed_to: format!("testrun-kept-{n} [{}]", second.tab_id),
+                labels: (label.clone(), format!("testrun-kept-{n}")),
+            },
+            Case {
+                name: "thread name without the tab suffix",
+                target: thread,
+                thread,
+                tab_id: fixture.tab_id.clone(),
+                renamed_to: format!("testrun-whole-{n}"),
+                labels: (label.clone(), format!("testrun-whole-{n}")),
+            },
+            Case {
+                name: "workspace channel name",
+                target: parent,
+                thread,
+                tab_id: fixture.tab_id.clone(),
+                renamed_to: channel_label.clone(),
+                labels: (channel_label, format!("testrun-whole-{n}")),
+            },
+        ];
+        let result = async {
+            gateway_ready(&guild, thread, &mut events).await?;
+            for case in cases {
+                check_case(
+                    &guild,
+                    &creator,
+                    &owner,
+                    &mut events,
+                    &fixture.workspace_id,
+                    case,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        reader.abort();
+        result
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_renaming_a_thread_and_channel_renames_the_herdr_tab_and_workspace() {
+        run(|guild| async move {
+            let n = nonce()?;
+            let fixture =
+                create_fixture(&format!("testrun-owner-{n}"), &format!("testrun-tab-{n}"))?;
+            let result = Box::pin(owner_renames(guild, n, &fixture)).await;
+            let removed = remove_fixture(&fixture);
+            result.and(removed)
+        })
+        .await;
     }
 
     #[tokio::test]
