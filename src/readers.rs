@@ -202,6 +202,31 @@ fn owner_queued_claude_prompt(record: &Value) -> Option<&Value> {
     .flatten()
 }
 
+fn unwrap_claude_pastes(text: &str) -> String {
+    let opening = "<pasted_content id=\"";
+    let mut remaining = text;
+    let mut unwrapped = String::new();
+    while let Some(start) = remaining.find(opening) {
+        let Some((id, after_opening)) = remaining[start + opening.len()..].split_once("\">\n")
+        else {
+            break;
+        };
+        let closing = format!("\n</pasted_content id=\"{id}\">");
+        let Some((inner, after_closing)) = after_opening.split_once(&closing) else {
+            break;
+        };
+        unwrapped.push_str(&remaining[..start]);
+        unwrapped.push_str(
+            &inner
+                .replace("<\\pasted_content", "<pasted_content")
+                .replace("<\\/pasted_content", "</pasted_content"),
+        );
+        remaining = after_closing;
+    }
+    unwrapped.push_str(remaining);
+    unwrapped
+}
+
 pub fn read_claude_prompts_incremental(
     path: &Path,
     offset: u64,
@@ -241,6 +266,7 @@ pub fn read_claude_prompts_incremental(
         texts
             .into_iter()
             .filter(|text| is_owner_typed_claude_text(text))
+            .map(|text| unwrap_claude_pastes(&text))
             .collect()
     }))
 }
@@ -723,6 +749,54 @@ mod tests {
                 .map(|prompt| (prompt.to_owned(), text.len() as u64))
                 .collect();
             assert_eq!(prompts, expected_prompts, "{name}");
+            assert_eq!(checkpoint, text.len() as u64, "{name}");
+        }
+    }
+
+    #[test]
+    fn claude_pasted_prompts_restore_owner_text_for_typed_and_queued_records() {
+        let pasted = "\n\n<pasted_content id=\"7723\">\nThen why do I keep getting this echoed back in Slack?\n\n\n<\\pasted_content id=\"2d3a\">\nMessage \n<\\/pasted_content id=\"2d3a\">\n</pasted_content id=\"7723\">\n";
+        let owner = "Then why do I keep getting this echoed back in Slack?\n\n\n<pasted_content id=\"2d3a\">\nMessage \n</pasted_content id=\"2d3a\">";
+        let cases = [
+            (
+                "typed",
+                serde_json::json!({
+                    "type": "user",
+                    "origin": {"kind": "human"},
+                    "promptSource": "typed",
+                    "message": {"role": "user", "content": pasted},
+                }),
+            ),
+            (
+                "queued",
+                serde_json::json!({
+                    "type": "attachment",
+                    "attachment": {
+                        "type": "queued_command",
+                        "origin": {"kind": "human"},
+                        "prompt": pasted,
+                    },
+                }),
+            ),
+        ];
+        for (name, record) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "herdr-connect-claude-pasted-prompt-{}-{name}.jsonl",
+                std::process::id()
+            ));
+            let text = format!("{record}\n");
+            let mut file = std::fs::File::create_new(&path).expect("create log");
+            std::io::Write::write_all(&mut file, text.as_bytes()).expect("write log");
+            drop(file);
+            let result = read_claude_prompts_incremental(&path, 0);
+            std::fs::remove_file(&path).expect("remove log");
+            let (prompts, checkpoint) = result.expect("read prompts");
+            assert_eq!(
+                prompts,
+                vec![(format!("\n\n{owner}\n"), text.len() as u64)],
+                "{name}"
+            );
+            assert_eq!(prompts[0].0.trim(), owner, "{name}");
             assert_eq!(checkpoint, text.len() as u64, "{name}");
         }
     }
