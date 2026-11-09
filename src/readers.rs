@@ -212,6 +212,8 @@ pub fn read_claude_prompts_incremental(
     Ok(extract_tolerant(&lines, offset, |record| {
         let content = if is_qualifying_claude_user_record(record)
             && record.get(COMPACT_SUMMARY_KEY) != Some(&Value::Bool(true))
+            && (record.get("origin").is_none()
+                || record.pointer("/origin/kind").and_then(Value::as_str) == Some("human"))
         {
             record
                 .get(MESSAGE_KEY)
@@ -675,7 +677,7 @@ fn format_question(input: Option<&Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_claude;
+    use super::{parse_claude, read_claude_prompts_incremental};
     use crate::question::{Question, QuestionOption};
 
     const PENDING_QUESTION_LOG: &str = concat!(
@@ -684,6 +686,46 @@ mod tests {
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"AskUserQuestion","id":"t1","input":{"questions":[{"question":"Which toppings?","header":"Toppings","options":[{"label":"Cheese","description":"Add cheese"},{"label":"Olives","description":"Add olives"}],"multiSelect":true}]}}]}}"#,
         "\n",
     );
+
+    #[test]
+    fn claude_prompt_origins_keep_human_and_legacy_records_and_skip_plugin_records() {
+        let cases = [
+            (
+                "human",
+                r#"{"type":"user","origin":{"kind":"human"},"promptSource":"typed","turnOrigin":"human","message":{"role":"user","content":"You are the verifier"}}"#,
+                Some("You are the verifier"),
+            ),
+            (
+                "plugin",
+                r#"{"type":"user","origin":{"kind":"plugin","name":"reply-size-check"},"promptSource":"system","turnOrigin":"system","message":{"role":"user","content":"The reply-size-check plugin sent a message:\nReply check:"}}"#,
+                None,
+            ),
+            (
+                "legacy",
+                r#"{"type":"user","message":{"role":"user","content":"You are the verifier"}}"#,
+                Some("You are the verifier"),
+            ),
+        ];
+        for (name, record, expected) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "herdr-connect-claude-prompt-origin-{}-{name}.jsonl",
+                std::process::id()
+            ));
+            let text = format!("{record}\n");
+            let mut file = std::fs::File::create_new(&path).expect("create log");
+            std::io::Write::write_all(&mut file, text.as_bytes()).expect("write log");
+            drop(file);
+            let result = read_claude_prompts_incremental(&path, 0);
+            std::fs::remove_file(&path).expect("remove log");
+            let (prompts, checkpoint) = result.expect("read prompts");
+            let expected_prompts: Vec<_> = expected
+                .into_iter()
+                .map(|prompt| (prompt.to_owned(), text.len() as u64))
+                .collect();
+            assert_eq!(prompts, expected_prompts, "{name}");
+            assert_eq!(checkpoint, text.len() as u64, "{name}");
+        }
+    }
 
     #[test]
     fn a_pending_ask_user_question_yields_its_structured_questions() {
