@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use pulldown_cmark::{Event, Parser, Tag};
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tokio::sync::Mutex;
@@ -70,10 +71,24 @@ pub(super) fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn escape_markdown(text: &str) -> String {
+    let mut escaped = String::new();
+    let mut end = 0;
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        if matches!(event, Event::Code(_) | Event::Start(Tag::CodeBlock(_))) {
+            escaped.push_str(&escape(&text[end..range.start]));
+            escaped.push_str(&text[range.clone()]);
+            end = range.end;
+        }
+    }
+    escaped.push_str(&escape(&text[end..]));
+    escaped
+}
+
 fn markdown(text: &str) -> SlackMessageContent {
     SlackMessageContent::new()
         .with_text(escape(text))
-        .with_blocks(vec![SlackMarkdownBlock::new(escape(text)).into()])
+        .with_blocks(vec![SlackMarkdownBlock::new(escape_markdown(text)).into()])
 }
 
 pub(super) fn activity_content(
@@ -400,5 +415,51 @@ impl SlackState {
             self.working.lock().await.insert(route.clone(), None);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use slack_morphism::prelude::SlackMarkdownBlock;
+
+    use super::markdown;
+
+    #[test]
+    fn markdown_preserves_code_characters_and_escapes_plain_text_and_fallback() {
+        let cases = [
+            (
+                "inline",
+                "Inline: `<pasted_content> & < >`",
+                "Inline: `<pasted_content> & < >`",
+                "Inline: `&lt;pasted_content&gt; &amp; &lt; &gt;`",
+            ),
+            (
+                "fenced",
+                "```\n<pasted_content> & < >\n```",
+                "```\n<pasted_content> & < >\n```",
+                "```\n&lt;pasted_content&gt; &amp; &lt; &gt;\n```",
+            ),
+            (
+                "plain",
+                "Plain: <pasted_content> & < > <!here> <https://example.com|probe>",
+                "Plain: &lt;pasted_content&gt; &amp; &lt; &gt; &lt;!here&gt; &lt;https://example.com|probe&gt;",
+                "Plain: &lt;pasted_content&gt; &amp; &lt; &gt; &lt;!here&gt; &lt;https://example.com|probe&gt;",
+            ),
+            (
+                "combined",
+                "Inline: `<pasted_content> & < >`\n\n```\n<pasted_content> & < >\n```\n\nPlain: <pasted_content> & < > <!here> <https://example.com|probe>",
+                "Inline: `<pasted_content> & < >`\n\n```\n<pasted_content> & < >\n```\n\nPlain: &lt;pasted_content&gt; &amp; &lt; &gt; &lt;!here&gt; &lt;https://example.com|probe&gt;",
+                "Inline: `&lt;pasted_content&gt; &amp; &lt; &gt;`\n\n```\n&lt;pasted_content&gt; &amp; &lt; &gt;\n```\n\nPlain: &lt;pasted_content&gt; &amp; &lt; &gt; &lt;!here&gt; &lt;https://example.com|probe&gt;",
+            ),
+        ];
+        for (name, input, block, fallback) in cases {
+            let content = markdown(input);
+            assert_eq!(content.text.as_deref(), Some(fallback), "{name}");
+            assert_eq!(
+                content.blocks,
+                Some(vec![SlackMarkdownBlock::new(block.to_owned()).into()]),
+                "{name}"
+            );
+        }
     }
 }
