@@ -359,6 +359,19 @@ async fn slack_working_status_loading_text_follows_the_newest_plan_task()
             .await?;
         slack.set_working(&found, true).await?;
         observed.push(slack.loading_text(&found).await);
+        let command = "cargo test --test slack_bridge -- --test-threads=1 --nocapture";
+        let long = called.next_tool_call("Bash", command);
+        slack
+            .edit_activity(
+                &found,
+                &message,
+                &route.pane_id,
+                &activity_message_text(2, "Bash", command),
+                &long,
+            )
+            .await?;
+        slack.set_working(&found, true).await?;
+        observed.push(slack.loading_text(&found).await);
         slack.delete_activity(&found, &message).await?;
         observed.push(slack.loading_text(&found).await);
         slack.agent_status(&route, false).await?;
@@ -376,9 +389,10 @@ async fn slack_working_status_loading_text_follows_the_newest_plan_task()
             "Working…",
             "Prompt submitted",
             "Bash: cargo test",
+            "Bash: cargo test --test slack_bridge -- --test-th…",
             "Working…"
         ],
-        "loading text before any task, after the prompt task, after a tool call, and after the plan block is deleted"
+        "loading text before any task, after the prompt task, after a tool call, after a tool call with a title longer than 50 characters, and after the plan block is deleted"
     );
     Ok(())
 }
