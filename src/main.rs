@@ -17,17 +17,18 @@ use herdr_connect_rs::{
 };
 use herdr_connect_rs::{
     AgentLogCapture, AgentSession, AgentSnapshot, Chat, ChatError, ChatScope, Discord,
-    ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY,
-    HerdrSubscription, HerdrTab, OwnerIdentity, Question, STATUS_BLOCKED, STATUS_DONE, STATUS_IDLE,
-    STATUS_WORKING, Slack, TopologyCache, TopologyClosure, TopologyRoute, Transition,
-    TransitionMessage, agent_read_detection, create_transition_messages, dialog_shows_question,
-    drive_gateway, fetch_startup_owner_identity, forget_departed_owner_prompt_suppressions,
-    format_detection_question, hook_timeout, is_postable_transition, list_agents, list_mirrored,
-    live_message_nonce, load_discord_config, name_unlabeled_tabs, read_claude_incremental,
-    read_claude_prompts_incremental, read_codex_incremental, read_codex_prompts_incremental,
-    read_cursor_incremental, read_cursor_prompts_incremental, route_topology, split_live_message,
-    status_subscriptions, subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression,
-    transition_card_nonce, workspace_list_result,
+    ENV_DISCORD_GUILD_ID, ENV_DISCORD_OWNER_ID, ENV_DISCORD_TOKEN, ENV_HOME, EVENT_KEY, Follower,
+    HerdrSubscription, HerdrTab, LogPositions, OwnerIdentity, Question, STATUS_BLOCKED,
+    STATUS_DONE, STATUS_IDLE, STATUS_WORKING, Slack, TopologyCache, TopologyClosure, TopologyRoute,
+    Transition, TransitionMessage, agent_read_detection, create_transition_messages,
+    dialog_shows_question, drive_gateway, fetch_startup_owner_identity,
+    forget_departed_owner_prompt_suppressions, format_detection_question, hook_timeout,
+    is_postable_transition, list_agents, list_mirrored, live_message_nonce, load_discord_config,
+    name_unlabeled_tabs, read_claude_incremental, read_claude_prompts_incremental,
+    read_codex_incremental, read_codex_prompts_incremental, read_cursor_incremental,
+    read_cursor_prompts_incremental, route_topology, split_live_message, status_subscriptions,
+    subscribe_herdr_events, tab_list_result, take_owner_prompt_suppression, transition_card_nonce,
+    workspace_list_result,
 };
 use herdr_connect_rs::{
     Decision, Interaction, PermissionResponder, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
@@ -55,13 +56,6 @@ impl<C: Chat> Clone for InformationalCard<C> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Follower {
-    Claude(u64),
-    Codex(u64),
-    Cursor(i64),
-}
-
 struct LiveWatch {
     _watcher: notify::RecommendedWatcher,
     path: PathBuf,
@@ -84,6 +78,7 @@ struct BridgeState<C: Chat> {
     seen_without_session: HashMap<String, SystemTime>,
     ignore_test_runs: bool,
     mirrored_topology: HashSet<String>,
+    saved_positions: Option<LogPositions>,
 }
 
 impl<C: Chat> Default for BridgeState<C> {
@@ -103,6 +98,7 @@ impl<C: Chat> Default for BridgeState<C> {
             seen_without_session: HashMap::new(),
             ignore_test_runs: false,
             mirrored_topology: HashSet::new(),
+            saved_positions: None,
         }
     }
 }
@@ -112,6 +108,25 @@ struct ActivityMessage<C: Chat> {
     message: C::Message,
     text: String,
     plan: ActivityPlan,
+}
+
+fn save_log_positions<C: Chat>(state: &mut BridgeState<C>) -> Result<(), String> {
+    let Some(saved) = state.saved_positions.as_mut() else {
+        return Ok(());
+    };
+    saved.save(
+        state
+            .terminal_prompt_positions
+            .iter()
+            .map(|(terminal, (path, prompt, live))| {
+                let live = state
+                    .live_watches
+                    .get(terminal)
+                    .filter(|watch| watch.path == *path)
+                    .map_or(*live, |watch| watch.follower);
+                (path.clone(), *prompt, live)
+            }),
+    )
 }
 
 struct BlockedCardContext<'a, C: Chat> {
@@ -1054,12 +1069,22 @@ fn maybe_establish_terminal_prompt_baseline<C: Chat>(
     } else {
         false
     };
-    let positions = if was_awaiting_this_session || created_after_first_sighting {
-        initial_live_position(zero, &path).map(|_| (zero, zero))
-    } else {
-        initial_terminal_prompt_position(zero, &path)
-            .and_then(|prompt| initial_live_position(zero, &path).map(|live| (prompt, live)))
-    };
+    let saved = state
+        .saved_positions
+        .as_ref()
+        .and_then(|saved| saved.get(&path));
+    let positions = saved.map_or_else(
+        || {
+            if was_awaiting_this_session || created_after_first_sighting {
+                initial_live_position(zero, &path).map(|_| (zero, zero))
+            } else {
+                initial_terminal_prompt_position(zero, &path).and_then(|prompt| {
+                    initial_live_position(zero, &path).map(|live| (prompt, live))
+                })
+            }
+        },
+        Ok,
+    );
     match positions {
         Ok((prompt_position, live_position)) => {
             state.awaiting_first_log.remove(terminal);
@@ -1928,6 +1953,7 @@ async fn bridge_event_loop<C: Chat>(
                 return result.map_err(Into::into);
             }
         }
+        save_log_positions(&mut runtime.state)?;
     }
     Ok(())
 }
@@ -2328,7 +2354,7 @@ async fn run_bridge() -> Result<(), Box<dyn std::error::Error>> {
         activity_tx.clone(),
     )
     .await?;
-    run_connected_bridge(connection, gateway, activity_tx, activity_events).await
+    run_connected_bridge(connection, gateway, activity_tx, activity_events, "discord").await
 }
 
 async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
@@ -2360,6 +2386,7 @@ async fn run_slack_bridge() -> Result<(), Box<dyn std::error::Error>> {
         gateway,
         activity_tx,
         activity_events,
+        "slack",
     )
     .await
     .map_err(|error| error.to_string());
@@ -2373,12 +2400,20 @@ async fn run_connected_bridge<C: Chat>(
     mut gateway: GatewayTask,
     activity_tx: tokio::sync::mpsc::UnboundedSender<ActivityFrame>,
     activity_events: tokio::sync::mpsc::UnboundedReceiver<ActivityFrame>,
+    destination: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let home = std::env::var_os(ENV_HOME).ok_or("HOME is not configured")?;
+    let saved_positions = LogPositions::open(
+        Path::new(&home)
+            .join(".local/state/herdr-connect")
+            .join(format!("{destination}-positions.json")),
+    )?;
     let mut broker = start_broker(&connection, activity_tx);
     let (live_tx, live_events) = tokio::sync::mpsc::unbounded_channel();
     let state = BridgeState {
         live_tx: Some(live_tx),
         ignore_test_runs: true,
+        saved_positions: Some(saved_positions),
         ..BridgeState::default()
     };
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -2416,6 +2451,7 @@ async fn run_connected_bridge<C: Chat>(
     {
         return Ok(());
     }
+    save_log_positions(&mut runtime.state)?;
     spawn_archived_thread_registration(&connection);
     spawn_startup_topology_sweep(
         &connection,

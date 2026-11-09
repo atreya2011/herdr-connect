@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_connect_rs::{
-    AgentSnapshot, Chat, ChatError, Closed, Inbound, PermissionResponder, Slack, SlackRoute,
-    handle_component, handle_owner_message, workspace_close, workspace_list_result,
+    AgentSnapshot, Chat, ChatError, Closed, Inbound, LogPositions, PermissionResponder, Slack,
+    SlackRoute, handle_component, handle_owner_message, workspace_close, workspace_list_result,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     BridgeState, ChatConnection, handle_activity_event, handle_live_event, process_snapshot,
-    route_topology, tab_list_result,
+    route_topology, save_log_positions, tab_list_result,
 };
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -70,6 +70,7 @@ enum Exercise {
     Activity,
     BackgroundActivity,
     RestartActivity,
+    RestartResume,
     PromptActivity,
     Stop,
 }
@@ -441,6 +442,79 @@ fn start_agent(name: &str, pane: &str, settings: &Path) -> Result<(), String> {
 }
 
 impl Driver {
+    async fn restart_resume(&mut self) -> Result<(), String> {
+        self.ready().await?;
+        let path = self.directory.join("slack-positions.json");
+        self.state.saved_positions = Some(LogPositions::open(path.clone())?);
+        save_log_positions(&mut self.state)?;
+        self.connection
+            .0
+            .shutdown_socket()
+            .await
+            .map_err(String::from)?;
+        self.state = BridgeState::default();
+        let prompt = "Reply with exactly RESTART RESUME OK and use no tools.";
+        let pane = self.pane.clone();
+        tokio::task::spawn_blocking(move || {
+            herdr_json(&[
+                "agent",
+                "prompt",
+                &pane,
+                prompt,
+                "--wait",
+                "--timeout",
+                "120000",
+            ])
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        let before = self
+            .connection
+            .0
+            .history(&self.route.channel)
+            .await
+            .map_err(String::from)?;
+        if before
+            .iter()
+            .any(|message| message.content.text.as_deref() == Some(prompt))
+        {
+            return Err("terminal prompt was mirrored while its follower was stopped".into());
+        }
+        self.connection
+            .0
+            .connect_socket(test_env("SLACK_TEST_APP_TOKEN")?)
+            .await
+            .map_err(String::from)?;
+        for restart in 1..=2 {
+            let (live_tx, live) = unbounded_channel();
+            self.live = live;
+            self.state = BridgeState {
+                live_tx: Some(live_tx),
+                saved_positions: Some(LogPositions::open(path.clone())?),
+                ..BridgeState::default()
+            };
+            self.refresh().await?;
+            save_log_positions(&mut self.state)?;
+            for (case, expected) in [
+                ("terminal prompt", prompt),
+                ("assistant reply", "RESTART RESUME OK"),
+            ] {
+                let count = self
+                    .messages
+                    .iter()
+                    .filter(|message| message.content.text.as_deref() == Some(expected))
+                    .count();
+                if count != 1 {
+                    return Err(format!(
+                        "restart {restart}: {case} appeared {count} times, expected once"
+                    ));
+                }
+                println!("RESTART OBSERVED: restart {restart}, {case} appeared once");
+            }
+        }
+        Ok(())
+    }
+
     async fn refresh(&mut self) -> Result<(), String> {
         if self.archived_by_owner {
             return Ok(());
@@ -1499,6 +1573,7 @@ async fn run_owner_exercise(exercise: Exercise) -> Result<(), String> {
                     Exercise::Activity => driver.activity_deleted().await,
                     Exercise::BackgroundActivity => driver.background_activity_deleted().await,
                     Exercise::RestartActivity => driver.restart_activity_deleted().await,
+                    Exercise::RestartResume => driver.restart_resume().await,
                     Exercise::PromptActivity => driver.prompt_activity().await,
                     Exercise::Stop => driver.stop_button_stops_the_turn().await,
                 }
@@ -1551,6 +1626,13 @@ async fn real_claude_activity_message_is_deleted_when_the_main_turn_ends_during_
 async fn real_claude_activity_message_posted_before_a_restart_is_deleted_after_it()
 -> Result<(), String> {
     run_owner_exercise(Exercise::RestartActivity).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn real_claude_terminal_prompt_and_reply_written_during_restart_are_mirrored_once()
+-> Result<(), String> {
+    run_owner_exercise(Exercise::RestartResume).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -14,6 +14,7 @@ mod discord;
 mod gateway;
 mod herdr;
 mod permission;
+mod positions;
 mod prompting;
 mod question;
 mod readers;
@@ -72,6 +73,7 @@ pub use permission::{
     decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
     encode_cursor_decision, is_cursor_agent_argv,
 };
+pub use positions::{Follower, LogPositions};
 pub use prompting::{
     forget_departed_owner_prompt_suppressions, handle_owner_message, maintain_typing_until_settled,
     should_handle_owner_message, submit_owner_prompt, take_owner_prompt_suppression,
