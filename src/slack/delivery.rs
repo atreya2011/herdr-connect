@@ -9,6 +9,7 @@ use crate::{ActivityPlan, ChatError};
 
 const WORKING_STATUS: &str = "is working…";
 const WORKING_LOADING_TEXT: &str = "Working…";
+const MAX_LOADING_TEXT_CHARS: usize = 50;
 
 #[derive(serde::Serialize)]
 struct WorkingStatus<'a> {
@@ -22,12 +23,20 @@ async fn loading_text(
     loading: &Mutex<HashMap<SlackChannelId, String>>,
     channel: &SlackChannelId,
 ) -> String {
-    loading
+    let text = loading
         .lock()
         .await
         .get(channel)
         .cloned()
-        .unwrap_or_else(|| WORKING_LOADING_TEXT.to_owned())
+        .unwrap_or_else(|| WORKING_LOADING_TEXT.to_owned());
+    if text.chars().count() > MAX_LOADING_TEXT_CHARS {
+        text.chars()
+            .take(MAX_LOADING_TEXT_CHARS - 1)
+            .chain(['…'])
+            .collect()
+    } else {
+        text
+    }
 }
 
 async fn show_working(
