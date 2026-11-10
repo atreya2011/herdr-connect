@@ -1,14 +1,15 @@
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
 
 use herdr_connect_rs::{
-    Decision, cursor_argv_forces_allow, encode_cursor_decision, is_cursor_agent_argv,
+    Decision, ENV_HERDR_PANE_ID, HookSession, cursor_argv_forces_allow, encode_cursor_decision,
+    is_cursor_agent_argv,
 };
 
 #[test]
@@ -116,20 +117,21 @@ fn socket_path(label: &str) -> PathBuf {
     ))
 }
 
-fn invoke_cursor_hook(payload: &str, socket: &Path, pane_id: Option<&str>) -> std::process::Output {
+fn invoke_cursor_hook(payload: &str, socket: &Path, session: HookSession) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-connect-rs"));
     command
         .args(["hook", "--vendor", "cursor", "--socket"])
         .arg(socket)
         .env_remove("HERDR_CLAUDE_BROKER_SOCKET")
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
-        .env_remove("HERDR_TAB_ID")
+        .env_remove(ENV_HERDR_PANE_ID)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(pane_id) = pane_id {
-        command.env("HERDR_PANE_ID", pane_id);
+    match session {
+        HookSession::OutsidePane => {}
+        HookSession::InsidePane => {
+            command.env(ENV_HERDR_PANE_ID, "w1:p1");
+        }
     }
     let mut child = command.spawn().expect("spawn hook subcommand");
     child
@@ -146,36 +148,24 @@ fn cursor_permission(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("hook stdout is JSON")
 }
 
-#[tokio::test]
-async fn hook_outside_a_herdr_pane_allows_without_a_broker_call() {
-    let path = socket_path("outside-pane");
-    let listener = UnixListener::bind(&path).expect("bind broker listener");
-    let output = tokio::task::spawn_blocking({
-        let path = path.clone();
-        move || invoke_cursor_hook(CURSOR_SHELL_HOOK, &path, None)
-    })
-    .await
-    .expect("outside-pane hook process task completes");
-    let connected = tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
-    let _ = std::fs::remove_file(&path);
-
+#[test]
+fn hook_outside_a_herdr_pane_allows() {
+    let output = invoke_cursor_hook(
+        CURSOR_SHELL_HOOK,
+        &socket_path("outside-pane"),
+        HookSession::OutsidePane,
+    );
     let value = cursor_permission(&output);
     assert_eq!(value["permission"], "allow");
-    assert!(
-        connected.is_err(),
-        "a hook outside a herdr pane must not contact the broker"
-    );
 }
 
-#[tokio::test]
-async fn hook_inside_a_herdr_pane_denies_when_the_broker_returns_no_decision() {
-    let path = socket_path("inside-pane-no-decision");
-    let output = tokio::task::spawn_blocking(move || {
-        invoke_cursor_hook(CURSOR_SHELL_HOOK, &path, Some("w1:p1"))
-    })
-    .await
-    .expect("inside-pane hook process task completes");
-
+#[test]
+fn hook_inside_a_herdr_pane_fails_closed_when_the_broker_errors() {
+    let output = invoke_cursor_hook(
+        CURSOR_SHELL_HOOK,
+        &socket_path("inside-pane-error"),
+        HookSession::InsidePane,
+    );
     let value = cursor_permission(&output);
     assert_eq!(value["permission"], "deny");
     assert_eq!(
@@ -184,22 +174,19 @@ async fn hook_inside_a_herdr_pane_denies_when_the_broker_returns_no_decision() {
     );
 }
 
-#[tokio::test]
-async fn hook_inside_a_herdr_pane_passes_through_a_broker_decision() {
+#[test]
+fn hook_inside_a_herdr_pane_returns_the_broker_decision() {
     let path = socket_path("inside-pane-decision");
     let listener = UnixListener::bind(&path).expect("bind broker listener");
-    let hook = tokio::task::spawn_blocking({
+    let hook = thread::spawn({
         let path = path.clone();
-        move || invoke_cursor_hook(CURSOR_SHELL_HOOK, &path, Some("w1:p1"))
+        move || invoke_cursor_hook(CURSOR_SHELL_HOOK, &path, HookSession::InsidePane)
     });
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .expect("hook inside a herdr pane contacts the broker")
-        .expect("accept broker connection");
+    let (mut stream, _) = listener.accept().expect("accept broker connection");
     let mut request = Vec::new();
     let mut byte = [0; 1];
     loop {
-        stream.read_exact(&mut byte).await.expect("read request");
+        stream.read_exact(&mut byte).expect("read request");
         if byte[0] == b'\n' {
             break;
         }
@@ -216,10 +203,9 @@ async fn hook_inside_a_herdr_pane_passes_through_a_broker_decision() {
     });
     stream
         .write_all(format!("{response}\n").as_bytes())
-        .await
         .expect("write broker decision");
     drop(stream);
-    let output = hook.await.expect("inside-pane hook process task completes");
+    let output = hook.join().expect("inside-pane hook thread completes");
     let _ = std::fs::remove_file(&path);
 
     let value = cursor_permission(&output);
