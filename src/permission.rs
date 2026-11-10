@@ -6,6 +6,13 @@ const PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
 pub const VENDOR_CLAUDE: &str = "claude";
 pub const VENDOR_CODEX: &str = "codex";
 pub const VENDOR_CURSOR: &str = "cursor";
+pub const ENV_HERDR_PANE_ID: &str = "HERDR_PANE_ID";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookSession {
+    OutsidePane,
+    InsidePane,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ClaudePermissionRequest {

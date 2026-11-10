@@ -67,11 +67,11 @@ pub use herdr::{
     workspace_rename,
 };
 pub use permission::{
-    ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior, Interaction,
-    PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX, VENDOR_CURSOR, cursor_argv_forces_allow,
-    decode_claude_permission_request, decode_codex_permission_request,
-    decode_cursor_permission_request, encode_claude_decision, encode_codex_decision,
-    encode_cursor_decision, is_cursor_agent_argv,
+    ClaudePermissionRequest, ClaudePermissionToolInput, Decision, DecisionBehavior,
+    ENV_HERDR_PANE_ID, HookSession, Interaction, PermissionVendor, VENDOR_CLAUDE, VENDOR_CODEX,
+    VENDOR_CURSOR, cursor_argv_forces_allow, decode_claude_permission_request,
+    decode_codex_permission_request, decode_cursor_permission_request, encode_claude_decision,
+    encode_codex_decision, encode_cursor_decision, is_cursor_agent_argv,
 };
 pub use positions::{Follower, LogPositions};
 pub use prompting::{
