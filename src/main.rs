@@ -1557,6 +1557,9 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     };
+    if !hook_session_is_in_herdr_pane() {
+        return write_hook_decision(interaction.vendor, Some(&Decision::allow())).await;
+    }
     if matches!(interaction.vendor, PermissionVendor::Cursor)
         && cursor_agent_ancestor_argv().is_some_and(|argv| cursor_argv_forces_allow(&argv))
     {
@@ -1579,6 +1582,10 @@ async fn run_hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let decision = request_decision(&interaction, &socket_paths, hook_timeout()).await;
     write_hook_decision(interaction.vendor, decision.as_ref()).await
+}
+
+fn hook_session_is_in_herdr_pane() -> bool {
+    std::env::var_os("HERDR_PANE_ID").is_some()
 }
 
 fn cursor_agent_ancestor_argv() -> Option<Vec<String>> {
@@ -6299,6 +6306,7 @@ mod tests {
         }
         let mut child = command
             .env_remove("HERDR_CLAUDE_BROKER_SOCKET")
+            .env("HERDR_PANE_ID", "testrun-pane")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
